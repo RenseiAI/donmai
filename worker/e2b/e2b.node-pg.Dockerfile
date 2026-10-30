@@ -86,9 +86,15 @@ RUN curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
 # and loopback TCP connections trust: in-box `*.pg.test.ts` suites connect
 # with no credential setup. Remote TCP is untouched (no listen_addresses
 # change here; the default is localhost-only).
-RUN sed -i -E \
-      -e 's/^(local\s+all\s+(all|postgres)\s+)peer$/\1trust/' \
-      -e 's/^(host\s+all\s+all\s+(127\.0\.0\.1\/32|::1\/128)\s+)scram-sha-256$/\1trust/' \
+# NOTE: no backslashes in any RUN command body. The E2B template build SDK
+# parses the Dockerfile with dockerfile-ast and re-emits each RUN joined by
+# single spaces, which strips every single backslash before the builder
+# shell ever sees it. Keep every RUN free of regex escapes and printf
+# escapes (use plain s/peer/trust/ and echo, never regex classes,
+# backreferences, or percent-n escapes).
+RUN sed -i \
+      -e 's/peer/trust/' \
+      -e 's/scram-sha-256/trust/' \
       /etc/postgresql/17/main/pg_hba.conf \
     && grep -E '^(local|host)' /etc/postgresql/17/main/pg_hba.conf
 
@@ -97,25 +103,27 @@ RUN sed -i -E \
 # unconditionally, and it waits for readiness instead of returning while the
 # server is still starting. Lives in /usr/local/bin so it resolves under
 # `bash -l -c`, the shell E2B uses for build steps and SDK version checks.
-RUN cat > /usr/local/bin/pg-start <<'EOF'
-#!/bin/sh
-# Bring up the template's local Postgres 17 cluster on first use.
-set -eu
-if pg_lsclusters 17 main 2>/dev/null | grep -q ' online'; then
-  echo "postgres 17/main already online"
-else
-  pg_ctlcluster 17 main start
-fi
-for _ in $(seq 1 30); do
-  if pg_isready -h /var/run/postgresql -U postgres >/dev/null 2>&1; then
-    echo "postgres 17/main ready"
-    exit 0
-  fi
-  sleep 1
-done
-echo "pg-start: postgres 17/main did not become ready" >&2
-exit 1
-EOF \
+# Written with echo (no heredoc): the SDK joins each RUN into one line, so a
+# shell heredoc terminator would never stand alone and the whole remainder of
+# the Dockerfile would be swallowed into this RUN. Every echo body is
+# single-quoted with no backslashes for the same reason.
+RUN echo '#!/bin/sh' > /usr/local/bin/pg-start \
+    && echo '# Bring up the template local Postgres 17 cluster on first use.' >> /usr/local/bin/pg-start \
+    && echo 'set -eu' >> /usr/local/bin/pg-start \
+    && echo 'if pg_lsclusters 17 main 2>/dev/null | grep -q " online"; then' >> /usr/local/bin/pg-start \
+    && echo 'echo "postgres 17/main already online"' >> /usr/local/bin/pg-start \
+    && echo 'else' >> /usr/local/bin/pg-start \
+    && echo 'pg_ctlcluster 17 main start' >> /usr/local/bin/pg-start \
+    && echo 'fi' >> /usr/local/bin/pg-start \
+    && echo 'for _ in $(seq 1 30); do' >> /usr/local/bin/pg-start \
+    && echo 'if pg_isready -h /var/run/postgresql -U postgres >/dev/null 2>&1; then' >> /usr/local/bin/pg-start \
+    && echo 'echo "postgres 17/main ready"' >> /usr/local/bin/pg-start \
+    && echo 'exit 0' >> /usr/local/bin/pg-start \
+    && echo 'fi' >> /usr/local/bin/pg-start \
+    && echo 'sleep 1' >> /usr/local/bin/pg-start \
+    && echo 'done' >> /usr/local/bin/pg-start \
+    && echo 'echo "pg-start: postgres 17/main did not become ready" >&2' >> /usr/local/bin/pg-start \
+    && echo 'exit 1' >> /usr/local/bin/pg-start \
     && chmod +x /usr/local/bin/pg-start
 
 # Node 22 + provider CLIs. Same pins as e2b.Dockerfile and worker/Dockerfile:
@@ -141,11 +149,13 @@ RUN chmod +x /usr/local/bin/donmai
 # pnpm, pinned once via ARG and installed both ways at that pin (see the
 # header for why both are needed). PNPM_VERSION is the single source of truth
 # the template verifier parses; keep the corepack prepare and the npm install
-# on ${PNPM_VERSION} so they can never drift apart.
+# on ${PNPM_VERSION} so they can never drift apart. The npm install uses
+# --force because corepack enable already placed pnpm/pnpx shims in the
+# global bin dir, and a plain npm install would fail with EEXIST there.
 ARG PNPM_VERSION=12.16.1
 RUN corepack enable \
     && corepack prepare pnpm@${PNPM_VERSION} --activate \
-    && npm i -g pnpm@${PNPM_VERSION} \
+    && npm i -g pnpm@${PNPM_VERSION} --force \
     && npm cache clean --force \
     && bash -l -c 'pnpm --version'
 
@@ -159,16 +169,16 @@ RUN corepack enable \
 ARG PNPM_WARM_STORE=1
 RUN if [ "${PNPM_WARM_STORE}" = "1" ]; then \
       mkdir -p /tmp/pnpm-seed && cd /tmp/pnpm-seed \
-      && printf '%s\n' '{' \
-        '  "name": "node-pg-seed",' \
-        '  "private": true,' \
-        '  "version": "0.0.0",' \
-        '  "dependencies": {' \
-        '    "pg": "8.23.1",' \
-        '    "typescript": "7.0.2",' \
-        '    "vitest": "5.0.5"' \
-        '  }' \
-        '}' > package.json \
+      && echo '{' > package.json \
+      && echo ' "name": "node-pg-seed",' >> package.json \
+      && echo ' "private": true,' >> package.json \
+      && echo ' "version": "0.0.0",' >> package.json \
+      && echo ' "dependencies": {' >> package.json \
+      && echo ' "pg": "8.23.1",' >> package.json \
+      && echo ' "typescript": "7.0.2",' >> package.json \
+      && echo ' "vitest": "5.0.5"' >> package.json \
+      && echo ' }' >> package.json \
+      && echo '}' >> package.json \
       && pnpm install --lockfile-only \
       && pnpm fetch \
       && cd / && rm -rf /tmp/pnpm-seed; \

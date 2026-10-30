@@ -10,6 +10,7 @@ const {
   PG_START_COMMAND,
   PGVECTOR_PROBE_COMMAND,
   PNPM_VERSION_COMMAND,
+  POSTGRES_VERSION_COMMAND,
   assertGofumptVersionOutput,
   assertGolangciLintVersionOutput,
   assertGoVersionOutput,
@@ -18,6 +19,7 @@ const {
   assertPgvectorProbeOutput,
   assertPiVersionOutput,
   assertPnpmVersionOutput,
+  assertPostgresVersionOutput,
   assertVersionOutput,
   executableDockerfileText,
   hasBuildTimeVectorSmoke,
@@ -1552,6 +1554,7 @@ function makeNodePgSandbox({ commandResults = {}, commandErrors = {}, cleanupErr
     [PNPM_VERSION_COMMAND]: { exitCode: 0, stdout: '12.16.1\n' },
     [PG_START_COMMAND]: { exitCode: 0, stdout: 'postgres 17/main ready\n' },
     [PGVECTOR_PROBE_COMMAND]: { exitCode: 0, stdout: 'CREATE EXTENSION\n' },
+    [POSTGRES_VERSION_COMMAND]: { exitCode: 0, stdout: '17.6\n' },
   }
   const Sandbox = {
     async create(templateRef, options) {
@@ -1599,6 +1602,7 @@ function expectedNodePgCalls({ runs, kill = true, apiKey = 'test-key' } = {}) {
     PNPM_VERSION_COMMAND,
     PG_START_COMMAND,
     PGVECTOR_PROBE_COMMAND,
+    POSTGRES_VERSION_COMMAND,
   ]
   const calls = [['create', 'donmai-worker-node-pg:v0.68.5', { apiKey, timeoutMs: 60_000 }]]
   for (const run of runs || defaultRuns) {
@@ -1644,7 +1648,15 @@ test('verifyTemplateVersion fails when the CREATE EXTENSION vector probe exits n
       }),
     /CREATE EXTENSION vector probe exited 1/
   )
-  assert.deepEqual(calls, expectedNodePgCalls())
+  assert.deepEqual(calls, expectedNodePgCalls({
+    runs: [
+      'donmai --version',
+      'pi --version',
+      PNPM_VERSION_COMMAND,
+      PG_START_COMMAND,
+      PGVECTOR_PROBE_COMMAND,
+    ],
+  }))
 })
 
 test('verifyTemplateVersion fails when pg-start exits non-zero', async () => {
@@ -1799,6 +1811,14 @@ test('main() runs node-pg checks for the node-pg template through production sel
             if (command === PGVECTOR_PROBE_COMMAND) {
               return { exitCode: 0, stdout: 'CREATE EXTENSION\n' }
             }
+            if (command === POSTGRES_VERSION_COMMAND) {
+              const source = fs.readFileSync(
+                path.join(repoRoot, 'worker', 'e2b', 'e2b.node-pg.Dockerfile'),
+                'utf8'
+              )
+              const { parsePostgresMajorVersion: parseMajor } = require('./verify-e2b-template.cjs')
+              return { exitCode: 0, stdout: `${parseMajor(source)}.6\n` }
+            }
             throw new Error(`unexpected command: ${command}`)
           },
         },
@@ -1832,6 +1852,7 @@ test('main() runs node-pg checks for the node-pg template through production sel
     PNPM_VERSION_COMMAND,
     PG_START_COMMAND,
     PGVECTOR_PROBE_COMMAND,
+    POSTGRES_VERSION_COMMAND,
   ])
 })
 
@@ -1864,6 +1885,14 @@ test('main() runs node-pg checks for the base template with the explicit flag', 
             if (command === PGVECTOR_PROBE_COMMAND) {
               return { exitCode: 0, stdout: 'CREATE EXTENSION\n' }
             }
+            if (command === POSTGRES_VERSION_COMMAND) {
+              const source = fs.readFileSync(
+                path.join(repoRoot, 'worker', 'e2b', 'e2b.node-pg.Dockerfile'),
+                'utf8'
+              )
+              const { parsePostgresMajorVersion: parseMajor } = require('./verify-e2b-template.cjs')
+              return { exitCode: 0, stdout: `${parseMajor(source)}.6\n` }
+            }
             throw new Error(`unexpected command: ${command}`)
           },
         },
@@ -1890,6 +1919,7 @@ test('main() runs node-pg checks for the base template with the explicit flag', 
     PNPM_VERSION_COMMAND,
     PG_START_COMMAND,
     PGVECTOR_PROBE_COMMAND,
+    POSTGRES_VERSION_COMMAND,
   ])
 })
 
@@ -2059,4 +2089,122 @@ test('release workflow gates node-pg verification on the release checkout', () =
     fs.rmSync(withNodePg, { recursive: true, force: true })
     fs.rmSync(withoutNodePg, { recursive: true, force: true })
   }
+})
+
+// Blocking-findings regression guards: each fails when its production fix is
+// reverted, so the second-pass review can verify the fix by reverting.
+
+test('assertPostgresVersionOutput accepts the pinned major', () => {
+  assert.doesNotThrow(() =>
+    assertPostgresVersionOutput({ exitCode: 0, stdout: '17.6\n' }, '17')
+  )
+})
+
+test('assertPostgresVersionOutput rejects a wrong major', () => {
+  assert.throws(
+    () => assertPostgresVersionOutput({ exitCode: 0, stdout: '15.13\n' }, '17'),
+    /want "17"/
+  )
+})
+
+test('assertPostgresVersionOutput refuses a nonzero exit even with the pinned major', () => {
+  assert.throws(
+    () =>
+      assertPostgresVersionOutput(
+        { exitCode: 1, stdout: '17.6\n', stderr: 'boom' },
+        '17'
+      ),
+    /postgres version query exited 1/
+  )
+})
+
+test('assertPostgresVersionOutput requires an expected major', () => {
+  assert.throws(
+    () => assertPostgresVersionOutput({ exitCode: 0, stdout: '17.6\n' }, ''),
+    /the expected postgres major version is required/
+  )
+})
+
+test('verifyTemplateVersion rejects Postgres 15 when 17 is expected', async () => {
+  const { Sandbox, calls } = makeNodePgSandbox({
+    commandResults: {
+      [POSTGRES_VERSION_COMMAND]: { exitCode: 0, stdout: '15.13\n' },
+    },
+  })
+
+  await assert.rejects(
+    () =>
+      verifyTemplateVersion({
+        Sandbox,
+        templateRef: 'donmai-worker-node-pg:v0.68.5',
+        expectedVersion: 'v0.68.5',
+        expectedPiVersion: '0.80.10',
+        apiKey: 'test-key',
+        expectedPnpmVersion: '12.16.1',
+        expectedPostgresMajorVersion: '17',
+      }),
+    /want "17"/
+  )
+  assert.ok(calls.some((entry) => entry[0] === 'kill'))
+})
+
+test('verifyTemplateVersion refuses a nonzero postgres version query', async () => {
+  const { Sandbox, calls } = makeNodePgSandbox({
+    commandResults: {
+      [POSTGRES_VERSION_COMMAND]: { exitCode: 1, stdout: '', stderr: 'connection refused' },
+    },
+  })
+
+  await assert.rejects(
+    () =>
+      verifyTemplateVersion({
+        Sandbox,
+        templateRef: 'donmai-worker-node-pg:v0.68.5',
+        expectedVersion: 'v0.68.5',
+        expectedPiVersion: '0.80.10',
+        apiKey: 'test-key',
+        expectedPnpmVersion: '12.16.1',
+        expectedPostgresMajorVersion: '17',
+      }),
+    /postgres version query exited 1/
+  )
+  assert.ok(calls.some((entry) => entry[0] === 'kill'))
+})
+
+test('e2b.node-pg.Dockerfile RUN bodies contain no interior backslashes', () => {
+  const repoRoot = testRepoRoot()
+  const dockerfile = fs.readFileSync(
+    path.join(repoRoot, 'worker', 'e2b', 'e2b.node-pg.Dockerfile'),
+    'utf8'
+  )
+  const executable = executableDockerfileText(dockerfile)
+  assert.doesNotMatch(
+    executable,
+    /\\/,
+    'RUN bodies must not contain backslashes: the build SDK strips every single backslash before the builder shell runs'
+  )
+})
+
+test('e2b.node-pg.Dockerfile provisions pg-start without a heredoc', () => {
+  const repoRoot = testRepoRoot()
+  const dockerfile = fs.readFileSync(
+    path.join(repoRoot, 'worker', 'e2b', 'e2b.node-pg.Dockerfile'),
+    'utf8'
+  )
+  assert.doesNotMatch(dockerfile, /<<'EOF'/, 'heredoc terminators do not survive the SDK argument join')
+  assert.match(dockerfile, /echo '#!\/bin\/sh' > \/usr\/local\/bin\/pg-start/)
+  assert.match(dockerfile, /chmod \+x \/usr\/local\/bin\/pg-start/)
+  assert.equal(hasPgStartScript(dockerfile), true)
+})
+
+test('e2b.node-pg.Dockerfile installs pnpm with --force over corepack shims', () => {
+  const repoRoot = testRepoRoot()
+  const dockerfile = fs.readFileSync(
+    path.join(repoRoot, 'worker', 'e2b', 'e2b.node-pg.Dockerfile'),
+    'utf8'
+  )
+  assert.match(
+    executableDockerfileText(dockerfile),
+    /npm i -g pnpm@\$\{PNPM_VERSION\} --force/
+  )
 })

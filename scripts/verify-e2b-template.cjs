@@ -79,6 +79,13 @@ const PGVECTOR_PROBE_COMMAND =
   "psql -U postgres -d postgres -c 'DROP DATABASE IF EXISTS pgvector_probe' " +
   '&& createdb -U postgres pgvector_probe ' +
   "&& psql -U postgres -d pgvector_probe -c 'CREATE EXTENSION vector'"
+// POSTGRES_VERSION_COMMAND queries the running server for its version so the
+// verifier compares the actual major against the Dockerfile pin instead of
+// trusting pg-start's ready message. No backslashes: the E2B build SDK
+// strips single backslashes from RUN bodies, and the same rule keeps
+// verifier commands free of escapes.
+const POSTGRES_VERSION_COMMAND =
+  "psql -U postgres -d postgres -tAc 'SHOW server_version'"
 
 function nodePgCheckCommands() {
   return [PNPM_VERSION_COMMAND, PG_START_COMMAND, PGVECTOR_PROBE_COMMAND]
@@ -520,6 +527,25 @@ function assertPgvectorProbeOutput(result) {
   }
 }
 
+function assertPostgresVersionOutput(result, expectedMajorVersion) {
+  if (!expectedMajorVersion) {
+    throw new Error('the expected postgres major version is required')
+  }
+  if (result.exitCode !== 0) {
+    throw new Error(
+      `postgres version query exited ${result.exitCode}: ${String(result.stderr || '').trim()}`
+    )
+  }
+  const raw = String(result.stdout || '').trim()
+  const match = raw.match(/^(\d+)(?:\.|$)/)
+  const got = match ? match[1] : null
+  if (got !== String(expectedMajorVersion)) {
+    throw new Error(
+      `postgres version = ${JSON.stringify(raw)}, parsed major ${JSON.stringify(got)}, want ${JSON.stringify(String(expectedMajorVersion))}`
+    )
+  }
+}
+
 // assertNodePgCheckOutput runs the assertion for one entry of
 // nodePgCheckCommands(). Unknown commands fail closed so a check that
 // nobody asserts can never silently pass.
@@ -589,6 +615,8 @@ async function verifyTemplateVersion({
         const checkResult = await sandbox.commands.run(command)
         assertNodePgCheckOutput(command, checkResult, { expectedPnpmVersion })
       }
+      const pgVersionResult = await sandbox.commands.run(POSTGRES_VERSION_COMMAND)
+      assertPostgresVersionOutput(pgVersionResult, expectedPostgresMajorVersion)
     }
     let verified = `Verified ${templateRef}: donmai version ${expectedVersion}, pi version ${expectedPiVersion}`
     if (expectGo) {
@@ -722,6 +750,7 @@ module.exports = {
   PG_START_COMMAND,
   PGVECTOR_PROBE_COMMAND,
   PNPM_VERSION_COMMAND,
+  POSTGRES_VERSION_COMMAND,
   assertGofumptVersionOutput,
   assertGolangciLintVersionOutput,
   assertGoVersionOutput,
@@ -730,6 +759,7 @@ module.exports = {
   assertPgvectorProbeOutput,
   assertPiVersionOutput,
   assertPnpmVersionOutput,
+  assertPostgresVersionOutput,
   assertVersionOutput,
   executableDockerfileText,
   formatFailure,
