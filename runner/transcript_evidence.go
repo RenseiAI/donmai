@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -184,17 +185,11 @@ var transcriptUsageCounterKeys = map[string]bool{
 
 func isUsageTranscriptCounterKey(k string) bool {
 	lower := strings.ToLower(k)
+	if transcriptUsageCounterKeys[lower] {
+		return true
+	}
 	norm := strings.ReplaceAll(strings.ReplaceAll(lower, "_", ""), "-", "")
-	if transcriptUsageCounterKeys[norm] {
-		return true
-	}
-	// Camel/snake variants collapse to the same normalized form above;
-	// anything else containing a usage prefix plus "token" is still
-	// telemetry (for example future cache_*_tokens counters).
-	if strings.Contains(norm, "token") && (strings.HasPrefix(norm, "input") || strings.HasPrefix(norm, "output") || strings.HasPrefix(norm, "total") || strings.HasPrefix(norm, "cache") || strings.HasPrefix(norm, "prompt") || strings.HasPrefix(norm, "completion")) {
-		return true
-	}
-	return false
+	return transcriptUsageCounterKeys[norm]
 }
 
 func isSensitiveTranscriptKey(k string) bool {
@@ -377,7 +372,7 @@ func redactJSONValueSensitive(v interface{}, values []string, sensitive bool) in
 		}
 		s := string(typed)
 		for _, sec := range values {
-			if sec != "" && s == sec {
+			if sec != "" && transcriptNumberStringsEqual(s, sec) {
 				return "[REDACTED]"
 			}
 		}
@@ -388,7 +383,7 @@ func redactJSONValueSensitive(v interface{}, values []string, sensitive bool) in
 		}
 		s := fmt.Sprint(typed)
 		for _, sec := range values {
-			if sec != "" && s == sec {
+			if sec != "" && transcriptNumberStringsEqual(s, sec) {
 				return "[REDACTED]"
 			}
 		}
@@ -415,15 +410,16 @@ func redactJSONValueSensitive(v interface{}, values []string, sensitive bool) in
 			rk = diagnostic.Redact(rk)
 			childSensitive := sensitive || isSensitiveTranscriptKey(k)
 			if !childSensitive && isUsageTranscriptCounterKey(k) {
-				// Usage counters stay numeric so evidence keeps its shape,
-				// but a string under a counter key has no numeric shape to
-				// keep: the shared output rail masks
-				// {"input_tokens":"secret"} wholesale, so the JSON-aware
-				// rail must too. Otherwise an unknown password under a
-				// counter key would survive while the same bytes through
-				// diagnostic.Redact are masked.
-				if s, ok := val.(string); ok && s != "" {
-					childSensitive = true
+				// Exact counter keys are telemetry only when the value
+				// is a JSON number; anything else under a counter key
+				// is redacted whole fail-closed so object, array,
+				// string, boolean, and null values cannot smuggle
+				// secrets behind the telemetry exemption.
+				switch val.(type) {
+				case json.Number, float64, float32, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+				default:
+					out[rk] = "[REDACTED]"
+					continue
 				}
 			}
 			out[rk] = redactJSONValueSensitive(val, values, childSensitive)
@@ -528,8 +524,9 @@ func transcriptJSONValuesEqual(a, b interface{}) bool {
 }
 
 // transcriptJSONNumberEqual compares one number literal against any decoded
-// JSON number form by string literal first, then by numeric value so 123
-// and 123.0 match fail-closed.
+// JSON number form by string literal first, then by parsed numeric value
+// (big.Float) so 123, 123.0, and 1.23e2 match fail-closed without float64
+// spelling or precision bypasses.
 func transcriptJSONNumberEqual(a string, b interface{}) bool {
 	var bs string
 	switch bv := b.(type) {
@@ -542,21 +539,28 @@ func transcriptJSONNumberEqual(a string, b interface{}) bool {
 	default:
 		return false
 	}
-	if a == bs {
-		return true
-	}
-	af, aerr := parseTranscriptJSONFloat(a)
-	bf, berr := parseTranscriptJSONFloat(bs)
-	return aerr == nil && berr == nil && af == bf
+	return transcriptNumberStringsEqual(a, bs)
 }
 
-// parseTranscriptJSONFloat parses one JSON number literal for equality.
-func parseTranscriptJSONFloat(s string) (float64, error) {
-	var f float64
-	if err := json.Unmarshal([]byte(strings.TrimSpace(s)), &f); err != nil {
-		return 0, err
+// transcriptNumberStringsEqual reports whether two JSON number literals
+// denote the same numeric value. Spelling comparison alone lets
+// 9.87654321e8 slip past a "987654321" secret; parsed-value comparison
+// closes it. Non-numeric inputs never match.
+func transcriptNumberStringsEqual(a, b string) bool {
+	a = strings.TrimSpace(a)
+	b = strings.TrimSpace(b)
+	if a == "" || b == "" {
+		return false
 	}
-	return f, nil
+	if a == b {
+		return true
+	}
+	af, ok1 := new(big.Float).SetString(a)
+	bf, ok2 := new(big.Float).SetString(b)
+	if !ok1 || !ok2 {
+		return false
+	}
+	return af.Cmp(bf) == 0
 }
 
 // redactJSONString redacts one decoded string value. A JSON-shaped string
@@ -645,6 +649,12 @@ func redactJSONString(s string, values []string) string {
 // decoded and redacted recursively. Candidates that fail to parse are left
 // for the literal rail.
 func redactEmbeddedTranscriptJSON(s string, values []string) string {
+	// Fail closed on budget exhaustion: a string larger than twice the
+	// per-file tail cap cannot be scanned faithfully, so it is redacted
+	// whole rather than copied unchecked.
+	if int64(len(s)) > transcriptEvidencePerFileCapBytes*2 {
+		return "[REDACTED]"
+	}
 	type span struct {
 		start int
 		end   int
@@ -680,13 +690,13 @@ func redactEmbeddedTranscriptJSON(s string, values []string) string {
 				// prose braces that parse but need no redaction are left
 				// untouched to keep the archive faithful.
 				if redactedNeedsReplacement(cand, redacted) {
+					if len(spans) >= 1024 {
+						return "[REDACTED]"
+					}
 					spans = append(spans, span{start: i, end: end, text: string(b)})
 					i = end - 1
 				}
 			}
-		}
-		if len(spans) >= 8 {
-			break
 		}
 	}
 	if len(spans) == 0 {
@@ -698,8 +708,14 @@ func redactEmbeddedTranscriptJSON(s string, values []string) string {
 		sb.WriteString(s[prev:sp.start])
 		sb.WriteString(sp.text)
 		prev = sp.end
+		if int64(sb.Len()+(len(s)-prev)) > transcriptEvidencePerFileCapBytes*2 {
+			return "[REDACTED]"
+		}
 	}
 	sb.WriteString(s[prev:])
+	if int64(sb.Len()) > transcriptEvidencePerFileCapBytes*2 {
+		return "[REDACTED]"
+	}
 	return sb.String()
 }
 

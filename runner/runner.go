@@ -1001,11 +1001,18 @@ func (r *Runner) run(ctx context.Context, qw QueuedWork, admission *HarnessAdmis
 			// Failed-session transcript tails share this teardown's directory
 			// with patches and descriptors. Unlike descriptors, tails are
 			// fail-closed: a tail failure keeps the workarea so a failed
-			// session never loses evidence silently. (Failed sessions never
-			// take the leased-completed path above, so flipping
-			// teardownRequired here is sufficient to retain the workarea.)
+			// session never loses evidence silently. A lease acquired for
+			// the pre-flip completed status already holds a destroy
+			// disposition, so flipping teardownRequired alone cannot
+			// retain the workarea once the reaper runs: the lease
+			// itself must be flipped to retain.
 			if !r.archiveFailedSessionEvidence(qw, res, pres.dirFor) {
 				teardownRequired = false
+				if leaseAcquired && leaseProjection != nil {
+					if _, retainErr := r.wt.RetainTerminalLease(context.Background(), leaseProjection.LeaseID, qw.SessionID, terminalResultID, leaseProjection.WorkareaID); retainErr != nil {
+						r.logger.Warn("failed-session evidence retention failed; workarea may not survive reaping", "sessionId", qw.SessionID)
+					}
+				}
 			}
 		}
 		if pres != nil && finalGate {

@@ -708,6 +708,42 @@ func (s *LeaseStore) RecordArchiveReference(ctx context.Context, leaseID string,
 	return out, err
 }
 
+// Retain durably flips a leased workarea to the retain disposition so a
+// later fail-closed evidence failure keeps the workarea across restart and
+// expiry reaping. It is idempotent: a lease already retained succeeds
+// without further mutation.
+func (s *LeaseStore) Retain(ctx context.Context, leaseID, sessionID, terminalResultID, workareaID string) (*TerminalLease, error) {
+	if err := s.Ready(); err != nil {
+		return nil, err
+	}
+	var out *TerminalLease
+	err := s.withLocks(ctx, []string{"result:" + terminalResultID, "workarea:" + workareaID, clockLockKey}, func() error {
+		lease, err := s.load(leaseID)
+		if err != nil {
+			return err
+		}
+		if err := validateIdentity(*lease, sessionID, terminalResultID, workareaID); err != nil {
+			return err
+		}
+		if lease.ReleaseDisposition == "retain" {
+			out = lease
+			return nil
+		}
+		nowMS, err := s.sampleClockLocked()
+		if err != nil {
+			return s.failClosed(err)
+		}
+		lease.ReleaseDisposition = "retain"
+		lease.ClockHighWatermarkMS = nowMS
+		if err := s.saveUnlocked(*lease); err != nil {
+			return s.failClosed(err)
+		}
+		out = lease
+		return nil
+	})
+	return out, err
+}
+
 // MarkTerminalStatusDelivered implements the documented terminal-workarea contract.
 func (s *LeaseStore) MarkTerminalStatusDelivered(ctx context.Context, leaseID, sessionID, terminalResultID, workareaID string) (*TerminalLease, error) {
 	var out *TerminalLease
@@ -1658,7 +1694,7 @@ func validateAcquireSpec(spec AcquireSpec) error {
 	if err := spec.Policy.Validate(); err != nil {
 		return err
 	}
-	if spec.ReleaseDisposition != "destroy" && spec.ReleaseDisposition != "return-to-pool" && spec.ReleaseDisposition != "pause" && spec.ReleaseDisposition != "archive" {
+	if spec.ReleaseDisposition != "destroy" && spec.ReleaseDisposition != "return-to-pool" && spec.ReleaseDisposition != "pause" && spec.ReleaseDisposition != "archive" && spec.ReleaseDisposition != "retain" {
 		return errors.New("runtime/workarea: invalid release disposition")
 	}
 	return nil
