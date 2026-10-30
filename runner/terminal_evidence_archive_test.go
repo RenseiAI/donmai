@@ -841,3 +841,202 @@ func TestPreserveTerminalEvidence_ArchiveWriteFailureRetainsWorkarea(t *testing.
 		t.Fatalf("PostSessionWarnings = %v; want exactly [%q]", res.PostSessionWarnings, terminalEvidenceWarnMessage)
 	}
 }
+
+// TestRun_FailedSessionParentSwapNeverArchivesOutside pins the post-open
+// identity refusal through production Run: the declared path is a regular
+// victim file at the Lstat hint, but its parent directory is swapped for a
+// symlink to an outside directory holding the same basename before the
+// production open runs. O_NOFOLLOW protects only the trailing component,
+// so the open succeeds on the outside file; only the SameFile identity
+// comparison against the Lstat result refuses. Without it the outside
+// content is archived, readback verifies the wrong file, and teardown
+// deletes the workarea holding the original evidence.
+func TestRun_FailedSessionParentSwapNeverArchivesOutside(t *testing.T) {
+	const victimBody = "victim-transcript-body-b1\n"
+	const outsideBody = "outside-content-must-never-be-archived-b1\n"
+	rescueDir := t.TempDir()
+	outsideDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(outsideDir, "evidence-test.cast"), []byte(outsideBody), 0o600); err != nil {
+		t.Fatalf("write outside evidence: %v", err)
+	}
+
+	h := newRunnerHarness(t)
+	provider := &archiveTestProvider{HarnessProvider: stubBaseForArchive(t), t: t, evidenceBody: victimBody, crash: true}
+	reg := NewRegistry()
+	if err := reg.Register(provider); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	h.runner.registry = reg
+	h.runner.preserveAlways = false
+	h.runner.rescueDir = rescueDir
+
+	swapped := false
+	h.runner.terminalEvidenceOpenFile = func(p string) (*os.File, error) {
+		if !swapped {
+			swapped = true
+			parent := filepath.Dir(p)
+			backup := parent + ".victim-bak"
+			if err := os.Rename(parent, backup); err != nil {
+				return nil, err
+			}
+			if err := os.Symlink(outsideDir, parent); err != nil {
+				_ = os.Rename(backup, parent)
+				return nil, err
+			}
+		}
+		return openTerminalEvidenceFile(p)
+	}
+
+	qw := h.queuedWork("ARCHIVE-PARENT-SWAP")
+	qw.WorkType = "research"
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := h.runner.Run(ctx, qw)
+	if err != nil && res == nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Status != "failed" {
+		t.Fatalf("Status = %q; want failed (failureMode=%q error=%q)", res.Status, res.FailureMode, res.Error)
+	}
+	if _, err := os.Stat(res.WorktreePath); err != nil {
+		t.Fatalf("worktree stat err = %v; want the workarea kept when the parent swap refuses preservation", err)
+	}
+	found := false
+	for _, w := range append(append([]string{}, res.PostSessionWarnings...), res.Result.PostSessionWarnings...) {
+		if w == terminalEvidenceWarnMessage {
+			found = true
+		}
+		if strings.Contains(w, outsideBody) || strings.Contains(w, victimBody) || strings.Contains(w, ".cast") {
+			t.Fatalf("warning %q leaks content or a path; want value-free", w)
+		}
+	}
+	if !found {
+		t.Fatalf("PostSessionWarnings = %v + wire %v; want the value-free warning", res.PostSessionWarnings, res.Result.PostSessionWarnings)
+	}
+	for _, a := range findEvidenceArchives(t, rescueDir) {
+		//nolint:gosec // G304: test-owned archive path under t.TempDir().
+		raw, err := os.ReadFile(a)
+		if err != nil {
+			t.Fatalf("read archive: %v", err)
+		}
+		if strings.Contains(string(raw), outsideBody) {
+			t.Fatalf("archive %s holds outside content; parent swap must refuse preservation", a)
+		}
+		if len(raw) != 0 {
+			t.Fatalf("archive %s holds %d bytes; want none: the swapped open must not archive", a, len(raw))
+		}
+	}
+	if archives := findEvidenceArchives(t, rescueDir); len(archives) != 0 {
+		t.Fatalf("evidence archives = %v; want none: identity mismatch must refuse before any copy", archives)
+	}
+}
+
+// TestRun_FailedSessionSourceReadErrorKeepsWorkarea pins the source-read
+// error refusal through production Run: the declared file exists and
+// opens, but the read returns partial bytes plus an error. Preservation
+// must refuse, keep the workarea, and emit only the value-free warning.
+// Ignoring the read error would archive the partial bytes, verify that
+// partial copy, and authorize teardown of the only complete evidence.
+func TestRun_FailedSessionSourceReadErrorKeepsWorkarea(t *testing.T) {
+	const victimBody = "victim-transcript-body-b2\n"
+	const partialBody = "partial-bytes-b2\n"
+	rescueDir := t.TempDir()
+
+	h := newRunnerHarness(t)
+	provider := &archiveTestProvider{HarnessProvider: stubBaseForArchive(t), t: t, evidenceBody: victimBody, crash: true}
+	reg := NewRegistry()
+	if err := reg.Register(provider); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	h.runner.registry = reg
+	h.runner.preserveAlways = false
+	h.runner.rescueDir = rescueDir
+	h.runner.terminalEvidenceReadSource = func(*os.File) ([]byte, error) {
+		return []byte(partialBody), errors.New("injected source read failure")
+	}
+
+	qw := h.queuedWork("ARCHIVE-SOURCE-ERROR")
+	qw.WorkType = "research"
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := h.runner.Run(ctx, qw)
+	if err != nil && res == nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Status != "failed" {
+		t.Fatalf("Status = %q; want failed (failureMode=%q error=%q)", res.Status, res.FailureMode, res.Error)
+	}
+	if _, err := os.Stat(res.WorktreePath); err != nil {
+		t.Fatalf("worktree stat err = %v; want the workarea kept when the source read fails", err)
+	}
+	found := false
+	for _, w := range append(append([]string{}, res.PostSessionWarnings...), res.Result.PostSessionWarnings...) {
+		if w == terminalEvidenceWarnMessage {
+			found = true
+		}
+		if strings.Contains(w, partialBody) || strings.Contains(w, victimBody) || strings.Contains(w, ".cast") {
+			t.Fatalf("warning %q leaks content or a path; want value-free", w)
+		}
+	}
+	if !found {
+		t.Fatalf("PostSessionWarnings = %v + wire %v; want the value-free warning", res.PostSessionWarnings, res.Result.PostSessionWarnings)
+	}
+	for _, a := range findEvidenceArchives(t, rescueDir) {
+		//nolint:gosec // G304: test-owned archive path under t.TempDir().
+		raw, err := os.ReadFile(a)
+		if err != nil {
+			t.Fatalf("read archive: %v", err)
+		}
+		if strings.Contains(string(raw), partialBody) {
+			t.Fatalf("archive %s holds the partial read; a read error must never archive", a)
+		}
+	}
+	if archives := findEvidenceArchives(t, rescueDir); len(archives) != 0 {
+		t.Fatalf("evidence archives = %v; want none: a source read error must refuse before any copy", archives)
+	}
+}
+
+// TestReadTerminalEvidenceChunk_ProbeByteDetectsGrowth pins the extra
+// probe byte in the production bounded reader with a real file: the file
+// is opened small and then grows past the limit before the read, exactly
+// the Stat-to-read growth window the probe guards. The reader must return
+// limit+1 bytes so the caller refuses instead of archiving a truncated
+// copy as success. Reading only limit bytes would return success for the
+// truncated prefix and authorize teardown of the complete source.
+func TestReadTerminalEvidenceChunk_ProbeByteDetectsGrowth(t *testing.T) {
+	const limit int64 = 16
+	path := filepath.Join(t.TempDir(), "evidence.cast")
+	if err := os.WriteFile(path, []byte("01234567"), 0o600); err != nil {
+		t.Fatalf("write small evidence: %v", err)
+	}
+	//nolint:gosec // G304: test-owned path under t.TempDir().
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("open evidence: %v", err)
+	}
+	defer func() { _ = f.Close() }()
+	// Grow after open through a second handle: the read below must
+	// observe the grown content even though the file was small at open.
+	//nolint:gosec // G304: test-owned path under t.TempDir().
+	g, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		t.Fatalf("open evidence for growth: %v", err)
+	}
+	if _, err := g.WriteString("0123456789ABCDEF"); err != nil {
+		_ = g.Close()
+		t.Fatalf("grow evidence: %v", err)
+	}
+	if err := g.Close(); err != nil {
+		t.Fatalf("close grown evidence: %v", err)
+	}
+	raw, err := readTerminalEvidenceChunk(f, limit)
+	if err != nil {
+		t.Fatalf("readTerminalEvidenceChunk: %v", err)
+	}
+	if int64(len(raw)) != limit+1 {
+		t.Fatalf("readTerminalEvidenceChunk len = %d; want %d (the probe byte past the bound)", len(raw), limit+1)
+	}
+	if int64(len(raw)) <= limit {
+		t.Fatalf("readTerminalEvidenceChunk len = %d; want more than %d so growth refuses", len(raw), limit)
+	}
+}

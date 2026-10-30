@@ -19,6 +19,17 @@ const terminalEvidenceMaxBytes = 64 << 20
 // so the evidence is never deleted without a copy.
 const terminalEvidenceWarnMessage = "terminal evidence preservation failed; workarea retained"
 
+// readTerminalEvidenceChunk reads one opened evidence file with a bounded
+// probe: up to limit+1 bytes. The extra byte distinguishes a file that
+// grew past the bound after Stat (the read observes limit+1 bytes, which
+// the caller refuses) from one that fits (the read observes at most limit
+// bytes, accepted). Without the probe byte a file that grew mid-read
+// would archive as a truncated success and authorize teardown of the
+// workarea holding the only complete copy.
+func readTerminalEvidenceChunk(f *os.File, limit int64) ([]byte, error) {
+	return io.ReadAll(io.LimitReader(f, limit+1))
+}
+
 // needsTerminalEvidenceArchive reports whether a terminal result owes a
 // terminal evidence archive. Only failed and stopped sessions archive;
 // completed sessions (and empty or descriptor-free results) are untouched.
@@ -89,12 +100,19 @@ func (r *Runner) preserveTerminalEvidence(qw QueuedWork, res *Result) bool {
 			r.warnTerminalEvidencePreservation(qw, res)
 			return false
 		}
-		// Re-verify after open: the descriptor could have been swapped
-		// to a FIFO between the Lstat hint and Open. The LimitReader in
-		// the source read additionally caps a file that grew in that
-		// window, so the read never allocates beyond the bound plus one
-		// probe byte.
-		if st, err := f.Stat(); err != nil || !st.Mode().IsRegular() || st.Size() > terminalEvidenceMaxBytes {
+		// Re-verify after open: the descriptor or one of its parent
+		// directories could have been swapped between the Lstat hint and
+		// Open. O_NOFOLLOW stops only a swapped trailing symlink; a
+		// swapped parent directory redirects the open through a symlink
+		// to an outside file with the same basename, which opens as a
+		// regular file. The SameFile identity comparison closes that
+		// seam: any file that is not the Lstat-observed file refuses, so
+		// readback can only verify the original evidence and teardown can
+		// only delete a workarea whose evidence was actually copied. The
+		// LimitReader in the source read additionally caps a file that
+		// grew in that window, so the read never allocates beyond the
+		// bound plus one probe byte.
+		if st, err := f.Stat(); err != nil || !st.Mode().IsRegular() || st.Size() > terminalEvidenceMaxBytes || !os.SameFile(fi, st) {
 			_ = f.Close()
 			r.warnTerminalEvidencePreservation(qw, res)
 			return false
@@ -102,7 +120,7 @@ func (r *Runner) preserveTerminalEvidence(qw QueuedWork, res *Result) bool {
 		readSource := r.terminalEvidenceReadSource
 		if readSource == nil {
 			readSource = func(f *os.File) ([]byte, error) {
-				return io.ReadAll(io.LimitReader(f, terminalEvidenceMaxBytes+1))
+				return readTerminalEvidenceChunk(f, terminalEvidenceMaxBytes)
 			}
 		}
 		raw, err := readSource(f)
