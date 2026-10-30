@@ -2277,10 +2277,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 	// cancellable, non-overlapping loop owned by Start/Stop. It starts
 	// only for explicitly opted-in configs (nightly/on-release schedule
 	// plus a configured source plus pinned signers); every other config
-	// stays inert with no goroutine and no network calls. This is the
-	// last fallible-adjacent step: nothing below fails, so a failed
-	// Start can never leak the loop.
-	d.startAutoUpdateScheduler()
+	// stays inert with no goroutine and no network calls.
 	d.lifecycleMu.Lock()
 	if err := ctx.Err(); err != nil {
 		d.lifecycleMu.Unlock()
@@ -2296,6 +2293,9 @@ func (d *Daemon) Start(ctx context.Context) error {
 		d.activateStartupPollingLocked()
 	}
 	d.lifecycleMu.Unlock()
+	// Start the scheduler after the cancellation check: nothing below
+	// fails, so a failed Start can never leak the loop.
+	d.startAutoUpdateScheduler()
 	localStarted = true
 	return nil
 }

@@ -24,8 +24,11 @@ import (
 //
 //	trigger                 result              end state
 //	up-to-date manifest     no lifecycle step   running (never drained)
+//	pre-check failure       check failed        running (never drained,
+//	                                            no Update entered)
 //	preflight refused       Update refused      draining (explicit resume required)
-//	attempt timeout/failure Update error        draining (explicit resume required)
+//	Update-phase timeout/   Update error        draining (explicit resume required)
+//	failure                   after entering Update
 //	verification failed     swap refused        draining (explicit resume required)
 //	swap applied            restart pending     draining; the process exits only
 //	                                            via the caller's restart path
@@ -137,15 +140,15 @@ func (d *Daemon) startAutoUpdateScheduler() {
 		return
 	}
 	clock := d.autoUpdateClockOrDefault()
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(context.Background()) //nolint:gosec // G118: cancel stored on the scheduler and called in stopAutoUpdateScheduler
 	s := &autoUpdateScheduler{
 		daemon: d,
 		clock:  clock,
 		ctx:    ctx,
-		cancel: cancel,
 		quit:   make(chan struct{}),
 		done:   make(chan struct{}),
 	}
+	s.cancel = cancel
 	d.lifecycleMu.Lock()
 	d.autoUpdateScheduler = s
 	d.lifecycleMu.Unlock()

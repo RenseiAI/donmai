@@ -369,8 +369,9 @@ running/draining/updating states:
 | Trigger | Result | End state |
 |---|---|---|
 | up-to-date manifest | no lifecycle step | running (never drained) |
+| pre-check (manifest) failure | check failed before entering Update | running (never drained) |
 | newer release, preflight refused | update refused before any binary download | draining (explicit resume required) |
-| attempt timeout or failure | update error | draining (explicit resume required) |
+| Update-phase timeout or failure after entering Update | update error | draining (explicit resume required) |
 | invalid signature | swap refused fail-closed | draining (explicit resume required) |
 | failed restart preflight | swap refused | draining (explicit resume required) |
 | newer signed release | swap applied, restart pending | draining until the caller's restart path runs |
