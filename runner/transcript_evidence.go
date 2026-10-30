@@ -9,9 +9,11 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/RenseiAI/donmai/internal/diagnostic"
 )
@@ -35,6 +37,14 @@ var transcriptEvidencePerFileCapBytes int64 = 64 * 1024
 // transcriptEvidencePerAttemptCapBytes bounds all archived transcript tails
 // in one rescue attempt.
 var transcriptEvidencePerAttemptCapBytes int64 = 256 * 1024
+
+// transcriptEvidenceIOTimeout bounds every blocking evidence file operation
+// (validation, open, stat, tail read, atomic write, readback) so a stalled
+// transcript on network/FUSE storage cannot hang failed-session
+// finalization. Each operation fails closed on timeout and the caller keeps
+// the workarea. A variable so tests prove the deadline without waiting the
+// production budget.
+var transcriptEvidenceIOTimeout = 800 * time.Millisecond
 
 // transcriptEvidenceLstat validates the declared path without following a
 // final symlink. A variable so tests can prove the fail-closed branches.
@@ -109,13 +119,16 @@ func sameTranscriptFile(a, b os.FileInfo) bool {
 // archiver must redact: the session bearers, ALL session env values, and
 // the process env values with secret-shaped names, plus any userinfo
 // password embedded in a URL-style value. Unlike the checkpoint content
-// gate it has no minimum-length floor: a short session secret that reaches
-// a transcript must still fail closed.
+// gate it has no minimum-length floor and no maximum-length exclusion: a
+// short session secret that reaches a transcript must still fail closed,
+// and a long session value up to the per-file cap must not survive intact
+// in a successful archive. Tails are bounded (per-file and per-attempt
+// caps) so the scan stays cheap without dropping long secrets.
 func transcriptEvidenceSecretValues(qw QueuedWork) []string {
 	seen := map[string]bool{}
 	var out []string
 	add := func(v string) {
-		if v == "" || len(v) > wipSecretMaxValueLen || seen[v] {
+		if v == "" || seen[v] {
 			return
 		}
 		seen[v] = true
@@ -144,8 +157,10 @@ func transcriptEvidenceSecretValues(qw QueuedWork) []string {
 // transcriptSensitiveKeyRE mirrors the shared output rail's secret-name
 // list for JSON-aware redaction. A string value under one of these keys is
 // replaced wholesale so an unknown password never survives with its JSON
-// quoting intact. Numeric, boolean, and null values are left alone so
-// ordinary token-usage counters stay valid JSON numbers.
+// quoting intact. Numbers that equal a known session secret are redacted
+// too (a numeric PIN emitted as a JSON number); other numbers, booleans,
+// and null are left alone so ordinary token-usage counters stay valid JSON
+// numbers.
 var transcriptSensitiveKeyRE = regexp.MustCompile(`(?i)(authorization|bearer|api[_-]?keys?|access[_-]?tokens?|refresh[_-]?tokens?|auth[_-]?tokens?|client[_-]?secrets?|private[_-]?keys?|secrets?|tokens?|passwords?|passwds?|credentials?|cookies?|sessions?)`)
 
 func isSensitiveTranscriptKey(k string) bool {
@@ -283,32 +298,62 @@ func parseTranscriptJSONLine(line string, out *interface{}) error {
 	return nil
 }
 
-// redactJSONValue redacts one decoded JSON value in place.
+// redactJSONValue redacts one decoded JSON value. Object keys carrying a
+// known secret are rewritten, json.Number values equal to a known secret
+// are replaced, and sensitive context propagates into nested objects and
+// arrays so unknown credentials under a sensitive key cannot survive.
 func redactJSONValue(v interface{}, values []string) interface{} {
+	return redactJSONValueSensitive(v, values, false)
+}
+
+// redactJSONValueSensitive redacts one decoded JSON value, treating the
+// value as sensitive when it sits under a sensitive key. Sensitive string
+// values are replaced wholesale (unknown passwords fail closed);
+// sensitive arrays are replaced wholesale so array elements cannot lose
+// that context. Numbers are redacted only when they equal a known secret
+// so usage counters stay numeric while numeric PINs do not survive.
+func redactJSONValueSensitive(v interface{}, values []string, sensitive bool) interface{} {
 	switch typed := v.(type) {
 	case string:
+		if sensitive {
+			return "[REDACTED]"
+		}
 		return redactJSONString(typed, values)
-	case map[string]interface{}:
-		for k, val := range typed {
-			if isSensitiveTranscriptKey(k) {
-				switch sv := val.(type) {
-				case string:
-					_ = sv
-					typed[k] = "[REDACTED]"
-				case map[string]interface{}, []interface{}:
-					typed[k] = redactJSONValue(val, values)
-				default:
-					// Numbers, booleans, and null under usage-style keys
-					// (for example input_tokens) are counters, not secrets.
-				}
-			} else {
-				typed[k] = redactJSONValue(val, values)
+	case json.Number:
+		s := string(typed)
+		for _, sec := range values {
+			if sec != "" && s == sec {
+				return "[REDACTED]"
 			}
 		}
-		return typed
+		return v
+	case float64, float32, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+		s := fmt.Sprint(typed)
+		for _, sec := range values {
+			if sec != "" && s == sec {
+				return "[REDACTED]"
+			}
+		}
+		return v
+	case map[string]interface{}:
+		out := make(map[string]interface{}, len(typed))
+		for k, val := range typed {
+			rk := k
+			for _, sec := range values {
+				if sec != "" && strings.Contains(rk, sec) {
+					rk = strings.ReplaceAll(rk, sec, "[REDACTED]")
+				}
+			}
+			childSensitive := sensitive || isSensitiveTranscriptKey(k)
+			out[rk] = redactJSONValueSensitive(val, values, childSensitive)
+		}
+		return out
 	case []interface{}:
+		if sensitive {
+			return "[REDACTED]"
+		}
 		for i, e := range typed {
-			typed[i] = redactJSONValue(e, values)
+			typed[i] = redactJSONValueSensitive(e, values, false)
 		}
 		return typed
 	default:
@@ -316,17 +361,53 @@ func redactJSONValue(v interface{}, values []string) interface{} {
 	}
 }
 
-// redactJSONString redacts one decoded string value. When the whole string
-// is itself JSON (a doubly-encoded record), the inner record is redacted
-// recursively so nested secrets cannot survive behind a second encoding.
+// redactJSONString redacts one decoded string value. A JSON-shaped string
+// that contains a known session secret is itself a credential value and is
+// replaced wholesale so the secret cannot survive behind a second encoding.
+// Otherwise, when the whole string is itself JSON (a doubly-encoded record),
+// the inner record is redacted recursively and the re-encoded form is
+// redacted again with the literal rail so a complete JSON credential value
+// emitted as an escaped JSON string cannot bypass the exact-match loop.
 func redactJSONString(s string, values []string) string {
 	trimmed := strings.TrimSpace(s)
-	if len(trimmed) >= 2 && ((trimmed[0] == '{' && trimmed[len(trimmed)-1] == '}') || (trimmed[0] == '[' && trimmed[len(trimmed)-1] == ']')) {
+	isJSONShape := len(trimmed) >= 2 && ((trimmed[0] == '{' && trimmed[len(trimmed)-1] == '}') || (trimmed[0] == '[' && trimmed[len(trimmed)-1] == ']'))
+	if isJSONShape {
+		for _, v := range values {
+			if v != "" && strings.Contains(s, v) {
+				return "[REDACTED]"
+			}
+		}
+		var innerRaw interface{}
+		if err := json.Unmarshal([]byte(trimmed), &innerRaw); err == nil {
+			for _, v := range values {
+				vt := strings.TrimSpace(v)
+				if len(vt) < 2 {
+					continue
+				}
+				isSecretJSON := (vt[0] == '{' && vt[len(vt)-1] == '}') || (vt[0] == '[' && vt[len(vt)-1] == ']')
+				if !isSecretJSON {
+					continue
+				}
+				var secretRaw interface{}
+				if err := json.Unmarshal([]byte(vt), &secretRaw); err != nil {
+					continue
+				}
+				if reflect.DeepEqual(innerRaw, secretRaw) {
+					return "[REDACTED]"
+				}
+			}
+		}
 		var inner interface{}
 		if err := json.Unmarshal([]byte(trimmed), &inner); err == nil {
 			redacted := redactJSONValue(inner, values)
 			if b, err := json.Marshal(redacted); err == nil {
-				return string(b)
+				s2 := string(b)
+				for _, v := range values {
+					if v != "" {
+						s2 = strings.ReplaceAll(s2, v, "[REDACTED]")
+					}
+				}
+				return diagnostic.Redact(s2)
 			}
 		}
 	}
@@ -450,6 +531,51 @@ func transcriptEvidenceSafeErr(err error, values []string) string {
 		return redactTranscriptEvidence(msg, values)
 	}
 	return redactTranscriptEvidence(err.Error(), values)
+}
+
+// transcriptEvidenceCallWithTimeout runs fn with the evidence I/O deadline.
+// A read that never returns (a regular transcript on stalled network/FUSE
+// storage, where O_NONBLOCK gives regular-file reads no timeout) fails
+// closed here so Runner.Run can still reach its terminal result delivery
+// and retention decision instead of hanging finalization.
+func transcriptEvidenceCallWithTimeout(fn func() error) error {
+	if transcriptEvidenceIOTimeout <= 0 {
+		return fn()
+	}
+	done := make(chan error, 1)
+	go func() { done <- fn() }()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(transcriptEvidenceIOTimeout):
+		return fmt.Errorf("transcript evidence I/O timed out")
+	}
+}
+
+// transcriptEvidenceValueWithTimeout runs a value-returning evidence file
+// operation with the same deadline. The buffered channel avoids a data race
+// when the operation outlives the timeout: the late sender never blocks and
+// the caller discards its result fail-closed.
+func transcriptEvidenceValueWithTimeout[T any](fn func() (T, error)) (T, error) {
+	if transcriptEvidenceIOTimeout <= 0 {
+		return fn()
+	}
+	type result struct {
+		v   T
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		v, err := fn()
+		done <- result{v: v, err: err}
+	}()
+	select {
+	case r := <-done:
+		return r.v, r.err
+	case <-time.After(transcriptEvidenceIOTimeout):
+		var zero T
+		return zero, fmt.Errorf("transcript evidence I/O timed out")
+	}
 }
 
 // capTranscriptBytes keeps the newest complete lines of s under capBytes.
@@ -606,7 +732,9 @@ func (r *Runner) archiveFailedSessionEvidence(qw QueuedWork, res *Result, dirFor
 			appendTranscriptEvidenceWarning(res, i)
 			return false
 		}
-		linfo, err := transcriptEvidenceLstat(resolved)
+		linfo, err := transcriptEvidenceValueWithTimeout(func() (os.FileInfo, error) {
+			return transcriptEvidenceLstat(resolved)
+		})
 		if err != nil {
 			r.logger.Warn("transcript evidence validation failed; keeping workarea", "sessionId", qw.SessionID, "err", transcriptEvidenceSafeErr(err, values))
 			appendTranscriptEvidenceWarning(res, i)
@@ -621,16 +749,24 @@ func (r *Runner) archiveFailedSessionEvidence(qw QueuedWork, res *Result, dirFor
 			transcriptEvidenceAfterValidate(resolved)
 		}
 		//nolint:gosec // G304: resolved is the validated declared transcript path.
-		f, err := transcriptEvidenceOpen(resolved)
+		f, err := transcriptEvidenceValueWithTimeout(func() (*os.File, error) {
+			//nolint:gosec // G304: resolved is the validated declared transcript path.
+			return transcriptEvidenceOpen(resolved)
+		})
 		if err != nil {
 			r.logger.Warn("transcript evidence read failed; keeping workarea", "sessionId", qw.SessionID, "err", transcriptEvidenceSafeErr(err, values))
 			appendTranscriptEvidenceWarning(res, i)
 			return false
 		}
-		finfo, statErr := f.Stat()
-		tail, readErr := func() ([]byte, error) {
+		finfo, statErr := transcriptEvidenceValueWithTimeout(func() (os.FileInfo, error) {
+			return f.Stat()
+		})
+		tail, readErr := transcriptEvidenceValueWithTimeout(func() ([]byte, error) {
 			if statErr != nil {
 				return nil, statErr
+			}
+			if finfo == nil {
+				return nil, fmt.Errorf("transcript stat missing")
 			}
 			if finfo.Mode()&os.ModeSymlink != 0 || !finfo.Mode().IsRegular() {
 				return nil, fmt.Errorf("transcript is not a regular file")
@@ -639,7 +775,7 @@ func (r *Runner) archiveFailedSessionEvidence(qw QueuedWork, res *Result, dirFor
 				return nil, fmt.Errorf("transcript identity changed between validation and read")
 			}
 			return transcriptEvidenceReadTail(f, finfo, transcriptEvidencePerFileCapBytes)
-		}()
+		})
 		_ = f.Close()
 		if readErr != nil {
 			r.logger.Warn("transcript evidence read failed; keeping workarea", "sessionId", qw.SessionID, "err", transcriptEvidenceSafeErr(readErr, values))
@@ -664,12 +800,16 @@ func (r *Runner) archiveFailedSessionEvidence(qw QueuedWork, res *Result, dirFor
 			return false
 		}
 		name := transcriptEvidenceName(i)
-		if err := transcriptEvidenceWriteAtomic(dir, name, []byte(redacted)); err != nil {
+		if err := transcriptEvidenceCallWithTimeout(func() error {
+			return transcriptEvidenceWriteAtomic(dir, name, []byte(redacted))
+		}); err != nil {
 			r.logger.Warn("transcript evidence write failed; keeping workarea", "sessionId", qw.SessionID, "err", transcriptEvidenceSafeErr(err, values))
 			appendTranscriptEvidenceWarning(res, i)
 			return false
 		}
-		if err := transcriptEvidenceReadback(filepath.Join(dir, name), []byte(redacted)); err != nil {
+		if err := transcriptEvidenceCallWithTimeout(func() error {
+			return transcriptEvidenceReadback(filepath.Join(dir, name), []byte(redacted))
+		}); err != nil {
 			r.logger.Warn("transcript evidence readback failed; keeping workarea", "sessionId", qw.SessionID, "err", transcriptEvidenceSafeErr(err, values))
 			appendTranscriptEvidenceWarning(res, i)
 			return false
