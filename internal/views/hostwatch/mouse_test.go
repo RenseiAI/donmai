@@ -163,6 +163,150 @@ func TestMouse_PartialCardAndPlainPolicy(t *testing.T) {
 	}
 }
 
+func TestMouse_ErrorWithRetainedCardsIsInert(t *testing.T) {
+	// The daemon-error view renders no cards. With cards retained in
+	// state, a click where a card would be must still do nothing.
+	m := newFixtureModel(t, 120, 40, false, 1)
+	before := m.selectedVisibleID()
+	if before != "1c2d3e4f-2222" {
+		t.Fatalf("fixture cursor = %q, want selected card", before)
+	}
+	// Reachability: the same cell selects a different card while healthy.
+	reach := newFixtureModel(t, 120, 40, false, 1)
+	if cmd := clickXY(reach, 5, 2, tea.MouseLeft); cmd != nil {
+		t.Fatal("healthy click returned a command")
+	}
+	wantSelected(t, reach, "0b1e6c2a-1111")
+	// Now fail the daemon with cards retained and click the same cell.
+	m.snapErr = errFake("down")
+	if cmd := clickXY(m, 5, 2, tea.MouseLeft); cmd != nil {
+		t.Fatal("error-view click returned a command")
+	}
+	wantSelected(t, m, before)
+	if m.detail {
+		t.Fatal("click on error view with retained cards opened detail")
+	}
+	if cmd := clickXY(m, 5, 2, tea.MouseRight); cmd != nil {
+		t.Fatal("error-view right click returned a command")
+	}
+	wantSelected(t, m, before)
+	if m.detail {
+		t.Fatal("right click on error view opened detail")
+	}
+}
+
+func TestMouse_RightClickOutsideFrameIsInert(t *testing.T) {
+	m := newFixtureModel(t, 120, 40, false, 0)
+	m.filterActive, m.filterQuery = true, "ENG-14"
+	m.cursor = 0
+	m.detail = true
+	beforeQ := m.filterQuery
+	for _, xy := range [][2]int{{-1, 3}, {500, 3}, {3, -1}, {3, 500}, {m.width, 3}, {3, m.height}} {
+		if cmd := clickXY(m, xy[0], xy[1], tea.MouseRight); cmd != nil {
+			t.Fatalf("right click %v returned a command", xy)
+		}
+		if !m.filterActive || m.filterQuery != beforeQ {
+			t.Fatalf("outside-frame right click %v cleared filtering", xy)
+		}
+		if !m.detail {
+			t.Fatalf("outside-frame right click %v closed detail", xy)
+		}
+	}
+	wantSelected(t, m, m.visibleCards()[0].SessionID)
+	// Inside-frame right click still follows escape (clears filter).
+	if cmd := clickXY(m, 1, 1, tea.MouseRight); cmd != nil {
+		t.Fatal("inside right click returned a command")
+	}
+	if m.filterActive {
+		t.Fatal("inside-frame right click did not clear filtering")
+	}
+}
+
+func TestMouse_ZeroHeightPaneIsInert(t *testing.T) {
+	// Height 2 leaves no rows for the card pane (gridH == 0).
+	m := newFixtureModel(t, 120, 2, false, 1)
+	gridH, _ := splitPaneHeights(m.height-2, m.split)
+	if gridH != 0 {
+		t.Fatalf("gridH = %d, want 0 for height 2", gridH)
+	}
+	before := m.selectedVisibleID()
+	if cmd := clickXY(m, 5, 1, tea.MouseLeft); cmd != nil {
+		t.Fatal("zero-height click returned a command")
+	}
+	wantSelected(t, m, before)
+	if m.detail {
+		t.Fatal("zero-height pane click opened detail")
+	}
+	// Reachability: the same cell selects with a normal-height pane.
+	reach := newFixtureModel(t, 120, 40, false, 1)
+	if cmd := clickXY(reach, 5, 1, tea.MouseLeft); cmd != nil {
+		t.Fatal("healthy click returned a command")
+	}
+	wantSelected(t, reach, "0b1e6c2a-1111")
+}
+
+func TestMouse_CompactPartialMarkerAndCard(t *testing.T) {
+	// Narrow pane with a one-row grid window: the overflow marker shares
+	// the pane with a single compact row.
+	m := newFixtureModel(t, 30, 6, false, 7)
+	view := m.View().Content
+	markerRow, _ := cellIndex(view, "more")
+	if markerRow < 0 {
+		t.Fatalf("marker not rendered:\n%s", view)
+	}
+	cardRow, cardCol := cellIndex(view, "ENG-1312")
+	if cardRow < 0 {
+		t.Fatalf("selected compact card not rendered:\n%s", view)
+	}
+	if cmd := clickXY(m, 5, markerRow, tea.MouseLeft); cmd != nil {
+		t.Fatal("marker click returned a command")
+	}
+	wantSelected(t, m, "7c8d9e0f-8888")
+	if m.detail {
+		t.Fatal("compact marker click opened detail")
+	}
+	if cmd := clickXY(m, cardCol, cardRow, tea.MouseLeft); cmd != nil {
+		t.Fatal("compact card click returned a command")
+	}
+	if !m.detail {
+		t.Fatal("click on compact partial selected card did not open detail")
+	}
+	wantSelected(t, m, "7c8d9e0f-8888")
+}
+
+func TestMouse_StreamChromeBeneathPartialIsInert(t *testing.T) {
+	// Wide pane with a cut card row: only the head of the selected row
+	// shows; the marker and stream rows beneath it are not cards.
+	m := newFixtureModel(t, 120, 12, false, 4)
+	view := m.View().Content
+	topRow, _ := cellIndex(view, "more")
+	if topRow < 0 {
+		t.Fatalf("overflow marker not rendered:\n%s", view)
+	}
+	streamRow, streamCol := cellIndex(view, "session stream")
+	if streamRow < 0 {
+		t.Fatalf("stream title not rendered:\n%s", view)
+	}
+	before := m.selectedVisibleID()
+	for _, xy := range [][2]int{{5, topRow}, {5, streamRow}, {streamCol, streamRow}} {
+		if cmd := clickXY(m, xy[0], xy[1], tea.MouseLeft); cmd != nil {
+			t.Fatalf("click %v returned a command", xy)
+		}
+		wantSelected(t, m, before)
+		if m.detail {
+			t.Fatalf("click %v beneath partial card opened detail", xy)
+		}
+	}
+	// The visible head of the selected row still toggles detail.
+	if cmd := clickRendered(t, m, "4f5a6b7c", tea.MouseLeft); cmd != nil {
+		t.Fatal("partial card click returned a command")
+	}
+	if !m.detail {
+		t.Fatal("click on visible partial head did not open detail")
+	}
+	wantSelected(t, m, before)
+}
+
 func TestMouse_ClickCancelsConfirmationWithoutAction(t *testing.T) {
 	m := newFixtureModel(t, 120, 40, false, 0)
 	acts := newFakeHostActions()
