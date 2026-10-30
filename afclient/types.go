@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // SessionStatus matches the public API status union type.
@@ -861,4 +863,48 @@ type StatsResponseV2 struct {
 	// Providers is the per-provider cost and capacity breakdown.
 	// Empty when no provider cost data is available.
 	Providers []ProviderCost `json:"providers,omitempty"`
+}
+
+// ── Headless runner failure tail bounds ────────────────────────────────────
+//
+// Operator bounds for failed headless runs: every redacted failure tail
+// is capped to these byte and line limits before transport so
+// infrastructure failures cannot collapse into an unowned label.
+const (
+	// MaxHeadlessFailureTailBytes bounds one failure tail in bytes.
+	MaxHeadlessFailureTailBytes = 4096
+	// MaxHeadlessFailureTailLines bounds one failure tail in lines.
+	MaxHeadlessFailureTailLines = 50
+)
+
+// TruncateHeadlessFailureTail applies line then byte bounds to a redacted
+// tail, rune-safe. Empty stays empty. Invalid UTF-8 is sanitized first so
+// the Go-string bound is also the JSON-decoded wire bound: encoding/json
+// replaces each invalid byte with U+FFFD on marshal, which would otherwise
+// expand a 4096-byte invalid tail to 12288 bytes for the recipient.
+func TruncateHeadlessFailureTail(s string) string {
+	if s == "" {
+		return ""
+	}
+	// Sanitize before measuring: raw subprocess diagnostics can carry
+	// invalid UTF-8, and the JSON transport replaces each invalid byte
+	// with U+FFFD on decode. Bounding the raw bytes first would still
+	// deliver an expanded tail past the byte limit.
+	s = strings.ToValidUTF8(s, string(utf8.RuneError))
+	if s == "" {
+		return ""
+	}
+	if lines := strings.Split(s, "\n"); len(lines) > MaxHeadlessFailureTailLines {
+		s = strings.Join(lines[len(lines)-MaxHeadlessFailureTailLines:], "\n")
+	}
+	if len(s) <= MaxHeadlessFailureTailBytes {
+		return s
+	}
+	// Keep the longest rune-aligned suffix within the byte bound: slice
+	// from the end once, then trim a leading partial rune. O(n).
+	s = s[len(s)-MaxHeadlessFailureTailBytes:]
+	for len(s) > 0 && !utf8.RuneStart(s[0]) {
+		s = s[1:]
+	}
+	return s
 }
