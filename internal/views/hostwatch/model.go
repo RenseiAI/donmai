@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
@@ -15,6 +16,7 @@ import (
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/tui-components/format"
 	"github.com/RenseiAI/tui-components/theme"
+	"github.com/charmbracelet/x/ansi"
 )
 
 // Default cadences. The index poll is deliberately low-frequency (a
@@ -208,6 +210,15 @@ type Model struct {
 	// session's full detail (enter toggles, esc closes).
 	detail bool
 
+	// help, when true, renders the contextual keyboard help overlay
+	// over the content area. "?" opens and closes it; esc closes it.
+	// While open the model consumes action keys so they cannot leak
+	// into selection, filter, split or lifecycle state, and the
+	// underlying detail/filter/cursor/split/follow state is preserved
+	// across dismissal. helpScroll is the first visible help row.
+	help       bool
+	helpScroll int
+
 	// filterActive, when true, narrows the visible card grid to the
 	// cards matching filterQuery. The source snapshot (m.cards),
 	// counters, tailers, and the merged stream are never affected:
@@ -354,6 +365,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// resize keeps the operator's ratio without any recomputation.
 		m.width = msg.Width
 		m.height = msg.Height
+		m.clampHelpScroll()
 		return m, nil
 
 	case indexTickMsg:
@@ -374,6 +386,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case snapshotMsg:
 		m.applySnapshot(msg.snap)
+		m.clampHelpScroll()
 		return m, nil
 
 	case tailBatchMsg:
@@ -388,6 +401,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyPressMsg:
 		return m.handleKey(msg)
+	case tea.MouseClickMsg, tea.MouseWheelMsg, tea.MouseMotionMsg, tea.MouseReleaseMsg:
+		// The dashboard has no mouse bindings: mouse reports are
+		// accepted and ignored so a stray click never mutates state.
+		return m, nil
 	}
 	return m, nil
 }
@@ -435,6 +452,11 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 	if m.filterActive {
+		// While help is open the overlay owns every key, including
+		// "?": route there before the filter consumes printable input.
+		if m.help {
+			return m.handleHelpKey(msg)
+		}
 		if _, done := m.handleFilterKey(msg); done {
 			return m, nil
 		}
@@ -444,6 +466,20 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		if msg.Text != "" {
 			return m, nil
 		}
+	}
+	// The help overlay intercepts after confirmation (a pending gate
+	// outranks help: "?" stays ignored while confirming) and before
+	// filtering, so "?" opens help instead of becoming query text.
+	// When neither confirmation nor help is active, "?" also opens
+	// help from inside an active filter via the filter handler.
+	if m.help {
+		return m.handleHelpKey(msg)
+	}
+	if msg.String() == "?" {
+		m.help = true
+		m.helpScroll = 0
+		m.clampHelpScroll()
+		return m, nil
 	}
 	key := msg.String()
 	switch key {
@@ -491,6 +527,327 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// handleHelpKey routes keys while the help overlay is open. It returns
+// the model with every key consumed: "?" toggles help closed, esc closes
+// it, ctrl+c quits, up/down (and j/k) scroll the overlay, and all other
+// keys are swallowed so selection, follow, split, filtering and lifecycle
+// state stay exactly as they were. Dismissal preserves detail, filter,
+// cursor, split and follow.
+func (m *Model) handleHelpKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	if msg.Code == tea.KeyEscape || msg.String() == "esc" || msg.String() == "escape" {
+		m.help = false
+		m.helpScroll = 0
+		return m, nil
+	}
+	// "?" toggles help closed from every context, including an active
+	// filter: it must be checked before the filter handler below would
+	// consume it as query text. While filtering, "?" arrives here
+	// (via handleKey's help branch) and also via handleFilterKey, so
+	// both paths converge on closing with state preserved.
+	if msg.String() == "?" {
+		m.help = false
+		m.helpScroll = 0
+		return m, nil
+	}
+	// "j"/"k" scroll the overlay (vim-style), mirroring up/down; the
+	// underlying cursor never moves.
+	switch msg.String() {
+	case "ctrl+c", "q":
+		return m, tea.Quit
+	case "up":
+		if m.helpScroll > 0 {
+			m.helpScroll--
+		}
+		return m, nil
+	case "down":
+		m.helpScroll++
+		m.clampHelpScroll()
+		return m, nil
+	case "k":
+		if m.helpScroll > 0 {
+			m.helpScroll--
+		}
+		return m, nil
+	case "j":
+		m.helpScroll++
+		m.clampHelpScroll()
+		return m, nil
+	default:
+		return m, nil
+	}
+}
+
+// clampHelpScroll bounds the overlay scroll offset to the rows the
+// current frame can show. Zero height or no help rows pins it at zero.
+func (m *Model) clampHelpScroll() {
+	limit := len(m.helpRows(m.helpContentWidth())) - m.helpBodyHeight()
+	if limit < 0 {
+		limit = 0
+	}
+	if m.helpScroll > limit {
+		m.helpScroll = limit
+	}
+	if m.helpScroll < 0 {
+		m.helpScroll = 0
+	}
+}
+
+// helpCompact reports whether the overlay drops its border chrome to
+// keep help rows reachable on short terminals. Below eight rows the
+// four bordered chrome rows leave fewer than two body rows, so the
+// overlay renders borderless (title + body + hint) and reclaims the
+// two border rows for help text.
+func (m *Model) helpCompact() bool {
+	return m.height > 0 && m.height < 8
+}
+
+// helpContentWidth is the overlay's text width: the terminal width
+// minus its two border cells, floored so tiny terminals stay non-empty.
+// Compact (borderless) overlays use the full width.
+func (m *Model) helpContentWidth() int {
+	w := m.width - 2
+	if m.helpCompact() {
+		w = m.width
+	}
+	if w < 1 {
+		w = 1
+	}
+	return w
+}
+
+// helpBodyHeight is the overlay rows available for help text: the
+// content rows minus its title, hint and border rows, floored at zero
+// so short terminals scroll instead of overflowing. Compact overlays
+// omit the top/bottom border rows, so they subtract only the title
+// and hint rows and keep two body rows at the minimum 80x6 geometry.
+func (m *Model) helpBodyHeight() int {
+	h := m.height - 2
+	if h < 0 {
+		h = 0
+	}
+	if m.helpCompact() {
+		// Title row + closing hint row (no borders).
+		h -= 2
+	} else {
+		// Title row + closing hint row + top/bottom border rows.
+		h -= 4
+	}
+	if h < 0 {
+		h = 0
+	}
+	return h
+}
+
+// helpEntry is one contextual help row: the key and its description.
+type helpEntry struct {
+	key  string
+	desc string
+}
+
+// helpEntries lists the overlay rows for the current context: the
+// selection, detail, split, follow, filtering, quit and lifecycle
+// controls, plus filter-text precedence, the stop/drain confirmation
+// keys and the no-mouse-bindings note. Detail and filter rows reflect
+// the context help was opened over. Every key named here is handled by
+// handleKey/handleFilterKey/handleHelpKey; the command help names the
+// same set (see the contract test in afcli).
+func (m *Model) helpEntries() []helpEntry {
+	entries := []helpEntry{
+		{"↑↓/jk", "select a session card"},
+		{"enter", "show the selected session detail (esc closes detail)"},
+		{"esc", "close this help, then detail, then the filter"},
+		{"[ ]", "move the cards/stream split"},
+		{"0", "reset the split to 50/50 (survives resizes)"},
+		{"f", "pause or resume the stream"},
+		{"g", "jump to the stream tail"},
+		{"/", "filter cards (issue, title, repository, work type)"},
+		{"backspace", "delete one filter character while filtering"},
+		{"x", "ask to stop the selected session"},
+		{"d", "ask to drain the host past an explicit deadline"},
+		{"y / n", "confirm / cancel the pending stop or drain"},
+		{"p", "pause host admissions"},
+		{"r", "reopen host admissions"},
+		{"q", "quit the dashboard (sessions keep running)"},
+		{"ctrl+c", "quit the dashboard"},
+	}
+	if m.detail {
+		entries = append(entries, helpEntry{"detail open", "enter toggles detail; esc closes this help first"})
+	}
+	if m.filterActive {
+		query := m.filterQuery
+		if query == "" {
+			query = "(empty shows every card)"
+		}
+		entries = append(entries, helpEntry{"filtering: /" + query, "typed text narrows cards; shortcuts are filter text"})
+	} else {
+		entries = append(entries, helpEntry{"filter precedence", "while filtering, keys type query text, not shortcuts"})
+	}
+	entries = append(entries, helpEntry{"mouse", "no mouse bindings: mouse input is ignored"})
+	return entries
+}
+
+// helpRows wraps every help entry's description to the content width so
+// each row fits the terminal. Keys stay whole; long descriptions wrap
+// onto continuation rows indented under the key column.
+func (m *Model) helpRows(width int) []string {
+	if width < 1 {
+		width = 1
+	}
+	entries := m.helpEntries()
+	keyW := 0
+	for _, e := range entries {
+		if w := len([]rune(e.key)); w > keyW {
+			keyW = w
+		}
+	}
+	prefix := keyW + 3 // key column + " · " separator
+	var rows []string
+	for _, e := range entries {
+		pad := ""
+		if d := keyW - len([]rune(e.key)); d > 0 {
+			pad = strings.Repeat(" ", d)
+		}
+		first := e.key + pad + " · " + e.desc
+		rows = append(rows, wrapHelpRow(first, width, strings.Repeat(" ", prefix))...)
+	}
+	return rows
+}
+
+// wrapHelpRow folds one row to width on cell boundaries, indenting
+// continuation rows with indent. Short rows pass through unchanged.
+// The fold counts terminal cells (wide CJK/emoji wrap by cells, not
+// bytes) and prefers word boundaries so descriptions stay readable.
+func wrapHelpRow(row string, width int, indent string) []string {
+	if width < 1 {
+		return []string{row}
+	}
+	var out []string
+	rest := row
+	first := true
+	for {
+		if ansiWidth(rest) <= width {
+			out = append(out, rest)
+			return out
+		}
+		// Longest cell-fitting byte prefix; the loop in cellPrefixLen
+		// already backs off whole runes.
+		cutBytes := cellPrefixLen(rest, width)
+		if cutBytes < 1 {
+			cutBytes = cellPrefixLen(rest, 1)
+		}
+		if cutBytes < 1 || cutBytes > len(rest) {
+			cutBytes = len(rest)
+		}
+		// Prefer a word boundary so descriptions stay readable.
+		if sp := lastSpaceBefore(rest, width); sp > 0 {
+			cutBytes = sp
+		}
+		out = append(out, strings.TrimRight(rest[:cutBytes], " "))
+		rest = strings.TrimLeft(rest[cutBytes:], " ")
+		if rest == "" {
+			return out
+		}
+		if first {
+			rest = indent + rest
+			first = false
+		}
+	}
+}
+
+func cellPrefixLen(s string, width int) int {
+	n := 0
+	for i := range s {
+		if ansi.StringWidth(s[:i]) > width {
+			break
+		}
+		n = i
+	}
+	if ansi.StringWidth(s) <= width {
+		return len(s)
+	}
+	// Back off one rune so the prefix fits: i indexes byte offsets.
+	for n > 0 && ansi.StringWidth(s[:n]) > width {
+		_, size := utf8.DecodeLastRuneInString(s[:n])
+		n -= size
+	}
+	return n
+}
+
+func lastSpaceBefore(s string, width int) int {
+	prefix := s[:cellPrefixLen(s, width)]
+	return strings.LastIndex(prefix, " ")
+}
+
+func ansiWidth(s string) int {
+	return ansi.StringWidth(s)
+}
+
+// renderHelpOverlay renders the contextual help overlay bounded to the
+// terminal: a bordered panel with a title, the scroll window of wrapped
+// help rows, and a closing hint. It never exceeds the frame width or
+// height and scrolls short terminals so every row stays reachable.
+// Below eight rows the borders are omitted so two body rows stay
+// visible at the minimum 80x6 geometry.
+func (m *Model) renderHelpOverlay() string {
+	width := m.width
+	if width < 1 {
+		width = 1
+	}
+	contentW := m.helpContentWidth()
+	bodyH := m.helpBodyHeight()
+	rows := m.helpRows(contentW)
+	m.clampHelpScroll()
+	start := m.helpScroll
+	if start > len(rows) {
+		start = len(rows)
+	}
+	end := start + bodyH
+	if end > len(rows) {
+		end = len(rows)
+	}
+	visible := rows[start:end]
+	// Pad the body so the panel keeps its frame rows on tall terminals.
+	for len(visible) < bodyH {
+		visible = append(visible, "")
+	}
+	title := "keyboard help  (? closes)"
+	hint := "↑↓ scroll · esc close"
+	if m.helpCompact() {
+		lines := make([]string, 0, len(visible)+2)
+		lines = append(lines, truncateWidth(fitCells(title, contentW), width))
+		for _, r := range visible {
+			lines = append(lines, truncateWidth(fitCells(r, contentW), width))
+		}
+		lines = append(lines, truncateWidth(fitCells(hint, contentW), width))
+		if m.opts.Plain {
+			return strings.Join(lines, "\n")
+		}
+		out := make([]string, 0, len(lines))
+		for _, ln := range lines {
+			out = append(out, lipgloss.NewStyle().Foreground(m.theme.TextTertiary).Render(ln))
+		}
+		return strings.Join(out, "\n")
+	}
+	lines := make([]string, 0, len(visible)+4)
+	top := "╭" + strings.Repeat("─", contentW) + "╮"
+	bottom := "╰" + strings.Repeat("─", contentW) + "╯"
+	lines = append(lines, truncateWidth(top, width))
+	lines = append(lines, truncateWidth("│"+fitCells(title, contentW)+"│", width))
+	for _, r := range visible {
+		lines = append(lines, truncateWidth("│"+fitCells(r, contentW)+"│", width))
+	}
+	lines = append(lines, truncateWidth("│"+fitCells(hint, contentW)+"│", width))
+	lines = append(lines, truncateWidth(bottom, width))
+	if m.opts.Plain {
+		return strings.Join(lines, "\n")
+	}
+	out := make([]string, 0, len(lines))
+	for _, ln := range lines {
+		out = append(out, lipgloss.NewStyle().Foreground(m.theme.TextTertiary).Render(ln))
+	}
+	return strings.Join(out, "\n")
+}
+
 // handleFilterKey routes keys while the card filter is active. It returns
 // true when the key was consumed as filter input (or filter navigation)
 // and no global shortcut should run. Printable text appends to the query;
@@ -498,6 +855,16 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 // Arrow navigation and enter operate on the visible slice; ctrl+c still
 // quits and is left for the global handler (false).
 func (m *Model) handleFilterKey(msg tea.KeyPressMsg) (tea.Model, bool) {
+	// "?" opens the help overlay instead of becoming query text. It is
+	// intercepted here (filter state stays intact underneath) because
+	// the global help check runs after this handler consumes printable
+	// input; without this branch "?" would type into the query.
+	if msg.String() == "?" {
+		m.help = true
+		m.helpScroll = 0
+		m.clampHelpScroll()
+		return m, true
+	}
 	// Match by name and by code: String() is the documented matcher, Code
 	// is the foolproof fallback for special keys.
 	if msg.Code == tea.KeyEscape || msg.String() == "esc" || msg.String() == "escape" {
@@ -1265,6 +1632,16 @@ func (m *Model) render() string {
 	unbounded := m.opts.Plain && m.opts.UnboundedCards
 	header := m.renderHeader()
 	help := m.renderHelp()
+	if m.help {
+		if m.snapErr != nil {
+			warn := truncateWidth(fmt.Sprintf("daemon unreachable: %v", cleanText(m.snapErr.Error())), m.width)
+			if !m.opts.Plain {
+				warn = theme.ErrorText().Render(warn)
+			}
+			return m.clipHeight([]string{header, m.renderHelpOverlay(), warn, help}, unbounded)
+		}
+		return m.clipHeight([]string{header, m.renderHelpOverlay(), help}, unbounded)
+	}
 	if m.snapErr != nil {
 		warn := truncateWidth(fmt.Sprintf("daemon unreachable: %v", cleanText(m.snapErr.Error())), m.width)
 		if !m.opts.Plain {
@@ -1483,8 +1860,9 @@ func truncateHeaderHost(host string, width int) string {
 	return truncateWidth(host, width)
 }
 
-// helpText documents every key. It is truncated to the terminal width.
-const helpText = "↑↓/jk select   enter detail   x stop   p pause   r resume   d drain   [ ] split   0 reset   f follow/pause   g tail   q quit"
+// helpText is the compact footer row. "?" opens the full contextual
+// help overlay; the footer stays one discoverable line.
+const helpText = "? help   ↑↓/jk select   enter detail   x stop   p pause   r resume   d drain   [ ] split   0 reset   f follow/pause   g tail   q quit"
 
 func (m *Model) renderHelp() string {
 	help := helpText
@@ -1500,26 +1878,133 @@ func (m *Model) renderHelp() string {
 	case m.notice != "":
 		help = m.notice + "   " + helpText
 	}
+	// A pending stop/drain confirmation owns the footer: the prompt must
+	// keep its leading action words ("stop …", "drain host …") so the
+	// armed operation stays identified. The "? help" anchor is reserved
+	// for the idle footer — confirmation handling swallows "?", so
+	// advertising it here would promise a key that does nothing. Render
+	// the prompt head-truncated exactly as before the anchor existed.
+	if m.confirmKind != "" {
+		if m.filterActive {
+			suffix := "   filter: /" + m.filterQuery
+			if m.width > 0 {
+				avail := m.width - lipgloss.Width(suffix)
+				if avail < 0 {
+					help = truncateWidth(suffix, m.width)
+				} else {
+					help = truncateWidth(help, avail) + suffix
+					help = truncateWidth(help, m.width)
+				}
+			} else {
+				help += suffix
+			}
+		} else {
+			help = truncateWidth(help, m.width)
+		}
+		if m.opts.Plain {
+			return help
+		}
+		return lipgloss.NewStyle().Foreground(m.theme.TextTertiary).Render(help)
+	}
+	// The "?" opener stays visible at narrow widths even beside a long
+	// filter or notice: it is the footer's discoverability anchor. When
+	// the filter suffix alone overflows, the suffix keeps its tail (the
+	// live query text) while the anchor still leads.
+	anchor := "? help"
 	if m.filterActive {
 		suffix := "   filter: /" + m.filterQuery
 		if m.width > 0 {
 			avail := m.width - lipgloss.Width(suffix)
 			if avail < 0 {
-				help = truncateWidth(suffix, m.width)
+				// Suffix overflows on its own: anchor + the suffix tail.
+				room := m.width - lipgloss.Width(anchor) - 3
+				if room < 0 {
+					room = 0
+				}
+				help = anchor + "   " + truncateWidth(filterSuffixTail(suffix, room), room)
+				help = truncateWidth(help, m.width)
 			} else {
 				help = truncateWidth(help, avail) + suffix
-				help = truncateWidth(help, m.width)
+				help = reserveHelpAnchor(truncateWidth(help, m.width), anchor, m.width)
 			}
 		} else {
 			help += suffix
 		}
 	} else {
 		help = truncateWidth(help, m.width)
+		help = reserveHelpAnchor(help, anchor, m.width)
 	}
 	if m.opts.Plain {
 		return help
 	}
 	return lipgloss.NewStyle().Foreground(m.theme.TextTertiary).Render(help)
+}
+
+// tailFitWidth returns the longest trailing rune-boundary suffix of s
+// that fits in room terminal cells. It binary-searches rune boundaries
+// so an overflowing filter costs O(n log n) width scans instead of the
+// O(n*n) remove-one-rune loop (each probe re-measured and re-copied
+// the whole remainder). The result matches the loop's longest fitting
+// suffix for plain text, where dropping a leading rune never grows the
+// width.
+func tailFitWidth(s string, room int) string {
+	if room <= 0 {
+		return ""
+	}
+	if lipgloss.Width(s) <= room {
+		return s
+	}
+	offsets := make([]int, 0, len(s)+1)
+	for i := range s {
+		offsets = append(offsets, i)
+	}
+	lo, hi := 0, len(offsets)
+	for lo < hi {
+		mid := (lo + hi) / 2
+		if lipgloss.Width(s[offsets[mid]:]) <= room {
+			hi = mid
+		} else {
+			lo = mid + 1
+		}
+	}
+	if lo >= len(offsets) {
+		return ""
+	}
+	return s[offsets[lo]:]
+}
+
+// filterSuffixTail keeps the live end of an overflowing filter suffix:
+// the "filter: /" marker when it fits, else the query tail alone,
+// truncated to room cells.
+func filterSuffixTail(suffix string, room int) string {
+	if room <= 0 {
+		return ""
+	}
+	if lipgloss.Width(suffix) <= room {
+		return suffix
+	}
+	const marker = "filter: /"
+	if idx := strings.Index(suffix, marker); idx >= 0 {
+		return tailFitWidth(suffix[idx:], room)
+	}
+	return truncateWidth(suffix, room)
+}
+
+// reserveHelpAnchor keeps the "? help" opener visible at narrow widths:
+// when it was truncated away, the row is rebuilt from the anchor plus as
+// much of the remainder as fits. Wide rows pass through unchanged.
+func reserveHelpAnchor(help, anchor string, width int) string {
+	if width <= 0 || lipgloss.Width(anchor) >= width {
+		return truncateWidth(anchor, width)
+	}
+	if strings.Contains(help, anchor) {
+		return help
+	}
+	// Rebuild: anchor + separator + the tail of the row that still fits.
+	room := width - lipgloss.Width(anchor) - 3
+	tail := tailFitWidth(help, room)
+	tail = strings.TrimLeft(tail, " ")
+	return anchor + "   " + truncateWidth(tail, room)
 }
 
 // A journal position identifies a local observation when optional span upload

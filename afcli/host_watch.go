@@ -96,7 +96,11 @@ func newHostWatchCmdWithSource(factory func(afclient.DaemonConfig) hostWatchSour
 			"selected session (y confirms, n cancels), p pauses host admissions,\n" +
 			"r reopens them, d asks to drain the host to an explicit deadline\n" +
 			"(y confirms, n cancels): sessions still running past the deadline\n" +
-			"are stopped; q quits.\n" +
+			"are stopped; / filters cards by issue, title, repository or work type\n" +
+			"(backspace deletes one character, esc clears the filter); ? opens the\n" +
+			"contextual keyboard help overlay (esc closes it); q quits.\n" +
+			"While filtering, typed keys are filter text, not shortcuts.\n" +
+			"There are no mouse bindings: mouse input is ignored.\n" +
 			"Lifecycle keys send one authenticated request each and the next\n" +
 			"daemon snapshot owns what the dashboard shows.",
 		SilenceUsage: true,
