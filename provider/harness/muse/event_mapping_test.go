@@ -155,8 +155,7 @@ func TestMapItem_RevisionRuleDropsStale(t *testing.T) {
 	started := func(rev int) json.RawMessage {
 		return json.RawMessage(`{"sessionId":"s","viewCursor":"c","item":{"itemId":"i1","kind":"agentMessage","revision":` + itoa(rev) + `,"status":"inProgress","text":"hi"}}`)
 	}
-	// item/started at rev 1 carries no event for agentMessage (only
-	// completed emits), but it records the revision.
+	// item/started at rev 1 emits its initial text and records the revision.
 	mapNotification("item/started", started(1), state, nil)
 	// A stale item/updated at rev 1 after rev 2 applied must drop.
 	mapNotification("item/updated", started(2), state, nil)
@@ -164,12 +163,13 @@ func TestMapItem_RevisionRuleDropsStale(t *testing.T) {
 	if len(stale) != 0 {
 		t.Errorf("stale revision produced %v", kindsOf(stale))
 	}
-	// Completion always applies, even at a stale revision.
-	done := mapNotification("item/completed", json.RawMessage(`{"sessionId":"s","viewCursor":"c","item":{"itemId":"i1","kind":"agentMessage","revision":1,"status":"completed","text":"hi"}}`), state, nil)
+	// Completion always applies, even at a stale revision and when it
+	// replaces already streamed text.
+	done := mapNotification("item/completed", json.RawMessage(`{"sessionId":"s","viewCursor":"c","item":{"itemId":"i1","kind":"agentMessage","revision":1,"status":"completed","text":"bye"}}`), state, nil)
 	if len(done) != 1 {
 		t.Fatalf("authoritative completion produced %v", kindsOf(done))
 	}
-	if text, ok := done[0].(agent.AssistantTextEvent); !ok || text.Text != "hi" {
+	if text, ok := done[0].(agent.AssistantTextEvent); !ok || text.Text != "bye" {
 		t.Errorf("completion event=%+v", done[0])
 	}
 }

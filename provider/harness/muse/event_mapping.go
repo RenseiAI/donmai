@@ -39,7 +39,8 @@ type mapperState struct {
 	// updates at a stale revision are dropped; completion always
 	// applies (the host guarantees item/completed is authoritative,
 	// including for itemIds never opened on this connection).
-	items map[string]int
+	items     map[string]int
+	textItems map[string]textItem
 
 	// pendingToolUse records ToolUseEvents emitted for open toolCall /
 	// userShell items so completion can pair the result.
@@ -54,6 +55,12 @@ type mapperState struct {
 	seenTurns map[string]struct{}
 }
 
+type textItem struct {
+	kind  ItemKind
+	text  string
+	field string
+}
+
 type pendingTool struct {
 	name string
 	id   string
@@ -62,6 +69,7 @@ type pendingTool struct {
 func newMapperState(model string) *mapperState {
 	return &mapperState{
 		model:          model,
+		textItems:      make(map[string]textItem),
 		turnStarted:    make(map[string]int64),
 		items:          make(map[string]int),
 		pendingToolUse: make(map[string]pendingTool),
@@ -440,20 +448,31 @@ func mapItemEvent(method string, params json.RawMessage, state *mapperState, raw
 		// The caller owns this input; forwarding would duplicate the
 		// prompt in the activity stream.
 		return nil
-	case ItemKindAgentMessage:
-		if isCompleted {
-			if text := itemText(&item); text != "" {
-				return []agent.Event{agent.AssistantTextEvent{Text: text, Raw: raw}}
-			}
+	case ItemKindAgentMessage, ItemKindReasoning:
+		text := itemText(&item)
+		if item.Kind == ItemKindReasoning {
+			text = reasoningText(&item)
 		}
-		return nil
-	case ItemKindReasoning:
-		if isCompleted {
-			if msg := reasoningText(&item); msg != "" {
-				return []agent.Event{agent.SystemEvent{Subtype: "reasoning", Message: msg, Raw: raw}}
+		previous := state.textItems[item.ItemID]
+		// Snapshots are authoritative; forward only the unseen suffix when
+		// they extend the streaming text. A replacement is emitted in full.
+		unseen := strings.TrimPrefix(text, previous.text)
+		switch {
+		case isCompleted:
+			delete(state.textItems, item.ItemID)
+		case len(text) <= 1<<20 && (previous.kind != "" || len(state.textItems) < 1024):
+			field := "text"
+			if item.Kind == ItemKindReasoning {
+				var parts []string
+				if json.Unmarshal(item.Summary, &parts) == nil && len(parts) > 0 {
+					field = fmt.Sprintf("summary.%d", len(parts)-1)
+				}
 			}
+			state.textItems[item.ItemID] = textItem{kind: item.Kind, text: text, field: field}
+		default:
+			delete(state.textItems, item.ItemID)
 		}
-		return nil
+		return textEvents(item.Kind, unseen, raw)
 	case ItemKindToolCall:
 		return mapToolCall(item, method, isCompleted, state, raw)
 	case ItemKindUserShell:
@@ -490,24 +509,44 @@ func mapItemEvent(method string, params json.RawMessage, state *mapperState, raw
 	}
 }
 
-// mapItemDelta appends a streaming delta to an open item's field. Deltas
-// never bump revision and never emit agent events directly (the full
-// text arrives on item/completed); they are tracked only to prove the
-// item is live. Deltas during a gap are dropped.
+// mapItemDelta forwards UTF-8 text appends for known open text items.
+// Unknown items/fields stay silent: a delta carries no item kind. Completion
+// still supplies the authoritative snapshot if the stream was saturated.
 func mapItemDelta(params json.RawMessage, state *mapperState, raw any) []agent.Event {
-	_ = raw
 	var p ItemDeltaParams
-	_ = json.Unmarshal(params, &p)
-	if p.ItemID == "" {
+	if json.Unmarshal(params, &p) != nil || p.ItemID == "" || state.gap != nil {
 		return nil
 	}
-	if state.gap != nil {
+	item, ok := state.textItems[p.ItemID]
+	if !ok {
 		return nil
 	}
-	if _, ok := state.items[p.ItemID]; !ok {
-		state.items[p.ItemID] = 0
+	field := strVal(p.Field)
+	if field != "" && field != "text" && !(item.kind == ItemKindReasoning && strings.HasPrefix(field, "summary.")) {
+		return nil
 	}
-	return nil
+	delta := p.Delta
+	if item.kind == ItemKindReasoning && strings.HasPrefix(field, "summary.") && item.field != field && item.text != "" {
+		delta = "\n" + delta
+	}
+	// Bound retained text while preserving liveness for oversized streams.
+	if len(item.text)+len(delta) > 1<<20 {
+		return []agent.Event{agent.StreamProgressEvent()}
+	}
+	item.field = field
+	item.text += delta
+	state.textItems[p.ItemID] = item
+	return textEvents(item.kind, delta, raw)
+}
+
+func textEvents(kind ItemKind, text string, raw any) []agent.Event {
+	if text == "" {
+		return nil
+	}
+	if kind == ItemKindReasoning {
+		return []agent.Event{agent.SystemEvent{Subtype: "reasoning", Message: text, Raw: raw}}
+	}
+	return []agent.Event{agent.AssistantTextEvent{Text: text, Raw: raw}}
 }
 
 func itemText(item *Item) string {
@@ -518,7 +557,12 @@ func itemText(item *Item) string {
 }
 
 func reasoningText(item *Item) string {
-	// summary is an array of parts; join text members.
+	// Current hosts export summary as an array of strings. Older hosts
+	// used text-bearing parts; retain that decoding for existing sessions.
+	var summary []string
+	if json.Unmarshal(item.Summary, &summary) == nil && len(summary) > 0 {
+		return strings.Join(summary, "\n")
+	}
 	if len(item.Summary) > 0 {
 		var parts []struct {
 			Text *string `json:"text"`

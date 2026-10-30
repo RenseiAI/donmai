@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -104,8 +105,8 @@ func (fh *fakeHost) run(t *testing.T) {
 					"museHome":            "/tmp/fake-muse-home",
 					"platformFamily":      "unix",
 					"platformOs":          "linux",
-					"schema":              map[string]any{"fingerprint": schemaExportFingerprint, "version": schemaVersion},
-					"serverInfo":          map[string]any{"name": "fake", "version": "1.4.6"},
+					"schema":              map[string]any{"fingerprint": "sha256:c94c3d1f2f51e6424074b9ec43eac3eedcf532d3dcd77351ec1383a87d3049c6", "version": schemaVersion},
+					"serverInfo":          map[string]any{"name": "fake", "version": "1.4.14"},
 					"userAgent":           "fake",
 					"sessionDurability":   "durable",
 				},
@@ -235,6 +236,40 @@ func (fh *fakeHost) emitScript(t *testing.T, script, sid, turnID string, denyApp
 			},
 		})
 		agentMsg("item-1", "hello world", 1)
+		completed("completed")
+	case "streaming-text":
+		notify := func(method string, params map[string]any) {
+			params["sessionId"] = sid
+			params["viewCursor"] = "cursor-stream"
+			fh.write(t, map[string]any{"jsonrpc": "2.0", "method": method, "params": params})
+		}
+		for _, kind := range []string{"agentMessage", "reasoning"} {
+			snapshot := func(method string, revision int, text string) {
+				item := map[string]any{"itemId": kind, "kind": kind, "revision": revision, "text": text, "status": "inProgress"}
+				if kind == "reasoning" {
+					delete(item, "text")
+					item["summary"] = strings.Split(text, "\n")
+				}
+				notify(method, map[string]any{"item": item})
+			}
+			snapshot("item/started", 1, "first")
+			field := "text"
+			if kind == "reasoning" {
+				field = "summary.0"
+			}
+			notify("item/delta", map[string]any{"itemId": kind, "field": field, "delta": " second"})
+			snapshot("item/updated", 2, "first second third")
+			snapshot("item/updated", 1, "stale")
+			notify("item/delta", map[string]any{"itemId": kind, "field": "output", "delta": "ignored"})
+			tail := "first second third last"
+			if kind == "reasoning" {
+				notify("item/delta", map[string]any{"itemId": kind, "field": "summary.1", "delta": "next"})
+				tail = "first second third\nnext last"
+			}
+			snapshot("item/completed", 3, tail)
+			notify("item/delta", map[string]any{"itemId": kind, "delta": "late"})
+		}
+		agentMsg("final", "final answer", 1)
 		completed("completed")
 	case "step-usage":
 		for i := 1; i <= 3; i++ {
