@@ -83,7 +83,8 @@ var transcriptEvidenceReadback = verifyTranscriptEvidenceReadback
 var transcriptEvidenceReadTail = readTranscriptTailBounded
 
 // resolveTranscriptEvidencePath resolves one declared transcript path: an
-// absolute path is used as-is, a relative path resolves against the
+// absolute path is used as-is (trusted handle output; archives stay
+// local-only and are never uploaded), a relative path resolves against the
 // session worktree (falling back to the workarea root). It never follows
 // symlinks itself; validation does that.
 func resolveTranscriptEvidencePath(declared string, res *Result) (string, error) {

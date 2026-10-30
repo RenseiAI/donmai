@@ -251,8 +251,20 @@ func TestMixedEvidenceAndPatchAttemptsShareRetention(t *testing.T) {
 		t.Helper()
 		clock = clock.Add(time.Minute)
 		_ = os.Remove(filepath.Join(clone, "work.txt"))
+		// Failed-session tails are fail-closed: the declared transcript must
+		// exist as a regular file or preservation keeps the workarea. Plant
+		// the descriptor's file so tails succeed alongside the best-effort
+		// descriptor manifest.
+		full := filepath.Join(clone, filepath.Clean("/"+path))
+		if err := os.MkdirAll(filepath.Dir(full), 0o750); err != nil {
+			t.Fatalf("mkdir transcript dir: %v", err)
+		}
+		if err := os.WriteFile(full, []byte("{\"msg\":\"retain probe\"}\n"), 0o600); err != nil {
+			t.Fatalf("write transcript fixture: %v", err)
+		}
 		res := &Result{rescueTargets: []rescueTarget{{path: clone, base: base}}}
 		res.Status = status
+		res.WorktreePath = clone
 		res.terminalTranscripts = []agent.TerminalTranscriptDescriptor{{Path: path}}
 		if !r.preserveUnpublishedWork(QueuedWork{QueuedWork: queuedWorkBase(session)}, res) {
 			t.Fatal("preserveUnpublishedWork = false for evidence attempt")
@@ -662,6 +674,26 @@ func TestStoppedEvidenceWriteFailureStillTearsDownViaRun(t *testing.T) {
 	}
 }
 
+// lateLeasePlantingProvider wraps a scripted handle and plants its relative
+// transcript descriptor into the provisioned worktree during Spawn so
+// fail-closed tails succeed alongside the descriptor manifest. Stopped
+// sessions need no tails; this wrapper is only used for the failed
+// late-lease runs.
+type lateLeasePlantingProvider struct {
+	agent.HarnessProvider
+	handle agent.Handle
+	rel    string
+}
+
+func (p *lateLeasePlantingProvider) Spawn(_ context.Context, spec agent.Spec) (agent.Handle, error) {
+	if p.rel != "" && !filepath.IsAbs(p.rel) && spec.Cwd != "" {
+		full := filepath.Join(spec.Cwd, filepath.Clean("/"+p.rel))
+		_ = os.MkdirAll(filepath.Dir(full), 0o750)
+		_ = os.WriteFile(full, []byte("{\"msg\":\"late-lease probe\"}\n"), 0o600)
+	}
+	return p.handle, nil
+}
+
 // TestLateLeaseFailurePreservesEvidenceViaRun pins the late-lease
 // boundary end to end: a research session that completes with a captured
 // descriptor but whose requested terminal lease fails acquisition flips to
@@ -706,7 +738,7 @@ func TestLateLeaseFailurePreservesEvidenceViaRun(t *testing.T) {
 	if !ok {
 		t.Fatal("stub provider is not a HarnessProvider")
 	}
-	provider := &evidenceProvider{HarnessProvider: harness, spawnHandle: handle}
+	provider := &lateLeasePlantingProvider{HarnessProvider: harness, handle: handle, rel: sentinel}
 	reg := NewRegistry()
 	if err := reg.Register(provider); err != nil {
 		t.Fatalf("Register: %v", err)
@@ -1080,7 +1112,19 @@ func (*interactiveEvidenceProvider) Resume(context.Context, string, agent.Spec) 
 	return nil, agent.ErrUnsupported
 }
 func (*interactiveEvidenceProvider) Shutdown(context.Context) error { return nil }
-func (p *interactiveEvidenceProvider) Spawn(_ context.Context, _ agent.Spec) (agent.Handle, error) {
+func (p *interactiveEvidenceProvider) Spawn(_ context.Context, spec agent.Spec) (agent.Handle, error) {
+	// Failed-session tails are fail-closed: the declared transcript must
+	// exist as a regular file or the teardown keeps the workarea. Plant
+	// each relative descriptor so tails succeed alongside the descriptor
+	// manifest.
+	for _, d := range p.descs {
+		if d.Path == "" || filepath.IsAbs(d.Path) || spec.Cwd == "" {
+			continue
+		}
+		full := filepath.Join(spec.Cwd, filepath.Clean("/"+d.Path))
+		_ = os.MkdirAll(filepath.Dir(full), 0o750)
+		_ = os.WriteFile(full, []byte("{\"msg\":\"interactive late-lease probe\"}\n"), 0o600)
+	}
 	sess := completedRecordingInteractiveSession()
 	base := &testInteractiveHandle{Handle: &fakeHandle{events: make(chan agent.Event)}, session: sess}
 	return &interactiveEvidenceHandle{testInteractiveHandle: base, descs: p.descs}, nil
