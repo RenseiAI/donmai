@@ -1940,6 +1940,39 @@ func (m *Model) renderHelp() string {
 	return lipgloss.NewStyle().Foreground(m.theme.TextTertiary).Render(help)
 }
 
+// tailFitWidth returns the longest trailing rune-boundary suffix of s
+// that fits in room terminal cells. It binary-searches rune boundaries
+// so an overflowing filter costs O(n log n) width scans instead of the
+// O(n*n) remove-one-rune loop (each probe re-measured and re-copied
+// the whole remainder). The result matches the loop's longest fitting
+// suffix for plain text, where dropping a leading rune never grows the
+// width.
+func tailFitWidth(s string, room int) string {
+	if room <= 0 {
+		return ""
+	}
+	if lipgloss.Width(s) <= room {
+		return s
+	}
+	offsets := make([]int, 0, len(s)+1)
+	for i := range s {
+		offsets = append(offsets, i)
+	}
+	lo, hi := 0, len(offsets)
+	for lo < hi {
+		mid := (lo + hi) / 2
+		if lipgloss.Width(s[offsets[mid]:]) <= room {
+			hi = mid
+		} else {
+			lo = mid + 1
+		}
+	}
+	if lo >= len(offsets) {
+		return ""
+	}
+	return s[offsets[lo]:]
+}
+
 // filterSuffixTail keeps the live end of an overflowing filter suffix:
 // the "filter: /" marker when it fits, else the query tail alone,
 // truncated to room cells.
@@ -1952,11 +1985,7 @@ func filterSuffixTail(suffix string, room int) string {
 	}
 	const marker = "filter: /"
 	if idx := strings.Index(suffix, marker); idx >= 0 {
-		tail := suffix[idx:]
-		for lipgloss.Width(tail) > room && len(tail) > 0 {
-			tail = string([]rune(tail)[1:])
-		}
-		return tail
+		return tailFitWidth(suffix[idx:], room)
 	}
 	return truncateWidth(suffix, room)
 }
@@ -1973,10 +2002,7 @@ func reserveHelpAnchor(help, anchor string, width int) string {
 	}
 	// Rebuild: anchor + separator + the tail of the row that still fits.
 	room := width - lipgloss.Width(anchor) - 3
-	tail := help
-	for lipgloss.Width(tail) > room && len(tail) > 0 {
-		tail = string([]rune(tail)[1:])
-	}
+	tail := tailFitWidth(help, room)
 	tail = strings.TrimLeft(tail, " ")
 	return anchor + "   " + truncateWidth(tail, room)
 }
