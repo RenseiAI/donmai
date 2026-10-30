@@ -63,6 +63,24 @@ func terminalBeaconStep(res *Result) string {
 	return StatusBeaconTeardown
 }
 
+// failurePhaseForMode maps a terminal failure classification onto the
+// phase and decider the terminal report carries. Spawn and provisioning
+// failures happen before any agent process exists, so they report their
+// own phase; stream failures report the event-stream phase. Unknown modes
+// report no phase rather than an invented one.
+func failurePhaseForMode(mode string) (phase, decidedBy string) {
+	switch mode {
+	case FailureSpawn:
+		return "spawn", "runner"
+	case FailureWorktreeProvision:
+		return "provision", "runner"
+	case FailureProviderError, FailureSilentExit, FailureTimeout, FailureNoProgress:
+		return "stream", "runner"
+	default:
+		return "", ""
+	}
+}
+
 // statusBeaconReporter is the runner's per-session current-step beacon:
 // it posts the orchestration phase (spawning, streaming, steering,
 // backstop, plus the terminal completed/failed/stopped) to the session progress

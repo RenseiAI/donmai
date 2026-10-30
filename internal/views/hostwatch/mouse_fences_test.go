@@ -9,7 +9,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 )
 
-// The four fences below each failed to pin one mouse decision boundary:
+// The five fences below each failed to pin one mouse decision boundary:
 // removing the fence left the suite green. Each test drives the production
 // Update with a MouseClickMsg and fails when its fence is reverted.
 
@@ -124,5 +124,38 @@ func TestModel_MouseConfirmRightAtColumnZeroCancels(t *testing.T) {
 	}
 	if _, _, drains, stops := acts.counts(); drains != 0 || len(stops) != 0 {
 		t.Fatalf("right confirmation at (0,0) dispatched drains=%d stops=%v", drains, stops)
+	}
+}
+
+// Help-open mouse clicks must preserve selection: while the contextual
+// help overlay is open, a click that would otherwise select a different
+// rendered card stays inert and the overlay stays open. Deleting the
+// help guard in handleMouseClick selects here and fails.
+func TestModel_MouseHelpOpenIsInert(t *testing.T) {
+	m := newMouseModel(t, 120, 40, 0)
+	x, y := mouseXYForVis(t, m, 1)
+	wantID := m.selectedVisibleID()
+	feedKey(m, questionKey())
+	if !m.help {
+		t.Fatal("setup: \"?\" did not open the help overlay")
+	}
+	if cmd := mouseClick(m, x, y, tea.MouseLeft); cmd != nil {
+		t.Fatal("help-open click must not dispatch")
+	}
+	if !m.help {
+		t.Fatal("help-open click closed the overlay")
+	}
+	if got := m.selectedVisibleID(); got != wantID {
+		t.Fatalf("help-open click selected %q, want %q (cursor=%d)", got, wantID, m.cursor)
+	}
+	if m.detail {
+		t.Fatal("help-open click must not open detail")
+	}
+	// Right clicks while help is open are equally inert.
+	if cmd := mouseClick(m, x, y, tea.MouseRight); cmd != nil {
+		t.Fatal("help-open right click must not dispatch")
+	}
+	if !m.help || m.selectedVisibleID() != wantID || m.detail {
+		t.Fatalf("help-open right click mutated state: help=%v id=%q detail=%v", m.help, m.selectedVisibleID(), m.detail)
 	}
 }

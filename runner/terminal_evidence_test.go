@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/RenseiAI/donmai/afclient"
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/provider/harness/stub"
 )
@@ -278,5 +279,537 @@ func TestTerminalEvidence_SentinelAbsentFromWire(t *testing.T) {
 	}
 	if strings.Contains(string(body), sentinel) {
 		t.Fatalf("prepared terminal body carries the sentinel descriptor path")
+	}
+}
+
+// spawnFailEvidenceProvider fails Spawn before any process exists.
+type spawnFailEvidenceProvider struct {
+	agent.HarnessProvider
+	spawnErr error
+}
+
+func (p *spawnFailEvidenceProvider) Spawn(context.Context, agent.Spec) (agent.Handle, error) {
+	return nil, p.spawnErr
+}
+
+func headlessTailLines(s string) int {
+	if s == "" {
+		return 0
+	}
+	return len(strings.Split(s, "\n"))
+}
+
+func assertBoundedRedacted(t *testing.T, tail string, secrets ...string) {
+	t.Helper()
+	if tail == "" {
+		t.Fatal("OutputTail is empty; want bounded tail")
+	}
+	if len(tail) > afclient.MaxHeadlessFailureTailBytes {
+		t.Fatalf("tail is %d bytes; want at most %d", len(tail), afclient.MaxHeadlessFailureTailBytes)
+	}
+	if n := headlessTailLines(tail); n > afclient.MaxHeadlessFailureTailLines {
+		t.Fatalf("tail has %d lines; want at most %d", n, afclient.MaxHeadlessFailureTailLines)
+	}
+	for _, s := range secrets {
+		if s != "" && strings.Contains(tail, s) {
+			t.Fatalf("tail carries unredacted secret")
+		}
+	}
+}
+
+// Headless regression: a 400 with provider code keeps its cause and the
+// diagnostic tail is bounded/redacted; an unavailable upstream stays null.
+func TestTerminalEvidence_HeadlessProviderErrorPreservesUpstreamAndBoundedTail(t *testing.T) {
+	t.Parallel()
+	secret := "api_key=super-secret-value-abc123"
+	msg := "endpoint refused\n" + strings.Repeat("filler line\n", 80) + secret + "\n" + strings.Repeat("x", 6000) + "\nBearer hidden-token-xyz"
+	upstream := &agent.UpstreamError{HTTPStatus: 400, ProviderCode: "invalid_request", ProviderMessage: "bad params"}
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType: "qa", skipSteering: true,
+		turns: []verdictScriptTurn{{events: []agent.Event{agent.ErrorEvent{Message: msg, Upstream: upstream}}}},
+	})
+	if res.Status != "failed" || res.FailureMode != FailureProviderError {
+		t.Fatalf("Status=%q Mode=%q; want failed/provider-error", res.Status, res.FailureMode)
+	}
+	if res.Upstream == nil || res.Upstream.HTTPStatus != 400 || res.Upstream.ProviderCode != "invalid_request" {
+		t.Fatalf("Upstream=%+v; want 400/invalid_request", res.Upstream)
+	}
+	if res.ExitCode != nil {
+		t.Fatalf("ExitCode=%d; want null", *res.ExitCode)
+	}
+	assertBoundedRedacted(t, res.OutputTail, secret, "hidden-token-xyz")
+	if res.FailurePhase == "" || res.FailureDecidedBy == "" {
+		t.Fatalf("phase=%q decidedBy=%q; want evidence", res.FailurePhase, res.FailureDecidedBy)
+	}
+	h := newRunnerHarness(t)
+	body, err := h.runner.poster.PrepareTerminalStatusBody(context.Background(), "evidence-headless", res.Result, nil)
+	if err != nil {
+		t.Fatalf("PrepareTerminalStatusBody: %v", err)
+	}
+	raw := string(body)
+	for _, want := range []string{`"failureMode":"provider-error"`, `"httpStatus":400`, `"providerCode":"invalid_request"`, `"outputTail"`} {
+		if !strings.Contains(raw, want) {
+			t.Fatalf("terminal body lacks %s: %s", want, raw)
+		}
+	}
+	if strings.Contains(raw, secret) || strings.Contains(raw, "hidden-token-xyz") {
+		t.Fatalf("terminal body carries secret")
+	}
+	// Unavailable upstream stays null with a bounded tail.
+	secret2 := "api_key=another-hidden-value-xyz789"
+	res2, _ := runScriptedSession(t, scriptedSession{
+		workType: "qa", skipSteering: true,
+		turns: []verdictScriptTurn{{events: []agent.Event{agent.ErrorEvent{Message: strings.Repeat("pad\n", 100) + secret2 + "\n" + strings.Repeat("z", 8000)}}}},
+	})
+	if res2.Upstream != nil {
+		t.Fatalf("Upstream=%+v; want nil", res2.Upstream)
+	}
+	assertBoundedRedacted(t, res2.OutputTail, secret2)
+}
+
+// Spawn before any process: null exit, phase/decider, no invented result.
+func TestTerminalEvidence_SpawnFailureHasNullExitCodeWithPhase(t *testing.T) {
+	t.Parallel()
+	base := stubBaseForEvidence(t, nil)
+	provider := &spawnFailEvidenceProvider{HarnessProvider: base, spawnErr: errors.New("handshake failed: Bearer hidden-spawn-token dial refused\n" + strings.Repeat("detail\n", 80))}
+	h := newRunnerHarness(t)
+	reg := NewRegistry()
+	if err := reg.Register(provider); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	h.runner.registry = reg
+	qw := h.queuedWork("EVIDENCE-SPAWN")
+	qw.WorkType = "research"
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := h.runner.Run(ctx, qw)
+	if err == nil || res == nil {
+		t.Fatalf("err=%v res=%+v; want spawn failure", err, res)
+	}
+	if res.Status != "failed" || res.FailureMode != FailureSpawn {
+		t.Fatalf("Status=%q Mode=%q; want failed/spawn-failed", res.Status, res.FailureMode)
+	}
+	if res.ExitCode != nil {
+		t.Fatalf("ExitCode=%d; want null (never zero)", *res.ExitCode)
+	}
+	if res.FailurePhase != "spawn" || res.FailureDecidedBy != "runner" {
+		t.Fatalf("phase=%q decidedBy=%q; want spawn/runner", res.FailurePhase, res.FailureDecidedBy)
+	}
+	if res.WorkResult != "" {
+		t.Fatalf("WorkResult=%q; want empty", res.WorkResult)
+	}
+	assertBoundedRedacted(t, res.OutputTail, "hidden-spawn-token")
+	if res.Upstream != nil {
+		t.Fatalf("Upstream=%+v; want nil", res.Upstream)
+	}
+}
+
+// Negative control: completed runs carry no failure evidence.
+func TestTerminalEvidence_SuccessCarriesNoFailureEvidence(t *testing.T) {
+	t.Parallel()
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType: "qa", skipSteering: true,
+		turns: []verdictScriptTurn{{text: "done\n<!-- WORK_RESULT:passed -->"}},
+	})
+	if res.Status != "completed" {
+		t.Fatalf("Status=%q; want completed", res.Status)
+	}
+	if res.FailureMode != "" || res.Upstream != nil || res.ExitCode != nil || res.OutputTail != "" || res.FailurePhase != "" || res.FailureDecidedBy != "" {
+		t.Fatalf("completed carries evidence: %+v", res)
+	}
+}
+
+// Unknown failure modes report no phase rather than an invented stream
+// phase. Known spawn/provision/stream modes keep their explicit mapping.
+func TestTerminalEvidence_FailurePhaseUnknownReportsNoPhase(t *testing.T) {
+	t.Parallel()
+	for _, mode := range []string{
+		FailureAgentBlocked, FailureBudgetExceeded, FailureBackstop,
+		FailureKitProvision, FailureProviderResolve, FailurePromptRender,
+		FailureInteractiveInput, "totally-unknown",
+	} {
+		if phase, decidedBy := failurePhaseForMode(mode); phase != "" || decidedBy != "" {
+			t.Fatalf("failurePhaseForMode(%q) = %q/%q; want empty", mode, phase, decidedBy)
+		}
+	}
+	for _, tc := range []struct {
+		mode        string
+		wantPhase   string
+		wantDecided string
+	}{
+		{FailureSpawn, "spawn", "runner"},
+		{FailureWorktreeProvision, "provision", "runner"},
+		{FailureProviderError, "stream", "runner"},
+		{FailureSilentExit, "stream", "runner"},
+		{FailureTimeout, "stream", "runner"},
+		{FailureNoProgress, "stream", "runner"},
+	} {
+		if phase, decidedBy := failurePhaseForMode(tc.mode); phase != tc.wantPhase || decidedBy != tc.wantDecided {
+			t.Fatalf("failurePhaseForMode(%q) = %q/%q; want %q/%q", tc.mode, phase, decidedBy, tc.wantPhase, tc.wantDecided)
+		}
+	}
+	// Production entry: a deliberately declined agent reports no invented
+	// phase through the real run loop.
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType: "qa", skipSteering: true,
+		turns: []verdictScriptTurn{{text: "need a decision\nAGENT_BLOCKED: need a product decision\nWORK_RESULT: blocked"}},
+	})
+	if res.Status != "failed" || res.FailureMode != FailureAgentBlocked {
+		t.Fatalf("Status=%q Mode=%q; want failed/agent-blocked", res.Status, res.FailureMode)
+	}
+	if res.FailurePhase != "" || res.FailureDecidedBy != "" {
+		t.Fatalf("phase=%q decidedBy=%q; want empty (no invented stream)", res.FailurePhase, res.FailureDecidedBy)
+	}
+	if res.OutputTail == "" {
+		t.Fatal("OutputTail is empty; want bounded tail even with empty phase")
+	}
+}
+
+// Pre-stream early returns carry bounded evidence through the real run:
+// a provider-resolve refusal has a null exit and a bounded redacted tail.
+func TestTerminalEvidence_PreStreamProviderResolveCarriesBoundedTail(t *testing.T) {
+	t.Parallel()
+	h := newRunnerHarness(t)
+	qw := h.queuedWork("EVIDENCE-RESOLVE")
+	qw.ResolvedProfile.Provider = agent.ProviderName("nonexistent")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := h.runner.Run(ctx, qw)
+	if err == nil || res == nil {
+		t.Fatalf("err=%v res=%+v; want provider-resolve failure", err, res)
+	}
+	if res.Status != "failed" || res.FailureMode != FailureProviderResolve {
+		t.Fatalf("Status=%q Mode=%q; want failed/provider-resolve", res.Status, res.FailureMode)
+	}
+	if res.ExitCode != nil {
+		t.Fatalf("ExitCode=%d; want null", *res.ExitCode)
+	}
+	if res.OutputTail == "" {
+		t.Fatal("OutputTail is empty; want bounded tail on pre-stream failure")
+	}
+	assertBoundedRedacted(t, res.OutputTail)
+}
+
+// Oversized diagnostic tails stay bounded through the real run: a 100 KB
+// provider-error message completes with a 4096-byte redacted tail.
+func TestTerminalEvidence_OversizedTailStaysBounded(t *testing.T) {
+	t.Parallel()
+	msg := strings.Repeat("x", 100*1024) + "\napi_key=oversized-secret-value"
+	upstream := &agent.UpstreamError{HTTPStatus: 500, ProviderCode: "server_error", ProviderMessage: "boom"}
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType: "qa", skipSteering: true,
+		turns: []verdictScriptTurn{{events: []agent.Event{agent.ErrorEvent{Message: msg, Upstream: upstream}}}},
+	})
+	if res.Status != "failed" || res.FailureMode != FailureProviderError {
+		t.Fatalf("Status=%q Mode=%q; want failed/provider-error", res.Status, res.FailureMode)
+	}
+	assertBoundedRedacted(t, res.OutputTail, "oversized-secret-value")
+}
+
+// Line bound is independent of the byte bound: 200 short lines fit well
+// under 4096 bytes, so only the 50-line bound can trim them.
+func TestTerminalEvidence_LineBoundIndependentOfByteBound(t *testing.T) {
+	t.Parallel()
+	var b strings.Builder
+	for i := 0; i < 200; i++ {
+		b.WriteString("pad-line\n")
+	}
+	msg := b.String()
+	if len(msg) >= afclient.MaxHeadlessFailureTailBytes {
+		t.Fatalf("fixture is %d bytes; want under %d so only the line bound applies", len(msg), afclient.MaxHeadlessFailureTailBytes)
+	}
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType: "qa", skipSteering: true,
+		turns: []verdictScriptTurn{{events: []agent.Event{agent.ErrorEvent{Message: msg}}}},
+	})
+	if res.Status != "failed" {
+		t.Fatalf("Status=%q; want failed", res.Status)
+	}
+	if n := headlessTailLines(res.OutputTail); n > afclient.MaxHeadlessFailureTailLines {
+		t.Fatalf("tail has %d lines; want at most %d", n, afclient.MaxHeadlessFailureTailLines)
+	}
+	if n := headlessTailLines(res.OutputTail); n != afclient.MaxHeadlessFailureTailLines {
+		t.Fatalf("tail has %d lines; want exactly %d (last lines kept)", n, afclient.MaxHeadlessFailureTailLines)
+	}
+}
+
+// Zero HTTP status with a provider code keeps the code while the status
+// stays null: the endpoint named a code but no status.
+func TestTerminalEvidence_ZeroStatusWithCodePreservesCode(t *testing.T) {
+	t.Parallel()
+	upstream := &agent.UpstreamError{HTTPStatus: 0, ProviderCode: "throttled_code", ProviderMessage: "slow down"}
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType: "qa", skipSteering: true,
+		turns: []verdictScriptTurn{{events: []agent.Event{agent.ErrorEvent{Message: "endpoint throttled", Upstream: upstream}}}},
+	})
+	if res.Status != "failed" || res.FailureMode != FailureProviderError {
+		t.Fatalf("Status=%q Mode=%q; want failed/provider-error", res.Status, res.FailureMode)
+	}
+	if res.Upstream == nil || res.Upstream.HTTPStatus != 0 || res.Upstream.ProviderCode != "throttled_code" {
+		t.Fatalf("Upstream=%+v; want 0/throttled_code", res.Upstream)
+	}
+	// The posted terminal body preserves the code while the status stays
+	// absent: the endpoint named a code but no status.
+	h := newRunnerHarness(t)
+	body, err := h.runner.poster.PrepareTerminalStatusBody(context.Background(), "evidence-zero-status", res.Result, nil)
+	if err != nil {
+		t.Fatalf("PrepareTerminalStatusBody: %v", err)
+	}
+	raw := string(body)
+	if !strings.Contains(raw, `"providerCode":"throttled_code"`) {
+		t.Fatalf("terminal body lacks providerCode throttled_code: %s", raw)
+	}
+	if strings.Contains(raw, `"httpStatus":0`) {
+		t.Fatalf("terminal body carries zero httpStatus: %s", raw)
+	}
+}
+
+// providerErrorOnlyHandle emits a failed terminal with no ErrorEvent: the
+// envelope Error stays empty while the stream observation carries a
+// provider error, so the run-loop finalise block must fill the diagnostic
+// tail from the provider error. Disabling that fallback leaves OutputTail
+// empty and fails this test.
+type providerErrorOnlyHandle struct {
+	events chan agent.Event
+}
+
+func (h *providerErrorOnlyHandle) SessionID() string { return "evidence-provider-only" }
+
+func (h *providerErrorOnlyHandle) Events() <-chan agent.Event { return h.events }
+
+func (h *providerErrorOnlyHandle) Inject(context.Context, string) error {
+	return agent.ErrUnsupported
+}
+
+func (h *providerErrorOnlyHandle) Stop(context.Context) error { return nil }
+
+// A failed run whose envelope Error is empty must still carry a bounded
+// tail from the stream provider error: the finalise fallback, not the
+// Error-derived defer, owns this path.
+func TestTerminalEvidence_ProviderErrorOnlyFillsTailWhenErrorEmpty(t *testing.T) {
+	t.Parallel()
+	const providerText = "model overloaded, retry later"
+	ch := make(chan agent.Event, 8)
+	ch <- agent.InitEvent{SessionID: "evidence-provider-only"}
+	ch <- agent.SystemEvent{Subtype: agent.SystemSubtypeProviderError, Message: providerText}
+	ch <- agent.ResultEvent{Success: false}
+	close(ch)
+	base := stubBaseForEvidence(t, nil)
+	provider := &evidenceProvider{HarnessProvider: base, spawnHandle: &providerErrorOnlyHandle{events: ch}}
+	h := newRunnerHarness(t)
+	reg := NewRegistry()
+	if err := reg.Register(provider); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	h.runner.registry = reg
+	qw := h.queuedWork("EVIDENCE-PROVIDER-ONLY")
+	qw.WorkType = "qa"
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := h.runner.Run(ctx, qw)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res == nil {
+		t.Fatal("res is nil; want failed envelope")
+	}
+	if res.Status != "failed" {
+		t.Fatalf("Status=%q; want failed", res.Status)
+	}
+	if res.Error != "" {
+		t.Fatalf("Error=%q; want empty so the provider-error fallback owns the tail", res.Error)
+	}
+	if res.OutputTail == "" {
+		t.Fatal("OutputTail is empty; want bounded tail from the provider error when Error is empty")
+	}
+	if !strings.Contains(res.OutputTail, providerText) {
+		t.Fatalf("OutputTail=%q; want provider text %q", res.OutputTail, providerText)
+	}
+	assertBoundedRedacted(t, res.OutputTail)
+	if res.FailurePhase == "" || res.FailureDecidedBy == "" {
+		t.Fatalf("phase=%q decidedBy=%q; want evidence", res.FailurePhase, res.FailureDecidedBy)
+	}
+}
+
+// resultErrorsOnlyHandle emits a canonical failed ResultEvent whose only
+// diagnostic is Errors: no assistant text, no ErrorEvent, no provider-error
+// SystemEvent. The run-loop finalise block must fill the diagnostic tail
+// from the terminal Errors. Removing that fallback leaves OutputTail empty
+// and fails this test.
+type resultErrorsOnlyHandle struct {
+	events chan agent.Event
+}
+
+func (h *resultErrorsOnlyHandle) SessionID() string { return "evidence-result-errors" }
+
+func (h *resultErrorsOnlyHandle) Events() <-chan agent.Event { return h.events }
+
+func (h *resultErrorsOnlyHandle) Inject(context.Context, string) error {
+	return agent.ErrUnsupported
+}
+
+func (h *resultErrorsOnlyHandle) Stop(context.Context) error { return nil }
+
+func TestTerminalEvidence_FailedResultErrorsFillTail(t *testing.T) {
+	t.Parallel()
+	const diagnostic = "terminal diagnostic from result errors: clone handshake refused"
+	ch := make(chan agent.Event, 8)
+	ch <- agent.InitEvent{SessionID: "evidence-result-errors"}
+	ch <- agent.ResultEvent{Success: false, Errors: []string{diagnostic}}
+	close(ch)
+	base := stubBaseForEvidence(t, nil)
+	provider := &evidenceProvider{HarnessProvider: base, spawnHandle: &resultErrorsOnlyHandle{events: ch}}
+	h := newRunnerHarness(t)
+	reg := NewRegistry()
+	if err := reg.Register(provider); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	h.runner.registry = reg
+	qw := h.queuedWork("EVIDENCE-RESULT-ERRORS")
+	qw.WorkType = "qa"
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := h.runner.Run(ctx, qw)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res == nil {
+		t.Fatal("res is nil; want failed envelope")
+	}
+	if res.Status != "failed" {
+		t.Fatalf("Status=%q; want failed", res.Status)
+	}
+	if res.OutputTail == "" {
+		t.Fatal("OutputTail is empty; want bounded tail from the failed terminal Errors")
+	}
+	if !strings.Contains(res.OutputTail, diagnostic) {
+		t.Fatalf("OutputTail=%q; want terminal Errors diagnostic %q", res.OutputTail, diagnostic)
+	}
+	assertBoundedRedacted(t, res.OutputTail)
+	if res.FailurePhase == "" || res.FailureDecidedBy == "" {
+		t.Fatalf("phase=%q decidedBy=%q; want evidence", res.FailurePhase, res.FailureDecidedBy)
+	}
+}
+
+// assistantOnlyHandle emits a failed terminal with assistant text and no
+// envelope error or provider-error observation. The run-loop finalise
+// block must fill the diagnostic tail from the assistant text. Disabling
+// that fallback leaves OutputTail empty and fails this test.
+type assistantOnlyHandle struct {
+	events chan agent.Event
+}
+
+func (h *assistantOnlyHandle) SessionID() string { return "evidence-assistant-only" }
+
+func (h *assistantOnlyHandle) Events() <-chan agent.Event { return h.events }
+
+func (h *assistantOnlyHandle) Inject(context.Context, string) error {
+	return agent.ErrUnsupported
+}
+
+func (h *assistantOnlyHandle) Stop(context.Context) error { return nil }
+
+func TestTerminalEvidence_AssistantOnlyFillsTailWhenErrorEmpty(t *testing.T) {
+	t.Parallel()
+	const assistantText = "assistant diagnostic tail: model stopped without a verdict"
+	ch := make(chan agent.Event, 8)
+	ch <- agent.InitEvent{SessionID: "evidence-assistant-only"}
+	ch <- agent.AssistantTextEvent{Text: assistantText}
+	ch <- agent.ResultEvent{Success: false}
+	close(ch)
+	base := stubBaseForEvidence(t, nil)
+	provider := &evidenceProvider{HarnessProvider: base, spawnHandle: &assistantOnlyHandle{events: ch}}
+	h := newRunnerHarness(t)
+	reg := NewRegistry()
+	if err := reg.Register(provider); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	h.runner.registry = reg
+	qw := h.queuedWork("EVIDENCE-ASSISTANT-ONLY")
+	qw.WorkType = "qa"
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := h.runner.Run(ctx, qw)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res == nil {
+		t.Fatal("res is nil; want failed envelope")
+	}
+	if res.Status != "failed" {
+		t.Fatalf("Status=%q; want failed", res.Status)
+	}
+	if res.Error != "" {
+		t.Fatalf("Error=%q; want empty so the assistant-text fallback owns the tail", res.Error)
+	}
+	if res.OutputTail == "" {
+		t.Fatal("OutputTail is empty; want bounded tail from the assistant text when Error is empty")
+	}
+	if !strings.Contains(res.OutputTail, assistantText) {
+		t.Fatalf("OutputTail=%q; want assistant text %q", res.OutputTail, assistantText)
+	}
+	assertBoundedRedacted(t, res.OutputTail)
+}
+
+// TestTerminalEvidence_MalformedSpawnTailWireBound proves the byte bound
+// holds at the transport boundary: a spawn failure carrying invalid UTF-8
+// must decode within 4096 bytes after a JSON round-trip. Without the
+// sanitize-first step the Go string measures 4096 bytes but decodes to
+// 12288.
+func TestTerminalEvidence_MalformedSpawnTailWireBound(t *testing.T) {
+	t.Parallel()
+	malformed := strings.Repeat("\xff", 5000)
+	base := stubBaseForEvidence(t, nil)
+	provider := &spawnFailEvidenceProvider{HarnessProvider: base, spawnErr: errors.New("handshake failed: " + malformed)}
+	h := newRunnerHarness(t)
+	reg := NewRegistry()
+	if err := reg.Register(provider); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	h.runner.registry = reg
+	qw := h.queuedWork("EVIDENCE-MALFORMED-SPAWN")
+	qw.WorkType = "research"
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := h.runner.Run(ctx, qw)
+	if err == nil || res == nil {
+		t.Fatalf("err=%v res=%+v; want spawn failure", err, res)
+	}
+	if res.Status != "failed" || res.FailureMode != FailureSpawn {
+		t.Fatalf("Status=%q Mode=%q; want failed/spawn-failed", res.Status, res.FailureMode)
+	}
+	if res.OutputTail == "" {
+		t.Fatal("OutputTail is empty; want bounded tail on malformed spawn failure")
+	}
+	if len(res.OutputTail) > afclient.MaxHeadlessFailureTailBytes {
+		t.Fatalf("tail is %d bytes; want at most %d", len(res.OutputTail), afclient.MaxHeadlessFailureTailBytes)
+	}
+	payload, err := json.Marshal(res.OutputTail)
+	if err != nil {
+		t.Fatalf("marshal tail: %v", err)
+	}
+	var decoded string
+	if err := json.Unmarshal(payload, &decoded); err != nil {
+		t.Fatalf("unmarshal tail: %v", err)
+	}
+	if len(decoded) > afclient.MaxHeadlessFailureTailBytes {
+		t.Fatalf("decoded tail is %d bytes; want at most %d", len(decoded), afclient.MaxHeadlessFailureTailBytes)
+	}
+	// The same bound holds on the posted terminal body the recipient
+	// decodes.
+	body, err := h.runner.poster.PrepareTerminalStatusBody(context.Background(), "evidence-malformed-spawn", res.Result, nil)
+	if err != nil {
+		t.Fatalf("PrepareTerminalStatusBody: %v", err)
+	}
+	var wire map[string]any
+	if err := json.Unmarshal(body, &wire); err != nil {
+		t.Fatalf("unmarshal terminal body: %v", err)
+	}
+	wireTail, _ := wire["outputTail"].(string)
+	if wireTail == "" {
+		t.Fatal("terminal body lacks outputTail")
+	}
+	if len(wireTail) > afclient.MaxHeadlessFailureTailBytes {
+		t.Fatalf("wire outputTail is %d bytes; want at most %d", len(wireTail), afclient.MaxHeadlessFailureTailBytes)
 	}
 }
