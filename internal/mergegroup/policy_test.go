@@ -98,3 +98,29 @@ func TestValidateWorkflowRejectsMissingCoverage(t *testing.T) {
 		t.Fatal("ValidateWorkflow without coverage snippet = nil, want error")
 	}
 }
+
+func TestValidateWorkflowRejectsMissingTrigger(t *testing.T) {
+	base := repoWorkflow(t)
+	stripped := strings.ReplaceAll(base, "merge_group:", "removed-trigger:")
+	if err := ValidateWorkflow(stripped); err == nil {
+		t.Fatal("ValidateWorkflow without merge_group trigger = nil, want error")
+	}
+}
+
+func TestValidateWorkflowRejectsRetryAction(t *testing.T) {
+	base := repoWorkflow(t)
+	withAction := strings.Replace(base, "timeout-minutes: 30",
+		"timeout-minutes: 30\n      - uses: nick-fields/retry@v3", 1)
+	if err := ValidateWorkflow(withAction); err == nil {
+		t.Fatal("ValidateWorkflow with retry action = nil, want error")
+	}
+}
+
+func TestValidateWorkflowRejectsRelocatedCoverage(t *testing.T) {
+	base := repoWorkflow(t)
+	removed := strings.Replace(base, Inventory[0].Snippet, "removed-coverage", 1)
+	relocated := removed + "\n  extra-holder:\n    runs-on: ubuntu-latest\n    steps:\n      - run: " + Inventory[0].Snippet + "\n"
+	if err := ValidateWorkflow(relocated); err == nil {
+		t.Fatal("ValidateWorkflow with relocated coverage = nil, want error")
+	}
+}

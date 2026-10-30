@@ -80,7 +80,32 @@ var (
 	continueOnErrorRe = regexp.MustCompile(`(?i)continue-on-error\s*:\s*true`)
 	maxAttemptsRe     = regexp.MustCompile(`(?i)max-attempts\s*:`)
 	retryActionRe     = regexp.MustCompile(`(?i)uses\s*:\s*\S*retr(y|ies)`)
+	jobHeaderRe       = regexp.MustCompile(`^  [A-Za-z0-9_.-]+:`)
 )
+
+// jobBlock returns one job's text; coverage must live inside its own job.
+func jobBlock(text, job string) (string, bool) {
+	lines := strings.Split(text, "\n")
+	header := "  " + job + ":"
+	start := -1
+	for i, line := range lines {
+		if line == header || strings.HasPrefix(line, header+" ") {
+			start = i
+			break
+		}
+	}
+	if start < 0 {
+		return "", false
+	}
+	end := len(lines)
+	for i := start + 1; i < len(lines); i++ {
+		if jobHeaderRe.MatchString(lines[i]) {
+			end = i
+			break
+		}
+	}
+	return strings.Join(lines[start:end], "\n"), true
+}
 
 // stripComments drops full-line and trailing `#` comments so prose about
 // retries in comments never reads as a retry construct.
@@ -107,10 +132,11 @@ func ValidateWorkflow(text string) error {
 		return fmt.Errorf("workflow must keep the merge_group trigger")
 	}
 	for _, e := range Inventory {
-		if !strings.Contains(text, "jobs."+e.Job) && !strings.Contains(text, e.Job+":") {
+		block, ok := jobBlock(text, e.Job)
+		if !ok {
 			return fmt.Errorf("inventory job %q is missing", e.Job)
 		}
-		if !strings.Contains(text, e.Snippet) {
+		if !strings.Contains(block, e.Snippet) {
 			return fmt.Errorf("inventory job %q lost its coverage %q", e.Job, e.Snippet)
 		}
 	}
