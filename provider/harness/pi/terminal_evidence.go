@@ -4,9 +4,12 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 
 	"github.com/RenseiAI/donmai/agent"
 )
@@ -16,11 +19,22 @@ import (
 // handle is still live marks every live lease on that root contaminated, so
 // each handle's later evidence collection refuses rather than attributing a
 // concurrent session's transcript to itself. Sequential reuse is unaffected:
-// the previous handle releases its lease when its evidence is collected, so
-// a later spawn sees an empty set.
+// the previous handle freezes its evidence and releases its lease at Stop,
+// so a later spawn sees an empty set and the earlier handle's delayed
+// collection returns its frozen outcome, never the later session's files.
+//
+// Overlap tracking spans processes: controllers share a workarea through
+// separate `agent run` processes (daemon/worker_command.go), so an
+// in-process map alone never sees a peer in another process. Each claim
+// also owns a claim file under the layout root; a spawn that finds another
+// live claim file (or a leftover overlap marker) is contaminated, and a
+// spawn that finds a live peer leaves the marker so the peer's Stop also
+// refuses. The marker is removed once the last live claim is released, so
+// sequential reuse after the overlap drains is clean again.
 type piEvidenceClaim struct {
 	root         string
 	contaminated bool
+	claimPath    string
 }
 
 var piEvidenceMu sync.Mutex
@@ -28,9 +42,20 @@ var piEvidenceMu sync.Mutex
 // piEvidenceActive tracks live evidence leases per layout root.
 var piEvidenceActive = map[string]map[*piEvidenceClaim]struct{}{}
 
+// piEvidenceClaimPrefix names per-handle live-claim files under a layout
+// root. piEvidenceOverlapName is the marker left while an overlap has been
+// observed and not yet drained. Neither ends in .jsonl, so the transcript
+// walker never visits them as candidates.
+const (
+	piEvidenceClaimPrefix = ".pi-evidence-claim-"
+	piEvidenceOverlapName = ".pi-evidence-overlap"
+)
+
 // acquirePiEvidenceClaim records a new live handle on root. A nil root
 // (no per-session root was recorded) needs no lease. Callers hold the
-// lease until their evidence is collected; release then removes it.
+// lease from spawn until Stop releases it; Stop freezes evidence before
+// releasing so sequential reuse is clean while true overlap stays
+// contaminated via the persisted flag and the cross-process marker.
 func acquirePiEvidenceClaim(root string) *piEvidenceClaim {
 	if strings.TrimSpace(root) == "" {
 		return nil
@@ -41,7 +66,6 @@ func acquirePiEvidenceClaim(root string) *piEvidenceClaim {
 	}
 	c := &piEvidenceClaim{root: clean}
 	piEvidenceMu.Lock()
-	defer piEvidenceMu.Unlock()
 	if live := piEvidenceActive[clean]; len(live) > 0 {
 		c.contaminated = true
 		for other := range live {
@@ -52,23 +76,186 @@ func acquirePiEvidenceClaim(root string) *piEvidenceClaim {
 		piEvidenceActive[clean] = map[*piEvidenceClaim]struct{}{}
 	}
 	piEvidenceActive[clean][c] = struct{}{}
+	piEvidenceMu.Unlock()
+	fsContaminated, claimPath := acquirePiEvidenceClaimFile(clean)
+	if fsContaminated {
+		piEvidenceMu.Lock()
+		c.contaminated = true
+		for other := range piEvidenceActive[clean] {
+			other.contaminated = true
+		}
+		piEvidenceMu.Unlock()
+	}
+	if claimPath != "" {
+		c.claimPath = claimPath
+	}
 	return c
 }
 
-// release removes the lease from the live set. The contaminated flag
-// persists so a handle that overlapped still refuses after the peer left.
+// acquirePiEvidenceClaimFile creates this handle's cross-process claim file
+// and reports whether the filesystem shows an overlap: another live claim
+// file, or a leftover overlap marker from an overlap that has not drained.
+// A detected overlap leaves the marker so the peer's Stop also refuses.
+// Filesystem errors fail closed (report overlap) so an unreadable root can
+// never silently attribute another session's transcript.
+func acquirePiEvidenceClaimFile(clean string) (bool, string) {
+	f, err := os.CreateTemp(clean, piEvidenceClaimPrefix+"*")
+	if err != nil {
+		return true, ""
+	}
+	claimPath := f.Name()
+	_, _ = f.WriteString(strconv.Itoa(os.Getpid()))
+	_ = f.Close()
+	overlapped := false
+	if _, err := os.Lstat(filepath.Join(clean, piEvidenceOverlapName)); err == nil {
+		overlapped = true
+	}
+	entries, err := os.ReadDir(clean)
+	if err != nil {
+		return true, claimPath
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasPrefix(name, piEvidenceClaimPrefix) || filepath.Join(clean, name) == claimPath {
+			continue
+		}
+		if piEvidenceClaimFileLive(filepath.Join(clean, name)) {
+			overlapped = true
+		} else {
+			_ = os.Remove(filepath.Join(clean, name))
+		}
+	}
+	if overlapped {
+		markPiEvidenceOverlap(clean)
+	}
+	return overlapped, claimPath
+}
+
+// piEvidenceClaimFileLive reports whether a claim file belongs to a live
+// controller: its recorded pid still runs. An unreadable or unparsable
+// claim fails closed (treated as live) so a peer is never silently
+// ignored; a pid that no longer runs is stale and cleaned by the caller.
+func piEvidenceClaimFileLive(path string) bool {
+	raw, err := os.ReadFile(path) //nolint:gosec // G304: path is a claim file discovered by listing the session's own state root.
+	if err != nil {
+		return true
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil || pid <= 0 {
+		return true
+	}
+	return isPiEvidenceProcessAlive(pid)
+}
+
+// isPiEvidenceProcessAlive probes one pid. Unknown pids fail closed as
+// live. On Windows the Signal(0) probe is unavailable, so any recorded pid
+// is treated as live: the workarea lifecycle still removes the claim files
+// with the workarea, bounding the false-refusal window to reused workareas.
+func isPiEvidenceProcessAlive(pid int) bool {
+	if runtime.GOOS == "windows" {
+		return true
+	}
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return true
+	}
+	if err := proc.Signal(syscall.Signal(0)); err != nil {
+		return false
+	}
+	return true
+}
+
+// markPiEvidenceOverlap leaves the cross-process overlap marker. Best
+// effort: a creation failure still leaves the in-process contamination,
+// and collection re-checks the live set directly.
+func markPiEvidenceOverlap(clean string) {
+	f, err := os.OpenFile(filepath.Join(clean, piEvidenceOverlapName), os.O_CREATE|os.O_WRONLY, 0o600) //nolint:gosec // G304: marker path joins the session's own state root with a fixed name.
+	if err != nil {
+		return
+	}
+	_ = f.Close()
+}
+
+// filesystemOverlapNow re-checks the cross-process set at Stop/collection:
+// another live claim file or a leftover overlap marker means this handle
+// overlapped, even when the peer started after this handle's spawn. A newly
+// observed overlap leaves the marker so the peer also refuses.
+func (c *piEvidenceClaim) filesystemOverlapNow() bool {
+	if c == nil {
+		return false
+	}
+	clean := c.root
+	if strings.TrimSpace(clean) == "" {
+		return false
+	}
+	if _, err := os.Lstat(filepath.Join(clean, piEvidenceOverlapName)); err == nil {
+		return true
+	}
+	entries, err := os.ReadDir(clean)
+	if err != nil {
+		return true
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasPrefix(name, piEvidenceClaimPrefix) {
+			continue
+		}
+		if c.claimPath != "" && filepath.Join(clean, name) == c.claimPath {
+			continue
+		}
+		if piEvidenceClaimFileLive(filepath.Join(clean, name)) {
+			markPiEvidenceOverlap(clean)
+			return true
+		}
+	}
+	return false
+}
+
+// release removes the lease from the live set and its claim file from the
+// layout root. The contaminated flag persists so a handle that overlapped
+// still refuses after the peer left. The overlap marker is removed only
+// once no live claim remains (in-process or on disk), so sequential reuse
+// after the overlap drains is clean again.
 func (c *piEvidenceClaim) release() {
 	if c == nil {
 		return
 	}
 	piEvidenceMu.Lock()
-	defer piEvidenceMu.Unlock()
 	if set := piEvidenceActive[c.root]; set != nil {
 		delete(set, c)
 		if len(set) == 0 {
 			delete(piEvidenceActive, c.root)
 		}
 	}
+	piEvidenceMu.Unlock()
+	if c.claimPath != "" {
+		_ = os.Remove(c.claimPath)
+		c.claimPath = ""
+	}
+	clean := c.root
+	if strings.TrimSpace(clean) == "" || clean == "." {
+		return
+	}
+	piEvidenceMu.Lock()
+	inProcessLive := len(piEvidenceActive[clean]) > 0
+	piEvidenceMu.Unlock()
+	if inProcessLive {
+		return
+	}
+	entries, err := os.ReadDir(clean)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if !strings.HasPrefix(e.Name(), piEvidenceClaimPrefix) {
+			continue
+		}
+		if piEvidenceClaimFileLive(filepath.Join(clean, e.Name())) {
+			return
+		}
+		_ = os.Remove(filepath.Join(clean, e.Name()))
+	}
+	_ = os.Remove(filepath.Join(clean, piEvidenceOverlapName))
 }
 
 // isContaminated reports whether another handle shared this root while this
@@ -78,8 +265,26 @@ func (c *piEvidenceClaim) isContaminated() bool {
 		return false
 	}
 	piEvidenceMu.Lock()
+	contaminated := c.contaminated
+	piEvidenceMu.Unlock()
+	if contaminated {
+		return true
+	}
+	return c.filesystemOverlapNow()
+}
+
+// markContaminated records an observed overlap on this lease and every
+// other live in-process lease on the same root.
+func (c *piEvidenceClaim) markContaminated() {
+	if c == nil {
+		return
+	}
+	piEvidenceMu.Lock()
 	defer piEvidenceMu.Unlock()
-	return c.contaminated
+	c.contaminated = true
+	for other := range piEvidenceActive[c.root] {
+		other.contaminated = true
+	}
 }
 
 // Compile-time assertions: both pi spawn modes expose the optional
@@ -146,6 +351,46 @@ func snapshotPiTranscriptBaseline(root string) (map[string]struct{}, bool) {
 	return baseline, false
 }
 
+// captureHeadlessEvidenceAtStop freezes this session's evidence at Stop,
+// before the overlap lease is released: a later sequential session in the
+// same checkout can never pollute this handle's delayed collection, which
+// returns the frozen outcome. Idempotent via evidenceDone.
+func (h *Handle) captureHeadlessEvidenceAtStop() {
+	h.evidenceMu.Lock()
+	defer h.evidenceMu.Unlock()
+	if h.evidenceDone {
+		return
+	}
+	if h.evidenceIncomplete {
+		h.evidenceDone = true
+		h.evidenceCachedErr = errors.New("pi: transcript evidence unavailable: pre-spawn transcript scan was incomplete")
+		return
+	}
+	if h.evidenceClaim.isContaminated() {
+		h.evidenceClaim.markContaminated()
+		h.evidenceDone = true
+		h.evidenceCachedErr = errors.New("pi: transcript evidence unavailable: concurrent session shared this state root")
+		return
+	}
+	root := h.stateRoot
+	if root == "" {
+		h.evidenceDone = true
+		return
+	}
+	descs, err := collectPiTranscriptDescriptors(root, h.evidenceBaseline)
+	if err != nil {
+		h.evidenceDone = true
+		h.evidenceCachedErr = err
+		return
+	}
+	if len(descs) == 0 {
+		h.evidenceDone = true
+		return
+	}
+	h.evidenceDone = true
+	h.evidenceCached = descs
+}
+
 // TerminalTranscripts implements agent.TerminalTranscriptCapable for the
 // headless RPC lane. It returns path-only descriptors for this session's
 // own JSONL transcripts beneath the exact per-session layout root, after
@@ -205,6 +450,54 @@ func (h *Handle) TerminalTranscripts() ([]agent.TerminalTranscriptDescriptor, er
 	cp := make([]agent.TerminalTranscriptDescriptor, len(descs))
 	copy(cp, descs)
 	return cp, nil
+}
+
+// captureInteractiveEvidenceAtStop freezes this session's evidence once the
+// final flush has been enqueued, before the overlap lease is released. See
+// captureHeadlessEvidenceAtStop for the delayed-collection rationale.
+// The caller must have joined activityFlushed already; if the flush has not
+// completed the capture refuses so a partial scan can never freeze as
+// success.
+func (h *interactiveStateLossHandle) captureInteractiveEvidenceAtStop() {
+	h.evidenceMu.Lock()
+	defer h.evidenceMu.Unlock()
+	if h.evidenceDone {
+		return
+	}
+	select {
+	case <-h.activityFlushed:
+	default:
+		h.evidenceDone = true
+		h.evidenceCachedErr = errors.New("pi: transcript evidence unavailable until the final transcript flush completes")
+		return
+	}
+	if h.evidenceIncomplete {
+		h.evidenceDone = true
+		h.evidenceCachedErr = errors.New("pi: transcript evidence unavailable: pre-spawn transcript scan was incomplete")
+		return
+	}
+	if h.evidenceClaim.isContaminated() {
+		h.evidenceClaim.markContaminated()
+		h.evidenceDone = true
+		h.evidenceCachedErr = errors.New("pi: transcript evidence unavailable: concurrent session shared this state root")
+		return
+	}
+	if strings.TrimSpace(h.stateRoot) == "" {
+		h.evidenceDone = true
+		return
+	}
+	descs, err := collectPiTranscriptDescriptors(h.stateRoot, h.evidenceBaseline)
+	if err != nil {
+		h.evidenceDone = true
+		h.evidenceCachedErr = err
+		return
+	}
+	if len(descs) == 0 {
+		h.evidenceDone = true
+		return
+	}
+	h.evidenceDone = true
+	h.evidenceCached = descs
 }
 
 // TerminalTranscripts implements agent.TerminalTranscriptCapable for the
@@ -290,6 +583,7 @@ func collectPiTranscriptDescriptors(root string, baseline map[string]struct{}) (
 		return nil, nil
 	}
 	var descs []agent.TerminalTranscriptDescriptor
+	var lstatErr error
 	walkErr := walkInteractiveTranscriptFiles(clean, func(path string, _ os.DirEntry) {
 		// A transcript that already existed before this session started
 		// belongs to a previous session reusing this workarea, never to
@@ -311,12 +605,21 @@ func collectPiTranscriptDescriptors(root string, baseline map[string]struct{}) (
 			return
 		}
 		fi, err := os.Lstat(path)
-		if err != nil || !fi.Mode().IsRegular() {
+		if err != nil {
+			// A candidate transcript that cannot be statted fails closed:
+			// dropping it would silently return empty or partial success
+			// while the transcript exists on disk.
+			if lstatErr == nil {
+				lstatErr = err
+			}
+			return
+		}
+		if !fi.Mode().IsRegular() {
 			return
 		}
 		descs = append(descs, agent.TerminalTranscriptDescriptor{Path: path})
 	})
-	if walkErr != nil {
+	if walkErr != nil || lstatErr != nil {
 		// The post-stop scan hit a read error: fail closed rather than
 		// returning a partial set that could hide this session's
 		// transcript or misattribute another's.

@@ -429,10 +429,12 @@ func (h *Handle) Stop(ctx context.Context) error {
 		}
 	})
 	h.stopped.Store(true)
-	// Writers have stopped: release the overlap lease so a later sequential
-	// session in the same checkout is not falsely contaminated. The
-	// contamination flag persists on the claim, so a true overlap still
-	// refuses at collection.
+	// Writers have stopped: freeze this session's evidence before releasing
+	// the overlap lease, so a later sequential session's transcript can
+	// never pollute this handle's delayed collection (it returns the frozen
+	// outcome). The contamination flag and the cross-process marker persist
+	// on the claim, so a true overlap still refuses at collection.
+	h.captureHeadlessEvidenceAtStop()
 	h.evidenceClaim.release()
 	return nil
 }

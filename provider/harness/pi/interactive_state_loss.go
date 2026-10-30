@@ -280,11 +280,23 @@ func newInteractiveStateLossHandle(handle *ptycli.Handle, stateDir string, taile
 // typed state-loss condition and transcript activity above.
 func (h *interactiveStateLossHandle) Events() <-chan agent.Event { return h.events }
 
-// Stop reaps the PTY child then releases the overlap lease, mirroring the
-// headless lane: sequential reuse after writers stop is clean, while true
-// overlap stays contaminated via the persisted flag.
+// Stop reaps the PTY child, joins the transcript tailer's final flush so
+// evidence is collectible immediately after Stop returns, freezes this
+// session's evidence, then releases the overlap lease. Sequential reuse
+// after writers stop is clean, while true overlap stays contaminated via
+// the persisted flag and the cross-process marker. The runner captures
+// evidence immediately after Stop and ignores collection errors, so
+// returning before the flush would lose a failed interactive session's
+// descriptor even though the child wrote its transcript.
 func (h *interactiveStateLossHandle) Stop(ctx context.Context) error {
 	err := h.Handle.Stop(ctx)
+	if h.activityFlushed != nil {
+		select {
+		case <-h.activityFlushed:
+		case <-ctx.Done():
+		}
+	}
+	h.captureInteractiveEvidenceAtStop()
 	h.evidenceClaim.release()
 	return err
 }

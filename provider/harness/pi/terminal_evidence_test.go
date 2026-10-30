@@ -908,3 +908,213 @@ func TestTerminalEvidence_RepeatedCollectionReturnsCached(t *testing.T) {
 		t.Fatalf("second = %+v; want cached original [%q], not the later session's transcript", second, aPath)
 	}
 }
+
+// TestTerminalEvidence_DelayedFirstCollectionAfterSequential pins B1/B5: Stop
+// freezes evidence, so a handle whose first collection happens after a later
+// sequential session ran still returns only its own transcript.
+//
+// RED proof: skip the Stop-time freeze (do not populate the cache at Stop)
+// and the delayed first collection returns both sessions' transcripts.
+func TestTerminalEvidence_DelayedFirstCollectionAfterSequential(t *testing.T) {
+	bin := buildEvidenceFakePi(t)
+	workdir := t.TempDir()
+	t.Setenv("FAKEPI_WRITE_TRANSCRIPT", "1")
+	t.Setenv("FAKEPI_TRANSCRIPT_LAST_LINE", "DELAYED_A_LINE")
+	t.Setenv("FAKEPI_REPLY", "a done")
+	newHeadless := func() *Provider {
+		t.Helper()
+		p, err := New(Options{
+			PiBin:            bin,
+			HandshakeTimeout: 20 * time.Second,
+			VersionProbe:     func(context.Context, string) (string, error) { return PinnedVersion, nil },
+		})
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		t.Cleanup(func() { _ = p.Shutdown(context.Background()) })
+		return p
+	}
+	pA, pB := newHeadless(), newHeadless()
+	hA, err := pA.Spawn(context.Background(), agent.Spec{Cwd: workdir, Prompt: "go"})
+	if err != nil {
+		t.Fatalf("Spawn A: %v", err)
+	}
+	drainToTerminal(t, hA)
+	if err := hA.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop A: %v", err)
+	}
+	t.Setenv("FAKEPI_TRANSCRIPT_LAST_LINE", "DELAYED_B_LINE")
+	hB, err := pB.Spawn(context.Background(), agent.Spec{Cwd: workdir, Prompt: "go"})
+	if err != nil {
+		t.Fatalf("Spawn B: %v", err)
+	}
+	drainToTerminal(t, hB)
+	if err := hB.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop B: %v", err)
+	}
+	capA, ok := hA.(agent.TerminalTranscriptCapable)
+	if !ok {
+		t.Fatal("handle A does not expose the terminal-transcript capability")
+	}
+	descs, err := capA.TerminalTranscripts()
+	if err != nil {
+		t.Fatalf("delayed A TerminalTranscripts refused: %v", err)
+	}
+	if len(descs) != 1 {
+		t.Fatalf("delayed A first collection = %+v; want only A's 1 transcript, not B's", descs)
+	}
+}
+
+// TestTerminalEvidence_InteractiveStopJoinsFlush pins B3: Stop joins the final
+// flush, so a failed interactive session whose child already wrote its trailing
+// line exposes it immediately after Stop returns.
+//
+// RED proof: return from Stop without joining activityFlushed and the
+// collection after Stop refuses while the flush is still pending.
+func TestTerminalEvidence_InteractiveStopJoinsFlush(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("pty spawn tests are unix-only")
+	}
+	workdir := t.TempDir()
+	const lastLine = "STOP_JOIN_FLUSH_LINE_9d2c"
+	script := fakePiTranscriptPrelude + `
+sleep 0.2
+tool_line final FINAL_TOOL
+printf '{"type":"message","id":"last-line","message":{"role":"assistant","content":[{"type":"text","text":"` + lastLine + `"}]}}\n' >> "$live"
+sleep 5
+`
+	p := newFakeInteractivePiProvider(t, script)
+	h, err := p.Spawn(context.Background(), agent.Spec{
+		Cwd:         workdir,
+		Interactive: &agent.InteractiveSpec{Cols: 80, Rows: 24},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+	root := ""
+	if w, ok := h.(*interactiveStateLossHandle); ok {
+		root = w.stateRoot
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		found := false
+		if root != "" {
+			_ = filepath.WalkDir(root, func(path string, e os.DirEntry, err error) error {
+				if err == nil && e != nil && !e.IsDir() && filepath.Ext(path) == ".jsonl" {
+					if b, rerr := os.ReadFile(path); rerr == nil && strings.Contains(string(b), lastLine) { //nolint:gosec // path discovered by walking the test state root
+						found = true
+					}
+				}
+				return nil
+			})
+		}
+		if found {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("transcript with last line never appeared; root=%q", root)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if err := h.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	capable, ok := h.(agent.TerminalTranscriptCapable)
+	if !ok {
+		t.Fatal("interactive handle does not expose the terminal-transcript capability")
+	}
+	descs, err := capable.TerminalTranscripts()
+	if err != nil {
+		t.Fatalf("TerminalTranscripts immediately after Stop refused: %v", err)
+	}
+	if len(descs) != 1 {
+		t.Fatalf("descriptors = %+v; want exactly this session's transcript", descs)
+	}
+	raw, err := os.ReadFile(descs[0].Path) //nolint:gosec // path came from the session's own evidence capability under test
+	if err != nil {
+		t.Fatalf("read transcript: %v", err)
+	}
+	if !strings.Contains(string(raw), lastLine) {
+		t.Fatalf("transcript lost its trailing line %q; got:\n%s", lastLine, raw)
+	}
+}
+
+// TestTerminalEvidence_CandidateLstatRefuses pins B4: a candidate transcript
+// whose Lstat fails (listable parent without execute permission) is a typed
+// refusal, not successful empty evidence.
+//
+// RED proof: drop Lstat errors in collectPiTranscriptDescriptors and the
+// collection returns (nil, nil) instead of refusing.
+func TestTerminalEvidence_CandidateLstatRefuses(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	sub := filepath.Join(root, "sub")
+	if err := os.MkdirAll(sub, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeTranscriptLine(t, filepath.Join(sub, "cand.jsonl"), transcriptMessage("m", map[string]any{
+		"role": "assistant", "content": []any{map[string]any{"type": "text", "text": "x"}},
+	}))
+	if err := os.Chmod(sub, 0o400); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chmod(sub, 0o700) }() //nolint:gosec // G302: test fixture dir restore needs the execute bit
+	if _, err := os.ReadDir(sub); err != nil {
+		t.Skipf("ReadDir failed with 0400, cannot probe: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(sub, "cand.jsonl")); err == nil {
+		t.Skip("Lstat succeeded despite 0400, cannot probe (running as root?)")
+	}
+	if descs, err := collectPiTranscriptDescriptors(root, nil); err == nil {
+		t.Fatalf("candidate Lstat EACCES: got %d descriptors and nil error, want incomplete-scan refusal", len(descs))
+	}
+}
+
+// TestTerminalEvidence_CrossProcessOverlapRefuses pins B2: a live claim file
+// from another controller process contaminates this handle, while a stale
+// claim from a dead pid is cleaned and stays clean.
+//
+// RED proof: track overlap only in the in-process map and the live peer file
+// is ignored (clean instead of refusal).
+func TestTerminalEvidence_CrossProcessOverlapRefuses(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	peer := filepath.Join(root, piEvidenceClaimPrefix+"peer")
+	if err := os.WriteFile(peer, []byte(itoa(os.Getpid())), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c := acquirePiEvidenceClaim(root)
+	if c == nil {
+		t.Fatal("nil claim")
+	}
+	defer c.release()
+	if !c.isContaminated() {
+		t.Fatal("live peer claim file must contaminate, want ownership refusal")
+	}
+	_ = os.Remove(peer)
+}
+
+// itoa is a tiny test-local int-to-string without importing strconv in the
+// test's import block.
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	neg := n < 0
+	if neg {
+		n = -n
+	}
+	var b [32]byte
+	i := len(b)
+	for n > 0 {
+		i--
+		b[i] = byte('0' + n%10)
+		n /= 10
+	}
+	if neg {
+		i--
+		b[i] = '-'
+	}
+	return string(b[i:])
+}
