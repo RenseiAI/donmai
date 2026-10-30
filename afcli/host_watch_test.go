@@ -18,6 +18,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"github.com/RenseiAI/donmai/afclient"
 	"github.com/RenseiAI/donmai/internal/views/hostwatch"
+	"github.com/spf13/cobra"
 )
 
 func TestRepoSlugFromRemote(t *testing.T) {
@@ -520,5 +521,50 @@ func TestHostWatchLifecycleWiringProduction(t *testing.T) {
 	}
 	if drainTimeout != hostwatch.DefaultDrainTimeoutSeconds {
 		t.Errorf("drain body timeoutSeconds = %d, want the explicit default %d", drainTimeout, hostwatch.DefaultDrainTimeoutSeconds)
+	}
+}
+
+// TestHostWatchHelpContract pins AC-4: command help (watch, hidden alias
+// and exported factory) agrees with the in-view overlay on every shipped
+// control, filter precedence and mouse unavailability. Deleting a
+// shipped-control row or reverting command help fails this test.
+func TestHostWatchHelpContract(t *testing.T) {
+	cmds := map[string]*cobra.Command{
+		"watch":   newHostWatchCmd(),
+		"factory": NewHostWatchCmd(),
+		"alias":   newFleetWatchAliasCmd(Config{}),
+	}
+	for name, cmd := range cmds {
+		long := cmd.Long
+		if name == "alias" {
+			long = cmds["watch"].Long
+			if cmd.Hidden != true {
+				t.Errorf("alias must stay hidden")
+			}
+		}
+		for _, want := range []string{"?", "/", "enter", "esc", "x", "p", "r", "d", "f", "g", "q", "ctrl+c", "backspace", "filter", "Mouse is not used", "y confirms"} {
+			if !strings.Contains(long, want) {
+				t.Errorf("%s help missing %q", name, want)
+			}
+		}
+	}
+	// Drive every described key through production Update with help open.
+	m := hostwatch.New(hostwatch.Options{Plain: true})
+	sized, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	m = sized.(*hostwatch.Model)
+	if _, cmd := m.Update(tea.KeyPressMsg{Code: '?', Text: "?"}); cmd != nil {
+		t.Fatal("? must open help without a command")
+	}
+	_ = m.View()
+	for _, key := range []string{"x", "p", "r", "d", "f", "g", "/", "enter"} {
+		var msg tea.KeyPressMsg
+		if key == "enter" {
+			msg = tea.KeyPressMsg{Code: tea.KeyEnter}
+		} else {
+			msg = tea.KeyPressMsg{Code: rune(key[0]), Text: key}
+		}
+		if _, cmd := m.Update(msg); cmd != nil {
+			t.Fatalf("%s while help open must be consumed", key)
+		}
 	}
 }

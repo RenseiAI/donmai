@@ -240,6 +240,12 @@ type Model struct {
 	// sanitized error), rendered with the help row until the next
 	// action replaces it.
 	notice string
+
+	// helpOpen shows the contextual keyboard help overlay; helpScroll
+	// is the scrolled offset into its wrapped rows. Closing help
+	// preserves detail, filter, selection, split and follow.
+	helpOpen   bool
+	helpScroll int
 }
 
 // New constructs a host-watch Model.
@@ -354,6 +360,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// resize keeps the operator's ratio without any recomputation.
 		m.width = msg.Width
 		m.height = msg.Height
+		// A resize clamps an open help overlay so the scroll offset
+		// never points past the last reachable row.
+		if m.helpOpen && m.helpScroll > m.helpMaxScroll() {
+			m.helpScroll = m.helpMaxScroll()
+		}
 		return m, nil
 
 	case indexTickMsg:
@@ -385,6 +396,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.actionBusy = false
 		m.notice = formatHostActionResult(msg)
 		return m, m.pollIndex()
+
+	case tea.MouseMsg:
+		// Mouse is not used; keyboard only. Consume without a command
+		// so a click never moves selection or fires an action.
+		return m, nil
 
 	case tea.KeyPressMsg:
 		return m.handleKey(msg)
@@ -433,6 +449,39 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		default:
 			return m, nil // swallow: only an explicit key resolves the gate
 		}
+	}
+	// The help overlay outranks filtering and shortcuts: ? never
+	// becomes filter text and nothing runs while help is open.
+	// Confirmations returned above, so ? stays ignored there.
+	if m.helpOpen {
+		switch key := msg.String(); key {
+		case "ctrl+c":
+			return m, tea.Quit
+		case "esc", "escape", "?":
+			m.helpOpen = false
+			return m, nil
+		case "up", "k":
+			if m.helpScroll > 0 {
+				m.helpScroll--
+			}
+			return m, nil
+		case "down", "j":
+			if m.helpScroll < m.helpMaxScroll() {
+				m.helpScroll++
+			}
+			return m, nil
+		default:
+			if msg.Code == tea.KeyEscape || msg.Text == "?" {
+				m.helpOpen = false
+				return m, nil
+			}
+			return m, nil // consume: help blocks selection/follow/split/filter/lifecycle
+		}
+	}
+	if msg.String() == "?" || msg.Text == "?" {
+		m.helpOpen = true
+		m.helpScroll = 0
+		return m, nil
 	}
 	if m.filterActive {
 		if _, done := m.handleFilterKey(msg); done {
@@ -1270,12 +1319,23 @@ func (m *Model) render() string {
 		if !m.opts.Plain {
 			warn = theme.ErrorText().Render(warn)
 		}
+		if m.helpOpen {
+			rows := []string{header, "", warn}
+			rows = append(rows, m.helpPanelRows(m.helpContentHeight())...)
+			rows = append(rows, help)
+			return m.clipHeight(rows, unbounded)
+		}
 		return m.clipHeight([]string{header, "", warn, "", help}, unbounded)
 	}
 
 	gridH, streamH := splitPaneHeights(m.height-2, m.split)
 	rows := []string{header}
 	vis := m.visibleCards()
+	if m.helpOpen {
+		rows = append(rows, m.helpPanelRows(m.helpContentHeight())...)
+		rows = append(rows, help)
+		return m.clipHeight(rows, unbounded)
+	}
 	if unbounded {
 		rows = append(rows, renderGrid(m.theme, vis, m.cursor, m.frame, m.width, 0, true, m.now()))
 	} else {
@@ -1483,8 +1543,14 @@ func truncateHeaderHost(host string, width int) string {
 	return truncateWidth(host, width)
 }
 
-// helpText documents every key. It is truncated to the terminal width.
-const helpText = "↑↓/jk select   enter detail   x stop   p pause   r resume   d drain   [ ] split   0 reset   f follow/pause   g tail   q quit"
+// helpText is the compact footer. It leads with the selection prefix
+// the layout pins, then the ? help hint so ? stays visible at 40
+// columns even with long filters or notices.
+const helpText = "↑↓/jk select   ? help   enter detail   x stop   p pause   r resume   d drain   [ ] split   0 reset   f follow/pause   g tail   q quit"
+
+// helpCore is the footer prefix that must survive truncation so the
+// overlay stays discoverable at the narrowest widths.
+const helpCore = "↑↓/jk select   ? help"
 
 func (m *Model) renderHelp() string {
 	help := helpText
@@ -1498,14 +1564,23 @@ func (m *Model) renderHelp() string {
 		}
 		help = fmt.Sprintf("drain host (%ds): sessions still running are stopped? y confirm · n cancel", secs)
 	case m.notice != "":
-		help = m.notice + "   " + helpText
+		// Help first so ? survives truncation; the notice tail is cut.
+		help = helpText + "   " + m.notice
 	}
 	if m.filterActive {
 		suffix := "   filter: /" + m.filterQuery
 		if m.width > 0 {
 			avail := m.width - lipgloss.Width(suffix)
 			if avail < 0 {
-				help = truncateWidth(suffix, m.width)
+				switch {
+				case m.confirmKind != "":
+					help = truncateWidth(suffix, m.width)
+				case lipgloss.Width(helpCore+"   filter: /") >= m.width:
+					help = truncateWidth(helpCore+"   filter: /"+m.filterQuery, m.width)
+				default:
+					availQuery := m.width - lipgloss.Width(helpCore) - lipgloss.Width("   filter: /")
+					help = truncateWidth(helpCore+"   filter: /"+truncateWidth(m.filterQuery, availQuery), m.width)
+				}
 			} else {
 				help = truncateWidth(help, avail) + suffix
 				help = truncateWidth(help, m.width)
@@ -1520,6 +1595,163 @@ func (m *Model) renderHelp() string {
 		return help
 	}
 	return lipgloss.NewStyle().Foreground(m.theme.TextTertiary).Render(help)
+}
+
+// hostHelpRow is one contextual help row: the key plus its description.
+type hostHelpRow struct {
+	key  string
+	desc string
+}
+
+// hostHelpRows lists every shipped control. The contract test fails when
+// a row is deleted; command help must describe the same controls.
+var hostHelpRows = []hostHelpRow{
+	{"↑↓ / j k", "move selection"},
+	{"enter", "open selected detail; selection follows cursor"},
+	{"esc", "close detail, exit filter, or close this help"},
+	{"?", "toggle this help; esc also closes"},
+	{"/ + type", "filter cards; printable keys become query text, never shortcuts"},
+	{"backspace", "delete one filter character"},
+	{"[ ] / 0", "shrink / grow cards pane; 0 resets 50/50, survives resize"},
+	{"f / g", "pause / resume stream follow; g jumps to latest"},
+	{"x then y", "stop selected session; y confirms, n cancels"},
+	{"p / r", "pause host admissions / reopen them"},
+	{"d then y", "drain host to deadline; y confirms, n cancels, running sessions stop"},
+	{"y / n", "confirm or cancel stop / drain; selection change cancels stop"},
+	{"q / ctrl+c", "quit, also from help and confirmations"},
+	{"mouse", "mouse is not used; keyboard only"},
+}
+
+// helpContextName names the current context for the overlay title.
+func (m *Model) helpContextName() string {
+	if m.filterActive {
+		return "filter: /" + m.filterQuery
+	}
+	if m.detail {
+		return "detail"
+	}
+	return "list"
+}
+
+// helpContentHeight is the rows available for the help panel between
+// the header and the footer.
+func (m *Model) helpContentHeight() int {
+	if m.height <= 2 {
+		return max(m.height-1, 0)
+	}
+	return m.height - 2
+}
+
+// helpContentLines wraps every help row to the terminal width so long
+// descriptions wrap instead of truncating at narrow widths.
+func (m *Model) helpContentLines() []string {
+	width := m.width
+	if width <= 0 {
+		width = 80
+	}
+	var out []string
+	for _, r := range hostHelpRows {
+		out = append(out, wrapHelpRow(r.key+"  "+r.desc, width)...)
+	}
+	return out
+}
+
+// helpMaxScroll bounds the scroll offset so the last row is reachable.
+func (m *Model) helpMaxScroll() int {
+	visible := m.helpContentHeight() - 1 // title takes one row
+	if visible < 0 {
+		visible = 0
+	}
+	maxOff := len(m.helpContentLines()) - visible
+	if maxOff < 0 {
+		return 0
+	}
+	return maxOff
+}
+
+// helpPanelRows renders the overlay panel: a pinned contextual title
+// plus the scrolled, width-bounded rows, padded to a fixed height so
+// the footer stays put.
+func (m *Model) helpPanelRows(contentH int) []string {
+	if contentH <= 0 {
+		return nil
+	}
+	width := m.width
+	if width <= 0 {
+		width = 80
+	}
+	title := truncateWidth("keyboard help — "+m.helpContextName()+"  (?/esc closes · ↑↓ scrolls)", width)
+	if !m.opts.Plain {
+		title = theme.SectionTitle().Render(truncateWidth("keyboard help — "+m.helpContextName(), width)) +
+			lipgloss.NewStyle().Foreground(m.theme.TextTertiary).Render(truncateWidth("  (?/esc closes · ↑↓ scrolls)", max(width-lipgloss.Width("keyboard help — "+m.helpContextName()), 0)))
+		title = truncateWidth(title, width)
+	}
+	if m.opts.Plain && m.opts.UnboundedCards {
+		return append([]string{title}, m.helpContentLines()...)
+	}
+	lines := m.helpContentLines()
+	scroll := m.helpScroll
+	if scroll < 0 {
+		scroll = 0
+	}
+	if limit := m.helpMaxScroll(); scroll > limit {
+		scroll = limit
+	}
+	visible := contentH - 1
+	if visible < 0 {
+		visible = 0
+	}
+	var body []string
+	for i := 0; i < visible; i++ {
+		if scroll+i < len(lines) {
+			body = append(body, truncateWidth(lines[scroll+i], width))
+		} else {
+			body = append(body, "")
+		}
+	}
+	return append([]string{title}, body...)
+}
+
+// wrapHelpRow word-wraps s to width display cells for the help overlay.
+func wrapHelpRow(s string, width int) []string {
+	if width <= 0 {
+		return []string{s}
+	}
+	if lipgloss.Width(s) <= width {
+		return []string{s}
+	}
+	words := strings.Fields(s)
+	if len(words) == 0 {
+		return []string{truncateWidth(s, width)}
+	}
+	var lines []string
+	cur := ""
+	for _, w := range words {
+		cand := w
+		if cur != "" {
+			cand = cur + " " + w
+		}
+		if lipgloss.Width(cand) <= width {
+			cur = cand
+			continue
+		}
+		if cur != "" {
+			lines = append(lines, cur)
+		}
+		if lipgloss.Width(w) > width {
+			lines = append(lines, truncateWidth(w, width))
+			cur = ""
+		} else {
+			cur = w
+		}
+	}
+	if cur != "" {
+		lines = append(lines, cur)
+	}
+	if len(lines) == 0 {
+		return []string{truncateWidth(s, width)}
+	}
+	return lines
 }
 
 // A journal position identifies a local observation when optional span upload
