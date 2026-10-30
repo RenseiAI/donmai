@@ -647,11 +647,11 @@ func TestTranscriptEvidence_ShortSecretRedacted(t *testing.T) {
 func TestTranscriptEvidence_UnicodeEscapedRedacted(t *testing.T) {
 	secret := "unisecretXYZ"
 	var esc strings.Builder
-	for _, ch := range secret {
+	for i := 0; i < len(secret); i++ {
 		esc.WriteString(`\u00`)
 		hex := "0123456789abcdef"
-		esc.WriteByte(hex[(byte(ch)>>4)&0xf])
-		esc.WriteByte(hex[byte(ch)&0xf])
+		esc.WriteByte(hex[secret[i]>>4&0xf])
+		esc.WriteByte(hex[secret[i]&0xf])
 	}
 	body := "{\"msg\":\"prefix " + esc.String() + " suffix\"}\n"
 	clone, _, base := cloneForRescue(t)
@@ -1004,7 +1004,7 @@ func TestTranscriptEvidence_ReadbackMismatchKeepsWorkarea(t *testing.T) {
 	clone, _, base := cloneForRescue(t)
 	writeFile(t, clone, ".agent/transcript.jsonl", "{\"ok\":true}\n")
 	oldWrite := transcriptEvidenceWriteAtomic
-	transcriptEvidenceWriteAtomic = func(dir, name string, data []byte) error {
+	transcriptEvidenceWriteAtomic = func(dir, name string, _ []byte) error {
 		if err := oldWrite(dir, name, []byte("{\"tampered\":true}\n")); err != nil {
 			return err
 		}
@@ -1147,5 +1147,35 @@ func TestTranscriptEvidence_UnknownPasswordRedacted(t *testing.T) {
 	}
 	if m["password"] != "[REDACTED]" {
 		t.Fatalf("password = %v; want [REDACTED]", m["password"])
+	}
+}
+
+// TestTranscriptEvidence_CompletedSessionSkipsEvidence pins the failed-only
+// scope guard: a completed session with declared transcripts writes no
+// evidence, preserves successfully, and emits no evidence warning. Deleting
+// the Status guard must make this test fail (an unexpected archive
+// appears and preservation still reports success on the wrong path).
+func TestTranscriptEvidence_CompletedSessionSkipsEvidence(t *testing.T) {
+	clone, _, base := cloneForRescue(t)
+	writeFile(t, clone, ".agent/transcript.jsonl", "{\"msg\":\"completed run\"}\n")
+	r := minimalRunner(t)
+	r.rescueDir = t.TempDir()
+	res := &Result{}
+	res.Status = "completed"
+	res.WorktreePath = clone
+	res.rescueTargets = []rescueTarget{{path: clone, base: base}}
+	res.terminalTranscripts = []agent.TerminalTranscriptDescriptor{{Path: ".agent/transcript.jsonl"}}
+	qw := QueuedWork{QueuedWork: queuedWorkBase("COMPLETED-NOEVIDENCE")}
+	qw.AuthToken = "completed-session-bearer-13579"
+	if !r.preserveUnpublishedWork(qw, res) {
+		t.Fatalf("preserve = false for a completed session (warnings %v); want true", res.PostSessionWarnings)
+	}
+	if files := findEvidenceFiles(t, r.rescueDir); len(files) != 0 {
+		t.Fatalf("evidence files = %v for a completed session; want none", files)
+	}
+	for _, w := range res.PostSessionWarnings {
+		if strings.Contains(w, "transcript evidence unavailable") {
+			t.Fatalf("unexpected evidence warning on the completed path: %q (all %v)", w, res.PostSessionWarnings)
+		}
 	}
 }
