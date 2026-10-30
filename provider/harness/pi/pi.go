@@ -83,6 +83,12 @@ type Provider struct {
 	// trustedExtensions is the immutable ordered same-process extension set
 	// supplied by the compiled embedder at provider construction.
 	trustedExtensions []TrustedExtensionIdentity
+	// interactiveBeforeChildStart is a deterministic test barrier after the
+	// interactive evidence-lease acquisition, before the PTY child starts.
+	// Observing the lease from the child cannot establish this ordering:
+	// the child may run before a post-spawn claim lands. Nil leaves the
+	// production spawn sequence unchanged.
+	interactiveBeforeChildStart func(root string)
 }
 
 // Options configures Provider construction. The empty value runs `pi` from

@@ -1095,6 +1095,64 @@ func TestTerminalEvidence_CrossProcessOverlapRefuses(t *testing.T) {
 	_ = os.Remove(peer)
 }
 
+// TestTerminalEvidence_InteractiveClaimPrecedesChildStart proves the interactive
+// spawn takes its evidence lease BEFORE the PTY child starts: the barrier
+// fires after acquisition but before SpawnWithOptions, and observes the live
+// lease plus its claim file already present on this session's exact layout
+// root. A session that stops in the gap between spawn and the first write
+// must still attribute only its own transcript, which needs the lease held
+// from before the child exists.
+//
+// RED proof: move acquirePiEvidenceClaim back after SpawnWithOptions and the
+// barrier observes no live lease and no claim file.
+func TestTerminalEvidence_InteractiveClaimPrecedesChildStart(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("pty spawn tests are unix-only")
+	}
+	workdir := t.TempDir()
+	wantRoot := sessionStateRoot(agent.Spec{Cwd: workdir})
+	var barrierRoot string
+	var sawLease, sawClaimFile bool
+	p := newFakeInteractivePiProvider(t, "exit 0\n")
+	p.interactiveBeforeChildStart = func(root string) {
+		barrierRoot = filepath.Clean(root)
+		piEvidenceMu.Lock()
+		_, sawLease = piEvidenceActive[filepath.Clean(root)]
+		piEvidenceMu.Unlock()
+		entries, err := os.ReadDir(root)
+		if err != nil {
+			return
+		}
+		for _, e := range entries {
+			if strings.HasPrefix(e.Name(), piEvidenceClaimPrefix) {
+				sawClaimFile = true
+			}
+		}
+	}
+	h, err := p.Spawn(context.Background(), agent.Spec{
+		Cwd:         workdir,
+		Interactive: &agent.InteractiveSpec{Cols: 80, Rows: 24},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+	awaitPTYExit(t, h)
+	_ = h.Stop(context.Background())
+	if barrierRoot == "" {
+		t.Fatal("interactive spawn barrier never fired before child start")
+	}
+	if barrierRoot != filepath.Clean(wantRoot) {
+		t.Fatalf("barrier root = %q, want this session's layout root %q", barrierRoot, wantRoot)
+	}
+	if !sawLease {
+		t.Fatal("no live evidence lease held before the interactive child started; the claim must precede SpawnWithOptions")
+	}
+	if !sawClaimFile {
+		t.Fatal("no evidence claim file present before the interactive child started; the claim must precede SpawnWithOptions")
+	}
+}
+
 // itoa is a tiny test-local int-to-string without importing strconv in the
 // test's import block.
 func itoa(n int) string {

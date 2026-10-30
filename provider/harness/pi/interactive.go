@@ -152,9 +152,21 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 	// Snapshot the shared state dir's existing transcripts BEFORE the child
 	// starts, so the transcript tail reads only what this session writes.
 	tailer := newInteractiveTranscriptTailer(layout.root)
+	// Claim the layout root for overlap detection BEFORE the child starts,
+	// next to the tailer baseline above: a concurrent session in the same
+	// checkout contaminates both leases and each later refuses rather than
+	// attributing the other's transcript, and a session that stops in the
+	// gap before the child writes still attributes only its own transcript.
+	// Held until Stop releases it (released below on the spawn-failure
+	// returns); sequential reuse after Stop sees an empty set.
+	evidenceClaim := acquirePiEvidenceClaim(layout.root)
+	if p.interactiveBeforeChildStart != nil {
+		p.interactiveBeforeChildStart(layout.root)
+	}
 
 	wrapped, err := confinePiArgv(plan, append([]string{p.binary}, interactiveArgs(spec, layout, extensionPaths)...))
 	if err != nil {
+		evidenceClaim.release()
 		if plan != nil {
 			_ = plan.Release()
 		}
@@ -178,6 +190,7 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 		ExactEnv: true,
 	})
 	if err != nil {
+		evidenceClaim.release()
 		if plan != nil {
 			_ = plan.Release()
 		}
@@ -185,13 +198,7 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 		return nil, err
 	}
 	wrappedHandle := newInteractiveStateLossHandle(handle, layout.root, tailer)
-	// Claim the layout root for overlap detection. Acquired after the child
-	// started but before it can write its transcript, so a concurrent
-	// session in the same checkout contaminates both leases and each later
-	// refuses rather than attributing the other's transcript. Held until the
-	// evidence is collected (released there); sequential reuse after
-	// collection sees an empty set.
-	wrappedHandle.evidenceClaim = acquirePiEvidenceClaim(layout.root)
+	wrappedHandle.evidenceClaim = evidenceClaim
 	return wrappedHandle, nil
 }
 
