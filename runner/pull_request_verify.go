@@ -52,19 +52,30 @@ import (
 // is continued (turn_continuation.go); a session still in that state when
 // its continuations run out ends not delivered, naming the reason.
 
-// pullRequestLookupTimeout bounds one remote lookup.
+// pullRequestLookupTimeout bounds all remote lookups in one verification
+// pass. One pass shares a single deadline so a transcript full of URLs
+// cannot stall the session end.
 const pullRequestLookupTimeout = 15 * time.Second
 
-// Candidate URLs are kept without a bound: verification reads them in one
-// batched remote lookup, so a transcript full of URLs costs a single
-// ls-remote (bounded by pullRequestLookupTimeout) instead of stalling the
-// session end. Retention is bounded by the transcript itself — every
-// candidate consumes input bytes — and every hint the stream carried must
-// still be present when the verifier runs: the session pull request is
-// verified, not voted on. A bounded window let a flood of unrelated URLs
-// evict the genuine session pull request before verification (a narrative
-// hint oldest under tool-result chatter, or an earlier inject turn's hint
-// after union), flipping a landed session to agent-blocked.
+// pullRequestLookupChunkSize bounds the pull refs in one ls-remote call:
+// one call with tens of thousands of refs fails with "argument list too
+// long" and would mark every candidate unconfirmed. Reads go in priority
+// order in chunks of this size (the session branch ref rides along in each
+// chunk), verified chunk by chunk, stopping at the first accepted pull
+// request. A failed chunk marks only its own candidates unconfirmed.
+const pullRequestLookupChunkSize = 256
+
+// Candidate URLs are kept without a bound: verification reads them in
+// chunked batched remote lookups, so a transcript full of URLs costs
+// ceil(candidates/chunkSize) ls-remote calls sharing one overall deadline
+// (bounded by pullRequestLookupTimeout) instead of stalling the session
+// end. Retention is bounded by the transcript itself — every candidate
+// consumes input bytes — and every hint the stream carried must still be
+// present when the verifier runs: the session pull request is verified, not
+// voted on. A bounded window let a flood of unrelated URLs evict the
+// genuine session pull request before verification (a narrative hint oldest
+// under tool-result chatter, or an earlier inject turn's hint after union),
+// flipping a landed session to agent-blocked.
 
 // pullRequestRefLookup reads refs from the checkout's origin remote and
 // returns the commit of each named ref that exists there.
@@ -386,24 +397,52 @@ func (v *sessionPullRequestVerifier) settle(ctx context.Context, res *Result, ob
 		needSet[c] = struct{}{}
 		needs = append(needs, need{url: c, number: number})
 	}
-	var found map[string]string
-	var lookupErr error
+	lookup := v.lookup
+	if lookup == nil {
+		lookup = originRefs
+	}
+	// Chunked remote reads in priority order: needs is already envelope
+	// first, then newest candidate first. Each chunk carries its own
+	// branch ref so every chunk can accept on the session branch head.
+	// Chunks are fetched lazily in evaluation order and share one overall
+	// deadline; a failed chunk marks only its own candidates unconfirmed.
+	var lookupCtx context.Context
+	var lookupCancel context.CancelFunc
 	if len(needs) > 0 {
-		refs := make([]string, 0, len(needs)+1)
-		for _, n := range needs {
+		lookupCtx, lookupCancel = context.WithTimeout(ctx, pullRequestLookupTimeout)
+		defer lookupCancel()
+	}
+	needIndex := make(map[string]int, len(needs))
+	for i, n := range needs {
+		needIndex[n.url] = i
+	}
+	numChunks := (len(needs) + pullRequestLookupChunkSize - 1) / pullRequestLookupChunkSize
+	foundChunks := make([]map[string]string, numChunks)
+	errChunks := make([]error, numChunks)
+	fetched := make([]bool, numChunks)
+	fetchChunk := func(chunk int) {
+		if chunk < 0 || chunk >= numChunks || fetched[chunk] {
+			return
+		}
+		fetched[chunk] = true
+		start := chunk * pullRequestLookupChunkSize
+		end := start + pullRequestLookupChunkSize
+		if end > len(needs) {
+			end = len(needs)
+		}
+		refs := make([]string, 0, end-start+1)
+		for _, n := range needs[start:end] {
 			refs = append(refs, fmt.Sprintf("refs/pull/%d/head", n.number))
 		}
 		if branchRef != "" {
 			refs = append(refs, branchRef)
 		}
-		lookup := v.lookup
-		if lookup == nil {
-			lookup = originRefs
-		}
-		found, lookupErr = lookup(ctx, v.worktreePath, refs...)
+		found, err := lookup(lookupCtx, v.worktreePath, refs...)
 		if found == nil {
 			found = map[string]string{}
 		}
+		foundChunks[chunk] = found
+		errChunks[chunk] = err
 	}
 	// The checkout's own commit is read once, only when a candidate's
 	// pull head is present but is not the session branch's head.
@@ -444,11 +483,24 @@ func (v *sessionPullRequestVerifier) settle(ctx context.Context, res *Result, ob
 			rejected = append(rejected, pullRequestRejection{url: candidate, reason: "the pull request is on another repository"})
 			continue
 		}
-		if lookupErr != nil {
+		idx, ok := needIndex[candidate]
+		if !ok {
+			// Unreachable: same-repository candidates are collected into
+			// needs above; anything else was refused as malformed,
+			// non-GitHub, or foreign. Treat as unconfirmed rather than
+			// accepting on a missing read.
 			v.outcomes[candidate] = candidateUnconfirmed
-			rejected = append(rejected, pullRequestRejection{url: candidate, reason: "could not read the pull request from the session's remote: " + lookupErr.Error()})
+			rejected = append(rejected, pullRequestRejection{url: candidate, reason: "could not read the pull request from the session's remote: no batched read covers this candidate"})
 			continue
 		}
+		chunk := idx / pullRequestLookupChunkSize
+		fetchChunk(chunk)
+		if errChunks[chunk] != nil {
+			v.outcomes[candidate] = candidateUnconfirmed
+			rejected = append(rejected, pullRequestRejection{url: candidate, reason: "could not read the pull request from the session's remote: " + errChunks[chunk].Error()})
+			continue
+		}
+		found := foundChunks[chunk]
 		pullRef := fmt.Sprintf("refs/pull/%d/head", number)
 		pullHead := found[pullRef]
 		if pullHead == "" {
@@ -456,7 +508,7 @@ func (v *sessionPullRequestVerifier) settle(ctx context.Context, res *Result, ob
 			rejected = append(rejected, pullRequestRejection{url: candidate, reason: "no such pull request on the session's repository"})
 			continue
 		}
-		if branchRef != "" && found[branchRef] == pullHead {
+		if branchRef != "" && found[branchRef] == pullHead && found[branchRef] != "" {
 			v.outcomes[candidate] = candidateAccepted
 			accepted = candidate
 			break

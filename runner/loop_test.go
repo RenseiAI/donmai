@@ -1188,7 +1188,7 @@ func TestRun_EarlierUnrelatedInjectCannotHideLaterSessionPR(t *testing.T) {
 
 // A genuine session PR reported in narrative before later tool chatter must
 // still verify. Narrative #7 is oldest, seventy unrelated tool URLs follow,
-// then the turn declines: the verifier checks every candidate in one batch.
+// then the turn declines: the verifier checks every candidate in chunked batches.
 // Seventy exceeds the old 64-entry window, which evicted the narrative hint
 // and flipped this landed session to agent-blocked.
 func TestRun_NarrativeBeforeToolChatterKeepsSessionPR(t *testing.T) {
@@ -1203,6 +1203,28 @@ func TestRun_NarrativeBeforeToolChatterKeepsSessionPR(t *testing.T) {
 	res, _ := runScriptedSession(t, scriptedSession{
 		workType: "development", repository: followUpRepository, pulls: pulls,
 		turns: []verdictScriptTurn{{events: events, text: "Still stuck.\nAGENT_BLOCKED: need decision"}},
+	})
+	if res.PullRequestURL != followUpPR || res.FailureMode == FailureAgentBlocked {
+		t.Fatalf("PR=%q FailureMode=%q; want verified %q without agent-blocked", res.PullRequestURL, res.FailureMode, followUpPR)
+	}
+}
+
+// A flood of forty thousand unrelated URLs must not hide the session pull
+// request: the verifier reads refs in ~256-ref chunks sharing one deadline,
+// so one over-long ls-remote never marks every candidate unconfirmed. The
+// session pull request is oldest, so every chunk is read before it verifies.
+// Without chunking the single batched read fails with "argument list too
+// long" and the landed session flips to agent-blocked.
+func TestRun_FortyThousandCandidatesStillFindSessionPR(t *testing.T) {
+	var sb strings.Builder
+	sb.WriteString("Opened " + followUpPR + " for review. ")
+	for i := 0; i < 40000; i++ {
+		fmt.Fprintf(&sb, "https://github.com/example/repo/pull/%d ", 100000+i)
+	}
+	sb.WriteString("\nStill stuck.\nAGENT_BLOCKED: need decision")
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType: "development", repository: followUpRepository, pulls: map[int]string{7: pullAtSessionCommit},
+		turns: []verdictScriptTurn{{text: sb.String()}},
 	})
 	if res.PullRequestURL != followUpPR || res.FailureMode == FailureAgentBlocked {
 		t.Fatalf("PR=%q FailureMode=%q; want verified %q without agent-blocked", res.PullRequestURL, res.FailureMode, followUpPR)
