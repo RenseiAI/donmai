@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/prompt"
+	"github.com/RenseiAI/donmai/provider/harness/shell"
 	"github.com/RenseiAI/donmai/provider/harness/stub"
 	"github.com/RenseiAI/donmai/result"
 	"github.com/RenseiAI/donmai/runtime/worktree"
@@ -733,6 +735,345 @@ func TestLateLeaseFailurePreservesEvidenceViaRun(t *testing.T) {
 	}
 	if len(entries) != 1 {
 		t.Fatalf("evidence attempts = %d; want exactly 1 after the late lease failure", len(entries))
+	}
+	body, readErr := os.ReadFile(filepath.Join(sessionRoot, entries[0].Name(), terminalEvidenceFileName)) //nolint:gosec // G304: test-owned path.
+	if readErr != nil {
+		t.Fatalf("read terminal evidence: %v", readErr)
+	}
+	var manifest terminalEvidenceManifest
+	if err := json.Unmarshal(body, &manifest); err != nil {
+		t.Fatalf("decode terminal evidence: %v", err)
+	}
+	if manifest.Status != "failed" || len(manifest.Transcripts) != 1 || manifest.Transcripts[0] != sentinel {
+		t.Fatalf("evidence manifest = %+v; want failed with exactly [%q]", manifest, sentinel)
+	}
+	if res.WorktreePath == "" {
+		t.Fatal("failed session has no worktree path")
+	}
+	if _, err := os.Stat(res.WorktreePath); !os.IsNotExist(err) {
+		t.Fatalf("worktree stat err = %v; want the failed session's worktree torn down", err)
+	}
+}
+
+// retentionRunProvider serves one cancelled interview session per Spawn while
+// optionally planting unpublished work into the provisioned workarea. It
+// embeds the stub harness so registry identity, capabilities and manifest
+// stay production-faithful; only Spawn is overridden.
+type retentionRunProvider struct {
+	agent.HarnessProvider
+	gate  chan struct{}
+	once  *sync.Once
+	descs []agent.TerminalTranscriptDescriptor
+	plant bool
+}
+
+func (p *retentionRunProvider) Spawn(_ context.Context, spec agent.Spec) (agent.Handle, error) {
+	if p.plant && spec.Cwd != "" {
+		_ = os.MkdirAll(spec.Cwd, 0o750)
+		_ = os.WriteFile(filepath.Join(spec.Cwd, "work.txt"), []byte("uncommitted\n"), 0o600) //nolint:gosec // G306: test-owned worktree.
+	}
+	p.once.Do(func() { close(p.gate) })
+	return &stoppedMultiEvidenceHandle{events: make(chan agent.Event), descs: p.descs}, nil
+}
+
+// runRetentionStoppedSession runs one cancelled interview session to the
+// stopped terminal state through the production Runner.Run entry point.
+// plant selects a patch-bearing attempt (unpublished work planted during
+// Spawn); descs selects the terminal evidence descriptors for the attempt.
+func runRetentionStoppedSession(t *testing.T, r *Runner, platformURL, repository, sessionID string, descs []agent.TerminalTranscriptDescriptor, plant bool) {
+	t.Helper()
+	base, err := stub.New()
+	if err != nil {
+		t.Fatalf("stub.New: %v", err)
+	}
+	harness, ok := base.(agent.HarnessProvider)
+	if !ok {
+		t.Fatal("stub provider is not a HarnessProvider")
+	}
+	gate := make(chan struct{})
+	provider := &retentionRunProvider{HarnessProvider: harness, gate: gate, once: &sync.Once{}, descs: descs, plant: plant}
+	reg := NewRegistry()
+	if err := reg.Register(provider); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	r.registry = reg
+	qw := QueuedWork{
+		QueuedWork:  queuedWorkBase("RETAIN-VIA-RUN"),
+		WorkerID:    "worker-1",
+		AuthToken:   "tok",
+		PlatformURL: platformURL,
+		ResolvedProfile: ResolvedProfile{
+			Provider: agent.ProviderStub,
+		},
+	}
+	qw.SessionID = sessionID
+	qw.Repository = repository
+	qw.Mode = "interview"
+	runCtx, cancel := context.WithCancel(context.Background())
+	type runResult struct {
+		res *Result
+		err error
+	}
+	done := make(chan runResult, 1)
+	go func() {
+		res, runErr := r.Run(runCtx, qw)
+		done <- runResult{res: res, err: runErr}
+	}()
+	select {
+	case <-gate:
+		cancel()
+	case <-time.After(30 * time.Second):
+		cancel()
+		t.Fatal("Run did not reach provider spawn before cancellation")
+	}
+	var got runResult
+	select {
+	case got = <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("Run did not return after cancellation")
+	}
+	if got.res == nil || got.res.Status != "stopped" {
+		t.Fatalf("Status = %+v err = %v; want stopped", got.res, got.err)
+	}
+}
+
+// TestMixedEvidenceAndPatchAttemptsShareRetentionViaRun pins the shared
+// retention boundary through the production Runner.Run entry point: six
+// mixed patch-bearing and evidence-only stopped runs for one session retain
+// the newest five, preserve another session, and ignore non-attempt entries.
+// Deleting the production finalization call leaves six attempts and fails
+// this test; widening the prune root or counting only patches breaks the
+// count or isolation assertions.
+func TestMixedEvidenceAndPatchAttemptsShareRetentionViaRun(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	bareRepo := makeBareRepo(t)
+	wtParent := t.TempDir()
+	srv := mockPlatformServer(t)
+	t.Cleanup(srv.Close)
+	manager, err := worktree.NewManager(worktree.Options{ParentDir: wtParent})
+	if err != nil {
+		t.Fatalf("worktree.NewManager: %v", err)
+	}
+	poster, err := result.NewPoster(result.Options{
+		PlatformURL: srv.URL, WorkerID: "worker-1", AuthToken: "tok",
+		HTTPClient: srv.Client(), BaseDelay: 1,
+	})
+	if err != nil {
+		t.Fatalf("result.NewPoster: %v", err)
+	}
+	base, err := stub.New()
+	if err != nil {
+		t.Fatalf("stub.New: %v", err)
+	}
+	reg := NewRegistry()
+	if err := reg.Register(base); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	r, err := New(Options{
+		Registry: reg, WorktreeManager: manager, Poster: poster,
+		HTTPClient: srv.Client(), SkipBackstop: true, SkipSteering: true, SkipPostSession: true,
+		MaxSessionDuration: -1,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	rescueDir := t.TempDir()
+	r.rescueDir = rescueDir
+	clock := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	r.now = func() time.Time { return clock }
+	const retainSession = "test-session-RETAIN-VIA-RUN"
+	const otherSession = "test-session-OTHER-VIA-RUN"
+	const otherEvidenceSession = "test-session-OTHER-EVIDENCE-VIA-RUN"
+	// Another session's archives must survive the retention churn below.
+	clock = clock.Add(time.Minute)
+	runRetentionStoppedSession(t, r, srv.URL, bareRepo, otherSession, nil, true)
+	clock = clock.Add(time.Minute)
+	runRetentionStoppedSession(t, r, srv.URL, bareRepo, otherEvidenceSession, []agent.TerminalTranscriptDescriptor{{Path: "evidence/other-session.cast"}}, false)
+	// Five mixed attempts for RETAIN: patch-only and evidence-only
+	// interleaved so the shared boundary is exercised.
+	clock = clock.Add(time.Minute)
+	runRetentionStoppedSession(t, r, srv.URL, bareRepo, retainSession, nil, true)
+	clock = clock.Add(time.Minute)
+	runRetentionStoppedSession(t, r, srv.URL, bareRepo, retainSession, []agent.TerminalTranscriptDescriptor{{Path: "evidence/retain-1.cast"}}, false)
+	clock = clock.Add(time.Minute)
+	runRetentionStoppedSession(t, r, srv.URL, bareRepo, retainSession, nil, true)
+	clock = clock.Add(time.Minute)
+	runRetentionStoppedSession(t, r, srv.URL, bareRepo, retainSession, []agent.TerminalTranscriptDescriptor{{Path: "evidence/retain-2.cast"}}, false)
+	clock = clock.Add(time.Minute)
+	runRetentionStoppedSession(t, r, srv.URL, bareRepo, retainSession, nil, true)
+	sessionRoot := filepath.Join(rescueDir, retainSession)
+	if err := os.WriteFile(filepath.Join(sessionRoot, "notes.txt"), []byte("operator notes\n"), 0o600); err != nil {
+		t.Fatalf("write non-attempt file: %v", err)
+	}
+	// The sixth mixed attempt triggers pruning with the stray file present.
+	clock = clock.Add(time.Minute)
+	runRetentionStoppedSession(t, r, srv.URL, bareRepo, retainSession, []agent.TerminalTranscriptDescriptor{{Path: "evidence/retain-3.cast"}}, false)
+	entries, err := os.ReadDir(sessionRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var archives []string
+	for _, entry := range entries {
+		if entry.IsDir() && rescueArchiveDirRE.MatchString(entry.Name()) {
+			archives = append(archives, entry.Name())
+		}
+	}
+	if len(archives) != rescueKeepPerSession {
+		t.Fatalf("production Run archives kept = %d (%v); want %d", len(archives), archives, rescueKeepPerSession)
+	}
+	var sawPatch, sawEvidence bool
+	for _, name := range archives {
+		dir := filepath.Join(sessionRoot, name)
+		if patches := rescuePatches(t, dir); len(patches) > 0 {
+			sawPatch = true
+		}
+		if _, err := os.Stat(filepath.Join(dir, terminalEvidenceFileName)); err == nil {
+			sawEvidence = true
+		}
+	}
+	if !sawPatch || !sawEvidence {
+		t.Fatalf("production Run survivors patch=%v evidence=%v; want both kinds retained", sawPatch, sawEvidence)
+	}
+	if _, err := os.Stat(filepath.Join(sessionRoot, "notes.txt")); err != nil {
+		t.Fatalf("non-attempt file was touched: %v", err)
+	}
+	if got := len(rescuePatches(t, filepath.Join(rescueDir, otherSession))); got != 1 {
+		t.Errorf("other session patches = %d; want its 1 untouched", got)
+	}
+	otherEvidenceRoot := filepath.Join(rescueDir, otherEvidenceSession)
+	otherEntries, err := os.ReadDir(otherEvidenceRoot)
+	if err != nil {
+		t.Fatalf("read other evidence session root: %v", err)
+	}
+	if len(otherEntries) != 1 {
+		t.Errorf("other evidence session attempts = %d; want its 1 untouched", len(otherEntries))
+	} else if _, err := os.Stat(filepath.Join(otherEvidenceRoot, otherEntries[0].Name(), terminalEvidenceFileName)); err != nil {
+		t.Errorf("other session evidence file missing: %v", err)
+	}
+}
+
+// interactiveEvidenceHandle is an exited interactive session that also
+// serves terminal transcript descriptors after Stop.
+type interactiveEvidenceHandle struct {
+	*testInteractiveHandle
+	descs []agent.TerminalTranscriptDescriptor
+}
+
+func (h *interactiveEvidenceHandle) TerminalTranscripts() ([]agent.TerminalTranscriptDescriptor, error) {
+	out := make([]agent.TerminalTranscriptDescriptor, len(h.descs))
+	copy(out, h.descs)
+	return out, nil
+}
+
+// interactiveEvidenceProvider serves one already-exited interactive session
+// carrying the configured descriptors. The exited session maps to a
+// completed result before the terminal lease decision runs.
+type interactiveEvidenceProvider struct {
+	manifest agent.HarnessManifest
+	descs    []agent.TerminalTranscriptDescriptor
+}
+
+func (p *interactiveEvidenceProvider) Name() agent.ProviderName { return agent.ProviderShell }
+func (p *interactiveEvidenceProvider) Capabilities() agent.Capabilities {
+	return (&shell.Provider{}).Capabilities()
+}
+func (p *interactiveEvidenceProvider) Manifest() agent.HarnessManifest { return p.manifest }
+func (*interactiveEvidenceProvider) Resume(context.Context, string, agent.Spec) (agent.Handle, error) {
+	return nil, agent.ErrUnsupported
+}
+func (*interactiveEvidenceProvider) Shutdown(context.Context) error { return nil }
+func (p *interactiveEvidenceProvider) Spawn(_ context.Context, _ agent.Spec) (agent.Handle, error) {
+	sess := completedRecordingInteractiveSession()
+	base := &testInteractiveHandle{Handle: &fakeHandle{events: make(chan agent.Event)}, session: sess}
+	return &interactiveEvidenceHandle{testInteractiveHandle: base, descs: p.descs}, nil
+}
+
+// TestInteractiveLateLeaseFailurePreservesEvidenceViaRun pins the
+// interactive fallback preservation scope end to end: an interactive session
+// that exits cleanly (completed) but whose requested terminal lease fails
+// acquisition flips to failed and still archives its evidence manifest
+// through the production Run path. Inverting the fallback scope guard
+// (pres == nil to pres != nil) drops the manifest and fails this test; the
+// existing research late-lease test cannot catch it because that path
+// creates its scope before the lease decision.
+func TestInteractiveLateLeaseFailurePreservesEvidenceViaRun(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	const sentinel = "evidence/interactive-late-lease-9d4e2b.cast"
+	t.Setenv(envAttachURL, "")
+	t.Setenv(envAttachToken, "")
+	wtParent := t.TempDir()
+	srv := mockPlatformServer(t)
+	t.Cleanup(srv.Close)
+	manager, err := worktree.NewManager(worktree.Options{ParentDir: wtParent})
+	if err != nil {
+		t.Fatalf("worktree.NewManager: %v", err)
+	}
+	leaseRecords := filepath.Join(wtParent, ".terminal-leases", "records")
+	if err := os.RemoveAll(leaseRecords); err != nil {
+		t.Fatalf("remove lease records dir: %v", err)
+	}
+	if err := os.WriteFile(leaseRecords, []byte("blocked\n"), 0o600); err != nil {
+		t.Fatalf("block lease records dir: %v", err)
+	}
+	poster, err := result.NewPoster(result.Options{
+		PlatformURL: srv.URL, WorkerID: "worker-1", AuthToken: "tok",
+		HTTPClient: srv.Client(), BaseDelay: 1,
+	})
+	if err != nil {
+		t.Fatalf("result.NewPoster: %v", err)
+	}
+	provider := &interactiveEvidenceProvider{manifest: (&shell.Provider{}).Manifest(), descs: []agent.TerminalTranscriptDescriptor{{Path: sentinel}}}
+	reg := NewRegistry()
+	if err := reg.Register(provider); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	r, err := New(Options{
+		Registry: reg, WorktreeManager: manager, Poster: poster,
+		HTTPClient: srv.Client(), SkipBackstop: true, SkipSteering: true, SkipPostSession: true,
+		MaxSessionDuration: -1,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	rescueDir := t.TempDir()
+	r.rescueDir = rescueDir
+	qw := QueuedWork{
+		QueuedWork:  queuedWorkBase("INTERACTIVE-LATE-LEASE"),
+		WorkerID:    "worker-1",
+		AuthToken:   "tok",
+		PlatformURL: srv.URL,
+		ResolvedProfile: ResolvedProfile{
+			Provider: agent.ProviderShell,
+		},
+		TerminalWorkareaLease: terminalLeaseRequest(),
+	}
+	qw.SessionID = "test-session-INTERACTIVE-LATE-LEASE"
+	qw.Repository = makeBareRepo(t)
+	qw.Mode = prompt.InteractiveRunMode
+	qw.WorkType = "development"
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := r.Run(ctx, qw)
+	if err == nil {
+		t.Fatalf("Run err = nil; want the lease-acquisition failure")
+	}
+	if res == nil || res.Status != "failed" || res.FailureMode != FailureTerminalWorkareaLease {
+		t.Fatalf("Status = %+v err = %v; want failed with %q", res, err, FailureTerminalWorkareaLease)
+	}
+	if len(res.terminalTranscripts) != 1 || res.terminalTranscripts[0].Path != sentinel {
+		t.Fatalf("terminalTranscripts = %+v; want exactly [%q]", res.terminalTranscripts, sentinel)
+	}
+	sessionRoot := filepath.Join(rescueDir, "test-session-INTERACTIVE-LATE-LEASE")
+	entries, readErr := os.ReadDir(sessionRoot)
+	if readErr != nil {
+		t.Fatalf("read session rescue root: %v", readErr)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("evidence attempts = %d; want exactly 1 after the interactive late lease failure", len(entries))
 	}
 	body, readErr := os.ReadFile(filepath.Join(sessionRoot, entries[0].Name(), terminalEvidenceFileName)) //nolint:gosec // G304: test-owned path.
 	if readErr != nil {
