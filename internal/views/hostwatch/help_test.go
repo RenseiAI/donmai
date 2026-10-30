@@ -536,3 +536,50 @@ func TestModel_HelpOverlaySourceUnavailable(t *testing.T) {
 		t.Fatalf("esc left help=%v or lost the warning", m.help)
 	}
 }
+
+// TestModel_HelpOverlayPinsCompleteControls pins the overlay's complete
+// control list through production Update/View at a width where no row
+// wraps, so every hardcoded description fragment below must appear in
+// the rendered frame. The wants are hardcoded here (not derived from
+// the implementation's row helper), so deleting any overlay row — for
+// example the backspace row — makes this RED while scroll-reachability
+// tests that iterate the surviving rows stay GREEN.
+func TestModel_HelpOverlayPinsCompleteControls(t *testing.T) {
+	wants := []string{
+		"select a session card",
+		"show the selected session detail",
+		"close this help, then detail, then the filter",
+		"move the cards/stream split",
+		"reset the split to 50/50",
+		"pause or resume the stream",
+		"jump to the stream tail",
+		"filter cards",
+		"backspace",
+		"delete one filter character while filtering",
+		"ask to stop the selected session",
+		"ask to drain the host past an explicit deadline",
+		"confirm / cancel the pending stop or drain",
+		"pause host admissions",
+		"reopen host admissions",
+		"quit the dashboard (sessions keep running)",
+		"ctrl+c",
+		"while filtering, keys type query text, not shortcuts",
+		"no mouse bindings",
+	}
+	for _, plain := range []bool{true, false} {
+		m := newFixtureModel(t, 200, 40, plain, 0)
+		feedKey(m, questionKey())
+		if !m.help {
+			t.Fatalf("plain=%v: \"?\" did not open help", plain)
+		}
+		stripped := ansi.Strip(m.render())
+		if !strings.Contains(stripped, "keyboard help") {
+			t.Fatalf("plain=%v: help overlay did not render", plain)
+		}
+		for _, want := range wants {
+			if !strings.Contains(stripped, want) {
+				t.Errorf("plain=%v: help overlay missing shipped control %q", plain, want)
+			}
+		}
+	}
+}

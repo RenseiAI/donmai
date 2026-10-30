@@ -71,4 +71,44 @@ func TestHostWatchHelpContractPinsShippedControls(t *testing.T) {
 	if got := model.View().Content; got == "" {
 		t.Error("empty view after driving the described keys")
 	}
+	// Overlay completeness: the in-view help opened through the
+	// production Update/View path must describe the same shipped
+	// controls. Each want is a hardcoded description fragment from
+	// the overlay rows, so deleting any overlay row (for example
+	// the backspace row) makes this RED even though the command
+	// help above stays GREEN.
+	overlay := hostwatch.New(hostwatch.Options{Plain: true})
+	sizedOverlay, _ := overlay.Update(tea.WindowSizeMsg{Width: 200, Height: 40})
+	overlay = sizedOverlay.(*hostwatch.Model)
+	_, _ = overlay.Update(tea.KeyPressMsg{Code: '?', Text: "?"})
+	helpView := overlay.View().Content
+	if !strings.Contains(helpView, "keyboard help") {
+		t.Fatalf("help overlay did not open through production Update:\n%s", helpView)
+	}
+	overlayWants := []string{
+		"select a session card",
+		"show the selected session detail",
+		"close this help, then detail, then the filter",
+		"move the cards/stream split",
+		"reset the split to 50/50",
+		"pause or resume the stream",
+		"jump to the stream tail",
+		"filter cards",
+		"backspace",
+		"delete one filter character while filtering",
+		"ask to stop the selected session",
+		"ask to drain the host past an explicit deadline",
+		"confirm / cancel the pending stop or drain",
+		"pause host admissions",
+		"reopen host admissions",
+		"quit the dashboard (sessions keep running)",
+		"ctrl+c",
+		"while filtering, keys type query text, not shortcuts",
+		"no mouse bindings",
+	}
+	for _, want := range overlayWants {
+		if !strings.Contains(helpView, want) {
+			t.Errorf("help overlay missing shipped control %q:\n%s", want, helpView)
+		}
+	}
 }
