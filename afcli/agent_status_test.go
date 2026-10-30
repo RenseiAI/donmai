@@ -478,13 +478,14 @@ func TestAgentStatusDiagnosticDetail(t *testing.T) {
 
 // diagnosticTextRowValue extracts the exact cell value for a detail row
 // label (including its trailing colon) from tabwriter-aligned human output.
-// It trims the alignment padding so the comparison is against the exact
-// rendered value, not a substring.
+// It strips only the leading alignment padding so the comparison preserves
+// the rendered value's own whitespace: production trimming of a padded
+// summary must show up here, not be re-applied by the assertion.
 func diagnosticTextRowValue(t *testing.T, out, label string) string {
 	t.Helper()
 	for _, line := range strings.Split(out, "\n") {
 		if strings.HasPrefix(line, label) {
-			return strings.TrimSpace(strings.TrimPrefix(line, label))
+			return strings.TrimLeft(strings.TrimPrefix(line, label), " \t")
 		}
 	}
 	t.Fatalf("missing row %q; got:\n%s", label, out)
