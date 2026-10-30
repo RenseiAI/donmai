@@ -202,16 +202,40 @@ function parseE2bPathEntries(dockerfileSource) {
   return raw.split(':')
 }
 
+// hasE2bCompatibleGoPath reports whether `go` stays resolvable after Debian
+// bookworm's login-shell PATH reset. E2B runs build steps and SDK version
+// checks under `/bin/bash -l -c`, and /etc/profile overwrites the incoming
+// PATH (dropping /usr/local/go/bin) for both root and the sandbox user.
+// ENV PATH alone therefore cannot make `go` visible there — checking only
+// the ENV text returns true for a template whose first `go version` exits
+// 127. This predicate requires a login-shell-persistent provision instead:
+// a symlink/copy of the Go binary into a directory on the login default
+// PATH (/usr/local/bin, /usr/bin), or a profile.d fragment that re-exports
+// /usr/local/go/bin. Comment lines are ignored so a header note alone cannot
+// satisfy it (same executable-instruction rule as parseAptInstalledPackages).
 function hasE2bCompatibleGoPath(dockerfileSource) {
-  const raw = parseE2bPathRaw(dockerfileSource)
-  if (raw === null) {
-    return false
-  }
-  if (/["']/.test(raw)) {
-    return false
-  }
-  const entries = raw.split(':')
-  return entries[0] === '/usr/local/go/bin'
+  const executable = String(dockerfileSource)
+    .split('\n')
+    .filter((line) => !/^\s*#/.test(line))
+    .join('\n')
+    .replace(/\\\n/g, ' ')
+  const onDefaultPath =
+    /\bln\s+[^&;\n]*\/usr\/local\/go\/bin\/go\s+[^&;\n]*\/usr\/local\/bin\/go/.test(
+      executable
+    ) ||
+    /\bln\s+[^&;\n]*\/usr\/local\/go\/bin\/go\s+[^&;\n]*\/usr\/bin\/go/.test(
+      executable
+    ) ||
+    /\bcp\s+[^&;\n]*\/usr\/local\/go\/bin\/go\s+[^&;\n]*\/usr\/(local\/)?bin\//.test(
+      executable
+    ) ||
+    /\binstall\s+[^&;\n]*\/usr\/local\/go\/bin\/go\s+[^&;\n]*\/usr\/(local\/)?bin\//.test(
+      executable
+    )
+  const viaProfileFragment =
+    /\/etc\/profile\.d\//.test(executable) &&
+    /\/usr\/local\/go\/bin/.test(executable)
+  return onDefaultPath || viaProfileFragment
 }
 
 function resolveRepoRoot({ env, cwd, scriptDir } = {}) {

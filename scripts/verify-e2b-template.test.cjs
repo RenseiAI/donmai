@@ -476,6 +476,23 @@ test('e2b.go.Dockerfile sets an E2B-compatible Go PATH', () => {
   assert.ok(entries, 'expected ENV PATH entries')
   assert.equal(entries[0], '/usr/local/go/bin')
   assert.doesNotMatch(parseE2bPathRaw(dockerfile), /^["'].*/)
+  // Login-shell survival: bookworm /etc/profile overwrites PATH for
+  // `bash -l -c`, dropping /usr/local/go/bin. The template must provision
+  // `go` on the login default PATH, not rely on ENV text alone.
+  const executable = dockerfile
+    .split('\n')
+    .filter((line) => !/^\s*#/.test(line))
+    .join('\n')
+  assert.match(
+    executable,
+    /ln\s+[^&;]*\/usr\/local\/go\/bin\/go\s+[^&;]*\/usr\/local\/bin\/go/
+  )
+  assert.match(executable, /bash -l -c 'go version'/)
+  // Simulate the login reset: /usr/local/go/bin is gone, /usr/local/bin
+  // survives, and the Dockerfile puts `go` there.
+  const loginPath = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+  assert.equal(loginPath.split(':').includes('/usr/local/go/bin'), false)
+  assert.equal(loginPath.split(':').includes('/usr/local/bin'), true)
 })
 
 test('E2B PATH evaluation retains quotes where an ordinary parser would strip them', () => {
@@ -486,10 +503,24 @@ test('E2B PATH evaluation retains quotes where an ordinary parser would strip th
   ].join('\n')
   assert.equal(hasE2bCompatibleGoPath(quoted), false)
   assert.equal(parseE2bPathEntries(quoted)[0], '"/usr/local/go/bin')
-  const fixed = [
+  // ENV text alone is NOT login-shell compatible: bookworm /etc/profile
+  // overwrites PATH under `bash -l -c`, dropping /usr/local/go/bin even
+  // when the ENV line is unquoted. The old predicate returned true here
+  // for a template whose first `go version` exits 127.
+  const envOnly = [
     'FROM debian:bookworm-slim',
     'ENV PATH=/usr/local/go/bin:/usr/local/bin:${PATH}',
     'RUN go version',
+  ].join('\n')
+  assert.equal(hasE2bCompatibleGoPath(envOnly), false)
+  assert.equal(parseE2bPathEntries(envOnly)[0], '/usr/local/go/bin')
+  const fixed = [
+    'FROM debian:bookworm-slim',
+    'RUN curl -fsSL https://go.dev/dl/go1.26.10.linux-amd64.tar.gz -o /tmp/go.tgz \\',
+    '    && tar -C /usr/local -xzf /tmp/go.tgz \\',
+    '    && ln -s /usr/local/go/bin/go /usr/local/bin/go \\',
+    '    && bash -l -c \'go version\'',
+    'ENV PATH=/usr/local/go/bin:/usr/local/bin:${PATH}',
   ].join('\n')
   assert.equal(hasE2bCompatibleGoPath(fixed), true)
   assert.equal(parseE2bPathEntries(fixed)[0], '/usr/local/go/bin')
@@ -503,6 +534,22 @@ test('E2B Go PATH check fails when the ENV is deleted', () => {
   assert.equal(parseE2bPathRaw(noEnv), null)
   assert.equal(parseE2bPathEntries(noEnv), null)
   assert.equal(hasE2bCompatibleGoPath(noEnv), false)
+  // A symlink into /usr/local/bin survives the login reset even with no
+  // ENV line at all: `go` resolves via the login default PATH.
+  const symlinkNoEnv = [
+    'FROM debian:bookworm-slim',
+    'RUN tar -C /usr/local -xzf /tmp/go.tgz \\',
+    '    && ln -s /usr/local/go/bin/go /usr/local/bin/go \\',
+    "    && bash -l -c 'go version'",
+  ].join('\n')
+  assert.equal(hasE2bCompatibleGoPath(symlinkNoEnv), true)
+  // A comment mentioning the symlink installs nothing.
+  const commentOnly = [
+    '# ln -s /usr/local/go/bin/go /usr/local/bin/go',
+    'FROM debian:bookworm-slim',
+    'ENV PATH=/usr/local/go/bin:/usr/local/bin:${PATH}',
+  ].join('\n')
+  assert.equal(hasE2bCompatibleGoPath(commentOnly), false)
 })
 
 test('e2b.go.Dockerfile Go tarball tracks the go.mod floor', () => {

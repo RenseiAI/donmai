@@ -64,17 +64,28 @@ RUN chmod +x /usr/local/bin/donmai
 
 # Go toolchain for Go seats (matches go.mod's 1.26.10 floor). Single-stage
 # tarball install keeps this Dockerfile to one FROM for the E2B build SDK.
+# NOTE: E2B runs build steps and later SDK version checks under `bash -l -c`,
+# and bookworm's /etc/profile overwrites PATH for login shells, dropping
+# /usr/local/go/bin. ENV PATH alone therefore does NOT make `go` visible to
+# those shells. Symlink go/gofmt into /usr/local/bin (always on the login
+# default PATH) so unqualified `go` resolves in login shells, Docker RUN, and
+# SDK exec alike.
 RUN curl -fsSL https://go.dev/dl/go1.26.10.linux-amd64.tar.gz -o /tmp/go.tgz \
     && tar -C /usr/local -xzf /tmp/go.tgz \
     && rm /tmp/go.tgz \
-    && /usr/local/go/bin/go version
+    && ln -s /usr/local/go/bin/go /usr/local/bin/go \
+    && ln -s /usr/local/go/bin/gofmt /usr/local/bin/gofmt \
+    && bash -l -c 'go version'
 ENV PATH=/usr/local/go/bin:/usr/local/bin:${PATH}
 
 # Go lint + format tools, version-pinned (see header). GOBIN keeps the
-# binaries on the default PATH without an extra GOPATH entry.
+# binaries on the default PATH without an extra GOPATH entry. The trailing
+# `bash -l -c` probes fail the build if a login shell cannot resolve a tool
+# (the E2B execution model), rather than shipping a template whose verify
+# step fails at its first unqualified `go version`.
 RUN go version \
     && GOBIN=/usr/local/bin go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.11.4 \
     && GOBIN=/usr/local/bin go install mvdan.cc/gofumpt@v0.12.0 \
-    && go version \
-    && golangci-lint --version \
-    && gofumpt --version
+    && bash -l -c 'go version' \
+    && bash -l -c 'golangci-lint --version' \
+    && bash -l -c 'gofumpt --version'
