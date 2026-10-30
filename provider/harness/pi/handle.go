@@ -168,6 +168,39 @@ type Handle struct {
 	onStop     func()
 	onStopOnce sync.Once
 
+	// stateRoot is the exact per-session layout root (sessionStateRoot)
+	// this handle's transcripts live under. Set once at spawn from the
+	// materialized layout; read by TerminalTranscripts after Stop.
+	stateRoot string
+	// evidenceBaseline holds the transcripts that already existed under the
+	// layout root before this session's child started. TerminalTranscripts
+	// excludes them so a reused workarea never attributes a previous
+	// session's transcript to this one. Set once at spawn from the
+	// pre-spawn snapshot; nil means the root held no transcript at spawn.
+	evidenceBaseline map[string]struct{}
+	// evidenceIncomplete marks a failed pre-spawn transcript scan: evidence
+	// collection refuses rather than attributing an unseen transcript.
+	evidenceIncomplete bool
+	// evidenceClaim is the per-handle lease on the layout root. It detects
+	// concurrent sessions sharing the root; a contaminated lease refuses.
+	// The lease is live from spawn until Stop releases it: sequential reuse
+	// after Stop sees an empty set, while overlap while both writers are
+	// live contaminates both sides. Collection never releases; it caches.
+	evidenceClaim *piEvidenceClaim
+	// evidenceMu guards the single-use collection cache below. The first
+	// TerminalTranscripts after Stop scans and caches; later calls return
+	// the cached outcome so a session started after the first collection
+	// can never pollute this handle's evidence.
+	evidenceMu        sync.Mutex
+	evidenceDone      bool
+	evidenceCached    []agent.TerminalTranscriptDescriptor
+	evidenceCachedErr error
+	// stopped closes once Stop has reaped the child and removed the
+	// session credential files: transcript writers have stopped and the
+	// state root is stable for evidence collection. TerminalTranscripts
+	// refuses before it.
+	stopped atomic.Bool
+
 	// handshakeResult delivers exactly one verdict to Spawn: nil = verified,
 	// err = failed/mismatch. Buffered so the pump never blocks on it.
 	handshakeResult chan error
@@ -395,6 +428,14 @@ func (h *Handle) Stop(ctx context.Context) error {
 			h.onStop()
 		}
 	})
+	h.stopped.Store(true)
+	// Writers have stopped: freeze this session's evidence before releasing
+	// the overlap lease, so a later sequential session's transcript can
+	// never pollute this handle's delayed collection (it returns the frozen
+	// outcome). The contamination flag and the cross-process marker persist
+	// on the claim, so a true overlap still refuses at collection.
+	h.captureHeadlessEvidenceAtStop()
+	h.evidenceClaim.release()
 	return nil
 }
 

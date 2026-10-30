@@ -149,6 +149,29 @@ const (
 type interactiveStateLossHandle struct {
 	*ptycli.Handle
 	events chan agent.Event
+	// stateRoot is the exact per-session layout root (layout.root) this
+	// handle's transcripts live under. Stored at spawn; read by
+	// TerminalTranscripts after the final flush.
+	stateRoot string
+	// evidenceBaseline holds the transcripts that already existed under the
+	// layout root before this session's child started, copied from the
+	// tailer's pre-spawn snapshot. TerminalTranscripts excludes them so a
+	// reused workarea never attributes a previous session's transcript to
+	// this one. Nil means the root held no transcript at spawn.
+	evidenceBaseline map[string]struct{}
+	// evidenceIncomplete marks a failed pre-spawn scan (copied from the
+	// tailer); evidence refuses then. evidenceClaim detects concurrent
+	// sessions sharing the root; a contaminated lease refuses.
+	evidenceIncomplete bool
+	evidenceClaim      *piEvidenceClaim
+	// evidenceMu guards the single-use collection cache: the first
+	// TerminalTranscripts after the final flush scans and caches; later
+	// calls return the cached outcome so a later session can never pollute
+	// this handle's evidence.
+	evidenceMu        sync.Mutex
+	evidenceDone      bool
+	evidenceCached    []agent.TerminalTranscriptDescriptor
+	evidenceCachedErr error
 	// activityFlushed closes once the transcript tailer has enqueued its
 	// final flush (or dropped it on a full channel) and returned.
 	activityFlushed chan struct{}
@@ -161,11 +184,32 @@ type interactiveStateLossHandle struct {
 // been constructed before the child was spawned (see
 // newInteractiveTranscriptTailer).
 func newInteractiveStateLossHandle(handle *ptycli.Handle, stateDir string, tailer *interactiveTranscriptTailer) *interactiveStateLossHandle {
+	cleanRoot := ""
+	if strings.TrimSpace(stateDir) != "" {
+		cleanRoot = filepath.Clean(stateDir)
+	}
+	// Copy the tailer's pre-spawn baseline (see newInteractiveTranscriptTailer):
+	// the tailer was constructed before the child started, so its baseline
+	// is exactly the previous-session set evidence must exclude.
+	var baseline map[string]struct{}
+	var baselineIncomplete bool
+	if tailer != nil {
+		baselineIncomplete = tailer.baselineIncomplete
+		if len(tailer.baseline) > 0 {
+			baseline = make(map[string]struct{}, len(tailer.baseline))
+			for p := range tailer.baseline {
+				baseline[filepath.Clean(p)] = struct{}{}
+			}
+		}
+	}
 	h := &interactiveStateLossHandle{
-		Handle:          handle,
-		events:          make(chan agent.Event, interactiveCoarseEventSlots+interactiveTranscriptEventSlots),
-		activityFlushed: make(chan struct{}),
-		finished:        make(chan struct{}),
+		Handle:             handle,
+		stateRoot:          cleanRoot,
+		evidenceBaseline:   baseline,
+		evidenceIncomplete: baselineIncomplete,
+		events:             make(chan agent.Event, interactiveCoarseEventSlots+interactiveTranscriptEventSlots),
+		activityFlushed:    make(chan struct{}),
+		finished:           make(chan struct{}),
 	}
 	session := handle.InteractiveSession()
 	// emit forwards one transcript event best-effort. Only the tailer
@@ -235,6 +279,27 @@ func newInteractiveStateLossHandle(handle *ptycli.Handle, stateDir string, taile
 // Events overrides ptycli.Handle.Events with the same coarse events plus the
 // typed state-loss condition and transcript activity above.
 func (h *interactiveStateLossHandle) Events() <-chan agent.Event { return h.events }
+
+// Stop reaps the PTY child, joins the transcript tailer's final flush so
+// evidence is collectible immediately after Stop returns, freezes this
+// session's evidence, then releases the overlap lease. Sequential reuse
+// after writers stop is clean, while true overlap stays contaminated via
+// the persisted flag and the cross-process marker. The runner captures
+// evidence immediately after Stop and ignores collection errors, so
+// returning before the flush would lose a failed interactive session's
+// descriptor even though the child wrote its transcript.
+func (h *interactiveStateLossHandle) Stop(ctx context.Context) error {
+	err := h.Handle.Stop(ctx)
+	if h.activityFlushed != nil {
+		select {
+		case <-h.activityFlushed:
+		case <-ctx.Done():
+		}
+	}
+	h.captureInteractiveEvidenceAtStop()
+	h.evidenceClaim.release()
+	return err
+}
 
 // ActivityFlushed implements agent.InteractiveActivityFlusher: it closes once
 // the session's final transcript activity has been enqueued on Events.

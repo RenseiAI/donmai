@@ -152,9 +152,21 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 	// Snapshot the shared state dir's existing transcripts BEFORE the child
 	// starts, so the transcript tail reads only what this session writes.
 	tailer := newInteractiveTranscriptTailer(layout.root)
+	// Claim the layout root for overlap detection BEFORE the child starts,
+	// next to the tailer baseline above: a concurrent session in the same
+	// checkout contaminates both leases and each later refuses rather than
+	// attributing the other's transcript, and a session that stops in the
+	// gap before the child writes still attributes only its own transcript.
+	// Held until Stop releases it (released below on the spawn-failure
+	// returns); sequential reuse after Stop sees an empty set.
+	evidenceClaim := acquirePiEvidenceClaim(layout.root)
+	if p.interactiveBeforeChildStart != nil {
+		p.interactiveBeforeChildStart(layout.root)
+	}
 
 	wrapped, err := confinePiArgv(plan, append([]string{p.binary}, interactiveArgs(spec, layout, extensionPaths)...))
 	if err != nil {
+		evidenceClaim.release()
 		if plan != nil {
 			_ = plan.Release()
 		}
@@ -178,13 +190,16 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 		ExactEnv: true,
 	})
 	if err != nil {
+		evidenceClaim.release()
 		if plan != nil {
 			_ = plan.Release()
 		}
 		removeCredentials()
 		return nil, err
 	}
-	return newInteractiveStateLossHandle(handle, layout.root, tailer), nil
+	wrappedHandle := newInteractiveStateLossHandle(handle, layout.root, tailer)
+	wrappedHandle.evidenceClaim = evidenceClaim
+	return wrappedHandle, nil
 }
 
 // noticeClaimDeliveryID is the AdditionalExtensions ID under which a

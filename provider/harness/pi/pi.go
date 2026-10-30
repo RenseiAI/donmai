@@ -83,6 +83,12 @@ type Provider struct {
 	// trustedExtensions is the immutable ordered same-process extension set
 	// supplied by the compiled embedder at provider construction.
 	trustedExtensions []TrustedExtensionIdentity
+	// interactiveBeforeChildStart is a deterministic test barrier after the
+	// interactive evidence-lease acquisition, before the PTY child starts.
+	// Observing the lease from the child cannot establish this ordering:
+	// the child may run before a post-spawn claim lands. Nil leaves the
+	// production spawn sequence unchanged.
+	interactiveBeforeChildStart func(root string)
 }
 
 // Options configures Provider construction. The empty value runs `pi` from
@@ -513,6 +519,21 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 		}
 	}
 
+	// Snapshot the shared state dir's existing transcripts BEFORE the child
+	// starts, so evidence reports only what this session writes. The state
+	// dir is shared across reuses of a workarea: without this, a reused
+	// workarea would attribute the previous session's transcript to this
+	// one. Taken after every parent write (extensions, credentials,
+	// tmp/cache dirs) and before the child can create its own transcript.
+	evidenceBaseline, evidenceIncomplete := snapshotPiTranscriptBaseline(layout.root)
+	evidenceClaim := acquirePiEvidenceClaim(layout.root)
+	spawned := false
+	defer func() {
+		if !spawned {
+			evidenceClaim.release()
+		}
+	}()
+
 	var (
 		cmd    *exec.Cmd
 		stdin  io.Writer
@@ -548,6 +569,9 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 		h.maxConsecutiveOutputLimitTurns = p.opts.MaxConsecutiveOutputLimitTurns
 	}
 	h.setConfinement(plan)
+	h.setStateRoot(layout.root)
+	h.setEvidenceBaseline(evidenceBaseline, evidenceIncomplete)
+	h.evidenceClaim = evidenceClaim
 	// The session credential files live in the session state root. Stop
 	// removes them so a finished session leaves no secret on disk; the
 	// worktree lifecycle that removes the state root is the backstop.
@@ -609,6 +633,7 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 	if spec.OnProcessSpawned != nil && cmd != nil && cmd.Process != nil {
 		spec.OnProcessSpawned(cmd.Process.Pid)
 	}
+	spawned = true
 	return h, nil
 }
 
