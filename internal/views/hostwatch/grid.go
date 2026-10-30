@@ -84,29 +84,31 @@ func renderGrid(t theme.Theme, cards []SessionCard, selectedIdx, frame, width, m
 	return windowBlocks(t, blocks, counts, selRow, maxLines, plain, !plain)
 }
 
-// windowBlocks trims rendered blocks to at most maxLines display lines,
-// keeping the selected block visible: it expands outward from the selection
-// and collapses hidden blocks above/below into one marker line each
-// ("↑ N more" / "↓ N more", counting hidden sessions) so overflow selection
-// stays visible and truncation is explicit. maxLines <= 0 renders
-// everything. A selected block taller than the budget shows its head —
-// after its frame row when framed, so the identity row comes first — with
-// a "↓ more" marker.
-func windowBlocks(t theme.Theme, blocks []string, counts []int, selBlock, maxLines int, plain, framed bool) string {
-	if len(blocks) == 0 {
-		return ""
-	}
-	selBlock = max(0, min(selBlock, len(blocks)-1))
-	heights := make([]int, len(blocks))
+// windowPlan is the placement windowBlocks renders and mouse hit-testing
+// maps clicks through, so a click only lands on an on-screen session.
+type windowPlan struct {
+	lo, hi         int
+	topMarker      bool
+	topCount       int
+	bottomMarker   bool
+	bottomCount    int
+	bottomPartial  bool // bare "↓ more": the shown block itself is cut
+	partial        bool // only the selected block shows, possibly cut
+	partialVisible int  // lines of the selected block shown when partial
+	dropFrame      bool // partial view drops the block's top frame row
+}
+
+// planWindow computes the window over blocks of the given heights/counts
+// that keeps selBlock visible within maxLines (see windowBlocks).
+func planWindow(heights, counts []int, selBlock, maxLines int, framed bool) windowPlan {
+	selBlock = max(0, min(selBlock, len(heights)-1))
 	total := 0
-	for i, b := range blocks {
-		heights[i] = displayLines(b)
-		total += heights[i]
+	for _, h := range heights {
+		total += h
 	}
 	if maxLines <= 0 || total <= maxLines {
-		return strings.Join(blocks, "\n")
+		return windowPlan{lo: 0, hi: len(heights) - 1}
 	}
-
 	hidden := func(from, to int) int {
 		n := 0
 		for i := from; i < to; i++ {
@@ -122,7 +124,7 @@ func windowBlocks(t theme.Theme, blocks []string, counts []int, selBlock, maxLin
 		if lo > 0 {
 			n++
 		}
-		if hi < len(blocks)-1 {
+		if hi < len(heights)-1 {
 			n++
 		}
 		return n
@@ -135,7 +137,7 @@ func windowBlocks(t theme.Theme, blocks []string, counts []int, selBlock, maxLin
 				lo--
 				progress = true
 			}
-			if hi < len(blocks)-1 && cost(lo, hi+1) <= maxLines {
+			if hi < len(heights)-1 && cost(lo, hi+1) <= maxLines {
 				hi++
 				progress = true
 			}
@@ -143,26 +145,25 @@ func windowBlocks(t theme.Theme, blocks []string, counts []int, selBlock, maxLin
 				break
 			}
 		}
-		var out []string
+		p := windowPlan{lo: lo, hi: hi}
 		if n := hidden(0, lo); n > 0 {
-			out = append(out, overflowMarker(t, true, n, plain))
+			p.topMarker, p.topCount = true, n
 		}
-		out = append(out, blocks[lo:hi+1]...)
-		if n := hidden(hi+1, len(blocks)); n > 0 {
-			out = append(out, overflowMarker(t, false, n, plain))
+		if n := hidden(hi+1, len(heights)); n > 0 {
+			p.bottomMarker, p.bottomCount = true, n
 		}
-		return strings.Join(out, "\n")
+		return p
 	}
-
 	// The selected block alone exceeds the pane. Keep its identity row
 	// visible first, then spend the remaining rows on content and markers.
 	// A one-line pane cannot fit both a card row and an overflow marker.
-	lines := strings.Split(blocks[selBlock], "\n")
-	if framed && len(lines) > 1 {
-		lines = lines[1:] // the row's top frame carries no content
+	lines := heights[selBlock]
+	dropFrame := framed && lines > 1
+	if dropFrame {
+		lines-- // the row's top frame carries no content
 	}
 	above := hidden(0, selBlock)
-	below := hidden(selBlock+1, len(blocks))
+	below := hidden(selBlock+1, len(heights))
 	markers := 0
 	if above > 0 && maxLines > 1 {
 		markers++
@@ -171,26 +172,146 @@ func windowBlocks(t theme.Theme, blocks []string, counts []int, selBlock, maxLin
 		markers++
 	}
 	visible := maxLines - markers
-	partial := len(lines) > visible
-	if partial && below == 0 && maxLines-markers > 1 {
+	cut := lines > visible
+	if cut && below == 0 && maxLines-markers > 1 {
 		markers++
 		visible--
 	}
-	visible = min(visible, len(lines))
-	var out []string
+	p := windowPlan{lo: selBlock, hi: selBlock, partial: true, dropFrame: dropFrame}
+	p.partialVisible = min(visible, lines)
 	if above > 0 && markers > 0 {
-		out = append(out, overflowMarker(t, true, above, plain))
+		p.topMarker, p.topCount = true, above
 		markers--
 	}
-	out = append(out, lines[:visible]...)
 	if markers > 0 {
-		if below > 0 {
-			out = append(out, overflowMarker(t, false, below, plain))
-		} else if partial {
-			out = append(out, overflowMarker(t, false, -1, plain))
+		switch {
+		case below > 0:
+			p.bottomMarker, p.bottomCount = true, below
+		case cut:
+			p.bottomMarker, p.bottomPartial = true, true
 		}
 	}
+	return p
+}
+
+// windowBlocks trims rendered blocks to at most maxLines display lines,
+// keeping the selected block visible: it expands outward from the selection
+// and collapses hidden blocks above/below into one marker line each
+// ("↑ N more" / "↓ N more", counting hidden sessions) so overflow selection
+// stays visible and truncation is explicit. maxLines <= 0 renders
+// everything. A selected block taller than the budget shows its head —
+// after its frame row when framed, so the identity row comes first — with
+// a "↓ more" marker.
+func windowBlocks(t theme.Theme, blocks []string, counts []int, selBlock, maxLines int, plain, framed bool) string {
+	if len(blocks) == 0 {
+		return ""
+	}
+	heights := make([]int, len(blocks))
+	for i, b := range blocks {
+		heights[i] = displayLines(b)
+	}
+	p := planWindow(heights, counts, selBlock, maxLines, framed)
+	var out []string
+	if p.topMarker {
+		out = append(out, overflowMarker(t, true, p.topCount, plain))
+	}
+	if p.partial {
+		lines := strings.Split(blocks[p.lo], "\n")
+		if p.dropFrame {
+			lines = lines[1:]
+		}
+		out = append(out, lines[:p.partialVisible]...)
+	} else {
+		out = append(out, blocks[p.lo:p.hi+1]...)
+	}
+	if p.bottomMarker {
+		n := p.bottomCount
+		if p.bottomPartial {
+			n = -1
+		}
+		out = append(out, overflowMarker(t, false, n, plain))
+	}
 	return strings.Join(out, "\n")
+}
+
+// hitRegion is one visible session's rectangle (x1/y1 exclusive); idx is
+// its index in the visible card slice.
+type hitRegion struct {
+	idx    int
+	x0, x1 int
+	y0, y1 int
+}
+
+// gridHitRegions projects the cards renderGrid shows in a pane of
+// maxLines rows from row topY into hit regions, through the same geometry
+// and window plan: markers, gaps and partial rows produce no region.
+func gridHitRegions(cards []SessionCard, selectedIdx, width, maxLines, topY int, plain bool) []hitRegion {
+	if len(cards) == 0 || width <= 0 || maxLines <= 0 {
+		return nil
+	}
+	perRow, cardW := gridGeometry(width, plain)
+	if perRow == 0 { // compact list: one line per session, full width
+		heights := make([]int, len(cards))
+		counts := make([]int, len(cards))
+		for i := range cards {
+			heights[i], counts[i] = 1, 1
+		}
+		sel := selectedIdx
+		if sel < 0 || sel >= len(cards) {
+			sel = 0
+		}
+		p := planWindow(heights, counts, sel, maxLines, false)
+		y := topY
+		if p.topMarker {
+			y++
+		}
+		if p.partial {
+			if p.partialVisible <= 0 {
+				return nil
+			}
+			return []hitRegion{{idx: p.lo, x0: 0, x1: width, y0: y, y1: y + p.partialVisible}}
+		}
+		var out []hitRegion
+		for b := p.lo; b <= p.hi; b++ {
+			out = append(out, hitRegion{idx: b, x0: 0, x1: width, y0: y, y1: y + 1})
+			y++
+		}
+		return out
+	}
+	rows := (len(cards) + perRow - 1) / perRow
+	h := cardHeight(plain)
+	heights := make([]int, rows)
+	counts := make([]int, rows)
+	selRow := 0
+	for r := 0; r < rows; r++ {
+		start := r * perRow
+		counts[r] = min(perRow, len(cards)-start)
+		heights[r] = h
+		if selectedIdx >= start && selectedIdx < start+counts[r] {
+			selRow = r
+		}
+	}
+	p := planWindow(heights, counts, selRow, maxLines, !plain)
+	y := topY
+	if p.topMarker {
+		y++
+	}
+	var out []hitRegion
+	for r := p.lo; r <= p.hi; r++ {
+		rowH := h
+		if p.partial {
+			rowH = p.partialVisible
+		}
+		for c := 0; c < counts[r]; c++ {
+			x0 := c * (cardW + cardGap)
+			out = append(out, hitRegion{idx: r*perRow + c, x0: x0, x1: x0 + cardW, y0: y, y1: y + rowH})
+		}
+		y += rowH
+		if p.partial {
+			break
+		}
+	}
+	return out
 }
 
 // overflowMarker renders a truncation marker. n < 0 (unknown count, e.g. a
