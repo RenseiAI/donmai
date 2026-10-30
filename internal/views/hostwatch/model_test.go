@@ -253,6 +253,26 @@ func TestModel_MouseDetailAndInertRegions(t *testing.T) {
 	}
 }
 
+// AC-2 expanded window: a click on the top overflow marker in an expanded
+// window must do nothing (cursor and detail unchanged, no command). This
+// pins the expanded-branch marker guard in sessionIndexAt, which the
+// partial-window marker test cannot reach.
+func TestModel_MouseExpandedMarkerIsInert(t *testing.T) {
+	m := newMouseModel(t, 120, 40, 7)
+	view := ansi.Strip(m.render())
+	lines := strings.Split(view, "\n")
+	if len(lines) < 2 || !strings.Contains(lines[1], "more") {
+		t.Fatalf("expected expanded top marker at row 1:\n%s", view)
+	}
+	keep := m.cursor
+	if cmd := mouseClick(m, 1, 1, tea.MouseLeft); cmd != nil {
+		t.Fatal("expanded marker click must not dispatch")
+	}
+	if m.cursor != keep || m.detail {
+		t.Fatalf("expanded marker click must leave cursor=%d detail=%v (got cursor=%d detail=%v)", keep, false, m.cursor, m.detail)
+	}
+}
+
 // AC-3: only interactive bounded views request reporting and react.
 func TestModel_MouseViewPolicy(t *testing.T) {
 	m := newMouseModel(t, 120, 40, 0)

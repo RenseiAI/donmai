@@ -465,7 +465,7 @@ func (m *Model) sessionIndexAt(x, y int) (int, bool) {
 	if m.snapErr != nil {
 		return 0, false
 	}
-	if m.opts.Plain && m.opts.UnboundedCards {
+	if m.opts.Plain || m.opts.UnboundedCards {
 		return 0, false
 	}
 	if m.width <= 0 || m.height <= 0 {
