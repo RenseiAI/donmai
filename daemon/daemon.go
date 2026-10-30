@@ -572,6 +572,18 @@ type Daemon struct {
 	// stopped by Stop.
 	quotaPoller *quotaPoller
 
+	// autoUpdateScheduler is the opt-in scheduled-update loop (see
+	// auto_update_scheduler.go). Nil unless Start opted in; Stop tears it
+	// down. It adds no lifecycle state — attempts reuse the existing
+	// running/draining/updating transitions via Daemon.Update.
+	autoUpdateScheduler *autoUpdateScheduler
+	// autoUpdateClock and autoUpdateRunBound are test seams for the
+	// scheduler: a controllable clock and a shortened post-drain run
+	// budget. Zero values select the production system clock and the
+	// 5-minute run bound; production code never sets them.
+	autoUpdateClock    updateClock
+	autoUpdateRunBound time.Duration
+
 	// credentials is the single refresher every lane draws its worker identity
 	// from, constructed in Start once registration has produced one. A durable-
 	// session composition that lands after startup re-declares this daemon's
@@ -2261,6 +2273,14 @@ func (d *Daemon) Start(ctx context.Context) error {
 			return err
 		}
 	}
+	// Opt-in scheduled auto-update (see auto_update_scheduler.go): one
+	// cancellable, non-overlapping loop owned by Start/Stop. It starts
+	// only for explicitly opted-in configs (nightly/on-release schedule
+	// plus a configured source plus pinned signers); every other config
+	// stays inert with no goroutine and no network calls. This is the
+	// last fallible-adjacent step: nothing below fails, so a failed
+	// Start can never leak the loop.
+	d.startAutoUpdateScheduler()
 	d.lifecycleMu.Lock()
 	if err := ctx.Err(); err != nil {
 		d.lifecycleMu.Unlock()
@@ -2696,6 +2716,11 @@ func (d *Daemon) Stop(ctx context.Context) error {
 	if reloadCancel != nil {
 		reloadCancel()
 	}
+
+	// Stop the scheduled-update loop first so no new Update can begin
+	// racing the drain below; an in-flight attempt ends with its bounded
+	// attempt context, so this join terminates within the attempt bound.
+	d.stopAutoUpdateScheduler()
 
 	// Start every shutdown barrier before waiting for any of them. In particular,
 	// an unjoinable poll or landing callback must not suppress worker admission
@@ -4009,7 +4034,11 @@ func (a *updateAttempt) run(ctx context.Context) (*UpdateResult, error) {
 	updater := NewUpdater(UpdaterOptions{
 		CurrentVersion: d.EffectiveVersion(),
 		Config:         cfg.AutoUpdate,
-		SkipExit:       true, // HTTP-driven update: caller decides to exit.
+		// The explicitly configured update origin reaches the production
+		// updater here; empty keeps the updater inert (up-to-date
+		// without a request) on both the manual and scheduled paths.
+		CDNBase:  strings.TrimSpace(cfg.AutoUpdate.Source),
+		SkipExit: true, // HTTP-driven update: caller decides to exit.
 	})
 	return updater.RunUpdate(ctx)
 }
