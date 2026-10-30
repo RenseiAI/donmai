@@ -886,10 +886,24 @@ func (r *Runner) run(ctx context.Context, qw QueuedWork, admission *HarnessAdmis
 	// the workarea when the archive cannot be written. Interactive sessions
 	// take the same path except on the completed path, where the publication
 	// hold below already retains an unpublished workarea.
+	//
+	// Preservation runs in two phases sharing one teardown directory. Patches
+	// archive before the terminal lease decision (the disposition needs to
+	// know whether unpublished work survived), while terminal evidence waits
+	// until the final status is known: the lease decision below can flip a
+	// completed session to failed, and sampling evidence before that flip
+	// would drop the failed session's manifest.
 	retainUnpreserved := false
-	if teardownRequired && (!qw.isInteractive() || res == nil || res.Status != "completed") && !r.preserveUnpublishedWork(qw, res) {
-		teardownRequired = false
-		retainUnpreserved = true
+	initialTeardown := teardownRequired
+	var pres *teardownPreservation
+	patchesAttempted := false
+	if initialTeardown && (!qw.isInteractive() || res == nil || res.Status != "completed") {
+		pres = r.newTeardownPreservation(qw.SessionID)
+		patchesAttempted = true
+		if !r.preservePatches(qw, res, pres) {
+			teardownRequired = false
+			retainUnpreserved = true
+		}
 	}
 	// Archive declared terminal evidence for failed/stopped sessions before
 	// teardown. Completed sessions are untouched. A preservation failure
@@ -997,6 +1011,25 @@ func (r *Runner) run(ctx context.Context, qw QueuedWork, admission *HarnessAdmis
 					}
 				}
 			}
+		}
+	}
+
+	// Terminal evidence is archived against the FINAL status: the lease
+	// decision above can flip a completed session to failed, and evidence
+	// sampled before that flip would lose the failed session's manifest.
+	// The teardown shares one directory between the patch phase above and
+	// this phase, so one teardown still counts as a single attempt under
+	// the per-session retention boundary.
+	if initialTeardown {
+		finalGate := !qw.isInteractive() || res == nil || res.Status != "completed"
+		if pres == nil && finalGate {
+			pres = r.newTeardownPreservation(qw.SessionID)
+		}
+		if pres != nil && finalGate {
+			r.preserveTerminalEvidenceFinal(qw, res, pres)
+		}
+		if pres != nil && (patchesAttempted || finalGate || pres.archiveDir != "") {
+			r.finalizeTeardownPreservation(qw, pres)
 		}
 	}
 

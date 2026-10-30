@@ -274,3 +274,348 @@ func TestAgentStatusTooManyArgsKeepsExactArgsParity(t *testing.T) {
 		t.Errorf("expected cobra ExactArgs(1) too-many error; got: %v", err)
 	}
 }
+
+func newDiagnosticServer(t *testing.T, detailRaw string) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasPrefix(r.URL.Path, "/api/public/session-activities") {
+			_ = json.NewEncoder(w).Encode(afclient.ActivityListResponse{
+				Activities:    []afclient.ActivityEvent{},
+				SessionStatus: afclient.StatusFailed,
+			})
+			return
+		}
+		_, _ = w.Write([]byte(detailRaw))
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestAgentStatusDiagnosticDetail(t *testing.T) {
+	t.Parallel()
+
+	const diagnosticRaw = `{"session":{"id":"sess-diag-001","identifier":"OPS-0001","status":"failed","workType":"development","startedAt":"2026-10-27T12:00:00Z","duration":1234,"timeline":{"created":"2026-10-27T11:40:00Z"},"terminalReason":{"code":"provision_failed","message":"Workarea provisioning failed","phase":"spawn","decidedBy":"platform","at":"2026-10-27T12:01:00Z"},"budgetBreach":{"cap":"max-tokens","detail":"max-tokens exceeded: observed=5100000 limit=5000000"},"pullRequestUrl":"https://example.invalid/repo/pull/42","pullRequest":{"number":42,"url":"https://example.invalid/repo/pull/42","headSha":"abc123def456abc123def456abc123def456abcd"},"summary":"Migrated middleware and opened PR."},"timestamp":"2026-10-27T12:02:00Z"}`
+	const legacyRaw = `{"session":{"id":"sess-diag-001","identifier":"OPS-0001","status":"failed","workType":"development","startedAt":"2026-10-27T12:00:00Z","duration":1234,"timeline":{"created":"2026-10-27T11:40:00Z"}},"timestamp":"2026-10-27T12:02:00Z"}`
+
+	t.Run("diagnostic_round_trips_json", func(t *testing.T) {
+		t.Parallel()
+		srv := newDiagnosticServer(t, diagnosticRaw)
+		ds := func() afclient.DataSource { return afclient.NewClient(srv.URL) }
+		cmd, buf := newTestAgentCmd(ds, []string{"status", "sess-diag-001", "--json"})
+		if err := cmd.Execute(); err != nil {
+			t.Fatalf("execute: %v", err)
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(buf.Bytes(), &payload); err != nil {
+			t.Fatalf("output not valid JSON: %v\n%s", err, buf.String())
+		}
+		session, ok := payload["session"].(map[string]any)
+		if !ok {
+			t.Fatalf("expected top-level 'session' object; got: %v", payload)
+		}
+		reason, ok := session["terminalReason"].(map[string]any)
+		if !ok {
+			t.Fatalf("expected session.terminalReason object; got: %v", session["terminalReason"])
+		}
+		for _, want := range [][2]string{
+			{"code", "provision_failed"},
+			{"message", "Workarea provisioning failed"},
+			{"phase", "spawn"},
+			{"decidedBy", "platform"},
+			{"at", "2026-10-27T12:01:00Z"},
+		} {
+			if got := reason[want[0]]; got != want[1] {
+				t.Errorf("terminalReason.%s = %v, want %q", want[0], got, want[1])
+			}
+		}
+		breach, ok := session["budgetBreach"].(map[string]any)
+		if !ok {
+			t.Fatalf("expected session.budgetBreach object; got: %v", session["budgetBreach"])
+		}
+		if got := breach["cap"]; got != "max-tokens" {
+			t.Errorf("budgetBreach.cap = %v, want max-tokens", got)
+		}
+		if got := breach["detail"]; got != "max-tokens exceeded: observed=5100000 limit=5000000" {
+			t.Errorf("budgetBreach.detail = %v, want breach detail", got)
+		}
+		if got := session["pullRequestUrl"]; got != "https://example.invalid/repo/pull/42" {
+			t.Errorf("pullRequestUrl = %v, want PR url", got)
+		}
+		pr, ok := session["pullRequest"].(map[string]any)
+		if !ok {
+			t.Fatalf("expected session.pullRequest object; got: %v", session["pullRequest"])
+		}
+		if got := pr["number"]; got != float64(42) {
+			t.Errorf("pullRequest.number = %v, want 42", got)
+		}
+		if got := pr["url"]; got != "https://example.invalid/repo/pull/42" {
+			t.Errorf("pullRequest.url = %v, want PR url", got)
+		}
+		if got := pr["headSha"]; got != "abc123def456abc123def456abc123def456abcd" {
+			t.Errorf("pullRequest.headSha = %v, want head sha", got)
+		}
+		if got := session["summary"]; got != "Migrated middleware and opened PR." {
+			t.Errorf("summary = %v, want summary text", got)
+		}
+	})
+
+	t.Run("diagnostic_renders_text", func(t *testing.T) {
+		t.Parallel()
+		srv := newDiagnosticServer(t, diagnosticRaw)
+		ds := func() afclient.DataSource { return afclient.NewClient(srv.URL) }
+		cmd, buf := newTestAgentCmd(ds, []string{"status", "sess-diag-001"})
+		if err := cmd.Execute(); err != nil {
+			t.Fatalf("execute: %v", err)
+		}
+		out := buf.String()
+		for _, want := range []string{
+			"Terminal Reason:",
+			"provision_failed",
+			"Workarea provisioning failed",
+			"Budget Breach:",
+			"max-tokens",
+			"max-tokens exceeded",
+			"Pull Request:",
+			"https://example.invalid/repo/pull/42",
+			"Summary:",
+			"Migrated middleware and opened PR.",
+			"Status:",
+			"failed",
+		} {
+			if !strings.Contains(out, want) {
+				t.Errorf("text output missing %q; got:\n%s", want, out)
+			}
+		}
+		if strings.Contains(out, "completed") {
+			t.Errorf("failed session must not render as completed; got:\n%s", out)
+		}
+	})
+
+	t.Run("legacy_without_diagnostics_stays_valid", func(t *testing.T) {
+		t.Parallel()
+		srv := newDiagnosticServer(t, legacyRaw)
+		ds := func() afclient.DataSource { return afclient.NewClient(srv.URL) }
+		cmd, buf := newTestAgentCmd(ds, []string{"status", "sess-diag-001", "--json"})
+		if err := cmd.Execute(); err != nil {
+			t.Fatalf("execute legacy: %v", err)
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(buf.Bytes(), &payload); err != nil {
+			t.Fatalf("legacy output not valid JSON: %v\n%s", err, buf.String())
+		}
+		session, ok := payload["session"].(map[string]any)
+		if !ok {
+			t.Fatalf("expected top-level 'session' object; got: %v", payload)
+		}
+		for _, key := range []string{"terminalReason", "budgetBreach", "pullRequest", "pullRequestUrl", "summary"} {
+			if _, present := session[key]; present {
+				t.Errorf("expected no session.%s key for older response; got: %v", key, session[key])
+			}
+		}
+		cmd2, buf2 := newTestAgentCmd(ds, []string{"status", "sess-diag-001"})
+		if err := cmd2.Execute(); err != nil {
+			t.Fatalf("execute legacy text: %v", err)
+		}
+		out := buf2.String()
+		if !strings.Contains(out, "failed") {
+			t.Errorf("legacy failed status lost; got:\n%s", out)
+		}
+		if strings.Contains(out, "completed") {
+			t.Errorf("legacy failed session must not render as completed; got:\n%s", out)
+		}
+		for _, label := range []string{"Terminal Reason:", "Budget Breach:", "Pull Request:", "Summary:"} {
+			if !strings.Contains(out, label) {
+				t.Errorf("legacy text missing row %q; got:\n%s", label, out)
+			}
+		}
+		if got := strings.Count(out, "unavailable"); got < 4 {
+			t.Errorf("expected unavailable placeholder on >= 4 rows, got %d; out:\n%s", got, out)
+		}
+	})
+
+	t.Run("pull_request_structured_wins_over_flat", func(t *testing.T) {
+		t.Parallel()
+		const divergentRaw = `{"session":{"id":"sess-diag-001","identifier":"OPS-0001","status":"failed","workType":"development","startedAt":"2026-10-27T12:00:00Z","duration":1234,"timeline":{"created":"2026-10-27T11:40:00Z"},"pullRequestUrl":"https://example.invalid/repo/pull/41","pullRequest":{"number":42,"url":"https://example.invalid/repo/pull/42","headSha":"abc123def456abc123def456abc123def456abcd"}},"timestamp":"2026-10-27T12:02:00Z"}`
+		srv := newDiagnosticServer(t, divergentRaw)
+		ds := func() afclient.DataSource { return afclient.NewClient(srv.URL) }
+		cmd, buf := newTestAgentCmd(ds, []string{"status", "sess-diag-001"})
+		if err := cmd.Execute(); err != nil {
+			t.Fatalf("execute: %v", err)
+		}
+		out := buf.String()
+		if !strings.Contains(out, "https://example.invalid/repo/pull/42") {
+			t.Errorf("expected structured PR url to win; got:\n%s", out)
+		}
+		if !strings.Contains(out, "#42:") {
+			t.Errorf("expected structured PR number to render; got:\n%s", out)
+		}
+		if strings.Contains(out, "https://example.invalid/repo/pull/41") {
+			t.Errorf("flat PR url must not win over structured record; got:\n%s", out)
+		}
+	})
+
+	t.Run("pull_request_flat_only_falls_back", func(t *testing.T) {
+		t.Parallel()
+		const flatOnlyRaw = `{"session":{"id":"sess-diag-001","identifier":"OPS-0001","status":"failed","workType":"development","startedAt":"2026-10-27T12:00:00Z","duration":1234,"timeline":{"created":"2026-10-27T11:40:00Z"},"pullRequestUrl":"https://example.invalid/repo/pull/41"},"timestamp":"2026-10-27T12:02:00Z"}`
+		srv := newDiagnosticServer(t, flatOnlyRaw)
+		ds := func() afclient.DataSource { return afclient.NewClient(srv.URL) }
+		cmd, buf := newTestAgentCmd(ds, []string{"status", "sess-diag-001"})
+		if err := cmd.Execute(); err != nil {
+			t.Fatalf("execute: %v", err)
+		}
+		out := buf.String()
+		if !strings.Contains(out, "https://example.invalid/repo/pull/41") {
+			t.Errorf("expected flat PR url fallback to render; got:\n%s", out)
+		}
+		for _, line := range strings.Split(out, "\n") {
+			if strings.Contains(line, "Pull Request:") && strings.Contains(line, "unavailable") {
+				t.Errorf("flat PR url must not render as unavailable; got:\n%s", out)
+			}
+		}
+	})
+}
+
+// diagnosticTextRowValue extracts the exact cell value for a detail row
+// label (including its trailing colon) from tabwriter-aligned human output.
+// It strips only the leading alignment padding so the comparison preserves
+// the rendered value's own whitespace: production trimming of a padded
+// summary must show up here, not be re-applied by the assertion.
+func diagnosticTextRowValue(t *testing.T, out, label string) string {
+	t.Helper()
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(line, label) {
+			return strings.TrimLeft(strings.TrimPrefix(line, label), " \t")
+		}
+	}
+	t.Fatalf("missing row %q; got:\n%s", label, out)
+	return ""
+}
+
+// TestAgentStatusDiagnosticPartialExactRows pins the exact human row values
+// for partial diagnostic objects through the production entry point
+// (HTTP detail response -> cobra status command). Deleting or inverting any
+// partial branch (message-only reason, code-only reason, reason context,
+// cap-only or detail-only budget, number-only pull request, blank summary)
+// changes one of these exact values to "unavailable" (or drops context)
+// and fails the table.
+func TestAgentStatusDiagnosticPartialExactRows(t *testing.T) {
+	t.Parallel()
+
+	const prefix = `{"session":{"id":"sess-diag-001","identifier":"OPS-0001","status":"failed","workType":"development","startedAt":"2026-10-27T12:00:00Z","duration":1234,"timeline":{"created":"2026-10-27T11:40:00Z"}`
+	const suffix = `},"timestamp":"2026-10-27T12:02:00Z"}`
+
+	cases := []struct {
+		name     string
+		fragment string
+		label    string
+		want     string
+	}{
+		{
+			name:     "message_only_reason",
+			fragment: `,"terminalReason":{"message":"Workarea provisioning failed"}`,
+			label:    "Terminal Reason:",
+			want:     "Workarea provisioning failed",
+		},
+		{
+			name:     "code_only_reason",
+			fragment: `,"terminalReason":{"code":"provision_failed"}`,
+			label:    "Terminal Reason:",
+			want:     "provision_failed",
+		},
+		{
+			name:     "reason_full_context",
+			fragment: `,"terminalReason":{"code":"provision_failed","message":"Workarea provisioning failed","phase":"spawn","decidedBy":"platform","at":"2026-10-27T12:01:00Z"}`,
+			label:    "Terminal Reason:",
+			want:     "provision_failed: Workarea provisioning failed (spawn/platform)",
+		},
+		{
+			name:     "reason_message_with_context",
+			fragment: `,"terminalReason":{"message":"Workarea provisioning failed","phase":"spawn","decidedBy":"platform"}`,
+			label:    "Terminal Reason:",
+			want:     "Workarea provisioning failed (spawn/platform)",
+		},
+		{
+			name:     "reason_code_with_phase_only",
+			fragment: `,"terminalReason":{"code":"provision_failed","phase":"spawn"}`,
+			label:    "Terminal Reason:",
+			want:     "provision_failed (spawn)",
+		},
+		{
+			name:     "reason_message_with_decidedBy_only",
+			fragment: `,"terminalReason":{"message":"Workarea provisioning failed","decidedBy":"platform"}`,
+			label:    "Terminal Reason:",
+			want:     "Workarea provisioning failed (platform)",
+		},
+		{
+			name:     "reason_empty_object_unavailable",
+			fragment: `,"terminalReason":{}`,
+			label:    "Terminal Reason:",
+			want:     "unavailable",
+		},
+		{
+			name:     "budget_cap_only",
+			fragment: `,"budgetBreach":{"cap":"max-tokens"}`,
+			label:    "Budget Breach:",
+			want:     "max-tokens",
+		},
+		{
+			name:     "budget_detail_only",
+			fragment: `,"budgetBreach":{"detail":"quota hit"}`,
+			label:    "Budget Breach:",
+			want:     "quota hit",
+		},
+		{
+			name:     "budget_full",
+			fragment: `,"budgetBreach":{"cap":"max-tokens","detail":"max-tokens exceeded"}`,
+			label:    "Budget Breach:",
+			want:     "max-tokens: max-tokens exceeded",
+		},
+		{
+			name:     "budget_empty_object_unavailable",
+			fragment: `,"budgetBreach":{}`,
+			label:    "Budget Breach:",
+			want:     "unavailable",
+		},
+		{
+			name:     "pr_number_only",
+			fragment: `,"pullRequest":{"number":42}`,
+			label:    "Pull Request:",
+			want:     "#42",
+		},
+		{
+			name:     "blank_summary_spaces_unavailable",
+			fragment: `,"summary":"   "`,
+			label:    "Summary:",
+			want:     "unavailable",
+		},
+		{
+			name:     "blank_summary_empty_unavailable",
+			fragment: `,"summary":""`,
+			label:    "Summary:",
+			want:     "unavailable",
+		},
+		{
+			name:     "summary_trims_surrounding_spaces",
+			fragment: `,"summary":"  Migrated middleware.  "`,
+			label:    "Summary:",
+			want:     "Migrated middleware.",
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			srv := newDiagnosticServer(t, prefix+tc.fragment+suffix)
+			ds := func() afclient.DataSource { return afclient.NewClient(srv.URL) }
+			cmd, buf := newTestAgentCmd(ds, []string{"status", "sess-diag-001"})
+			if err := cmd.Execute(); err != nil {
+				t.Fatalf("execute: %v", err)
+			}
+			if got := diagnosticTextRowValue(t, buf.String(), tc.label); got != tc.want {
+				t.Errorf("%s row = %q, want %q\nfull output:\n%s", tc.label, got, tc.want, buf.String())
+			}
+		})
+	}
+}
