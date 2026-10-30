@@ -132,21 +132,26 @@ func hostUpgradeStatePath(configPath string) string {
 	return filepath.Join(filepath.Dir(configPath), "host-upgrade-state.json")
 }
 
-// loadHostUpgradeOutcomes reads the durable outcome file. Missing file is not
-// an error (no upgrade has completed yet); a corrupt file fails closed with
-// no outcomes so a redelivery re-validates instead of trusting garbage.
-func loadHostUpgradeOutcomes(path string) map[string]hostUpgradeOutcome {
+// loadHostUpgradeOutcomes reads the durable outcome file. A missing file is
+// not an error (no upgrade has completed yet). Any other read or decode
+// failure is an error so the caller can fail closed: a corrupt or
+// unreadable file must refuse new swaps until the operator clears it, never
+// re-validate to a second swap.
+func loadHostUpgradeOutcomes(path string) (map[string]hostUpgradeOutcome, error) {
 	outcomes := make(map[string]hostUpgradeOutcome)
 	if strings.TrimSpace(path) == "" {
-		return outcomes
+		return outcomes, fmt.Errorf("host.upgrade refused: no durable state path")
 	}
 	data, err := os.ReadFile(path) //nolint:gosec
 	if err != nil {
-		return outcomes
+		if os.IsNotExist(err) {
+			return outcomes, nil
+		}
+		return outcomes, fmt.Errorf("host.upgrade refused: durable state unreadable: %w", err)
 	}
 	var decoded map[string]hostUpgradeOutcome
 	if err := json.Unmarshal(data, &decoded); err != nil {
-		return outcomes
+		return outcomes, fmt.Errorf("host.upgrade refused: durable state corrupt: %w", err)
 	}
 	for id, outcome := range decoded {
 		if strings.TrimSpace(id) == "" {
@@ -154,42 +159,74 @@ func loadHostUpgradeOutcomes(path string) map[string]hostUpgradeOutcome {
 		}
 		outcomes[id] = outcome
 	}
-	return outcomes
+	return outcomes, nil
 }
 
 // persistHostUpgradeOutcome durably records one request outcome before it is
 // ever ACKed. The write is atomic (temp + rename) so a crash mid-write
-// leaves the previous durable state intact.
-func persistHostUpgradeOutcome(path, id string, outcome hostUpgradeOutcome) {
+// leaves the previous durable state intact. Every failure is returned so
+// the caller can fail closed instead of running without durability.
+func persistHostUpgradeOutcome(path, id string, outcome hostUpgradeOutcome) error {
 	if strings.TrimSpace(path) == "" || strings.TrimSpace(id) == "" {
-		return
+		return fmt.Errorf("host.upgrade refused: no durable state path")
 	}
-	outcomes := loadHostUpgradeOutcomes(path)
+	outcomes, err := loadHostUpgradeOutcomes(path)
+	if err != nil {
+		return err
+	}
 	outcomes[id] = outcome
 	data, err := json.Marshal(outcomes)
 	if err != nil {
-		return
+		return fmt.Errorf("host.upgrade refused: durable state encode failed: %w", err)
 	}
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, "host-upgrade-state-*.tmp")
 	if err != nil {
-		return
+		return fmt.Errorf("host.upgrade refused: durable state not writable: %w", err)
 	}
 	tmpName := tmp.Name()
 	if _, err := tmp.Write(data); err != nil {
 		_ = tmp.Close()
 		_ = os.Remove(tmpName)
-		return
+		return fmt.Errorf("host.upgrade refused: durable state write failed: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
 		_ = os.Remove(tmpName)
-		return
+		return fmt.Errorf("host.upgrade refused: durable state write failed: %w", err)
 	}
-	_ = os.Rename(tmpName, path)
+	if err := os.Rename(tmpName, path); err != nil {
+		_ = os.Remove(tmpName)
+		return fmt.Errorf("host.upgrade refused: durable state write failed: %w", err)
+	}
+	return nil
+}
+
+// probeHostUpgradeDurability verifies the durable outcome file can be read
+// and the state directory can be written before a swap starts. A valid
+// request that cannot be made durable refuses without a swap instead of
+// entering a pending state that a restart would lose into a second swap.
+func probeHostUpgradeDurability(path string) error {
+	if strings.TrimSpace(path) == "" {
+		return fmt.Errorf("host.upgrade refused: no durable state path")
+	}
+	if _, err := loadHostUpgradeOutcomes(path); err != nil {
+		return err
+	}
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, "host-upgrade-probe-*.tmp")
+	if err != nil {
+		return fmt.Errorf("host.upgrade refused: durable state not writable: %w", err)
+	}
+	name := tmp.Name()
+	_ = tmp.Close()
+	_ = os.Remove(name) //nolint:gosec
+	return nil
 }
 
 // initHostUpgradeState lazily initializes the in-memory upgrade maps and
-// loads durable outcomes once per process.
+// loads durable outcomes once per process. A corrupt or unreadable durable
+// file fails closed: the daemon refuses new swaps until the operator clears
+// it, instead of re-validating to a second swap.
 func (d *Daemon) initHostUpgradeStateLocked() {
 	if d.hostUpgradeDone == nil {
 		d.hostUpgradeDone = make(map[string]hostUpgradeOutcome)
@@ -201,8 +238,14 @@ func (d *Daemon) initHostUpgradeStateLocked() {
 		d.hostUpgradeCancels = make(map[string]context.CancelFunc)
 	}
 	if !d.hostUpgradeLoaded {
-		for id, outcome := range loadHostUpgradeOutcomes(hostUpgradeStatePath(d.opts.ConfigPath)) {
-			d.hostUpgradeDone[id] = outcome
+		outcomes, err := loadHostUpgradeOutcomes(hostUpgradeStatePath(d.opts.ConfigPath))
+		if err != nil {
+			d.hostUpgradeDurableBroken = true
+			d.hostUpgradeDurableError = err.Error()
+		} else {
+			for id, outcome := range outcomes {
+				d.hostUpgradeDone[id] = outcome
+			}
 		}
 		d.hostUpgradeLoaded = true
 	}
@@ -226,6 +269,7 @@ func (d *Daemon) handleHostUpgradeMutation(m PendingMutation) (appliedID string,
 		return "", &HeartbeatMutationFailure{ID: m.ID, Error: "host.upgrade requires an id"}
 	}
 	now := time.Now()
+	statePath := hostUpgradeStatePath(d.opts.ConfigPath)
 	d.hostUpgradeMu.Lock()
 	d.initHostUpgradeStateLocked()
 	if outcome, ok := d.hostUpgradeDone[m.ID]; ok {
@@ -234,6 +278,16 @@ func (d *Daemon) handleHostUpgradeMutation(m PendingMutation) (appliedID string,
 			return m.ID, nil
 		}
 		return "", &HeartbeatMutationFailure{ID: m.ID, Error: outcome.Error}
+	}
+	if d.hostUpgradeDurableBroken {
+		errText := d.hostUpgradeDurableError
+		if strings.TrimSpace(errText) == "" {
+			errText = "host.upgrade refused: durable state unavailable"
+		}
+		outcome := hostUpgradeOutcome{Applied: false, Error: errText, CompletedAt: now.UTC().Format(time.RFC3339)}
+		d.hostUpgradeDone[m.ID] = outcome
+		d.hostUpgradeMu.Unlock()
+		return "", &HeartbeatMutationFailure{ID: m.ID, Error: errText}
 	}
 	if _, ok := d.hostUpgradeInFlight[m.ID]; ok {
 		d.hostUpgradeMu.Unlock()
@@ -253,7 +307,10 @@ func (d *Daemon) handleHostUpgradeMutation(m PendingMutation) (appliedID string,
 	if err := parseHostUpgradeParams(m, now); err != nil {
 		outcome := hostUpgradeOutcome{Applied: false, Error: err.Error(), CompletedAt: now.UTC().Format(time.RFC3339)}
 		d.hostUpgradeDone[m.ID] = outcome
-		persistHostUpgradeOutcome(hostUpgradeStatePath(d.opts.ConfigPath), m.ID, outcome)
+		if persistErr := persistHostUpgradeOutcome(statePath, m.ID, outcome); persistErr != nil {
+			d.hostUpgradeDurableBroken = true
+			d.hostUpgradeDurableError = persistErr.Error()
+		}
 		d.hostUpgradeMu.Unlock()
 		return "", &HeartbeatMutationFailure{ID: m.ID, Error: err.Error()}
 	}
@@ -261,9 +318,19 @@ func (d *Daemon) handleHostUpgradeMutation(m PendingMutation) (appliedID string,
 		err := "host.upgrade refused: machine-owner update consent is not configured (no signed source)"
 		outcome := hostUpgradeOutcome{Applied: false, Error: err, CompletedAt: now.UTC().Format(time.RFC3339)}
 		d.hostUpgradeDone[m.ID] = outcome
-		persistHostUpgradeOutcome(hostUpgradeStatePath(d.opts.ConfigPath), m.ID, outcome)
+		if persistErr := persistHostUpgradeOutcome(statePath, m.ID, outcome); persistErr != nil {
+			d.hostUpgradeDurableBroken = true
+			d.hostUpgradeDurableError = persistErr.Error()
+		}
 		d.hostUpgradeMu.Unlock()
 		return "", &HeartbeatMutationFailure{ID: m.ID, Error: err}
+	}
+	if err := probeHostUpgradeDurability(statePath); err != nil {
+		outcome := hostUpgradeOutcome{Applied: false, Error: err.Error(), CompletedAt: now.UTC().Format(time.RFC3339)}
+		d.hostUpgradeDone[m.ID] = outcome
+		_ = persistHostUpgradeOutcome(statePath, m.ID, outcome)
+		d.hostUpgradeMu.Unlock()
+		return "", &HeartbeatMutationFailure{ID: m.ID, Error: err.Error()}
 	}
 	d.hostUpgradeInFlight[m.ID] = struct{}{}
 	d.hostUpgradeMu.Unlock()
@@ -408,7 +475,9 @@ func (d *Daemon) executeHostUpgrade(ctx context.Context) (*UpdateResult, error) 
 
 // finishHostUpgrade durably records the outcome before it can ever be ACKed.
 // A lost response or process exit therefore cannot manufacture completion:
-// the next redelivery answers from the recorded outcome.
+// the next redelivery answers from the recorded outcome. A persist failure
+// marks durability broken so later requests refuse instead of risking a
+// second swap from a lost record.
 func (d *Daemon) finishHostUpgrade(id string, outcome hostUpgradeOutcome) {
 	if strings.TrimSpace(outcome.CompletedAt) == "" {
 		outcome.CompletedAt = time.Now().UTC().Format(time.RFC3339)
@@ -416,9 +485,13 @@ func (d *Daemon) finishHostUpgrade(id string, outcome hostUpgradeOutcome) {
 	if outcome.Error == "" && !outcome.Applied {
 		outcome.Error = "host.upgrade failed without a swap"
 	}
-	persistHostUpgradeOutcome(hostUpgradeStatePath(d.opts.ConfigPath), id, outcome)
+	persistErr := persistHostUpgradeOutcome(hostUpgradeStatePath(d.opts.ConfigPath), id, outcome)
 	d.hostUpgradeMu.Lock()
 	d.initHostUpgradeStateLocked()
+	if persistErr != nil {
+		d.hostUpgradeDurableBroken = true
+		d.hostUpgradeDurableError = persistErr.Error()
+	}
 	delete(d.hostUpgradeInFlight, id)
 	d.hostUpgradeDone[id] = outcome
 	d.hostUpgradeMu.Unlock()

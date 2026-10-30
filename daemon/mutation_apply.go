@@ -66,15 +66,16 @@ func (d *Daemon) applyPendingMutations(_ context.Context, mutations []PendingMut
 	for _, m := range mutations {
 		if m.Op == hostUpgradeOp {
 			appliedID, failure := d.handleHostUpgradeMutation(m)
-			if appliedID != "" {
+			switch {
+			case appliedID != "":
 				slog.Info("[daemon-sync] mutation applied",
 					"id", m.ID, "op", m.Op)
 				applied = append(applied, appliedID)
-			} else if failure != nil {
+			case failure != nil:
 				slog.Warn("[daemon-sync] mutation failed",
 					"id", m.ID, "op", m.Op, "err", failure.Error)
 				failures = append(failures, *failure)
-			} else {
+			default:
 				slog.Info("[daemon-sync] host upgrade pending",
 					"id", m.ID, "op", m.Op)
 			}

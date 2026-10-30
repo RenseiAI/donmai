@@ -705,6 +705,12 @@ type Daemon struct {
 	hostUpgradeCancels  map[string]context.CancelFunc
 	hostUpgradeDone     map[string]hostUpgradeOutcome
 	hostUpgradeLoaded   bool
+	// hostUpgradeDurableBroken is set when the durable outcome file cannot
+	// be read (corrupt/unreadable) or cannot be written. While set, new
+	// swaps refuse without running: a lost durable record must never cause
+	// a restart plus redelivery to run a second swap.
+	hostUpgradeDurableBroken bool
+	hostUpgradeDurableError  string
 }
 
 // New constructs a Daemon. Call Start() to bring it online.

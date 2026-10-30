@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -16,7 +17,8 @@ import (
 
 func hostUpgradeTestDaemon(t *testing.T, store interface {
 	AcknowledgeExact(ctx context.Context, req interface{}) (interface{}, error)
-}) *Daemon {
+},
+) *Daemon {
 	t.Helper()
 	_ = store
 	d := newRestartTestDaemon(t, nil)
@@ -621,5 +623,127 @@ func TestHostUpgradeNeverTakesReleaseURL(t *testing.T) {
 	}
 	if seenConfig.Channel != "" || len(seenConfig.Signers) != 0 {
 		t.Fatalf("remote request leaked into update config: %+v", seenConfig)
+	}
+}
+
+func TestHostUpgradeExactExpiryBoundary(t *testing.T) {
+	t.Parallel()
+	base := time.Now().UTC().Truncate(time.Second)
+	exact := base.Format(time.RFC3339)
+	m := PendingMutation{ID: "b", Op: hostUpgradeOp, Params: json.RawMessage(`{"consented":true,"expiresAt":"` + exact + `"}`)}
+	if err := parseHostUpgradeParams(m, base); err == nil || !strings.Contains(err.Error(), "expired") {
+		t.Fatalf("expiresAt == now should refuse expired, got %v", err)
+	}
+	later := base.Add(time.Second).Format(time.RFC3339)
+	m2 := PendingMutation{ID: "b2", Op: hostUpgradeOp, Params: json.RawMessage(`{"consented":true,"expiresAt":"` + later + `"}`)}
+	if err := parseHostUpgradeParams(m2, base); err != nil {
+		t.Fatalf("expiresAt == now+1s should be valid, got %v", err)
+	}
+}
+
+func TestHostUpgradeRefusesWithoutDurablePath(t *testing.T) {
+	t.Parallel()
+	d := hostUpgradeTestDaemon(t, nil)
+	d.opts.ConfigPath = ""
+	var calls atomic.Int32
+	d.runPreparedUpdate = func(context.Context, AutoUpdateConfig, string) (*UpdateResult, error) {
+		calls.Add(1)
+		return &UpdateResult{Updated: true, Version: "x", Reason: "update-applied"}, nil
+	}
+	m := hostUpgradeMutation("up-no-path", map[string]any{"consented": true})
+	applied, failures := d.applyPendingMutations(context.Background(), []PendingMutation{m})
+	if len(applied) != 0 || len(failures) != 1 {
+		t.Fatalf("applied/failures = %v/%v, want failure without durable path", applied, failures)
+	}
+	if !strings.Contains(failures[0].Error, "durable") {
+		t.Fatalf("failure %q should name durable state", failures[0].Error)
+	}
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("update calls = %d, want 0", got)
+	}
+	applied, failures = d.applyPendingMutations(context.Background(), []PendingMutation{m})
+	if len(applied) != 0 || len(failures) != 1 {
+		t.Fatalf("redelivery applied/failures = %v/%v, want failure", applied, failures)
+	}
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("redelivery calls = %d, want 0", got)
+	}
+}
+
+func TestHostUpgradeUnwritableStateRefusesWithoutSwap(t *testing.T) {
+	t.Parallel()
+	d := hostUpgradeTestDaemon(t, nil)
+	d.opts.ConfigPath = filepath.Join(t.TempDir(), "no-such-dir", "daemon.yaml")
+	var calls atomic.Int32
+	d.runPreparedUpdate = func(context.Context, AutoUpdateConfig, string) (*UpdateResult, error) {
+		calls.Add(1)
+		return &UpdateResult{Updated: true, Version: "x", Reason: "update-applied"}, nil
+	}
+	m := hostUpgradeMutation("up-unwritable", map[string]any{"consented": true})
+	applied, failures := d.applyPendingMutations(context.Background(), []PendingMutation{m})
+	if len(applied) != 0 || len(failures) != 1 {
+		t.Fatalf("applied/failures = %v/%v, want failure for unwritable state", applied, failures)
+	}
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("update calls = %d, want 0 (refuse without swap)", got)
+	}
+	applied, failures = d.applyPendingMutations(context.Background(), []PendingMutation{m})
+	if len(applied) != 0 || len(failures) != 1 {
+		t.Fatalf("redelivery applied/failures = %v/%v, want failure", applied, failures)
+	}
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("redelivery calls = %d, want 0", got)
+	}
+}
+
+func TestHostUpgradeCorruptDurableRefusesWithoutSwap(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "daemon.yaml")
+	statePath := hostUpgradeStatePath(cfgPath)
+	// Write a corrupt durable file before any upgrade.
+	if err := os.WriteFile(statePath, []byte("{corrupt-json"), 0o600); err != nil {
+		t.Fatalf("write corrupt state: %v", err)
+	}
+	d := newRestartTestDaemon(t, nil)
+	d.opts.ConfigPath = cfgPath
+	d.config = &Config{
+		AutoUpdate: AutoUpdateConfig{
+			Channel: ChannelStable, Schedule: ScheduleManual,
+			Signers: []UpdateSigner{{SAN: "test@example.com", Issuer: "https://example.test"}},
+		},
+	}
+	var calls atomic.Int32
+	d.runPreparedUpdate = func(context.Context, AutoUpdateConfig, string) (*UpdateResult, error) {
+		calls.Add(1)
+		return &UpdateResult{Updated: true, Version: "x", Reason: "update-applied"}, nil
+	}
+	m := hostUpgradeMutation("up-corrupt", map[string]any{"consented": true})
+	applied, failures := d.applyPendingMutations(context.Background(), []PendingMutation{m})
+	if len(applied) != 0 || len(failures) != 1 {
+		t.Fatalf("corrupt applied/failures = %v/%v, want failure", applied, failures)
+	}
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("corrupt update calls = %d, want 0 (no second swap)", got)
+	}
+	// Restart with the same corrupt file must still refuse without a swap.
+	second := newRestartTestDaemon(t, nil)
+	second.opts.ConfigPath = cfgPath
+	second.config = &Config{
+		AutoUpdate: AutoUpdateConfig{
+			Channel: ChannelStable, Schedule: ScheduleManual,
+			Signers: []UpdateSigner{{SAN: "test@example.com", Issuer: "https://example.test"}},
+		},
+	}
+	second.runPreparedUpdate = func(context.Context, AutoUpdateConfig, string) (*UpdateResult, error) {
+		calls.Add(1)
+		return &UpdateResult{Updated: true, Version: "x", Reason: "update-applied"}, nil
+	}
+	applied, failures = second.applyPendingMutations(context.Background(), []PendingMutation{m})
+	if len(applied) != 0 || len(failures) != 1 {
+		t.Fatalf("post-corrupt applied/failures = %v/%v, want failure", applied, failures)
+	}
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("post-corrupt calls = %d, want 0", got)
 	}
 }
