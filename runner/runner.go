@@ -599,6 +599,17 @@ type Runner struct {
 	// os.ReadFile. Tests substitute it to return mismatched bytes and pin
 	// the readback refusal.
 	terminalEvidenceReadFile func(string) ([]byte, error)
+	// terminalEvidenceOpenFile opens one declared evidence file; nil uses
+	// openTerminalEvidenceFile. Tests substitute it to swap the declared
+	// path to a FIFO between the Lstat hint and Open, pinning the
+	// post-open regular-file refusal through the production preserve path.
+	terminalEvidenceOpenFile func(string) (*os.File, error)
+	// terminalEvidenceReadSource reads one opened evidence file; nil reads
+	// up to terminalEvidenceMaxBytes+1 bytes. Tests substitute it to
+	// return over-bound bytes, simulating a file that grew past the bound
+	// between Stat and read, pinning the post-read truncation refusal
+	// through the production preserve path.
+	terminalEvidenceReadSource func(*os.File) ([]byte, error)
 
 	// rescueDir is Options.RescueDir (see rescueRoot for the default).
 	rescueDir string

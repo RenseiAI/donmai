@@ -716,6 +716,105 @@ func TestPreserveTerminalEvidence_ReadbackMismatchRetainsWorkarea(t *testing.T) 
 	}
 }
 
+// TestPreserveTerminalEvidence_SwappedFIFORefusesEmptyArchive pins the
+// post-open regular-file refusal through the production preserve path: the
+// declared path is a regular file at the Lstat hint but a FIFO when
+// opened (swapped between the two, then opened with the production
+// helper so O_NONBLOCK semantics are exercised, not a stub). The
+// post-open Stat must refuse; otherwise the FIFO reads zero bytes as
+// success, an empty archive is written, and the workarea would be torn
+// down with the only copy destroyed. Removing the post-open IsRegular
+// check archives the empty bytes as success.
+func TestPreserveTerminalEvidence_SwappedFIFORefusesEmptyArchive(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("FIFO semantics are unix-only")
+	}
+	r := minimalRunner(t)
+	r.rescueDir = t.TempDir()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "evidence.cast")
+	if err := os.WriteFile(path, []byte("victim-transcript-body\n"), 0o600); err != nil {
+		t.Fatalf("write victim evidence: %v", err)
+	}
+	// Swap between the Lstat hint and Open: by the time the production
+	// open runs, the declared path is a FIFO. The Lstat inside
+	// preserveTerminalEvidence still sees the regular victim file.
+	r.terminalEvidenceOpenFile = func(p string) (*os.File, error) {
+		if err := os.Remove(path); err != nil {
+			return nil, err
+		}
+		if err := syscall.Mkfifo(path, 0o600); err != nil {
+			return nil, err
+		}
+		return openTerminalEvidenceFile(p)
+	}
+	res := &Result{Result: agent.Result{Status: "failed"}}
+	res.terminalTranscripts = []agent.TerminalTranscriptDescriptor{{Path: path}}
+	qw := QueuedWork{QueuedWork: queuedWorkBase("EVIDENCE-SWAP-FIFO")}
+
+	if r.preserveTerminalEvidence(qw, res) {
+		t.Fatal("preserveTerminalEvidence = true for a regular-to-FIFO swap; want false so the workarea is kept")
+	}
+	if len(res.PostSessionWarnings) != 1 || res.PostSessionWarnings[0] != terminalEvidenceWarnMessage {
+		t.Fatalf("PostSessionWarnings = %v; want exactly [%q]", res.PostSessionWarnings, terminalEvidenceWarnMessage)
+	}
+	if len(res.Result.PostSessionWarnings) != 1 || res.Result.PostSessionWarnings[0] != terminalEvidenceWarnMessage {
+		t.Fatalf("wire PostSessionWarnings = %v; want exactly [%q]", res.Result.PostSessionWarnings, terminalEvidenceWarnMessage)
+	}
+	for _, w := range append(append([]string{}, res.PostSessionWarnings...), res.Result.PostSessionWarnings...) {
+		if strings.Contains(w, path) || strings.Contains(w, ".cast") {
+			t.Fatalf("warning %q carries a path; want value-free", w)
+		}
+	}
+	if archives := findEvidenceArchives(t, r.rescueDir); len(archives) != 0 {
+		t.Fatalf("evidence archives = %v; want none: a swapped FIFO must never archive empty bytes as success", archives)
+	}
+}
+
+// TestPreserveTerminalEvidence_GrownFileRefusesTruncatedArchive pins the
+// post-read truncation refusal through the production preserve path: the
+// file is small at both size checks but grows past the bound before the
+// read completes (simulated by observing over-bound bytes for a small
+// on-disk file, exactly the Lstat-to-read growth window the check
+// guards). Archiving the truncated prefix as success would delete the
+// workarea holding the only complete copy. Disabling the post-read length
+// check archives the truncated copy as success.
+func TestPreserveTerminalEvidence_GrownFileRefusesTruncatedArchive(t *testing.T) {
+	r := minimalRunner(t)
+	r.rescueDir = t.TempDir()
+	src := filepath.Join(t.TempDir(), "evidence.cast")
+	const body = "small-at-stat-grows-before-read\n"
+	if err := os.WriteFile(src, []byte(body), 0o600); err != nil {
+		t.Fatalf("write source evidence: %v", err)
+	}
+	// The size checks see the small on-disk file; the read observes the
+	// grown content. One probe byte past the bound is enough to refuse.
+	r.terminalEvidenceReadSource = func(*os.File) ([]byte, error) {
+		return make([]byte, terminalEvidenceMaxBytes+1), nil
+	}
+	res := &Result{Result: agent.Result{Status: "failed"}}
+	res.terminalTranscripts = []agent.TerminalTranscriptDescriptor{{Path: src}}
+	qw := QueuedWork{QueuedWork: queuedWorkBase("EVIDENCE-GROWN")}
+
+	if r.preserveTerminalEvidence(qw, res) {
+		t.Fatal("preserveTerminalEvidence = true for content grown past the bound before read; want false so the workarea is kept")
+	}
+	if len(res.PostSessionWarnings) != 1 || res.PostSessionWarnings[0] != terminalEvidenceWarnMessage {
+		t.Fatalf("PostSessionWarnings = %v; want exactly [%q]", res.PostSessionWarnings, terminalEvidenceWarnMessage)
+	}
+	if len(res.Result.PostSessionWarnings) != 1 || res.Result.PostSessionWarnings[0] != terminalEvidenceWarnMessage {
+		t.Fatalf("wire PostSessionWarnings = %v; want exactly [%q]", res.Result.PostSessionWarnings, terminalEvidenceWarnMessage)
+	}
+	for _, w := range append(append([]string{}, res.PostSessionWarnings...), res.Result.PostSessionWarnings...) {
+		if strings.Contains(w, src) || strings.Contains(w, ".cast") {
+			t.Fatalf("warning %q carries a path; want value-free", w)
+		}
+	}
+	if archives := findEvidenceArchives(t, r.rescueDir); len(archives) != 0 {
+		t.Fatalf("evidence archives = %v; want none: grown content must never archive a truncated copy as success", archives)
+	}
+}
+
 // TestPreserveTerminalEvidence_ArchiveWriteFailureRetainsWorkarea pins the
 // archive-stage write refusal: failing the copy itself suppresses teardown.
 // The existing unwritable-rescue test fails before any copy; this one

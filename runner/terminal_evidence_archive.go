@@ -80,21 +80,32 @@ func (r *Runner) preserveTerminalEvidence(qw QueuedWork, res *Result) bool {
 		// path swapped to a FIFO opens without blocking so the
 		// regular-file check below can reject it. The post-open Stat is
 		// authoritative; the pre-open Lstat is only a fast-path hint.
-		f, err := openTerminalEvidenceFile(desc.Path)
+		openFile := r.terminalEvidenceOpenFile
+		if openFile == nil {
+			openFile = openTerminalEvidenceFile
+		}
+		f, err := openFile(desc.Path)
 		if err != nil {
 			r.warnTerminalEvidencePreservation(qw, res)
 			return false
 		}
-		// Re-verify after open: the descriptor could have grown between
-		// the Lstat hint and Open. The LimitReader below additionally caps
-		// a file that grew in that window, so the read never allocates
-		// beyond the bound plus one probe byte.
+		// Re-verify after open: the descriptor could have been swapped
+		// to a FIFO between the Lstat hint and Open. The LimitReader in
+		// the source read additionally caps a file that grew in that
+		// window, so the read never allocates beyond the bound plus one
+		// probe byte.
 		if st, err := f.Stat(); err != nil || !st.Mode().IsRegular() || st.Size() > terminalEvidenceMaxBytes {
 			_ = f.Close()
 			r.warnTerminalEvidencePreservation(qw, res)
 			return false
 		}
-		raw, err := io.ReadAll(io.LimitReader(f, terminalEvidenceMaxBytes+1))
+		readSource := r.terminalEvidenceReadSource
+		if readSource == nil {
+			readSource = func(f *os.File) ([]byte, error) {
+				return io.ReadAll(io.LimitReader(f, terminalEvidenceMaxBytes+1))
+			}
+		}
+		raw, err := readSource(f)
 		_ = f.Close()
 		if err != nil {
 			r.warnTerminalEvidencePreservation(qw, res)
