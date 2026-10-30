@@ -2,6 +2,7 @@ package runner
 
 import (
 	"encoding/json"
+	"fmt"
 	"slices"
 	"testing"
 	"time"
@@ -139,6 +140,46 @@ func TestRun_ToolCallsAndScalarsAcrossBufferedInjects(t *testing.T) {
 
 // Earlier inject hint survives a later empty inject: first inject reports the
 // session PR in narrative, second reports nothing; the verified PR must stand.
+// The first trusted URL across buffered injects survives later chatter even
+// when the chatter would evict it from the candidate window. Inject 1 opens
+// the session PR #7; inject 2 reports eight unrelated PRs. Merging keeps the
+// first URL on the envelope so the batched verifier still finds #7; dropping
+// it (first := "") loses the session PR entirely.
+func TestRun_InjectFirstTrustedURLPreservedOverChatterOverflow(t *testing.T) {
+	platform := newRecordingPlatformServer(t)
+	platform.queueInject(heartbeat.InjectPayload{DeliveryID: "dlv-1", Text: "recall: first memory block"})
+	platform.queueInject(heartbeat.InjectPayload{DeliveryID: "dlv-2", Text: "recall: second memory block"})
+	secondBuffered := func() {
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			if acks, _ := platform.injectReports(); slices.Contains(acks, "dlv-2") {
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		t.Errorf("second inject was never buffered")
+	}
+	var chatter []agent.Event
+	pulls := map[int]string{7: pullAtSessionCommit}
+	for n := 101; n <= 108; n++ {
+		u := fmt.Sprintf("https://github.com/example/repo/pull/%d", n)
+		chatter = append(chatter, toolUse("list", "gh pr list"), toolResult("list", "see "+u))
+		pulls[n] = pullAtOtherCommit
+	}
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType: "development", repository: followUpRepository, pulls: pulls,
+		heartbeatInterval: 10 * time.Millisecond, platform: platform,
+		turns: []verdictScriptTurn{
+			{text: "Working."},
+			{before: secondBuffered, events: []agent.Event{toolUse("pr", "gh pr create --fill"), toolResult("pr", followUpPR)}, text: "Opened session PR."},
+			{events: chatter, text: "Noted."},
+		},
+	})
+	if res.PullRequestURL != followUpPR {
+		t.Fatalf("PullRequestURL = %q; want verified %q (first inject wins over overflow chatter)", res.PullRequestURL, followUpPR)
+	}
+}
+
 func TestRun_BufferedInjectNarrativeHintIsPreserved(t *testing.T) {
 	platform := newRecordingPlatformServer(t)
 	platform.queueInject(heartbeat.InjectPayload{DeliveryID: "dlv-1", Text: "recall: first memory block"})

@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -26,6 +27,8 @@ import (
 	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 	"github.com/RenseiAI/donmai/runtime/workarea"
 	"github.com/RenseiAI/donmai/runtime/worktree"
+
+	"github.com/RenseiAI/donmai/runtime/heartbeat"
 )
 
 func TestWorktreeProvisionStrategyRepositoryFreeOnly(t *testing.T) {
@@ -1139,6 +1142,95 @@ func TestRun_LaterToolChatterKeepsSessionPR(t *testing.T) {
 	})
 	if res.PullRequestURL != followUpPR || res.FailureMode == FailureAgentBlocked {
 		t.Fatalf("PR=%q FailureMode=%q; want %q without agent-blocked", res.PullRequestURL, res.FailureMode, followUpPR)
+	}
+}
+
+// An earlier unrelated inject URL must not hide the session pull request a
+// later inject reports. Inject 1 reads unrelated PR #99; inject 2 creates
+// the session PR #7, then reports three unrelated PRs and declines. The
+// merged observation keeps both, and the batched verifier still finds #7.
+func TestRun_EarlierUnrelatedInjectCannotHideLaterSessionPR(t *testing.T) {
+	platform := newRecordingPlatformServer(t)
+	platform.queueInject(heartbeat.InjectPayload{DeliveryID: "dlv-1", Text: "recall: first memory block"})
+	platform.queueInject(heartbeat.InjectPayload{DeliveryID: "dlv-2", Text: "recall: second memory block"})
+	secondBuffered := func() {
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			if acks, _ := platform.injectReports(); slices.Contains(acks, "dlv-2") {
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		t.Errorf("second inject was never buffered")
+	}
+	unrelated := "https://github.com/example/repo/pull/99"
+	var chatter []agent.Event
+	for _, n := range []int{101, 102, 103} {
+		u := fmt.Sprintf("https://github.com/example/repo/pull/%d", n)
+		chatter = append(chatter, toolUse("list", "gh pr list"), toolResult("list", "see "+u))
+	}
+	pulls := map[int]string{7: pullAtSessionCommit, 99: pullAtOtherCommit, 101: pullAtOtherCommit, 102: pullAtOtherCommit, 103: pullAtOtherCommit}
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType: "development", repository: followUpRepository, pulls: pulls,
+		heartbeatInterval: 10 * time.Millisecond, platform: platform,
+		turns: []verdictScriptTurn{
+			{text: "Working."},
+			{before: secondBuffered, events: []agent.Event{toolUse("r", "gh pr view 99"), toolResult("r", "see "+unrelated)}, text: "noted 99"},
+			{events: append([]agent.Event{toolUse("pr", "gh pr create --fill"), toolResult("pr", followUpPR)}, chatter...), text: "Stuck.\nAGENT_BLOCKED: need decision"},
+		},
+	})
+	if res.PullRequestURL != followUpPR || res.FailureMode == FailureAgentBlocked {
+		t.Fatalf("PR=%q FailureMode=%q; want verified %q without agent-blocked", res.PullRequestURL, res.FailureMode, followUpPR)
+	}
+}
+
+// A genuine session PR reported in narrative before later tool chatter must
+// still verify. Narrative #7 is oldest, four unrelated tool URLs follow,
+// then the turn declines: the verifier checks every candidate in one batch.
+func TestRun_NarrativeBeforeToolChatterKeepsSessionPR(t *testing.T) {
+	var events []agent.Event
+	pulls := map[int]string{7: pullAtSessionCommit}
+	events = append(events, say("Opened "+followUpPR+" for review."))
+	for n := 101; n <= 104; n++ {
+		u := fmt.Sprintf("https://github.com/example/repo/pull/%d", n)
+		events = append(events, toolUse("list", "gh pr list"), toolResult("list", "see "+u))
+		pulls[n] = pullAtOtherCommit
+	}
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType: "development", repository: followUpRepository, pulls: pulls,
+		turns: []verdictScriptTurn{{events: events, text: "Still stuck.\nAGENT_BLOCKED: need decision"}},
+	})
+	if res.PullRequestURL != followUpPR || res.FailureMode == FailureAgentBlocked {
+		t.Fatalf("PR=%q FailureMode=%q; want verified %q without agent-blocked", res.PullRequestURL, res.FailureMode, followUpPR)
+	}
+}
+
+// An unverified tool URL must not suppress the blocked fork on the initial
+// turn. QA owes no PR so no verifier is built: the envelope still carries
+// the scraped URL, but hasVerifiedPR is false and the decline stays blocked.
+func TestRun_UnverifiedToolURLStillBlocked(t *testing.T) {
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType: WorkTypeQAStr, repository: followUpRepository, pulls: map[int]string{7: pullAtOtherCommit},
+		turns: []verdictScriptTurn{{events: []agent.Event{toolUse("pr", "gh pr create --fill"), toolResult("pr", followUpPR)}, text: "Stuck.\nAGENT_BLOCKED: need decision"}},
+	})
+	if res.FailureMode != FailureAgentBlocked {
+		t.Fatalf("FailureMode=%q Status=%q PR=%q; want agent-blocked for unverified tool URL", res.FailureMode, res.Status, res.PullRequestURL)
+	}
+}
+
+// The follow-up blocked fork takes the same verified acceptance: a QA
+// follow-up turn that reports an unverified tool URL and declines stays
+// blocked. Forcing the second caller to envelope presence would complete it.
+func TestRun_UnverifiedToolURLStillBlockedAfterFollowUp(t *testing.T) {
+	res2, _ := runScriptedSession(t, scriptedSession{
+		workType: WorkTypeQAStr, repository: followUpRepository, pulls: map[int]string{7: pullAtOtherCommit},
+		turns: []verdictScriptTurn{
+			{text: "Work in progress."},
+			{events: []agent.Event{toolUse("pr", "gh pr create --fill"), toolResult("pr", followUpPR)}, text: "Need a decision.\nAGENT_BLOCKED: need decision"},
+		},
+	})
+	if res2.FailureMode != FailureAgentBlocked {
+		t.Fatalf("follow-up: FailureMode=%q Status=%q PR=%q; want agent-blocked for unverified tool URL", res2.FailureMode, res2.Status, res2.PullRequestURL)
 	}
 }
 

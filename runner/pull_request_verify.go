@@ -55,11 +55,10 @@ import (
 // pullRequestLookupTimeout bounds one remote lookup.
 const pullRequestLookupTimeout = 15 * time.Second
 
-// maxPullRequestLookups bounds the remote lookups one verification pass may
-// spend, so a transcript full of URLs cannot stall the session end.
-const maxPullRequestLookups = 4
-
 // maxPullRequestCandidates bounds the distinct candidate URLs a stream keeps.
+// Verification reads them in one batched remote lookup, so a transcript full
+// of URLs costs a single ls-remote (bounded by pullRequestLookupTimeout)
+// instead of stalling the session end.
 const maxPullRequestCandidates = 8
 
 // pullRequestRefLookup reads refs from the checkout's origin remote and
@@ -324,38 +323,146 @@ func (v *sessionPullRequestVerifier) settle(ctx context.Context, res *Result, ob
 	}
 	candidates = append(candidates, v.accepted)
 
+	// Distinct candidates in priority order: envelope first, then the
+	// turn's candidates newest-first, then the previously accepted URL.
+	distinct := make([]string, 0, len(candidates))
 	seen := make(map[string]struct{}, len(candidates))
-	lookups := 0
+	for _, c := range candidates {
+		if c == "" {
+			continue
+		}
+		if _, dup := seen[c]; dup {
+			continue
+		}
+		seen[c] = struct{}{}
+		distinct = append(distinct, c)
+	}
+	// A previously accepted URL short-circuits: everything after its
+	// first occurrence is never evaluated, so it is never fetched.
+	acceptedPos := -1
+	for i, c := range distinct {
+		if c == v.accepted && v.accepted != "" {
+			acceptedPos = i
+			break
+		}
+	}
+	eval := distinct
+	if acceptedPos >= 0 {
+		eval = distinct[:acceptedPos+1]
+	}
+	// Collect the same-repository pull refs a batched remote read must
+	// cover. Other-repository and malformed URLs are refused without a
+	// lookup; already-refused URLs are skipped without a lookup or a
+	// rejection, exactly like the per-candidate path they replace.
+	type need struct {
+		url    string
+		number int
+	}
+	var needs []need
+	needSet := map[string]struct{}{}
+	branchRef := ""
+	if v.branch != "" {
+		branchRef = "refs/heads/" + v.branch
+	}
+	for _, c := range eval {
+		if c == v.accepted && v.accepted != "" {
+			continue
+		}
+		if v.outcomes[c] == candidateRefused {
+			continue
+		}
+		slug, number, err := parseCanonicalGitHubPullRequestURL(c)
+		if err != nil || v.repository == "" || normalizeGitHubRepositorySlug(slug) != v.repository {
+			continue
+		}
+		if _, dup := needSet[c]; dup {
+			continue
+		}
+		needSet[c] = struct{}{}
+		needs = append(needs, need{url: c, number: number})
+	}
+	var found map[string]string
+	var lookupErr error
+	if len(needs) > 0 {
+		refs := make([]string, 0, len(needs)+1)
+		for _, n := range needs {
+			refs = append(refs, fmt.Sprintf("refs/pull/%d/head", n.number))
+		}
+		if branchRef != "" {
+			refs = append(refs, branchRef)
+		}
+		lookup := v.lookup
+		if lookup == nil {
+			lookup = originRefs
+		}
+		found, lookupErr = lookup(ctx, v.worktreePath, refs...)
+		if found == nil {
+			found = map[string]string{}
+		}
+	}
+	// The checkout's own commit is read once, only when a candidate's
+	// pull head is present but is not the session branch's head.
+	var localHEAD string
+	var localErr error
+	localRead := false
+	readLocal := func() (string, error) {
+		if !localRead {
+			localRead = true
+			shaCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+			localHEAD, localErr = captureHeadSHA(shaCtx, v.worktreePath)
+		}
+		return localHEAD, localErr
+	}
 	accepted := ""
-	for _, candidate := range candidates {
-		if candidate == "" {
-			continue
-		}
-		if _, dup := seen[candidate]; dup {
-			continue
-		}
-		seen[candidate] = struct{}{}
-		if candidate == v.accepted {
+	for _, candidate := range eval {
+		if candidate == v.accepted && v.accepted != "" {
 			accepted = candidate
 			break
 		}
 		if v.outcomes[candidate] == candidateRefused {
 			continue
 		}
-		if lookups >= maxPullRequestLookups {
-			rejected = append(rejected, pullRequestRejection{url: candidate, reason: "not checked: lookup budget spent"})
+		slug, number, err := parseCanonicalGitHubPullRequestURL(candidate)
+		if err != nil {
+			v.outcomes[candidate] = candidateRefused
+			rejected = append(rejected, pullRequestRejection{url: candidate, reason: "not a canonical GitHub pull request URL"})
 			continue
 		}
-		outcome, reason, lookedUp := v.verify(ctx, candidate)
-		if lookedUp {
-			lookups++
+		if v.repository == "" {
+			v.outcomes[candidate] = candidateRefused
+			rejected = append(rejected, pullRequestRejection{url: candidate, reason: "the session's repository is not a GitHub repository"})
+			continue
 		}
-		v.outcomes[candidate] = outcome
-		if outcome == candidateAccepted {
+		if normalizeGitHubRepositorySlug(slug) != v.repository {
+			v.outcomes[candidate] = candidateRefused
+			rejected = append(rejected, pullRequestRejection{url: candidate, reason: "the pull request is on another repository"})
+			continue
+		}
+		if lookupErr != nil {
+			v.outcomes[candidate] = candidateUnconfirmed
+			rejected = append(rejected, pullRequestRejection{url: candidate, reason: "could not read the pull request from the session's remote: " + lookupErr.Error()})
+			continue
+		}
+		pullRef := fmt.Sprintf("refs/pull/%d/head", number)
+		pullHead := found[pullRef]
+		if pullHead == "" {
+			v.outcomes[candidate] = candidateRefused
+			rejected = append(rejected, pullRequestRejection{url: candidate, reason: "no such pull request on the session's repository"})
+			continue
+		}
+		if branchRef != "" && found[branchRef] == pullHead {
+			v.outcomes[candidate] = candidateAccepted
 			accepted = candidate
 			break
 		}
-		rejected = append(rejected, pullRequestRejection{url: candidate, reason: reason})
+		if sha, shaErr := readLocal(); shaErr == nil && sha == pullHead {
+			v.outcomes[candidate] = candidateAccepted
+			accepted = candidate
+			break
+		}
+		v.outcomes[candidate] = candidateHeadMismatch
+		rejected = append(rejected, pullRequestRejection{url: candidate, reason: "the pull request's head is neither the session branch nor the session commit"})
 	}
 	v.accepted = accepted
 	res.PullRequestURL = accepted
