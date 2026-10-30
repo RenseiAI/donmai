@@ -121,7 +121,7 @@ jobs:
         id: go-template
         run: |
           set -euo pipefail
-          if [[ -f worker/e2b/e2b.go.Dockerfile ]]; then
+          if node -e "process.exit(require(process.env.RUNNER_TEMP + '/build-e2b-template.cjs').hasGoDockerfile('worker/e2b') ? 0 : 1)"; then
             echo "present=true" >> "${GITHUB_OUTPUT}"
             echo "Go template present in this release checkout."
           else

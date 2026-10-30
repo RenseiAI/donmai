@@ -373,3 +373,84 @@ test('historical base-only checkout still builds the base template (no Go Docker
     fs.rmSync(goDir, { recursive: true, force: true })
   }
 })
+
+function resolveWorkflowPath() {
+  const candidates = []
+  if (process.env.DONMAI_REPO_ROOT) {
+    candidates.push(
+      path.join(process.env.DONMAI_REPO_ROOT, '.github', 'workflows', 'e2b-template.yml')
+    )
+  }
+  candidates.push(path.join(process.cwd(), '.github', 'workflows', 'e2b-template.yml'))
+  candidates.push(path.join(__dirname, '..', '.github', 'workflows', 'e2b-template.yml'))
+  let dir = __dirname
+  for (let i = 0; i < 6; i += 1) {
+    candidates.push(path.join(dir, '.github', 'workflows', 'e2b-template.yml'))
+    dir = path.dirname(dir)
+  }
+  for (const candidate of candidates) {
+    try {
+      if (fs.existsSync(candidate)) {
+        return candidate
+      }
+    } catch {
+      // try the next candidate
+    }
+  }
+  throw new Error('could not find .github/workflows/e2b-template.yml')
+}
+
+function workflowStepBlock(workflow, stepName) {
+  const marker = `- name: ${stepName}`
+  const start = workflow.indexOf(marker)
+  assert.ok(start !== -1, `expected workflow step ${JSON.stringify(stepName)}`)
+  const next = workflow.indexOf('\n      - name: ', start + marker.length)
+  return next === -1 ? workflow.slice(start) : workflow.slice(start, next)
+}
+
+test('release workflow gates the Go template build on the release checkout', () => {
+  // Load-bearing guard for the historical base-only retry: the staged suites
+  // run before the release checkout, and the Go build/verification only run
+  // when the release contains worker/e2b/e2b.go.Dockerfile. Deleting either
+  // Go-step condition or reverting this workflow to the base-only version
+  // must fail this test.
+  const workflow = fs.readFileSync(resolveWorkflowPath(), 'utf8')
+  assert.ok(
+    workflow.indexOf('Test E2B version assertion') < workflow.indexOf('Checkout release tag'),
+    'staged version tests must run before the release checkout so assertions stay paired with their fixtures'
+  )
+  const detect = workflowStepBlock(workflow, 'Detect Go template in release checkout')
+  assert.match(detect, /hasGoDockerfile/, 'detection must call the production hasGoDockerfile helper')
+  assert.match(detect, /present=true/, 'detection must set present=true for Go releases')
+  assert.match(detect, /present=false/, 'detection must set present=false for base-only retries')
+  const goBuild = workflowStepBlock(workflow, 'Build versioned E2B Go template')
+  assert.match(
+    goBuild,
+    /steps\.go-template\.outputs\.present\s*==\s*'true'/,
+    'Go template build must be gated on the release containing the Go Dockerfile'
+  )
+  assert.match(goBuild, /E2B_CPU_COUNT:\s*4/, 'Go template build must request 4 vCPU')
+  assert.match(goBuild, /E2B_MEMORY_MB:\s*8192/, 'Go template build must request 8192 MB')
+  assert.match(goBuild, /E2B_DOCKERFILE:\s*e2b\.go\.Dockerfile/, 'Go build must select the Go Dockerfile')
+  const baseBuild = workflowStepBlock(workflow, 'Build versioned E2B template')
+  assert.doesNotMatch(
+    baseBuild,
+    /steps\.go-template/,
+    'base template build must stay ungated so historical retries still rebuild it'
+  )
+  assert.doesNotMatch(baseBuild, /E2B_CPU_COUNT/, 'base build must keep default resources')
+  assert.doesNotMatch(baseBuild, /E2B_MEMORY_MB/, 'base build must keep default resources')
+  const conditions = workflow.match(/steps\.go-template\.outputs\.present\s*==\s*'true'/g) || []
+  assert.equal(conditions.length, 2, `both Go steps must be gated, found ${conditions.length}`)
+  // Execute the production presence helper against both release layouts.
+  const withGo = fs.mkdtempSync(path.join(os.tmpdir(), 'build-e2b-workflow-go-'))
+  const withoutGo = fs.mkdtempSync(path.join(os.tmpdir(), 'build-e2b-workflow-base-'))
+  try {
+    fs.writeFileSync(path.join(withGo, 'e2b.go.Dockerfile'), 'FROM x\n')
+    assert.equal(hasGoDockerfile(withGo), true)
+    assert.equal(hasGoDockerfile(withoutGo), false)
+  } finally {
+    fs.rmSync(withGo, { recursive: true, force: true })
+    fs.rmSync(withoutGo, { recursive: true, force: true })
+  }
+})

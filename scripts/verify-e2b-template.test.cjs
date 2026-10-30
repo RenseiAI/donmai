@@ -879,3 +879,81 @@ test('hasGoTemplate reports the Go template only when the Go Dockerfile exists',
     fs.rmSync(withoutGo, { recursive: true, force: true })
   }
 })
+
+function resolveWorkflowPath() {
+  const candidates = []
+  if (process.env.DONMAI_REPO_ROOT) {
+    candidates.push(
+      path.join(process.env.DONMAI_REPO_ROOT, '.github', 'workflows', 'e2b-template.yml')
+    )
+  }
+  candidates.push(path.join(process.cwd(), '.github', 'workflows', 'e2b-template.yml'))
+  candidates.push(path.join(__dirname, '..', '.github', 'workflows', 'e2b-template.yml'))
+  let dir = __dirname
+  for (let i = 0; i < 6; i += 1) {
+    candidates.push(path.join(dir, '.github', 'workflows', 'e2b-template.yml'))
+    dir = path.dirname(dir)
+  }
+  for (const candidate of candidates) {
+    try {
+      if (fs.existsSync(candidate)) {
+        return candidate
+      }
+    } catch {
+      // try the next candidate
+    }
+  }
+  throw new Error('could not find .github/workflows/e2b-template.yml')
+}
+
+function workflowStepBlock(workflow, stepName) {
+  const marker = `- name: ${stepName}`
+  const start = workflow.indexOf(marker)
+  assert.ok(start !== -1, `expected workflow step ${JSON.stringify(stepName)}`)
+  const next = workflow.indexOf('\n      - name: ', start + marker.length)
+  return next === -1 ? workflow.slice(start) : workflow.slice(start, next)
+}
+
+test('release workflow gates Go toolchain verification on the release checkout', () => {
+  // Load-bearing guard for the historical base-only retry: the Go toolchain
+  // verification only runs when the release contains the Go Dockerfile.
+  // Deleting either Go-step condition or reverting this workflow to the
+  // base-only version must fail this test.
+  const workflow = fs.readFileSync(resolveWorkflowPath(), 'utf8')
+  assert.ok(
+    workflow.indexOf('Test E2B version assertion') < workflow.indexOf('Checkout release tag'),
+    'staged version tests must run before the release checkout so assertions stay paired with their fixtures'
+  )
+  const detect = workflowStepBlock(workflow, 'Detect Go template in release checkout')
+  assert.match(detect, /hasGoDockerfile/, 'detection must call the production hasGoDockerfile helper')
+  assert.match(detect, /present=false/, 'detection must name the base-only retry it preserves')
+  const goVerify = workflowStepBlock(workflow, 'Assert published E2B Go template toolchain')
+  assert.match(
+    goVerify,
+    /steps\.go-template\.outputs\.present\s*==\s*'true'/,
+    'Go toolchain verification must be gated on the release containing the Go Dockerfile'
+  )
+  const baseVerify = workflowStepBlock(workflow, 'Assert published E2B template binary version')
+  assert.doesNotMatch(
+    baseVerify,
+    /steps\.go-template/,
+    'base template verification must stay ungated so historical retries still verify it'
+  )
+  const conditions = workflow.match(/steps\.go-template\.outputs\.present\s*==\s*'true'/g) || []
+  assert.equal(conditions.length, 2, `both Go steps must be gated, found ${conditions.length}`)
+  const summary = workflowStepBlock(workflow, 'Summarize E2B template build')
+  assert.match(summary, /base-only retry/, 'summary must name the base-only retry it preserves')
+  // Execute the production presence helper against both release layouts.
+  const withGo = fs.mkdtempSync(path.join(os.tmpdir(), 'verify-e2b-workflow-go-'))
+  const withoutGo = fs.mkdtempSync(path.join(os.tmpdir(), 'verify-e2b-workflow-base-'))
+  try {
+    fs.mkdirSync(path.join(withGo, 'worker', 'e2b'), { recursive: true })
+    fs.writeFileSync(path.join(withGo, 'worker', 'e2b', 'e2b.go.Dockerfile'), 'FROM x\n')
+    fs.mkdirSync(path.join(withoutGo, 'worker', 'e2b'), { recursive: true })
+    assert.equal(hasGoTemplate(withGo), true)
+    assert.equal(hasGoTemplate(withoutGo), false)
+  } finally {
+    fs.rmSync(withGo, { recursive: true, force: true })
+    fs.rmSync(withoutGo, { recursive: true, force: true })
+  }
+})
