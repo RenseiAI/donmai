@@ -433,6 +433,92 @@ func TestModel_MouseRightClearsEmptyFilter(t *testing.T) {
 	}
 }
 
+// Visible compact rows inside expanded and partial overflow windows select
+// and open detail through the production click path. Width 30 forces the
+// one-line-per-session compact list; cursor 8 sits inside the overflow.
+// Height 12 keeps an expanded window (top and bottom markers): (2,3) is the
+// selected row. Height 6 forces the partial window: (2,2) is the selected
+// row. Inverting the expanded-window marker guard rejects the (2,3) row;
+// deleting the partial-window selection branch rejects the (2,2) row.
+func TestModel_MouseCompactOverflowVisibleOpensDetail(t *testing.T) {
+	m := newMouseModel(t, 30, 12, 8)
+	view := ansi.Strip(m.render())
+	lines := strings.Split(view, "\n")
+	if len(lines) < 2 || !strings.Contains(lines[1], "more") {
+		t.Fatalf("setup: expected compact expanded top marker at row 1:\n%s", view)
+	}
+	wantID := m.visibleCards()[8].SessionID
+	if cmd := mouseClick(m, 2, 3, tea.MouseLeft); cmd != nil {
+		t.Fatal("expanded compact visible click must not dispatch")
+	}
+	if got := m.selectedVisibleID(); got != wantID {
+		t.Fatalf("expanded compact click selected %q, want %q", got, wantID)
+	}
+	if !m.detail {
+		t.Fatal("visible selected compact row at height=12 click=(2,3) must open detail")
+	}
+	mp := newMouseModel(t, 30, 6, 8)
+	view = ansi.Strip(mp.render())
+	lines = strings.Split(view, "\n")
+	if len(lines) < 2 || !strings.Contains(lines[1], "more") {
+		t.Fatalf("setup: expected partial compact top marker at row 1:\n%s", view)
+	}
+	wantPartial := mp.visibleCards()[8].SessionID
+	if cmd := mouseClick(mp, 2, 2, tea.MouseLeft); cmd != nil {
+		t.Fatal("partial compact visible click must not dispatch")
+	}
+	if got := mp.selectedVisibleID(); got != wantPartial {
+		t.Fatalf("partial compact click selected %q, want %q", got, wantPartial)
+	}
+	if !mp.detail {
+		t.Fatal("visible selected compact row at height=6 click=(2,2) must open detail")
+	}
+}
+
+// Terminal edges stay inert through the production click path. A two-row
+// terminal has no grid rows (header plus help only), so (2,1) is the help
+// row and must do nothing; relaxing the pane boundary lets it act on a
+// hidden session. A plain right-click at column zero must preserve an
+// active empty filter and open detail; refusing plain input except at
+// column zero clears them.
+func TestModel_MousePaneBoundaryAndPlainColumnZeroAreInert(t *testing.T) {
+	m := newMouseModel(t, 120, 2, 0)
+	gridH, _ := splitPaneHeights(m.height-2, m.split)
+	if gridH != 0 {
+		t.Fatalf("setup: gridH = %d, want 0 for height 2", gridH)
+	}
+	keep, keepDetail := m.cursor, m.detail
+	keepID := m.selectedVisibleID()
+	if cmd := mouseClick(m, 2, 1, tea.MouseLeft); cmd != nil {
+		t.Fatal("help-row click in a two-row terminal must not dispatch")
+	}
+	if m.cursor != keep || m.detail != keepDetail {
+		t.Fatalf("help-row click in a two-row terminal must be inert (got cursor=%d detail=%v)", m.cursor, m.detail)
+	}
+	if got := m.selectedVisibleID(); got != keepID {
+		t.Fatalf("help-row click selected %q, want %q", got, keepID)
+	}
+	pf := New(Options{Plain: true, HostLabel: "h", Now: func() time.Time { return fixtureNow }})
+	_, _ = pf.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	pf.applySnapshot(Snapshot{Cards: filterTestCards(), Counters: Counters{Sessions: 4, Running: 4}})
+	_, _ = pf.Update(tea.KeyPressMsg{Code: '/', Text: "/"})
+	if !pf.filterActive || pf.filterQuery != "" {
+		t.Fatalf("setup: active empty filter active=%v query=%q", pf.filterActive, pf.filterQuery)
+	}
+	pf.detail = true
+	keepQ, keepCursor := pf.filterQuery, pf.cursor
+	keepPfID := pf.selectedVisibleID()
+	if _, cmd := pf.Update(tea.MouseClickMsg{X: 0, Y: 0, Button: tea.MouseRight}); cmd != nil {
+		t.Fatal("plain right-click at column zero must not dispatch")
+	}
+	if !pf.filterActive || pf.filterQuery != keepQ || pf.cursor != keepCursor || !pf.detail {
+		t.Fatalf("plain right-click at column zero must preserve active filter and detail (active=%v query=%q cursor=%d detail=%v)", pf.filterActive, pf.filterQuery, pf.cursor, pf.detail)
+	}
+	if got := pf.selectedVisibleID(); got != keepPfID {
+		t.Fatalf("plain column-zero click selected %q, want %q", got, keepPfID)
+	}
+}
+
 // AC-3: only interactive bounded views request reporting and react.
 func TestModel_MouseViewPolicy(t *testing.T) {
 	m := newMouseModel(t, 120, 40, 0)
