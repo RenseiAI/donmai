@@ -1147,8 +1147,10 @@ func TestRun_LaterToolChatterKeepsSessionPR(t *testing.T) {
 
 // An earlier unrelated inject URL must not hide the session pull request a
 // later inject reports. Inject 1 reads unrelated PR #99; inject 2 creates
-// the session PR #7, then reports three unrelated PRs and declines. The
+// the session PR #7, then reports eight unrelated PRs and declines. The
 // merged observation keeps both, and the batched verifier still finds #7.
+// Eight is the old window size: with an eight-entry window the union evicted
+// #7 and the envelope kept #99, so settlement lost the session PR.
 func TestRun_EarlierUnrelatedInjectCannotHideLaterSessionPR(t *testing.T) {
 	platform := newRecordingPlatformServer(t)
 	platform.queueInject(heartbeat.InjectPayload{DeliveryID: "dlv-1", Text: "recall: first memory block"})
@@ -1165,11 +1167,11 @@ func TestRun_EarlierUnrelatedInjectCannotHideLaterSessionPR(t *testing.T) {
 	}
 	unrelated := "https://github.com/example/repo/pull/99"
 	var chatter []agent.Event
-	for _, n := range []int{101, 102, 103} {
+	for _, n := range []int{101, 102, 103, 104, 105, 106, 107, 108} {
 		u := fmt.Sprintf("https://github.com/example/repo/pull/%d", n)
 		chatter = append(chatter, toolUse("list", "gh pr list"), toolResult("list", "see "+u))
 	}
-	pulls := map[int]string{7: pullAtSessionCommit, 99: pullAtOtherCommit, 101: pullAtOtherCommit, 102: pullAtOtherCommit, 103: pullAtOtherCommit}
+	pulls := map[int]string{7: pullAtSessionCommit, 99: pullAtOtherCommit, 101: pullAtOtherCommit, 102: pullAtOtherCommit, 103: pullAtOtherCommit, 104: pullAtOtherCommit, 105: pullAtOtherCommit, 106: pullAtOtherCommit, 107: pullAtOtherCommit, 108: pullAtOtherCommit}
 	res, _ := runScriptedSession(t, scriptedSession{
 		workType: "development", repository: followUpRepository, pulls: pulls,
 		heartbeatInterval: 10 * time.Millisecond, platform: platform,
@@ -1185,13 +1187,14 @@ func TestRun_EarlierUnrelatedInjectCannotHideLaterSessionPR(t *testing.T) {
 }
 
 // A genuine session PR reported in narrative before later tool chatter must
-// still verify. Narrative #7 is oldest, four unrelated tool URLs follow,
+// still verify. Narrative #7 is oldest, eight unrelated tool URLs follow,
 // then the turn declines: the verifier checks every candidate in one batch.
+// Eight is the old window size: the narrative hint fell out before the batch.
 func TestRun_NarrativeBeforeToolChatterKeepsSessionPR(t *testing.T) {
 	var events []agent.Event
 	pulls := map[int]string{7: pullAtSessionCommit}
 	events = append(events, say("Opened "+followUpPR+" for review."))
-	for n := 101; n <= 104; n++ {
+	for n := 101; n <= 108; n++ {
 		u := fmt.Sprintf("https://github.com/example/repo/pull/%d", n)
 		events = append(events, toolUse("list", "gh pr list"), toolResult("list", "see "+u))
 		pulls[n] = pullAtOtherCommit
@@ -1231,6 +1234,40 @@ func TestRun_UnverifiedToolURLStillBlockedAfterFollowUp(t *testing.T) {
 	})
 	if res2.FailureMode != FailureAgentBlocked {
 		t.Fatalf("follow-up: FailureMode=%q Status=%q PR=%q; want agent-blocked for unverified tool URL", res2.FailureMode, res2.Status, res2.PullRequestURL)
+	}
+}
+
+// A pull request number with no ref on the session's remote is refused
+// through the production settlement path. The session branch was never
+// pushed either, so both refs read absent: without the missing-pull guard
+// the two empty strings compare equal and the phantom URL would verify.
+func TestRun_MissingPullRequestIsRefused(t *testing.T) {
+	missing := "https://github.com/example/repo/pull/404"
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType: "development", repository: followUpRepository, pulls: map[int]string{},
+		turns: []verdictScriptTurn{{events: []agent.Event{toolUse("pr", "gh pr create --fill"), toolResult("pr", missing)}, text: "Opened the pull request."}},
+	})
+	if res.PullRequestURL != "" {
+		t.Fatalf("PullRequestURL = %q; want none (no such pull request on the session's repository)", res.PullRequestURL)
+	}
+}
+
+// A same-number pull request on another repository never consumes the
+// session's batched ref. The foreign URL is reported first so it leads the
+// settlement order; the session's own PR follows. Production refuses the
+// foreign URL and accepts the session's; without the repository guard the
+// foreign URL would verify against the session's own pull head.
+func TestRun_ForeignRepositorySharingNumberIsRefused(t *testing.T) {
+	foreign := "https://github.com/other/repo/pull/7"
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType: "development", repository: followUpRepository, pulls: map[int]string{7: pullAtSessionCommit},
+		turns: []verdictScriptTurn{{events: []agent.Event{
+			toolUse("a", "gh pr view"), toolResult("a", "see "+foreign),
+			toolUse("b", "gh pr create --fill"), toolResult("b", "opened "+followUpPR),
+		}, text: "Opened the session pull request."}},
+	})
+	if res.PullRequestURL != followUpPR {
+		t.Fatalf("PullRequestURL = %q; want the session's own %q (foreign URL must not consume its ref)", res.PullRequestURL, followUpPR)
 	}
 }
 

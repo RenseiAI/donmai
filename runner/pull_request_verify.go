@@ -58,8 +58,13 @@ const pullRequestLookupTimeout = 15 * time.Second
 // maxPullRequestCandidates bounds the distinct candidate URLs a stream keeps.
 // Verification reads them in one batched remote lookup, so a transcript full
 // of URLs costs a single ls-remote (bounded by pullRequestLookupTimeout)
-// instead of stalling the session end.
-const maxPullRequestCandidates = 8
+// instead of stalling the session end. The window is wide on purpose: the
+// session pull request is verified, not voted on, so every hint the stream
+// carried must still be present when the verifier runs. An eight-entry
+// window let eight unrelated URLs evict a genuine session pull request
+// before verification (narrative oldest, or a later inject turn's trusted
+// URL after union), flipping a landed session to agent-blocked.
+const maxPullRequestCandidates = 64
 
 // pullRequestRefLookup reads refs from the checkout's origin remote and
 // returns the commit of each named ref that exists there.
