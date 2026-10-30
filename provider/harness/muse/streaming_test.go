@@ -204,3 +204,75 @@ func TestStreaming_GapAndBounds(t *testing.T) {
 		t.Fatalf("summary boundary exceeded retained-text bound: %v", got)
 	}
 }
+
+// TestBurstPreservesTerminal pins the burst-overflow contract: a slow
+// consumer that never drains while 301 assistant deltas stream must still
+// observe the authoritative assistant completion and the terminal result.
+// Progress liveness is best-effort and never takes a reserved slot, so the
+// completion and terminal still fit after the burst. Drives the production
+// Handle.handleNotification + emitter path with no concurrent drain.
+func TestBurstPreservesTerminal(t *testing.T) {
+	h := newHandle(nil, agent.Spec{Prompt: "x"}, NewSpawnPlan(agent.Spec{Prompt: "x"}, t.TempDir()), HandleOptions{})
+	sid := "33333333-3333-7333-8333-333333333333"
+	turnID := "44444444-4444-7444-8444-444444444444"
+	h.setSessionID(sid)
+	h.setCurrentTurnID(turnID)
+	itemID := "m1"
+	started, err := json.Marshal(map[string]any{
+		"sessionId": sid, "viewCursor": "cursor-0",
+		"item": map[string]any{"itemId": itemID, "kind": "agentMessage", "revision": 1, "status": "inProgress", "text": "", "turnId": turnID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.handleNotification(context.Background(), notification{Method: "item/started", Params: started})
+	const burst = 301
+	for i := 0; i < burst; i++ {
+		delta, err := json.Marshal(map[string]any{"sessionId": sid, "viewCursor": "cursor-0", "itemId": itemID, "field": "text", "delta": "a"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		h.handleNotification(context.Background(), notification{Method: "item/delta", Params: delta})
+	}
+	full := strings.Repeat("a", burst)
+	completed, err := json.Marshal(map[string]any{
+		"sessionId": sid, "viewCursor": "cursor-1",
+		"item": map[string]any{"itemId": itemID, "kind": "agentMessage", "revision": 2, "status": "completed", "text": full, "turnId": turnID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.handleNotification(context.Background(), notification{Method: "item/completed", Params: completed})
+	turnDone, err := json.Marshal(map[string]any{"sessionId": sid, "viewCursor": "cursor-end", "turnId": turnID, "terminal": "completed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := h.handleNotification(context.Background(), notification{Method: "turn/completed", Params: turnDone})
+	if !done {
+		t.Fatalf("turn/completed did not report terminal")
+	}
+	var assistant, result int
+	for {
+		select {
+		case ev := <-h.Events():
+			switch e := ev.(type) {
+			case agent.AssistantTextEvent:
+				if e.Text != full {
+					t.Errorf("assistant text len=%d, want %d", len(e.Text), len(full))
+				} else {
+					assistant++
+				}
+			case agent.ResultEvent:
+				if e.Success {
+					result++
+				}
+			}
+		default:
+			goto drained
+		}
+	}
+drained:
+	if assistant == 0 || result == 0 {
+		t.Fatalf("burst lost final events: assistant=%d result=%d handlerDone=%v", assistant, result, done)
+	}
+}

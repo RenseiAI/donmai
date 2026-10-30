@@ -25,6 +25,14 @@ const stopGracePeriod = 5 * time.Second
 // stderr tail (same bounded drop-oldest shape).
 const stderrRetentionBytes = 8 * 1024
 
+// streamProgressReservedSlots reserves buffer slots for terminal-adjacent
+// events (assistant completion, turn usage, result) so a burst of
+// content-free stream-progress liveness can never fill the events channel
+// and silently drop the verdict. Progress is best-effort: it is dropped
+// once the buffer holds cap-reserved events, leaving the reserved tail
+// for the authoritative completion and terminal result.
+const streamProgressReservedSlots = 8
+
 // Handle is one live MSP session: exactly one `muse serve` child, one
 // session id, many turns. It implements agent.Handle.
 //
@@ -814,18 +822,35 @@ func (h *Handle) closeEvents() {
 }
 
 // emit publishes an event on the events channel without blocking. If
-// the channel is full, the event is dropped silently.
+// the channel is full, the event is dropped silently, except that
+// content-free stream-progress liveness never takes a reserved slot:
+// once the buffer holds cap-reserved events it is dropped early so the
+// authoritative assistant completion and terminal result still fit.
 func (h *Handle) emit(ev agent.Event) {
 	h.eventsMu.RLock()
 	defer h.eventsMu.RUnlock()
 	if h.eventsClosed.Load() {
 		return
 	}
+	if isStreamProgress(ev) {
+		if n := cap(h.events); n > streamProgressReservedSlots && len(h.events) >= n-streamProgressReservedSlots {
+			return
+		}
+	}
 	select {
 	case h.events <- ev:
 	case <-h.closed:
 	default:
 	}
+}
+
+// isStreamProgress reports whether ev is content-free streaming liveness.
+// Such events exist only to disarm the runner stall detector; the complete
+// message still arrives on the completion event, so they are safe to drop
+// first when the buffer fills.
+func isStreamProgress(ev agent.Event) bool {
+	sys, ok := ev.(agent.SystemEvent)
+	return ok && sys.Subtype == agent.SystemSubtypeStreamProgress
 }
 
 func approvalToolName(req ApprovalRequest) string {
