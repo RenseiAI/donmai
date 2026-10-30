@@ -326,11 +326,14 @@ func (r *Runner) preserveUnpublishedWork(qw QueuedWork, res *Result) bool {
 
 // archiveTerminalEvidence writes the result's terminal transcript
 // descriptors into this teardown's archive directory (created on first use
-// via dirFor, shared with any patch this teardown archives). Only the
-// descriptor paths are recorded; the transcript files themselves are never
-// read, opened, uploaded, or placed on any wire surface. A nil result, a
-// status outside failed/stopped, or no descriptors is a no-op. Failures
-// are returned so the caller can log them; they never keep the workarea.
+// via dirFor, shared with any patch this teardown archives). The manifest
+// records only the descriptor paths; the transcript files themselves are
+// never uploaded or placed on any wire surface, but readable ones are also
+// copied next to the manifest as verified evidence-<index>-<base> files.
+// A nil result, a status outside failed/stopped, or no descriptors is a
+// no-op. Manifest failures are returned so the caller can log them; they
+// never keep the workarea. Copy failures are best-effort per file and
+// never fail the manifest or the teardown.
 func (r *Runner) archiveTerminalEvidence(sessionID string, res *Result, dirFor func() (string, error)) error {
 	if res == nil || !shouldPreserveTerminalEvidence(res.Status) || len(res.terminalTranscripts) == 0 {
 		return nil
@@ -367,6 +370,10 @@ func (r *Runner) archiveTerminalEvidence(sessionID string, res *Result, dirFor f
 		"status", res.Status,
 		"transcripts", len(paths),
 	)
+	// Best-effort content alongside the manifest, in the same directory:
+	// readable transcripts are copied with verification, unreadable ones
+	// are skipped with a log line. Copies never fail this function.
+	r.copyTerminalEvidenceContents(sessionID, res, dir)
 	return nil
 }
 
