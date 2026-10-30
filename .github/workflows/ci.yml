@@ -48,6 +48,24 @@ jobs:
       - name: Release workflow contract tests
         run: bash scripts/test-release-workflows.sh
 
+  # flake-policy-decision: no-retry
+  # Merge-group flake policy: merge-group test jobs run once and never
+  # retry. Causal repairs cover the known flakes (pinned runner, skip
+  # guards, live-test liveness checks), so a retry would only mask a
+  # deterministic failure and stall the queue. Inventory: test keeps its
+  # go-test coverage, macos-confinement keeps its darwin live suite,
+  # linux-confinement keeps its bubblewrap suite. See internal/mergegroup.
+  flake-policy:
+    name: merge-group flake policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Enforce flake policy
+        run: GOWORK=off go test -race -count=1 ./internal/mergegroup/...
 
   test:
     # Pinned: ubuntu-latest moved to 26.04, where the ptyhost locale, signal-guard
