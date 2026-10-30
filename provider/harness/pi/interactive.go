@@ -184,7 +184,15 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 		removeCredentials()
 		return nil, err
 	}
-	return newInteractiveStateLossHandle(handle, layout.root, tailer), nil
+	wrappedHandle := newInteractiveStateLossHandle(handle, layout.root, tailer)
+	// Claim the layout root for overlap detection. Acquired after the child
+	// started but before it can write its transcript, so a concurrent
+	// session in the same checkout contaminates both leases and each later
+	// refuses rather than attributing the other's transcript. Held until the
+	// evidence is collected (released there); sequential reuse after
+	// collection sees an empty set.
+	wrappedHandle.evidenceClaim = acquirePiEvidenceClaim(layout.root)
+	return wrappedHandle, nil
 }
 
 // noticeClaimDeliveryID is the AdditionalExtensions ID under which a

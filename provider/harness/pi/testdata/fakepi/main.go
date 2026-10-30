@@ -160,7 +160,7 @@ func main() {
 			if sessionDelay > 0 {
 				time.Sleep(sessionDelay)
 			}
-			runTurn(out, sessionDir)
+			runTurn(out, sessionDir, sessionID)
 		case "abort":
 			return
 		}
@@ -172,12 +172,12 @@ func main() {
 // enough for handle.go's mapEvent to produce an AssistantTextEvent, an
 // LlmCallEvent and a ResultEvent, which is what the load harness's
 // consumeEvents-equivalent and the runner wait on.
-func runTurn(out *bufio.Writer, sessionDir string) {
+func runTurn(out *bufio.Writer, sessionDir, sessionID string) {
 	reply := os.Getenv(replyEnvVar)
 	if reply == "" {
 		reply = "ok"
 	}
-	maybeWriteEvidenceTranscript(sessionDir)
+	maybeWriteEvidenceTranscript(sessionDir, sessionID)
 	writeEvent(out, map[string]any{"type": "agent_start"})
 	writeEvent(out, map[string]any{
 		"type":                  "message_update",
@@ -202,7 +202,7 @@ func runTurn(out *bufio.Writer, sessionDir string) {
 // transcript. The last line carries FAKEPI_TRANSCRIPT_LAST_LINE (or a
 // default marker) so tests can prove the trailing write survives the
 // session. Best-effort: a write failure never fails the turn.
-func maybeWriteEvidenceTranscript(sessionDir string) {
+func maybeWriteEvidenceTranscript(sessionDir, sessionID string) {
 	if os.Getenv("FAKEPI_WRITE_TRANSCRIPT") != "1" || sessionDir == "" {
 		return
 	}
@@ -213,8 +213,19 @@ func maybeWriteEvidenceTranscript(sessionDir string) {
 	if last == "" {
 		last = "FINAL_TURN_MARKER"
 	}
-	path := filepath.Join(sessionDir, "20990101T000000Z_evidence.jsonl")
-	//nolint:gosec // G304: path joins the harness-provided session dir with a fixed fixture name.
+	// Session-scoped filename (like real pi's <timestamp>_<sessionID>.jsonl):
+	// concurrent sessions in one checkout must not share a transcript file.
+	safeID := strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			return r
+		}
+		return '_'
+	}, sessionID)
+	if safeID == "" {
+		safeID = "evidence"
+	}
+	path := filepath.Join(sessionDir, "20990101T000000Z_"+safeID+".jsonl")
+	//nolint:gosec // G304: path joins the harness-provided session dir with a session-scoped fixture name.
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return

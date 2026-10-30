@@ -464,3 +464,251 @@ printf '{"type":"message","id":"last-line","message":{"role":"assistant","conten
 		t.Fatalf("interactive transcript mixes the previous session's marker %q", prevMarker)
 	}
 }
+
+// TestTerminalEvidence_HeadlessBaselineIncompleteRefuses drives the production
+// headless Spawn entry with a failed pre-spawn scan: a previous transcript
+// sits under sessions/ while that directory is unreadable at snapshot time.
+// The snapshot is incomplete, so TerminalTranscripts must refuse after Stop
+// rather than misattributing the previous session's transcript.
+//
+// RED proof: ignore the walk error in snapshotPiTranscriptBaseline (always
+// report complete) and this test finds descriptors instead of a refusal.
+func TestTerminalEvidence_HeadlessBaselineIncompleteRefuses(t *testing.T) {
+	bin := buildEvidenceFakePi(t)
+	workdir := t.TempDir()
+	prevRoot := sessionStateRoot(agent.Spec{Cwd: workdir})
+	sessionsDir := filepath.Join(prevRoot, "sessions")
+	if err := os.MkdirAll(sessionsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeTranscriptLine(t, filepath.Join(sessionsDir, "20980101T000000Z_old.jsonl"), transcriptMessage("old", map[string]any{
+		"role": "assistant", "content": []any{map[string]any{"type": "text", "text": "old"}},
+	}))
+	if err := os.Chmod(sessionsDir, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.ReadDir(sessionsDir); err == nil {
+		_ = os.Chmod(sessionsDir, 0o700) //nolint:gosec // G302: test fixture dir restore needs the execute bit, same 0o700 as MkdirAll
+		t.Skip("unreadable-dir probe needs non-root EACCES; ReadDir succeeded")
+	}
+	// Restored after the child starts (baseline already taken while
+	// unreadable), so the child can write and the post-stop scan succeeds.
+	restore := func() { _ = os.Chmod(sessionsDir, 0o700) } //nolint:gosec // G302: test fixture dir restore needs the execute bit, same 0o700 as MkdirAll
+	t.Cleanup(restore)
+	t.Setenv("FAKEPI_WRITE_TRANSCRIPT", "1")
+	t.Setenv("FAKEPI_TRANSCRIPT_LAST_LINE", "BASELINE_INCOMPLETE_HEADLESS")
+	t.Setenv("FAKEPI_REPLY", "incomplete turn done")
+	p, err := New(Options{
+		PiBin:            bin,
+		HandshakeTimeout: 20 * time.Second,
+		VersionProbe:     func(context.Context, string) (string, error) { return PinnedVersion, nil },
+		afterChildStart:  restore,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Shutdown(context.Background()) })
+	h, err := p.Spawn(context.Background(), agent.Spec{Cwd: workdir, Prompt: "go"})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	drainToTerminal(t, h)
+	if err := h.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	capable, ok := h.(agent.TerminalTranscriptCapable)
+	if !ok {
+		t.Fatal("headless handle does not expose the terminal-transcript capability")
+	}
+	if descs, err := capable.TerminalTranscripts(); err == nil || len(descs) != 0 {
+		t.Fatalf("TerminalTranscripts = %+v, err = %v; want refusal with no descriptors when the baseline scan failed", descs, err)
+	}
+}
+
+// TestTerminalEvidence_InteractiveBaselineIncompleteRefuses drives the
+// production interactive Spawn entry with a failed pre-spawn tailer scan and
+// proves the wrapper refuses after the final flush.
+//
+// RED proof: ignore the walk error in newInteractiveTranscriptTailer and the
+// post-flush call returns the previous session's transcript instead of a
+// refusal.
+func TestTerminalEvidence_InteractiveBaselineIncompleteRefuses(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("pty spawn tests are unix-only")
+	}
+	workdir := t.TempDir()
+	prevRoot := sessionStateRoot(agent.Spec{Cwd: workdir})
+	sessionsDir := filepath.Join(prevRoot, "sessions")
+	if err := os.MkdirAll(sessionsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeTranscriptLine(t, filepath.Join(sessionsDir, "20980101T000000Z_old.jsonl"), transcriptMessage("old", map[string]any{
+		"role": "assistant", "content": []any{map[string]any{"type": "text", "text": "old"}},
+	}))
+	if err := os.Chmod(sessionsDir, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.ReadDir(sessionsDir); err == nil {
+		_ = os.Chmod(sessionsDir, 0o700) //nolint:gosec // G302: test fixture dir restore needs the execute bit, same 0o700 as MkdirAll
+		t.Skip("unreadable-dir probe needs non-root EACCES; ReadDir succeeded")
+	}
+	script := fakePiTranscriptPrelude + `
+sleep 0.2
+tool_line final FINAL_TOOL
+`
+	p := newFakeInteractivePiProvider(t, script)
+	h, err := p.Spawn(context.Background(), agent.Spec{
+		Cwd:         workdir,
+		Interactive: &agent.InteractiveSpec{Cols: 80, Rows: 24},
+	})
+	if err != nil {
+		_ = os.Chmod(sessionsDir, 0o700) //nolint:gosec // G302: test fixture dir restore needs the execute bit, same 0o700 as MkdirAll
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+	// Baseline already taken while unreadable; restore so the child can run
+	// and the post-flush scan succeeds.
+	if err := os.Chmod(sessionsDir, 0o700); err != nil { //nolint:gosec // G302: test fixture dir restore needs the execute bit, same 0o700 as MkdirAll
+		t.Fatal(err)
+	}
+	capable, ok := h.(agent.TerminalTranscriptCapable)
+	if !ok {
+		t.Fatal("interactive handle does not expose the terminal-transcript capability")
+	}
+	flusher, ok := h.(agent.InteractiveActivityFlusher)
+	if !ok {
+		t.Fatal("interactive handle does not signal its activity flush")
+	}
+	select {
+	case <-flusher.ActivityFlushed():
+	case <-time.After(20 * time.Second):
+		t.Fatal("timed out waiting for the interactive final flush")
+	}
+	if descs, err := capable.TerminalTranscripts(); err == nil || len(descs) != 0 {
+		t.Fatalf("TerminalTranscripts = %+v, err = %v; want refusal with no descriptors when the tailer baseline failed", descs, err)
+	}
+}
+
+// TestTerminalEvidence_HeadlessConcurrentOverlapRefuses spawns two headless
+// sessions in the same checkout while the first is still live. Each child
+// writes its own session-scoped transcript, so a created-after-spawn filter
+// alone would return both to each handle. Overlap contaminates both leases,
+// so each handle must refuse rather than attribute the other's transcript.
+//
+// RED proof: never acquire the evidence lease (nil claim) and each handle
+// returns both transcripts instead of refusing.
+func TestTerminalEvidence_HeadlessConcurrentOverlapRefuses(t *testing.T) {
+	bin := buildEvidenceFakePi(t)
+	workdir := t.TempDir()
+	t.Setenv("FAKEPI_WRITE_TRANSCRIPT", "1")
+	t.Setenv("FAKEPI_TRANSCRIPT_LAST_LINE", "CONCURRENT_HEADLESS")
+	t.Setenv("FAKEPI_REPLY", "concurrent turn done")
+	newHeadless := func() *Provider {
+		t.Helper()
+		p, err := New(Options{
+			PiBin:            bin,
+			HandshakeTimeout: 20 * time.Second,
+			VersionProbe:     func(context.Context, string) (string, error) { return PinnedVersion, nil },
+		})
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		t.Cleanup(func() { _ = p.Shutdown(context.Background()) })
+		return p
+	}
+	pA, pB := newHeadless(), newHeadless()
+	hA, err := pA.Spawn(context.Background(), agent.Spec{Cwd: workdir, Prompt: "go"})
+	if err != nil {
+		t.Fatalf("Spawn A: %v", err)
+	}
+	hB, err := pB.Spawn(context.Background(), agent.Spec{Cwd: workdir, Prompt: "go"})
+	if err != nil {
+		_ = hA.Stop(context.Background())
+		t.Fatalf("Spawn B: %v", err)
+	}
+	drainToTerminal(t, hA)
+	drainToTerminal(t, hB)
+	if err := hA.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop A: %v", err)
+	}
+	if err := hB.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop B: %v", err)
+	}
+	for name, h := range map[string]agent.Handle{"A": hA, "B": hB} {
+		capable, ok := h.(agent.TerminalTranscriptCapable)
+		if !ok {
+			t.Fatalf("handle %s does not expose the terminal-transcript capability", name)
+		}
+		if descs, err := capable.TerminalTranscripts(); err == nil || len(descs) != 0 {
+			t.Fatalf("handle %s TerminalTranscripts = %+v, err = %v; want refusal when sessions overlapped", name, descs, err)
+		}
+	}
+}
+
+// TestTerminalEvidence_InteractiveConcurrentOverlapRefuses spawns two
+// interactive sessions in the same checkout while the first is still live,
+// each writing a distinct transcript file. Each handle must refuse rather
+// than return the other's transcript.
+//
+// RED proof: never acquire the evidence lease (nil claim) and each handle
+// returns both transcripts instead of refusing.
+func TestTerminalEvidence_InteractiveConcurrentOverlapRefuses(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("pty spawn tests are unix-only")
+	}
+	workdir := t.TempDir()
+	scriptFor := func(name string) string {
+		return `
+dir=""
+while [ $# -gt 0 ]; do
+  if [ "$1" = "--session-dir" ]; then dir="$2"; shift 2; continue; fi
+  shift
+done
+live="$dir/2099-01-01T00-00-00-000Z_` + name + `.jsonl"
+printf '{"type":"message","id":"` + name + `","message":{"role":"assistant","content":[{"type":"text","text":"` + name + `"}]}}\n' >> "$live"
+sleep 5
+`
+	}
+	pA := newFakeInteractivePiProvider(t, scriptFor("live-A"))
+	pB := newFakeInteractivePiProvider(t, scriptFor("live-B"))
+	hA, err := pA.Spawn(context.Background(), agent.Spec{
+		Cwd:         workdir,
+		Interactive: &agent.InteractiveSpec{Cols: 80, Rows: 24},
+	})
+	if err != nil {
+		t.Fatalf("Spawn A: %v", err)
+	}
+	t.Cleanup(func() { _ = hA.Stop(context.Background()) })
+	hB, err := pB.Spawn(context.Background(), agent.Spec{
+		Cwd:         workdir,
+		Interactive: &agent.InteractiveSpec{Cols: 80, Rows: 24},
+	})
+	if err != nil {
+		t.Fatalf("Spawn B: %v", err)
+	}
+	t.Cleanup(func() { _ = hB.Stop(context.Background()) })
+	for name, h := range map[string]agent.Handle{"A": hA, "B": hB} {
+		flusher, ok := h.(agent.InteractiveActivityFlusher)
+		if !ok {
+			t.Fatalf("handle %s does not signal its activity flush", name)
+		}
+		select {
+		case <-flusher.ActivityFlushed():
+		case <-time.After(20 * time.Second):
+			t.Fatalf("handle %s timed out waiting for the interactive final flush", name)
+		}
+	}
+	// Stopping reaps the sleepers so the test does not wait out the full
+	// sleep; the flush already happened on Done.
+	_ = hA.Stop(context.Background())
+	_ = hB.Stop(context.Background())
+	for name, h := range map[string]agent.Handle{"A": hA, "B": hB} {
+		capable, ok := h.(agent.TerminalTranscriptCapable)
+		if !ok {
+			t.Fatalf("handle %s does not expose the terminal-transcript capability", name)
+		}
+		if descs, err := capable.TerminalTranscripts(); err == nil || len(descs) != 0 {
+			t.Fatalf("handle %s TerminalTranscripts = %+v, err = %v; want refusal when sessions overlapped", name, descs, err)
+		}
+	}
+}

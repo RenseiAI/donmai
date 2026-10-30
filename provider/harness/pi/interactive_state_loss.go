@@ -159,6 +159,11 @@ type interactiveStateLossHandle struct {
 	// reused workarea never attributes a previous session's transcript to
 	// this one. Nil means the root held no transcript at spawn.
 	evidenceBaseline map[string]struct{}
+	// evidenceIncomplete marks a failed pre-spawn scan (copied from the
+	// tailer); evidence refuses then. evidenceClaim detects concurrent
+	// sessions sharing the root; a contaminated lease refuses.
+	evidenceIncomplete bool
+	evidenceClaim      *piEvidenceClaim
 	// activityFlushed closes once the transcript tailer has enqueued its
 	// final flush (or dropped it on a full channel) and returned.
 	activityFlushed chan struct{}
@@ -179,19 +184,24 @@ func newInteractiveStateLossHandle(handle *ptycli.Handle, stateDir string, taile
 	// the tailer was constructed before the child started, so its baseline
 	// is exactly the previous-session set evidence must exclude.
 	var baseline map[string]struct{}
-	if tailer != nil && len(tailer.baseline) > 0 {
-		baseline = make(map[string]struct{}, len(tailer.baseline))
-		for p := range tailer.baseline {
-			baseline[filepath.Clean(p)] = struct{}{}
+	var baselineIncomplete bool
+	if tailer != nil {
+		baselineIncomplete = tailer.baselineIncomplete
+		if len(tailer.baseline) > 0 {
+			baseline = make(map[string]struct{}, len(tailer.baseline))
+			for p := range tailer.baseline {
+				baseline[filepath.Clean(p)] = struct{}{}
+			}
 		}
 	}
 	h := &interactiveStateLossHandle{
-		Handle:           handle,
-		stateRoot:        cleanRoot,
-		evidenceBaseline: baseline,
-		events:           make(chan agent.Event, interactiveCoarseEventSlots+interactiveTranscriptEventSlots),
-		activityFlushed:  make(chan struct{}),
-		finished:         make(chan struct{}),
+		Handle:             handle,
+		stateRoot:          cleanRoot,
+		evidenceBaseline:   baseline,
+		evidenceIncomplete: baselineIncomplete,
+		events:             make(chan agent.Event, interactiveCoarseEventSlots+interactiveTranscriptEventSlots),
+		activityFlushed:    make(chan struct{}),
+		finished:           make(chan struct{}),
 	}
 	session := handle.InteractiveSession()
 	// emit forwards one transcript event best-effort. Only the tailer

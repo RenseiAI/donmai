@@ -519,7 +519,14 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 	// workarea would attribute the previous session's transcript to this
 	// one. Taken after every parent write (extensions, credentials,
 	// tmp/cache dirs) and before the child can create its own transcript.
-	evidenceBaseline := snapshotPiTranscriptBaseline(layout.root)
+	evidenceBaseline, evidenceIncomplete := snapshotPiTranscriptBaseline(layout.root)
+	evidenceClaim := acquirePiEvidenceClaim(layout.root)
+	spawned := false
+	defer func() {
+		if !spawned {
+			evidenceClaim.release()
+		}
+	}()
 
 	var (
 		cmd    *exec.Cmd
@@ -557,7 +564,8 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 	}
 	h.setConfinement(plan)
 	h.setStateRoot(layout.root)
-	h.setEvidenceBaseline(evidenceBaseline)
+	h.setEvidenceBaseline(evidenceBaseline, evidenceIncomplete)
+	h.evidenceClaim = evidenceClaim
 	// The session credential files live in the session state root. Stop
 	// removes them so a finished session leaves no secret on disk; the
 	// worktree lifecycle that removes the state root is the backstop.
@@ -619,6 +627,7 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 	if spec.OnProcessSpawned != nil && cmd != nil && cmd.Process != nil {
 		spec.OnProcessSpawned(cmd.Process.Pid)
 	}
+	spawned = true
 	return h, nil
 }
 

@@ -88,8 +88,12 @@ type interactiveTranscriptTailer struct {
 	// spawned. Those belong to earlier or concurrent sessions and are never
 	// read.
 	baseline map[string]struct{}
-	files    map[string]*interactiveTranscriptFile
-	seen     map[string]struct{}
+	// baselineIncomplete is true when the pre-spawn walk hit a read error,
+	// so baseline may be missing entries. Evidence must refuse then: a
+	// failed scan cannot prove ownership.
+	baselineIncomplete bool
+	files              map[string]*interactiveTranscriptFile
+	seen               map[string]struct{}
 }
 
 // interactiveTranscriptFile is the read state of one tailed transcript.
@@ -115,9 +119,11 @@ func newInteractiveTranscriptTailer(stateDir string) *interactiveTranscriptTaile
 		return t
 	}
 	t.stateDir = filepath.Clean(stateDir)
-	walkInteractiveTranscriptFiles(t.stateDir, func(path string, _ os.DirEntry) {
+	if err := walkInteractiveTranscriptFiles(t.stateDir, func(path string, _ os.DirEntry) {
 		t.baseline[path] = struct{}{}
-	})
+	}); err != nil {
+		t.baselineIncomplete = true
+	}
 	return t
 }
 
@@ -206,7 +212,7 @@ func (t *interactiveTranscriptTailer) pendingFiles() (files []pendingTranscript,
 		modTime time.Time
 	}
 	var candidates []candidate
-	walkInteractiveTranscriptFiles(t.stateDir, func(path string, entry os.DirEntry) {
+	_ = walkInteractiveTranscriptFiles(t.stateDir, func(path string, entry os.DirEntry) {
 		if _, earlier := t.baseline[path]; earlier {
 			return
 		}
@@ -244,11 +250,13 @@ func (t *interactiveTranscriptTailer) pendingFiles() (files []pendingTranscript,
 // recursing into subdirectories (older pi builds nest transcripts under
 // sessions/) but never into the per-session config home, the
 // injected-extensions dir, or the per-session tmp/cache dirs, which hold
-// no transcripts.
-func walkInteractiveTranscriptFiles(dir string, fn func(path string, entry os.DirEntry)) {
-	_ = filepath.WalkDir(dir, func(path string, entry os.DirEntry, err error) error {
+// no transcripts. It reports the first traversal error, if any: baseline
+// snapshots must know when the scan was incomplete, while best-effort
+// tailing sweeps ignore it.
+func walkInteractiveTranscriptFiles(dir string, fn func(path string, entry os.DirEntry)) error {
+	return filepath.WalkDir(dir, func(path string, entry os.DirEntry, err error) error {
 		if err != nil {
-			return nil
+			return err
 		}
 		if entry.IsDir() {
 			switch entry.Name() {

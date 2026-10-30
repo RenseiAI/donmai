@@ -178,6 +178,12 @@ type Handle struct {
 	// session's transcript to this one. Set once at spawn from the
 	// pre-spawn snapshot; nil means the root held no transcript at spawn.
 	evidenceBaseline map[string]struct{}
+	// evidenceIncomplete marks a failed pre-spawn transcript scan: evidence
+	// collection refuses rather than attributing an unseen transcript.
+	evidenceIncomplete bool
+	// evidenceClaim is the per-handle lease on the layout root. It detects
+	// concurrent sessions sharing the root; a contaminated lease refuses.
+	evidenceClaim *piEvidenceClaim
 	// stopped closes once Stop has reaped the child and removed the
 	// session credential files: transcript writers have stopped and the
 	// state root is stable for evidence collection. TerminalTranscripts

@@ -6,9 +6,81 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/RenseiAI/donmai/agent"
 )
+
+// piEvidenceClaim is a per-handle lease on one layout root. It detects
+// concurrent sessions sharing the same root: the second spawn while another
+// handle is still live marks every live lease on that root contaminated, so
+// each handle's later evidence collection refuses rather than attributing a
+// concurrent session's transcript to itself. Sequential reuse is unaffected:
+// the previous handle releases its lease when its evidence is collected, so
+// a later spawn sees an empty set.
+type piEvidenceClaim struct {
+	root         string
+	contaminated bool
+}
+
+var piEvidenceMu sync.Mutex
+
+// piEvidenceActive tracks live evidence leases per layout root.
+var piEvidenceActive = map[string]map[*piEvidenceClaim]struct{}{}
+
+// acquirePiEvidenceClaim records a new live handle on root. A nil root
+// (no per-session root was recorded) needs no lease. Callers hold the
+// lease until their evidence is collected; release then removes it.
+func acquirePiEvidenceClaim(root string) *piEvidenceClaim {
+	if strings.TrimSpace(root) == "" {
+		return nil
+	}
+	clean := filepath.Clean(root)
+	if clean == "." {
+		return nil
+	}
+	c := &piEvidenceClaim{root: clean}
+	piEvidenceMu.Lock()
+	defer piEvidenceMu.Unlock()
+	if live := piEvidenceActive[clean]; len(live) > 0 {
+		c.contaminated = true
+		for other := range live {
+			other.contaminated = true
+		}
+	}
+	if piEvidenceActive[clean] == nil {
+		piEvidenceActive[clean] = map[*piEvidenceClaim]struct{}{}
+	}
+	piEvidenceActive[clean][c] = struct{}{}
+	return c
+}
+
+// release removes the lease from the live set. The contaminated flag
+// persists so a handle that overlapped still refuses after the peer left.
+func (c *piEvidenceClaim) release() {
+	if c == nil {
+		return
+	}
+	piEvidenceMu.Lock()
+	defer piEvidenceMu.Unlock()
+	if set := piEvidenceActive[c.root]; set != nil {
+		delete(set, c)
+		if len(set) == 0 {
+			delete(piEvidenceActive, c.root)
+		}
+	}
+}
+
+// isContaminated reports whether another handle shared this root while this
+// lease was live. A nil lease (handles built without a spawn) is clean.
+func (c *piEvidenceClaim) isContaminated() bool {
+	if c == nil {
+		return false
+	}
+	piEvidenceMu.Lock()
+	defer piEvidenceMu.Unlock()
+	return c.contaminated
+}
 
 // Compile-time assertions: both pi spawn modes expose the optional
 // terminal-transcript evidence capability the runner captures after Stop.
@@ -32,34 +104,39 @@ func (h *Handle) setStateRoot(root string) {
 // excludes them: the state dir is shared across reuses of a workarea, so
 // directory membership alone cannot prove session ownership (the tailer in
 // interactive_transcript.go snapshots the same baseline for the same reason).
-// Called once at spawn from the pre-spawn snapshot, before the pump starts.
-func (h *Handle) setEvidenceBaseline(baseline map[string]struct{}) {
-	if len(baseline) == 0 {
-		return
-	}
+// incomplete marks a failed pre-spawn scan: TerminalTranscripts refuses then
+// rather than attributing a transcript the scan never saw. Called once at
+// spawn from the pre-spawn snapshot, before the pump starts.
+func (h *Handle) setEvidenceBaseline(baseline map[string]struct{}, incomplete bool) {
 	h.evidenceBaseline = baseline
+	h.evidenceIncomplete = incomplete
 }
 
 // snapshotPiTranscriptBaseline records every transcript already present under
 // root. Call it after the parent has finished writing the layout (extensions,
 // credentials, tmp/cache dirs) and before the child starts, so only files
-// this session did not create are recorded. A missing root snapshots to nil.
-func snapshotPiTranscriptBaseline(root string) map[string]struct{} {
+// this session did not create are recorded. A missing root snapshots to a
+// complete empty baseline. The incomplete flag reports a failed scan: the
+// caller must refuse evidence then, since a transcript the scan never saw
+// would otherwise be misattributed to this session.
+func snapshotPiTranscriptBaseline(root string) (map[string]struct{}, bool) {
 	if strings.TrimSpace(root) == "" {
-		return nil
+		return nil, true
 	}
 	clean := filepath.Clean(root)
 	if info, err := os.Lstat(clean); err != nil || !info.IsDir() {
-		return nil
+		return nil, false
 	}
 	var baseline map[string]struct{}
-	walkInteractiveTranscriptFiles(clean, func(path string, _ os.DirEntry) {
+	if err := walkInteractiveTranscriptFiles(clean, func(path string, _ os.DirEntry) {
 		if baseline == nil {
 			baseline = make(map[string]struct{})
 		}
 		baseline[filepath.Clean(path)] = struct{}{}
-	})
-	return baseline
+	}); err != nil {
+		return baseline, true
+	}
+	return baseline, false
 }
 
 // TerminalTranscripts implements agent.TerminalTranscriptCapable for the
@@ -76,6 +153,16 @@ func snapshotPiTranscriptBaseline(root string) map[string]struct{} {
 func (h *Handle) TerminalTranscripts() ([]agent.TerminalTranscriptDescriptor, error) {
 	if !h.stopped.Load() {
 		return nil, errors.New("pi: transcript evidence unavailable while session writers may still be active")
+	}
+	// Held until collection so a concurrent spawn in the same root
+	// contaminates before either side collects; released here so a later
+	// sequential reuse sees an empty set. The contaminated flag persists.
+	defer h.evidenceClaim.release()
+	if h.evidenceIncomplete {
+		return nil, errors.New("pi: transcript evidence unavailable: pre-spawn transcript scan was incomplete")
+	}
+	if h.evidenceClaim.isContaminated() {
+		return nil, errors.New("pi: transcript evidence unavailable: concurrent session shared this state root")
 	}
 	root := h.stateRoot
 	if root == "" {
@@ -103,6 +190,13 @@ func (h *interactiveStateLossHandle) TerminalTranscripts() ([]agent.TerminalTran
 	default:
 		return nil, errors.New("pi: transcript evidence unavailable until the final transcript flush completes")
 	}
+	defer h.evidenceClaim.release()
+	if h.evidenceIncomplete {
+		return nil, errors.New("pi: transcript evidence unavailable: pre-spawn transcript scan was incomplete")
+	}
+	if h.evidenceClaim.isContaminated() {
+		return nil, errors.New("pi: transcript evidence unavailable: concurrent session shared this state root")
+	}
 	if strings.TrimSpace(h.stateRoot) == "" {
 		return nil, nil
 	}
@@ -124,7 +218,7 @@ func (h *interactiveStateLossHandle) TerminalTranscripts() ([]agent.TerminalTran
 // are absent. A missing, non-directory, or link-swapped root yields no
 // descriptors; a session with no transcript yields nil so callers keep
 // today's cleanup behavior with no empty evidence artifact.
-func collectPiTranscriptDescriptors(root string, baseline map[string]struct{}) []agent.TerminalTranscriptDescriptor {
+func collectPiTranscriptDescriptors(root string, baseline map[string]struct{}) (descs []agent.TerminalTranscriptDescriptor) {
 	if strings.TrimSpace(root) == "" {
 		return nil
 	}
@@ -133,8 +227,7 @@ func collectPiTranscriptDescriptors(root string, baseline map[string]struct{}) [
 	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return nil
 	}
-	var descs []agent.TerminalTranscriptDescriptor
-	walkInteractiveTranscriptFiles(clean, func(path string, _ os.DirEntry) {
+	walkErr := walkInteractiveTranscriptFiles(clean, func(path string, _ os.DirEntry) {
 		// A transcript that already existed before this session started
 		// belongs to a previous session reusing this workarea, never to
 		// this one — even when the child later appends to it (the tailer
@@ -160,6 +253,12 @@ func collectPiTranscriptDescriptors(root string, baseline map[string]struct{}) [
 		}
 		descs = append(descs, agent.TerminalTranscriptDescriptor{Path: path})
 	})
+	if walkErr != nil {
+		// The post-stop scan hit a read error: fail closed rather than
+		// returning a partial set that could hide this session's
+		// transcript or misattribute another's.
+		return nil
+	}
 	if len(descs) == 0 {
 		return nil
 	}
