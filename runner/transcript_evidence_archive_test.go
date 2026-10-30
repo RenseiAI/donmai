@@ -1552,3 +1552,92 @@ func TestTranscriptEvidence_ShadowBlockersRedacted(t *testing.T) {
 		}
 	})
 }
+
+// TestTranscriptEvidence_UsageCounterStringRedacted pins the shared-rail
+// parity hole: a string under a usage-counter key (input_tokens and its
+// variants) is redacted wholesale like any sensitive value, while numeric
+// counters stay numeric (pinned by ArchivedJSONStaysValid). Without the
+// fix the unknown password survives verbatim while the same bytes through
+// diagnostic.Redact are masked.
+func TestTranscriptEvidence_UsageCounterStringRedacted(t *testing.T) {
+	clone, _, base := cloneForRescue(t)
+	writeFile(t, clone, ".agent/transcript.jsonl", "{\"input_tokens\":\"unknown-pw-xyz-999\",\"msg\":\"clean\"}\n")
+	r := minimalRunner(t)
+	r.rescueDir = t.TempDir()
+	res := &Result{}
+	res.Status = "failed"
+	res.WorktreePath = clone
+	res.rescueTargets = []rescueTarget{{path: clone, base: base}}
+	res.terminalTranscripts = []agent.TerminalTranscriptDescriptor{{Path: ".agent/transcript.jsonl"}}
+	qw := QueuedWork{QueuedWork: queuedWorkBase("COUNTERSTR")}
+	if !r.preserveUnpublishedWork(qw, res) {
+		t.Fatalf("preserve = false (warnings %v)", res.PostSessionWarnings)
+	}
+	files := findEvidenceFiles(t, r.rescueDir)
+	if len(files) != 1 {
+		t.Fatalf("evidence files = %v; want one", files)
+	}
+	got := readEvidence(t, files[0])
+	if strings.Contains(got, "unknown-pw-xyz-999") {
+		t.Fatalf("archive retains string under usage-counter key:\n%q", got)
+	}
+	if !strings.Contains(got, "[REDACTED]") {
+		t.Fatalf("archive missing [REDACTED]:\n%q", got)
+	}
+	var m map[string]interface{}
+	if err := json.Unmarshal([]byte(strings.TrimSuffix(got, "\n")), &m); err != nil {
+		t.Fatalf("archived record invalid JSON %q: %v", got, err)
+	}
+	if m["input_tokens"] != "[REDACTED]" {
+		t.Fatalf("input_tokens = %v; want wholesale [REDACTED]", m["input_tokens"])
+	}
+}
+
+// TestTranscriptEvidence_StoppedSessionSkipsTailsKeepsDescriptors pins the
+// merged failed-vs-stopped scope: a stopped session archives terminal
+// descriptors best-effort per the mainline design but archives no redacted
+// transcript tails (tails are failed-only and fail-closed). Without the
+// scope pin a stopped session could gain tails or lose its descriptors.
+func TestTranscriptEvidence_StoppedSessionSkipsTailsKeepsDescriptors(t *testing.T) {
+	clone, _, base := cloneForRescue(t)
+	writeFile(t, clone, ".agent/transcript.jsonl", "{\"msg\":\"stopped run\"}\n")
+	r := minimalRunner(t)
+	r.rescueDir = t.TempDir()
+	res := &Result{}
+	res.Status = "stopped"
+	res.WorktreePath = clone
+	res.rescueTargets = []rescueTarget{{path: clone, base: base}}
+	res.terminalTranscripts = []agent.TerminalTranscriptDescriptor{{Path: ".agent/transcript.jsonl"}}
+	qw := QueuedWork{QueuedWork: queuedWorkBase("STOPPED-NOTAILS")}
+	if !r.preserveUnpublishedWork(qw, res) {
+		t.Fatalf("preserve = false for a stopped session (warnings %v); want true", res.PostSessionWarnings)
+	}
+	if files := findEvidenceFiles(t, r.rescueDir); len(files) != 0 {
+		t.Fatalf("tail files = %v for a stopped session; want none", files)
+	}
+	var manifests []string
+	err := filepath.WalkDir(r.rescueDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if !d.IsDir() && d.Name() == terminalEvidenceFileName {
+			manifests = append(manifests, path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk rescue dir: %v", err)
+	}
+	if len(manifests) != 1 {
+		t.Fatalf("descriptor manifests = %v; want one %s", manifests, terminalEvidenceFileName)
+	}
+	body := readEvidence(t, manifests[0])
+	if !strings.Contains(body, "stopped") {
+		t.Fatalf("descriptor manifest missing stopped status:\n%q", body)
+	}
+	for _, w := range res.PostSessionWarnings {
+		if strings.Contains(w, "transcript evidence unavailable") {
+			t.Fatalf("unexpected evidence warning on the stopped path: %q (all %v)", w, res.PostSessionWarnings)
+		}
+	}
+}

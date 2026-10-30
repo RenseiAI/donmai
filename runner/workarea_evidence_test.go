@@ -338,10 +338,12 @@ func TestMixedEvidenceAndPatchAttemptsShareRetention(t *testing.T) {
 func TestTerminalEvidence_PreservesPatchMetadataForTranscriptsRepository(t *testing.T) {
 	clone, _, base := cloneForRescue(t)
 	writeFile(t, clone, "work.txt", "uncommitted\n")
+	writeFile(t, clone, "evidence/collision-9f3a1c.cast", "{\"msg\":\"collision probe\"}\n")
 	r := minimalRunner(t)
 	r.rescueDir = t.TempDir()
 	res := &Result{rescueTargets: []rescueTarget{{name: "transcripts", path: clone, base: base}}}
 	res.Status = "failed"
+	res.WorktreePath = clone
 	res.terminalTranscripts = []agent.TerminalTranscriptDescriptor{{Path: "evidence/collision-9f3a1c.cast"}}
 	if !r.preserveUnpublishedWork(QueuedWork{QueuedWork: queuedWorkBase("COLLISION")}, res) {
 		t.Fatal("preserveUnpublishedWork = false; want the patch and the evidence archived")

@@ -997,6 +997,17 @@ func (r *Runner) run(ctx context.Context, qw QueuedWork, admission *HarnessAdmis
 		if pres == nil && finalGate {
 			pres = r.newTeardownPreservation(qw.SessionID)
 		}
+		if pres != nil && finalGate && res != nil && res.Status == "failed" && len(res.terminalTranscripts) > 0 {
+			// Failed-session transcript tails share this teardown's directory
+			// with patches and descriptors. Unlike descriptors, tails are
+			// fail-closed: a tail failure keeps the workarea so a failed
+			// session never loses evidence silently. (Failed sessions never
+			// take the leased-completed path above, so flipping
+			// teardownRequired here is sufficient to retain the workarea.)
+			if !r.archiveFailedSessionEvidence(qw, res, pres.dirFor) {
+				teardownRequired = false
+			}
+		}
 		if pres != nil && finalGate {
 			r.preserveTerminalEvidenceFinal(qw, res, pres)
 		}

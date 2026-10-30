@@ -413,6 +413,18 @@ func redactJSONValueSensitive(v interface{}, values []string, sensitive bool) in
 			}
 			rk = diagnostic.Redact(rk)
 			childSensitive := sensitive || isSensitiveTranscriptKey(k)
+			if !childSensitive && isUsageTranscriptCounterKey(k) {
+				// Usage counters stay numeric so evidence keeps its shape,
+				// but a string under a counter key has no numeric shape to
+				// keep: the shared output rail masks
+				// {"input_tokens":"secret"} wholesale, so the JSON-aware
+				// rail must too. Otherwise an unknown password under a
+				// counter key would survive while the same bytes through
+				// diagnostic.Redact are masked.
+				if s, ok := val.(string); ok && s != "" {
+					childSensitive = true
+				}
+			}
 			out[rk] = redactJSONValueSensitive(val, values, childSensitive)
 		}
 		return out
