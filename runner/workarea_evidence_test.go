@@ -615,8 +615,12 @@ func TestStoppedEmptyEvidenceWritesNoAttemptViaRun(t *testing.T) {
 
 // TestStoppedEvidenceWriteFailureStillTearsDownViaRun pins the
 // best-effort boundary end to end: when the evidence cannot be written the
-// teardown still proceeds. Making evidence failure prevent teardown keeps
-// the workarea and this test fails on the surviving worktree.
+// teardown still proceeds, and the failed write stays confined to the
+// rescue directory (no evidence file escapes to the process working
+// directory). Making evidence failure prevent teardown keeps the workarea
+// and this test fails on the surviving worktree; ignoring the directory
+// error and writing relative to the working directory fails this test on
+// the escaped file.
 func TestStoppedEvidenceWriteFailureStillTearsDownViaRun(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not on PATH")
@@ -626,7 +630,16 @@ func TestStoppedEvidenceWriteFailureStillTearsDownViaRun(t *testing.T) {
 		t.Fatalf("write rescue blocker: %v", err)
 	}
 	r, platformURL := newEvidenceRunner(t, t.TempDir(), blocked)
+	cwd, cwdErr := os.Getwd()
+	if cwdErr != nil {
+		t.Fatalf("process working directory: %v", cwdErr)
+	}
+	escapePath := filepath.Join(cwd, terminalEvidenceFileName)
+	t.Cleanup(func() { _ = os.Remove(escapePath) })
 	res := runStoppedEvidenceSession(t, r, platformURL, makeBareRepo(t), []agent.TerminalTranscriptDescriptor{{Path: "evidence/best-effort-4f2a9c.cast"}}, "test-session-EVIDENCE-BEST-EFFORT")
+	if _, err := os.Stat(escapePath); !os.IsNotExist(err) {
+		t.Fatalf("evidence escaped the rescue directory: stat %s err = %v; want it confined", escapePath, err)
+	}
 	if res.WorktreePath == "" {
 		t.Fatal("stopped session has no worktree path")
 	}
@@ -641,6 +654,9 @@ func TestStoppedEvidenceWriteFailureStillTearsDownViaRun(t *testing.T) {
 	helperRes.Status = "stopped"
 	if !helper.preserveUnpublishedWork(QueuedWork{QueuedWork: queuedWorkBase("BEST-EFFORT")}, helperRes) {
 		t.Fatal("preserveUnpublishedWork = false on evidence-write failure; want true (best-effort)")
+	}
+	if _, err := os.Stat(escapePath); !os.IsNotExist(err) {
+		t.Fatalf("helper evidence escaped the rescue directory: stat %s err = %v; want it confined", escapePath, err)
 	}
 }
 
@@ -951,6 +967,84 @@ func TestMixedEvidenceAndPatchAttemptsShareRetentionViaRun(t *testing.T) {
 		t.Errorf("other evidence session attempts = %d; want its 1 untouched", len(otherEntries))
 	} else if _, err := os.Stat(filepath.Join(otherEvidenceRoot, otherEntries[0].Name(), terminalEvidenceFileName)); err != nil {
 		t.Errorf("other session evidence file missing: %v", err)
+	}
+}
+
+// TestMixedPatchAndEvidenceShareSingleAttemptViaRun pins the shared-scope
+// teardown through the production Runner.Run entry point: one stopped
+// session carrying both unpublished work and a terminal transcript
+// descriptor archives both into a single attempt directory. Recreating the
+// teardown scope after the patch phase (dropping the shared-scope guard)
+// leaves the patch behind and writes the evidence to a second directory,
+// so the single-attempt assertion goes RED with two attempt directories.
+func TestMixedPatchAndEvidenceShareSingleAttemptViaRun(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	bareRepo := makeBareRepo(t)
+	wtParent := t.TempDir()
+	srv := mockPlatformServer(t)
+	t.Cleanup(srv.Close)
+	manager, err := worktree.NewManager(worktree.Options{ParentDir: wtParent})
+	if err != nil {
+		t.Fatalf("worktree.NewManager: %v", err)
+	}
+	poster, err := result.NewPoster(result.Options{
+		PlatformURL: srv.URL, WorkerID: "worker-1", AuthToken: "tok",
+		HTTPClient: srv.Client(), BaseDelay: 1,
+	})
+	if err != nil {
+		t.Fatalf("result.NewPoster: %v", err)
+	}
+	base, err := stub.New()
+	if err != nil {
+		t.Fatalf("stub.New: %v", err)
+	}
+	reg := NewRegistry()
+	if err := reg.Register(base); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	r, err := New(Options{
+		Registry: reg, WorktreeManager: manager, Poster: poster,
+		HTTPClient: srv.Client(), SkipBackstop: true, SkipSteering: true, SkipPostSession: true,
+		MaxSessionDuration: -1,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	rescueDir := t.TempDir()
+	r.rescueDir = rescueDir
+	const session = "test-session-MIXED-SINGLE-VIA-RUN"
+	const sentinel = "evidence/mixed-single-7f3a2b.cast"
+	runRetentionStoppedSession(t, r, srv.URL, bareRepo, session, []agent.TerminalTranscriptDescriptor{{Path: sentinel}}, true)
+	sessionRoot := filepath.Join(rescueDir, session)
+	entries, err := os.ReadDir(sessionRoot)
+	if err != nil {
+		t.Fatalf("read session rescue root: %v", err)
+	}
+	var archives []string
+	for _, entry := range entries {
+		if entry.IsDir() && rescueArchiveDirRE.MatchString(entry.Name()) {
+			archives = append(archives, entry.Name())
+		}
+	}
+	if len(archives) != 1 {
+		t.Fatalf("production mixed teardown wrote %d attempt directories (%v); want 1", len(archives), archives)
+	}
+	dir := filepath.Join(sessionRoot, archives[0])
+	if patches := rescuePatches(t, dir); len(patches) == 0 {
+		t.Fatalf("mixed teardown directory holds no patch; want the patch and the evidence together")
+	}
+	body, err := os.ReadFile(filepath.Join(dir, terminalEvidenceFileName)) //nolint:gosec // G304: test-owned path.
+	if err != nil {
+		t.Fatalf("read terminal evidence: %v", err)
+	}
+	var manifest terminalEvidenceManifest
+	if err := json.Unmarshal(body, &manifest); err != nil {
+		t.Fatalf("decode terminal evidence: %v", err)
+	}
+	if manifest.Status != "stopped" || len(manifest.Transcripts) != 1 || manifest.Transcripts[0] != sentinel {
+		t.Fatalf("evidence manifest = %+v; want stopped with exactly [%q]", manifest, sentinel)
 	}
 }
 
