@@ -405,6 +405,142 @@ func TestModel_MouseCancelsConfirmation(t *testing.T) {
 	}
 }
 
+// Pins the visible-projection mapping in sessionIndexAt: with the grid
+// filtered to 2 of 4, a click in the grid pane below the rendered rows
+// (where source-layout rows would be) must do nothing. Mapping against
+// the source slice selects a hidden row and loses the selection.
+func TestModel_MouseFilteredOutOfWindowIsInert(t *testing.T) {
+	m := New(Options{Plain: false, HostLabel: "h", Now: func() time.Time { return fixtureNow }})
+	_, _ = m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	m.applySnapshot(Snapshot{Cards: filterTestCards(), Counters: Counters{Sessions: 4, Running: 4}})
+	_, _ = m.Update(tea.KeyPressMsg{Code: '/', Text: "/"})
+	feedQuery(m, "development")
+	if got := len(m.visibleCards()); got != 2 {
+		t.Fatalf("setup: filtered visible = %d, want 2", got)
+	}
+	if m.cursor != 0 {
+		t.Fatalf("setup: cursor = %d, want 0", m.cursor)
+	}
+	keepID := m.selectedVisibleID()
+	if keepID != "sess-alpha-0001" {
+		t.Fatalf("setup: selected = %q, want alpha", keepID)
+	}
+	gridH, _ := splitPaneHeights(m.height-2, m.split)
+	y := 1 + cardHeight(false) + 1
+	if y-1 < 0 || y-1 >= gridH {
+		t.Fatalf("setup: probe y=%d outside gridH=%d", y, gridH)
+	}
+	x := 2
+	if cmd := mouseClick(m, x, y, tea.MouseLeft); cmd != nil {
+		t.Fatal("below-window click must not dispatch")
+	}
+	if m.cursor != 0 || m.detail {
+		t.Fatalf("below-window click must leave cursor=0 detail=false (got cursor=%d detail=%v)", m.cursor, m.detail)
+	}
+	if got := m.selectedVisibleID(); got != keepID {
+		t.Fatalf("below-window click selected %q, want %q", got, keepID)
+	}
+	if !m.filterActive || len(m.visibleCards()) != 2 {
+		t.Fatal("below-window click must not disturb the filter")
+	}
+}
+
+// Pins the middle/unknown-button guard in handleMouseClick: middle and
+// extended buttons are inert, including on the selected card and while a
+// confirmation gate is armed. Without the guard they act as left-click.
+func TestModel_MouseMiddleButtonIsInert(t *testing.T) {
+	m := newMouseModel(t, 120, 40, 0)
+	x, y := mouseXYForVis(t, m, 1)
+	keep := m.cursor
+	for _, btn := range []tea.MouseButton{tea.MouseMiddle, tea.MouseButton10} {
+		if cmd := mouseClick(m, x, y, btn); cmd != nil {
+			t.Fatalf("button %v must not dispatch", btn)
+		}
+		if m.cursor != keep || m.detail {
+			t.Fatalf("button %v must leave cursor=%d detail=false (got cursor=%d detail=%v)", btn, keep, m.cursor, m.detail)
+		}
+	}
+	if got := m.selectedVisibleID(); got != m.visibleCards()[keep].SessionID {
+		t.Fatalf("middle click moved selection to %q", got)
+	}
+	// Middle-click on the selected card must not toggle detail like Enter.
+	ms := newMouseModel(t, 120, 40, 1)
+	xs, ys := mouseXYForVis(t, ms, 1)
+	for _, btn := range []tea.MouseButton{tea.MouseMiddle, tea.MouseButton10} {
+		if cmd := mouseClick(ms, xs, ys, btn); cmd != nil {
+			t.Fatalf("selected-card button %v must not dispatch", btn)
+		}
+		if ms.detail {
+			t.Fatalf("selected-card button %v must not open detail", btn)
+		}
+	}
+	// An armed confirmation gate survives middle/extended clicks.
+	for _, btn := range []tea.MouseButton{tea.MouseMiddle, tea.MouseButton10} {
+		acts := newFakeHostActions()
+		mc := New(Options{Plain: false, HostLabel: "h", Now: func() time.Time { return fixtureNow }, Actions: acts})
+		_, _ = mc.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+		mc.applySnapshot(Snapshot{Cards: filterTestCards(), Counters: Counters{Sessions: 4, Running: 4}})
+		if cmd := mc.requestStopConfirm(); cmd != nil {
+			t.Fatal("arm must not dispatch")
+		}
+		xc, yc := mouseXYForVis(t, mc, 1)
+		if cmd := mouseClick(mc, xc, yc, btn); cmd != nil {
+			t.Fatalf("confirm-armed button %v must not dispatch", btn)
+		}
+		if mc.confirmKind != "stop" || mc.cursor != 0 {
+			t.Fatalf("confirm-armed button %v must keep gate armed at cursor 0 (got kind=%q cursor=%d)", btn, mc.confirmKind, mc.cursor)
+		}
+		if _, _, drains, stops := acts.counts(); drains != 0 || len(stops) != 0 {
+			t.Fatalf("confirm-armed button %v dispatched drains=%d stops=%v", btn, drains, stops)
+		}
+	}
+}
+
+// Pins the confirmation-gate invalid-click guard in handleMouseClick: a
+// header or gap click while stop/drain is armed keeps the gate armed with
+// the cursor unchanged and dispatches nothing. Without the guard the gate
+// silently disarms.
+func TestModel_MouseInvalidClickKeepsConfirmArmed(t *testing.T) {
+	for _, kind := range []string{"stop", "drain"} {
+		acts := newFakeHostActions()
+		m := New(Options{Plain: false, HostLabel: "h", Now: func() time.Time { return fixtureNow }, Actions: acts})
+		_, _ = m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+		m.applySnapshot(Snapshot{Cards: fixtureCards(), Counters: fixtureCounters()})
+		m.cursor = 1
+		if kind == "stop" {
+			if cmd := m.requestStopConfirm(); cmd != nil {
+				t.Fatal("arm must not dispatch")
+			}
+		} else {
+			if cmd := m.requestDrainConfirm(); cmd != nil {
+				t.Fatal("arm must not dispatch")
+			}
+		}
+		if m.confirmKind != kind {
+			t.Fatalf("%s: setup gate = %q, want %q", kind, m.confirmKind, kind)
+		}
+		// Header click is outside every card window.
+		if cmd := mouseClick(m, 2, 0, tea.MouseLeft); cmd != nil {
+			t.Fatalf("%s: header click must not dispatch", kind)
+		}
+		if m.confirmKind != kind || m.cursor != 1 || m.detail {
+			t.Fatalf("%s: header click must keep gate armed at cursor 1 (got kind=%q cursor=%d detail=%v)", kind, m.confirmKind, m.cursor, m.detail)
+		}
+		// Inter-card gap click in the selected row also misses.
+		_, cardW := gridGeometry(m.width, false)
+		yg := mouseRowWith(t, m, m.visibleCards()[1].displayID())
+		if cmd := mouseClick(m, cardW, yg, tea.MouseLeft); cmd != nil {
+			t.Fatalf("%s: gap click must not dispatch", kind)
+		}
+		if m.confirmKind != kind || m.cursor != 1 || m.detail {
+			t.Fatalf("%s: gap click must keep gate armed at cursor 1 (got kind=%q cursor=%d detail=%v)", kind, m.confirmKind, m.cursor, m.detail)
+		}
+		if _, _, drains, stops := acts.counts(); drains != 0 || len(stops) != 0 {
+			t.Fatalf("%s: invalid clicks dispatched drains=%d stops=%v", kind, drains, stops)
+		}
+	}
+}
+
 // newTestModel builds a plain-mode model over a fake daemon + on-disk
 // worktree fixtures, sized for rendering.
 func newTestModel(t *testing.T, fd *fakeDaemon, scope string) *Model {
