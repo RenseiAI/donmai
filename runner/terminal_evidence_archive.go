@@ -34,6 +34,17 @@ func readTerminalEvidenceChunk(f *os.File, limit int64) ([]byte, error) {
 // workarea. Callers rely on archiveTerminalEvidence's status gate (only
 // failed and stopped sessions) and its empty-descriptor no-op, so this
 // function only skips what is unsafe to read.
+//
+// Copy filenames live in a namespace no rescue patch or metadata can
+// occupy: every copy is "evidence+<index>-<base>.copy". The "+" keeps
+// the copy distinct from every per-repository "<label>.patch" /
+// "<label>.json" pair (rescueSegment maps every character outside
+// [A-Za-z0-9._-] to "_", so no sanitized label ever contains "+"),
+// and the trailing ".copy" keeps the copy from ever carrying the
+// ".patch" / ".json" suffix rescue tooling counts as a patch or
+// metadata file. A repository named "evidence-00-transcript" with a
+// descriptor basename "transcript.patch" therefore archives its patch
+// and its evidence side by side instead of truncating the patch.
 func (r *Runner) copyTerminalEvidenceContents(sessionID string, res *Result, dir string) {
 	if res == nil || dir == "" {
 		return
@@ -49,7 +60,7 @@ func (r *Runner) copyTerminalEvidenceContents(sessionID string, res *Result, dir
 			continue
 		}
 		base := rescueSegment(filepath.Base(desc.Path))
-		dest := filepath.Join(dir, fmt.Sprintf("evidence-%02d-%s", i, base))
+		dest := filepath.Join(dir, fmt.Sprintf("evidence+%02d-%s.copy", i, base))
 		if !r.writeVerifiedEvidenceCopy(dest, raw) {
 			r.logger.Warn("terminal evidence copy skipped; manifest still records the descriptor",
 				"sessionId", sessionID, "index", i)
@@ -114,10 +125,14 @@ func (r *Runner) readVerifiedEvidenceFile(path string) (raw []byte, ok bool) {
 }
 
 // writeVerifiedEvidenceCopy writes one verified evidence copy and reads it
-// back. A write failure or a readback mismatch removes the destination so
-// no partial or corrupted copy is mistaken for evidence, and returns false
-// so the caller skips the file. Best-effort throughout: the return only
-// decides whether this file is skipped, never the teardown.
+// back. A write failure removes the destination (os.WriteFile can
+// create/truncate the file and write a prefix before returning an error,
+// for example on disk exhaustion; leaving that prefix under the verified
+// filename would mistake an unverified truncation for evidence), and a
+// readback mismatch removes it as well, so no partial or corrupted copy
+// is mistaken for evidence. It returns false so the caller skips the
+// file. Best-effort throughout: the return only decides whether this file
+// is skipped, never the teardown.
 func (r *Runner) writeVerifiedEvidenceCopy(dest string, raw []byte) bool {
 	writeFile := r.terminalEvidenceWriteFile
 	if writeFile == nil {
@@ -129,6 +144,9 @@ func (r *Runner) writeVerifiedEvidenceCopy(dest string, raw []byte) bool {
 	}
 	//nolint:gosec // G703: dest is runner-owned under the rescue root, base is rescueSegment-sanitized
 	if err := writeFile(dest, raw, 0o600); err != nil {
+		// Remove a partial write: the destination may hold a truncated
+		// prefix even though the copy failed and was never verified.
+		_ = os.Remove(dest)
 		return false
 	}
 	//nolint:gosec // G304: dest is runner-owned under the rescue root.

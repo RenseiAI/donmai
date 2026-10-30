@@ -329,7 +329,9 @@ func (r *Runner) preserveUnpublishedWork(qw QueuedWork, res *Result) bool {
 // via dirFor, shared with any patch this teardown archives). The manifest
 // records only the descriptor paths; the transcript files themselves are
 // never uploaded or placed on any wire surface, but readable ones are also
-// copied next to the manifest as verified evidence-<index>-<base> files.
+// copied next to the manifest as verified evidence+<index>-<base>.copy files
+// (the "+" and trailing ".copy" keep each copy out of the
+// "<label>.patch" / "<label>.json" patch namespace).
 // A nil result, a status outside failed/stopped, or no descriptors is a
 // no-op. Manifest failures are returned so the caller can log them; they
 // never keep the workarea. Copy failures are best-effort per file and

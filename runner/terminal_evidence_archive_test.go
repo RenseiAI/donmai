@@ -168,7 +168,11 @@ func findEvidenceArchives(t *testing.T, rescueDir string) []string {
 		if err != nil {
 			return nil
 		}
-		if !d.IsDir() && strings.HasPrefix(filepath.Base(path), "evidence-") {
+		// Evidence copies live in the "+" namespace (evidence+<index>-<base>.copy)
+		// so they never share a filename with a rescue patch ("<label>.patch"
+		// has no "+"). Matching only the "+" prefix keeps patches out even
+		// when a repository is named like an evidence file.
+		if !d.IsDir() && strings.HasPrefix(filepath.Base(path), "evidence+") {
 			out = append(out, path)
 		}
 		return nil
@@ -222,7 +226,7 @@ func archiveEvidenceInto(t *testing.T, r *Runner, sessionID string, res *Result)
 
 // TestRun_FailedSessionArchivesEvidenceBeforeTeardown proves the failed path
 // archives the verified content before teardown and then deletes the
-// workarea: the manifest records the descriptor and the evidence-00 copy
+// workarea: the manifest records the descriptor and the evidence+00 copy
 // holds its exact bytes. Removing the content-copy call leaves the manifest
 // but no copy, failing this test.
 func TestRun_FailedSessionArchivesEvidenceBeforeTeardown(t *testing.T) {
@@ -1117,5 +1121,103 @@ func TestReadTerminalEvidenceChunk_ProbeByteDetectsGrowth(t *testing.T) {
 	}
 	if int64(len(raw)) <= limit {
 		t.Fatalf("readTerminalEvidenceChunk len = %d; want more than %d so growth refuses", len(raw), limit)
+	}
+}
+
+// TestCopyTerminalEvidenceContents_DoesNotOverwritePatch pins the evidence/patch
+// filename boundary through the shared teardown scope: a repository named
+// evidence-00-transcript archiving evidence-00-transcript.patch alongside a
+// descriptor basename transcript.patch must keep both. The copy lives in the
+// "+" namespace (evidence+00-transcript.patch.copy) so it can never truncate
+// the verified patch; sharing the bare evidence- prefix would overwrite the
+// only recovery patch with transcript text and then delete the workarea.
+func TestCopyTerminalEvidenceContents_DoesNotOverwritePatch(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	clone, _, base := cloneForRescue(t)
+	writeFile(t, clone, "work.txt", "uncommitted\n")
+	src := filepath.Join(t.TempDir(), "transcript.patch")
+	const evidenceBody = "terminal transcript, not a patch\n"
+	if err := os.WriteFile(src, []byte(evidenceBody), 0o600); err != nil {
+		t.Fatalf("write evidence source: %v", err)
+	}
+	r := minimalRunner(t)
+	r.rescueDir = t.TempDir()
+	res := &Result{rescueTargets: []rescueTarget{{name: "evidence-00-transcript", path: clone, base: base}}}
+	res.Status = "failed"
+	res.terminalTranscripts = []agent.TerminalTranscriptDescriptor{{Path: src}}
+	if !r.preserveUnpublishedWork(QueuedWork{QueuedWork: queuedWorkBase("NAMESPACE")}, res) {
+		t.Fatal("preserveUnpublishedWork = false; want the patch and the evidence archived")
+	}
+	sessionRoot := filepath.Join(r.rescueDir, "test-session-NAMESPACE")
+	entries, err := os.ReadDir(sessionRoot)
+	if err != nil {
+		t.Fatalf("read session rescue root: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("archive attempts = %d; want exactly 1 sharing patch and evidence", len(entries))
+	}
+	dir := filepath.Join(sessionRoot, entries[0].Name())
+	patchPath := filepath.Join(dir, "evidence-00-transcript.patch")
+	//nolint:gosec // G304: test-owned archive path under t.TempDir().
+	patchBody, err := os.ReadFile(patchPath)
+	if err != nil {
+		t.Fatalf("read rescue patch: %v", err)
+	}
+	if !strings.Contains(string(patchBody), "work.txt") {
+		t.Fatalf("rescue patch does not carry work.txt; got %q", patchBody)
+	}
+	if string(patchBody) == evidenceBody {
+		t.Fatal("rescue patch holds transcript text; the evidence copy overwrote the patch")
+	}
+	copies := findEvidenceArchives(t, dir)
+	if len(copies) != 1 {
+		t.Fatalf("evidence copies = %v; want exactly one distinct copy beside the patch", copies)
+	}
+	if copies[0] == patchPath {
+		t.Fatal("evidence copy targets the patch path; want a distinct filename")
+	}
+	if got := filepath.Base(copies[0]); !strings.Contains(got, "+") {
+		t.Fatalf("evidence copy name = %q; want '+' so it cannot equal a patch filename", got)
+	}
+	//nolint:gosec // G304: test-owned archive path under t.TempDir().
+	copied, err := os.ReadFile(copies[0])
+	if err != nil {
+		t.Fatalf("read evidence copy: %v", err)
+	}
+	if string(copied) != evidenceBody {
+		t.Fatalf("evidence copy = %q; want %q", copied, evidenceBody)
+	}
+	if patches := rescuePatches(t, dir); len(patches) != 1 {
+		t.Fatalf("rescue patches = %v; want exactly the one patch (the copy must not count as a patch)", patches)
+	}
+}
+
+// TestWriteVerifiedEvidenceCopy_WriteFailureRemovesPartialCopy pins the
+// failed-write cleanup: a copy write that creates the destination and then
+// fails (disk exhaustion after a short write) must leave no file. Keeping
+// the prefix under the verified filename would mistake an unverified
+// truncation for evidence beside the manifest.
+func TestWriteVerifiedEvidenceCopy_WriteFailureRemovesPartialCopy(t *testing.T) {
+	r := minimalRunner(t)
+	r.rescueDir = t.TempDir()
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "evidence+00-partial.cast.copy")
+	const body = "complete-evidence-body\n"
+	r.terminalEvidenceWriteFile = func(path string, data []byte, perm os.FileMode) error {
+		// Simulate ENOSPC after a short write: the destination holds a
+		// prefix even though the copy failed and was never verified.
+		//nolint:gosec // G304: test-owned archive path under t.TempDir().
+		if err := os.WriteFile(path, data[:4], perm); err != nil {
+			return err
+		}
+		return syscall.ENOSPC
+	}
+	if r.writeVerifiedEvidenceCopy(dest, []byte(body)) {
+		t.Fatal("writeVerifiedEvidenceCopy = true with a failed archive write; want false so the file is skipped")
+	}
+	if _, err := os.Stat(dest); !os.IsNotExist(err) {
+		t.Fatalf("partial copy stat err = %v; want no copy after a failed write", err)
 	}
 }
