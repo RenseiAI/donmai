@@ -135,7 +135,7 @@ func TestOperationalEnvironmentIsDigestBoundAndDefensivelyProjected(t *testing.T
 
 func TestOperationalPayloadProjectionClassifiesEveryQueuedWorkField(t *testing.T) {
 	classifications := map[string]string{
-		"QueuedWork": "projected", "RepositoryDeclaration": "projected", "ResolvedProfile": "projected", "Branch": "projected", "TerminalWorkareaLease": "projected",
+		"QueuedWork": "projected", "RepositoryDeclaration": "projected", "ResolvedProfile": "projected", "Branch": "projected", "TerminalWorkareaLease": "projected", "ContextPack": "projected",
 		"WorkareaMode": "projected", "ParentWorkareaID": "projected", "RepositoryFilter": "projected", "CacheSeedID": "projected",
 		// The dispatched pull request decides which commits the workarea
 		// materializes, so it is admission-bound like every other workarea
