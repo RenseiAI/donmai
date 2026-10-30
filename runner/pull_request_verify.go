@@ -52,15 +52,30 @@ import (
 // is continued (turn_continuation.go); a session still in that state when
 // its continuations run out ends not delivered, naming the reason.
 
-// pullRequestLookupTimeout bounds one remote lookup.
+// pullRequestLookupTimeout bounds all remote lookups in one verification
+// pass. One pass shares a single deadline so a transcript full of URLs
+// cannot stall the session end.
 const pullRequestLookupTimeout = 15 * time.Second
 
-// maxPullRequestLookups bounds the remote lookups one verification pass may
-// spend, so a transcript full of URLs cannot stall the session end.
-const maxPullRequestLookups = 4
+// pullRequestLookupChunkSize bounds the pull refs in one ls-remote call:
+// one call with tens of thousands of refs fails with "argument list too
+// long" and would mark every candidate unconfirmed. Reads go in priority
+// order in chunks of this size (the session branch ref rides along in each
+// chunk), verified chunk by chunk, stopping at the first accepted pull
+// request. A failed chunk marks only its own candidates unconfirmed.
+const pullRequestLookupChunkSize = 256
 
-// maxPullRequestCandidates bounds the distinct candidate URLs a stream keeps.
-const maxPullRequestCandidates = 8
+// Candidate URLs are kept without a bound: verification reads them in
+// chunked batched remote lookups, so a transcript full of URLs costs
+// ceil(candidates/chunkSize) ls-remote calls sharing one overall deadline
+// (bounded by pullRequestLookupTimeout) instead of stalling the session
+// end. Retention is bounded by the transcript itself — every candidate
+// consumes input bytes — and every hint the stream carried must still be
+// present when the verifier runs: the session pull request is verified, not
+// voted on. A bounded window let a flood of unrelated URLs evict the
+// genuine session pull request before verification (a narrative hint oldest
+// under tool-result chatter, or an earlier inject turn's hint after union),
+// flipping a landed session to agent-blocked.
 
 // pullRequestRefLookup reads refs from the checkout's origin remote and
 // returns the commit of each named ref that exists there.
@@ -324,38 +339,187 @@ func (v *sessionPullRequestVerifier) settle(ctx context.Context, res *Result, ob
 	}
 	candidates = append(candidates, v.accepted)
 
+	// Distinct candidates in priority order: envelope first, then the
+	// turn's candidates newest-first, then the previously accepted URL.
+	distinct := make([]string, 0, len(candidates))
 	seen := make(map[string]struct{}, len(candidates))
-	lookups := 0
+	for _, c := range candidates {
+		if c == "" {
+			continue
+		}
+		if _, dup := seen[c]; dup {
+			continue
+		}
+		seen[c] = struct{}{}
+		distinct = append(distinct, c)
+	}
+	// A previously accepted URL short-circuits: everything after its
+	// first occurrence is never evaluated, so it is never fetched.
+	acceptedPos := -1
+	for i, c := range distinct {
+		if c == v.accepted && v.accepted != "" {
+			acceptedPos = i
+			break
+		}
+	}
+	eval := distinct
+	if acceptedPos >= 0 {
+		eval = distinct[:acceptedPos+1]
+	}
+	// Collect the same-repository pull refs a batched remote read must
+	// cover. Other-repository and malformed URLs are refused without a
+	// lookup; already-refused URLs are skipped without a lookup or a
+	// rejection, exactly like the per-candidate path they replace.
+	type need struct {
+		url    string
+		number int
+	}
+	var needs []need
+	needSet := map[string]struct{}{}
+	branchRef := ""
+	if v.branch != "" {
+		branchRef = "refs/heads/" + v.branch
+	}
+	for _, c := range eval {
+		if c == v.accepted && v.accepted != "" {
+			continue
+		}
+		if v.outcomes[c] == candidateRefused {
+			continue
+		}
+		slug, number, err := parseCanonicalGitHubPullRequestURL(c)
+		if err != nil || v.repository == "" || normalizeGitHubRepositorySlug(slug) != v.repository {
+			continue
+		}
+		if _, dup := needSet[c]; dup {
+			continue
+		}
+		needSet[c] = struct{}{}
+		needs = append(needs, need{url: c, number: number})
+	}
+	lookup := v.lookup
+	if lookup == nil {
+		lookup = originRefs
+	}
+	// Chunked remote reads in priority order: needs is already envelope
+	// first, then newest candidate first. Each chunk carries its own
+	// branch ref so every chunk can accept on the session branch head.
+	// Chunks are fetched lazily in evaluation order and share one overall
+	// deadline; a failed chunk marks only its own candidates unconfirmed.
+	var lookupCtx context.Context
+	var lookupCancel context.CancelFunc
+	if len(needs) > 0 {
+		lookupCtx, lookupCancel = context.WithTimeout(ctx, pullRequestLookupTimeout)
+		defer lookupCancel()
+	}
+	needIndex := make(map[string]int, len(needs))
+	for i, n := range needs {
+		needIndex[n.url] = i
+	}
+	numChunks := (len(needs) + pullRequestLookupChunkSize - 1) / pullRequestLookupChunkSize
+	foundChunks := make([]map[string]string, numChunks)
+	errChunks := make([]error, numChunks)
+	fetched := make([]bool, numChunks)
+	fetchChunk := func(chunk int) {
+		if chunk < 0 || chunk >= numChunks || fetched[chunk] {
+			return
+		}
+		fetched[chunk] = true
+		start := chunk * pullRequestLookupChunkSize
+		end := start + pullRequestLookupChunkSize
+		if end > len(needs) {
+			end = len(needs)
+		}
+		refs := make([]string, 0, end-start+1)
+		for _, n := range needs[start:end] {
+			refs = append(refs, fmt.Sprintf("refs/pull/%d/head", n.number))
+		}
+		if branchRef != "" {
+			refs = append(refs, branchRef)
+		}
+		found, err := lookup(lookupCtx, v.worktreePath, refs...)
+		if found == nil {
+			found = map[string]string{}
+		}
+		foundChunks[chunk] = found
+		errChunks[chunk] = err
+	}
+	// The checkout's own commit is read once, only when a candidate's
+	// pull head is present but is not the session branch's head.
+	var localHEAD string
+	var localErr error
+	localRead := false
+	readLocal := func() (string, error) {
+		if !localRead {
+			localRead = true
+			shaCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+			localHEAD, localErr = captureHeadSHA(shaCtx, v.worktreePath)
+		}
+		return localHEAD, localErr
+	}
 	accepted := ""
-	for _, candidate := range candidates {
-		if candidate == "" {
-			continue
-		}
-		if _, dup := seen[candidate]; dup {
-			continue
-		}
-		seen[candidate] = struct{}{}
-		if candidate == v.accepted {
+	for _, candidate := range eval {
+		if candidate == v.accepted && v.accepted != "" {
 			accepted = candidate
 			break
 		}
 		if v.outcomes[candidate] == candidateRefused {
 			continue
 		}
-		if lookups >= maxPullRequestLookups {
-			rejected = append(rejected, pullRequestRejection{url: candidate, reason: "not checked: lookup budget spent"})
+		slug, number, err := parseCanonicalGitHubPullRequestURL(candidate)
+		if err != nil {
+			v.outcomes[candidate] = candidateRefused
+			rejected = append(rejected, pullRequestRejection{url: candidate, reason: "not a canonical GitHub pull request URL"})
 			continue
 		}
-		outcome, reason, lookedUp := v.verify(ctx, candidate)
-		if lookedUp {
-			lookups++
+		if v.repository == "" {
+			v.outcomes[candidate] = candidateRefused
+			rejected = append(rejected, pullRequestRejection{url: candidate, reason: "the session's repository is not a GitHub repository"})
+			continue
 		}
-		v.outcomes[candidate] = outcome
-		if outcome == candidateAccepted {
+		if normalizeGitHubRepositorySlug(slug) != v.repository {
+			v.outcomes[candidate] = candidateRefused
+			rejected = append(rejected, pullRequestRejection{url: candidate, reason: "the pull request is on another repository"})
+			continue
+		}
+		idx, ok := needIndex[candidate]
+		if !ok {
+			// Unreachable: same-repository candidates are collected into
+			// needs above; anything else was refused as malformed,
+			// non-GitHub, or foreign. Treat as unconfirmed rather than
+			// accepting on a missing read.
+			v.outcomes[candidate] = candidateUnconfirmed
+			rejected = append(rejected, pullRequestRejection{url: candidate, reason: "could not read the pull request from the session's remote: no batched read covers this candidate"})
+			continue
+		}
+		chunk := idx / pullRequestLookupChunkSize
+		fetchChunk(chunk)
+		if errChunks[chunk] != nil {
+			v.outcomes[candidate] = candidateUnconfirmed
+			rejected = append(rejected, pullRequestRejection{url: candidate, reason: "could not read the pull request from the session's remote: " + errChunks[chunk].Error()})
+			continue
+		}
+		found := foundChunks[chunk]
+		pullRef := fmt.Sprintf("refs/pull/%d/head", number)
+		pullHead := found[pullRef]
+		if pullHead == "" {
+			v.outcomes[candidate] = candidateRefused
+			rejected = append(rejected, pullRequestRejection{url: candidate, reason: "no such pull request on the session's repository"})
+			continue
+		}
+		if branchRef != "" && found[branchRef] == pullHead && found[branchRef] != "" {
+			v.outcomes[candidate] = candidateAccepted
 			accepted = candidate
 			break
 		}
-		rejected = append(rejected, pullRequestRejection{url: candidate, reason: reason})
+		if sha, shaErr := readLocal(); shaErr == nil && sha == pullHead {
+			v.outcomes[candidate] = candidateAccepted
+			accepted = candidate
+			break
+		}
+		v.outcomes[candidate] = candidateHeadMismatch
+		rejected = append(rejected, pullRequestRejection{url: candidate, reason: "the pull request's head is neither the session branch nor the session commit"})
 	}
 	v.accepted = accepted
 	res.PullRequestURL = accepted
@@ -620,22 +784,75 @@ func (r *Runner) acceptSessionPullRequest(ctx context.Context, v *sessionPullReq
 }
 
 // appendPullRequestCandidates records every GitHub pull request URL in text,
-// in order, keeping each URL once at its latest position and at most
-// maxPullRequestCandidates of them.
+// in order, keeping each URL once at its latest position. The list is
+// unbounded: dropping an older hint under a flood of newer URLs is what
+// flipped landed sessions to agent-blocked, so no hint is ever evicted.
+// Retention stays proportional to the transcript that carried the URLs.
+//
+// Collection is linear: the final list is the distinct URLs of
+// candidates followed by the URLs in text, ordered by last occurrence, so
+// a repeated URL moves to its latest position without rescanning the list
+// for every URL (which stalled session end on transcripts with tens of
+// thousands of URLs).
 func appendPullRequestCandidates(candidates []string, text string) []string {
-	for _, u := range prURLRE.FindAllString(text, -1) {
-		for i, existing := range candidates {
-			if existing == u {
-				candidates = append(candidates[:i], candidates[i+1:]...)
-				break
-			}
-		}
-		candidates = append(candidates, u)
-		if len(candidates) > maxPullRequestCandidates {
-			candidates = candidates[len(candidates)-maxPullRequestCandidates:]
-		}
+	urls := prURLRE.FindAllString(text, -1)
+	if len(urls) == 0 {
+		return candidates
 	}
-	return candidates
+	return unionPullRequestCandidates(candidates, urls)
+}
+
+// unionPullRequestCandidates returns the distinct URLs of a followed by b,
+// ordered by last occurrence: a URL appearing in both (or twice in b)
+// keeps only its latest position. Both inputs are already in that form in
+// the common case, so the union preserves their order and runs in linear
+// time via a single seen-set instead of rescanning the list per URL.
+func unionPullRequestCandidates(a, b []string) []string {
+	if len(b) == 0 {
+		return a
+	}
+	if len(a) == 0 {
+		return dedupPullRequestCandidatesByLastOccurrence(b)
+	}
+	seen := make(map[string]struct{}, len(a)+len(b))
+	rev := make([]string, 0, len(a)+len(b))
+	for i := len(b) - 1; i >= 0; i-- {
+		if _, dup := seen[b[i]]; dup {
+			continue
+		}
+		seen[b[i]] = struct{}{}
+		rev = append(rev, b[i])
+	}
+	for i := len(a) - 1; i >= 0; i-- {
+		if _, dup := seen[a[i]]; dup {
+			continue
+		}
+		seen[a[i]] = struct{}{}
+		rev = append(rev, a[i])
+	}
+	// Reverse so the order is by last occurrence in a followed by b.
+	for i, j := 0, len(rev)-1; i < j; i, j = i+1, j-1 {
+		rev[i], rev[j] = rev[j], rev[i]
+	}
+	return rev
+}
+
+// dedupPullRequestCandidatesByLastOccurrence keeps each URL once at its
+// latest position, preserving first-seen order of last occurrences.
+func dedupPullRequestCandidatesByLastOccurrence(urls []string) []string {
+	seen := make(map[string]struct{}, len(urls))
+	rev := make([]string, 0, len(urls))
+	for i := len(urls) - 1; i >= 0; i-- {
+		if _, dup := seen[urls[i]]; dup {
+			continue
+		}
+		seen[urls[i]] = struct{}{}
+		rev = append(rev, urls[i])
+	}
+	for i, j := 0, len(rev)-1; i < j; i, j = i+1, j-1 {
+		rev[i], rev[j] = rev[j], rev[i]
+	}
+	return rev
 }
 
 // firstLine returns the first non-empty line of s, for compact diagnostics.

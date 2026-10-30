@@ -1701,13 +1701,15 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// 10a. Structural blocked-agent classification. When the agent
 	// announced a deliberate decline (scanBlocked picked up a
 	// "WORK_RESULT:blocked" / "AGENT_BLOCKED: …" marker) and did not also
-	// produce a PR, fork to FailureAgentBlocked. This is a reasoned
+	// produce a VERIFIED PR, fork to FailureAgentBlocked. This is a reasoned
 	// refusal, not a crash — so we suppress steering + backstop below
 	// (there is nothing to recover) and surface a distinct outcome the
 	// platform can route to a needs-clarification path instead of
-	// re-dispatching the identical context. A PR-producing session is
-	// never treated as blocked even if the text mentions a blocker.
-	if classifyBlocked(res, streamRes) {
+	// re-dispatching the identical context. Only a pull request the remote
+	// verifier accepted suppresses the fork; a URL scraped from narrative
+	// never does.
+	// A decline never relabels a recorded failure (mirrors the follow-up fork).
+	if res.FailureMode == "" && classifyBlocked(res, streamRes, prVerifier != nil && prVerifier.accepted != "") {
 		r.logger.Info("agent blocked: deliberate decline detected",
 			"sessionId", qw.SessionID,
 			"reason", streamRes.blockedReason,
@@ -2007,7 +2009,7 @@ tailRecovery:
 	// the 10a fork — but only when the runner has recorded no failure of its
 	// own: an agent-authored decline never relabels a crash.
 	if followUpRan {
-		if res.FailureMode == "" && classifyBlocked(res, streamRes) {
+		if res.FailureMode == "" && classifyBlocked(res, streamRes, prVerifier != nil && prVerifier.accepted != "") {
 			r.logger.Info("agent blocked: deliberate decline detected after follow-up turn",
 				"sessionId", qw.SessionID,
 				"reason", streamRes.blockedReason,
@@ -2755,6 +2757,23 @@ func newInjectAcceptor(
 	}
 }
 
+// mergeInjectObservation unions buffered-inject turns: candidates union so an
+// earlier hint is still verified when a later turn carries none; first trusted
+// URL wins so later chatter cannot displace it; all else takes the latest.
+func mergeInjectObservation(merged, turn streamObservation) streamObservation {
+	// Batch union: appending one URL at a time rescans the list per URL
+	// (quadratic over a flooded turn), so union both candidate lists once.
+	cands := unionPullRequestCandidates(merged.pullRequestCandidates, turn.pullRequestCandidates)
+	first := merged.pullRequestURL
+	if first == "" {
+		first = turn.pullRequestURL
+	}
+	merged = turn
+	merged.pullRequestCandidates = cands
+	merged.pullRequestURL = first
+	return merged
+}
+
 // drainMemoryInjects delivers every memory block the heartbeat transport
 // buffered onto injectCh during the just-completed turn, then re-consumes
 // the resume turn's events. It is invoked at the post-terminal seam (the
@@ -2820,7 +2839,7 @@ func (r *Runner) drainMemoryInjects(
 			// turn — never a provider error to retry outside that bound.
 			injRes, _ := r.consumeEventsWithoutStallDetector(ctx, handle, worktreePath, qw, res, enforcer, sink, traceProcessor, beacons)
 			injRes.applyTo(res, res.ProviderName)
-			merged = injRes
+			merged = mergeInjectObservation(merged, injRes)
 			if enforcer != nil && enforcer.breached() != nil {
 				// A budget cap ended the turn: deliver nothing more.
 				return merged
@@ -3562,9 +3581,13 @@ func (r *Runner) observeEvent(ev agent.Event, obs *streamObservation, worktreePa
 		if review := scanReviewVerdict(e.Text); review != "" {
 			obs.reviewVerdict = review
 		}
-		if u := scanPRURL(e.Text); u != "" {
-			obs.pullRequestURL = u
-		}
+		// Provenance: assistant narrative is NEVER authoritative for the
+		// session pull request. A URL printed in free text is only a hint
+		// (see pullRequestCandidates below) for the remote verifier to
+		// confirm against the session's own repository state; only a
+		// trusted channel (tool result, manifest, backstop) may set
+		// obs.pullRequestURL before verification. Recording narrative URLs
+		// here let a hallucinated link suppress the blocked fork.
 		obs.pullRequestCandidates = appendPullRequestCandidates(obs.pullRequestCandidates, e.Text)
 	case agent.SystemEvent:
 		if e.Subtype == agent.SystemSubtypeProviderError {
@@ -3604,6 +3627,8 @@ func (r *Runner) observeEvent(ev agent.Event, obs *streamObservation, worktreePa
 			}
 		}
 	case agent.ToolResultEvent:
+		// Tool output is the trusted channel (`gh pr create`): first URL wins
+		// so later chatter cannot displace it; verifier still confirms it.
 		if u := scanPRURL(e.Content); u != "" && obs.pullRequestURL == "" {
 			obs.pullRequestURL = u
 		}
@@ -4506,15 +4531,20 @@ func scanPRURL(text string) string {
 }
 
 // classifyBlocked stamps FailureAgentBlocked onto res when the agent
-// deliberately declined (obs.blocked) and produced no PR. Returns true
-// when it classified the result as blocked so the caller can log + skip
-// steering/backstop. Pure aside from mutating res — no I/O — so the
-// classification fork is unit-testable in isolation.
+// deliberately declined (obs.blocked) and produced no VERIFIED pull
+// request. hasVerifiedPR must be true only when the session's pull request
+// was confirmed against the session's own remote state (the verifier's
+// accepted URL): a URL scraped from assistant narrative is only a hint and
+// never suppresses the blocked fork, so a hallucinated link cannot make a
+// stuck session look landed. Returns true when it classified the result as
+// blocked so the caller can log + skip steering/backstop. Pure aside from
+// mutating res — no I/O — so the classification fork is unit-testable in
+// isolation.
 //
-// A PR-producing session is never treated as blocked even if the agent's
-// narrative mentioned a blocker; the work landed.
-func classifyBlocked(res *Result, obs streamObservation) bool {
-	if !obs.blocked || res.PullRequestURL != "" {
+// A session with a verified pull request is never treated as blocked even
+// if the agent's narrative mentioned a blocker; the work landed.
+func classifyBlocked(res *Result, obs streamObservation, hasVerifiedPR bool) bool {
+	if !obs.blocked || hasVerifiedPR {
 		return false
 	}
 	res.Status = "failed"

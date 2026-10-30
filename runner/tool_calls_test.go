@@ -2,6 +2,7 @@ package runner
 
 import (
 	"encoding/json"
+	"fmt"
 	"slices"
 	"testing"
 	"time"
@@ -82,9 +83,12 @@ func TestRun_ToolCallsCountedOnStoppedRun(t *testing.T) {
 
 // TestRun_ToolCallsAndScalarsAcrossBufferedInjects drains two buffered
 // memory injects after the initial turn. The first inject turn reports the
-// pull request and the review verdict; the second reports neither. The
-// envelope must keep the first inject turn's pull request and verdicts, and
-// count every turn's tool calls exactly once (1 + 2 + 2).
+// pull request via the trusted tool-result channel (a `gh pr create` return
+// value) and the review verdict via narrative; the second reports neither.
+// The envelope must keep the first inject turn's pull request and verdicts,
+// and count every turn's tool calls exactly once (1 + 2 + 2). A pull request
+// URL printed only in assistant narrative is hint-only and never lands on
+// the envelope (see TestObserveEvent_AssistantNarrativePRURLIsHintOnly).
 func TestRun_ToolCallsAndScalarsAcrossBufferedInjects(t *testing.T) {
 	platform := newRecordingPlatformServer(t)
 	platform.queueInject(heartbeat.InjectPayload{DeliveryID: "dlv-1", Text: "recall: first memory block"})
@@ -110,8 +114,9 @@ func TestRun_ToolCallsAndScalarsAcrossBufferedInjects(t *testing.T) {
 		turns: []verdictScriptTurn{
 			{toolCalls: 1, text: "Reviewing."},
 			{
-				toolCalls: 2, before: secondBuffered,
-				text: "Reviewed " + followUpPR + "\nREVIEW_VERDICT: APPROVE\nWORK_RESULT: passed",
+				toolCalls: 1, before: secondBuffered,
+				events: []agent.Event{toolUse("pr", "gh pr create --fill"), toolResult("pr", followUpPR)},
+				text:   "Reviewed " + followUpPR + "\nREVIEW_VERDICT: APPROVE\nWORK_RESULT: passed",
 			},
 			{toolCalls: 2, text: "Noted."},
 		},
@@ -130,6 +135,79 @@ func TestRun_ToolCallsAndScalarsAcrossBufferedInjects(t *testing.T) {
 	}
 	if res.WorkResult != "passed" {
 		t.Errorf("WorkResult = %q; want passed from the first inject turn", res.WorkResult)
+	}
+}
+
+// Earlier inject hint survives a later inject's flood and a competing valid
+// URL: inject 1 opens the session PR #7, inject 2 opens #8 (also at the
+// session commit) then reports seventy unrelated PRs. The merged envelope
+// keeps the FIRST trusted URL so later chatter — or a later valid URL —
+// cannot displace it, and the batched verifier still checks every hint:
+// seventy exceeds the old 64-entry window, which evicted #7 from the
+// candidates. Dropping the first-URL preservation (first := "") settles #8
+// instead of #7 and fails this test.
+func TestRun_InjectFirstTrustedURLPreservedOverChatterOverflow(t *testing.T) {
+	platform := newRecordingPlatformServer(t)
+	platform.queueInject(heartbeat.InjectPayload{DeliveryID: "dlv-1", Text: "recall: first memory block"})
+	platform.queueInject(heartbeat.InjectPayload{DeliveryID: "dlv-2", Text: "recall: second memory block"})
+	secondBuffered := func() {
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			if acks, _ := platform.injectReports(); slices.Contains(acks, "dlv-2") {
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		t.Errorf("second inject was never buffered")
+	}
+	var chatter []agent.Event
+	pulls := map[int]string{7: pullAtSessionCommit, 8: pullAtSessionCommit}
+	for n := 101; n <= 170; n++ {
+		u := fmt.Sprintf("https://github.com/example/repo/pull/%d", n)
+		chatter = append(chatter, toolUse("list", "gh pr list"), toolResult("list", "see "+u))
+		pulls[n] = pullAtOtherCommit
+	}
+	competing := "https://github.com/example/repo/pull/8"
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType: "development", repository: followUpRepository, pulls: pulls,
+		heartbeatInterval: 10 * time.Millisecond, platform: platform,
+		turns: []verdictScriptTurn{
+			{text: "Working."},
+			{before: secondBuffered, events: []agent.Event{toolUse("pr", "gh pr create --fill"), toolResult("pr", followUpPR)}, text: "Opened session PR."},
+			{events: append([]agent.Event{toolUse("pr2", "gh pr create --fill"), toolResult("pr2", competing)}, chatter...), text: "Noted."},
+		},
+	})
+	if res.PullRequestURL != followUpPR {
+		t.Fatalf("PullRequestURL = %q; want the first inject's %q (first trusted URL wins over flood and later URLs)", res.PullRequestURL, followUpPR)
+	}
+}
+
+func TestRun_BufferedInjectNarrativeHintIsPreserved(t *testing.T) {
+	platform := newRecordingPlatformServer(t)
+	platform.queueInject(heartbeat.InjectPayload{DeliveryID: "dlv-1", Text: "recall: first memory block"})
+	platform.queueInject(heartbeat.InjectPayload{DeliveryID: "dlv-2", Text: "recall: second memory block"})
+	secondBuffered := func() {
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			if acks, _ := platform.injectReports(); slices.Contains(acks, "dlv-2") {
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		t.Errorf("second inject was never buffered")
+	}
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType: "development", repository: followUpRepository,
+		pulls:             map[int]string{7: pullAtSessionCommit},
+		heartbeatInterval: 10 * time.Millisecond, platform: platform,
+		turns: []verdictScriptTurn{
+			{text: "Working."},
+			{before: secondBuffered, text: "Opened " + followUpPR + "\nWORK_RESULT: passed"},
+			{text: "Noted."},
+		},
+	})
+	if res.PullRequestURL != followUpPR {
+		t.Fatalf("PullRequestURL = %q; want verified %q", res.PullRequestURL, followUpPR)
 	}
 }
 
