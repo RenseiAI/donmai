@@ -1187,14 +1187,15 @@ func TestRun_EarlierUnrelatedInjectCannotHideLaterSessionPR(t *testing.T) {
 }
 
 // A genuine session PR reported in narrative before later tool chatter must
-// still verify. Narrative #7 is oldest, eight unrelated tool URLs follow,
+// still verify. Narrative #7 is oldest, seventy unrelated tool URLs follow,
 // then the turn declines: the verifier checks every candidate in one batch.
-// Eight is the old window size: the narrative hint fell out before the batch.
+// Seventy exceeds the old 64-entry window, which evicted the narrative hint
+// and flipped this landed session to agent-blocked.
 func TestRun_NarrativeBeforeToolChatterKeepsSessionPR(t *testing.T) {
 	var events []agent.Event
 	pulls := map[int]string{7: pullAtSessionCommit}
 	events = append(events, say("Opened "+followUpPR+" for review."))
-	for n := 101; n <= 108; n++ {
+	for n := 101; n <= 170; n++ {
 		u := fmt.Sprintf("https://github.com/example/repo/pull/%d", n)
 		events = append(events, toolUse("list", "gh pr list"), toolResult("list", "see "+u))
 		pulls[n] = pullAtOtherCommit

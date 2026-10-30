@@ -55,16 +55,16 @@ import (
 // pullRequestLookupTimeout bounds one remote lookup.
 const pullRequestLookupTimeout = 15 * time.Second
 
-// maxPullRequestCandidates bounds the distinct candidate URLs a stream keeps.
-// Verification reads them in one batched remote lookup, so a transcript full
-// of URLs costs a single ls-remote (bounded by pullRequestLookupTimeout)
-// instead of stalling the session end. The window is wide on purpose: the
-// session pull request is verified, not voted on, so every hint the stream
-// carried must still be present when the verifier runs. An eight-entry
-// window let eight unrelated URLs evict a genuine session pull request
-// before verification (narrative oldest, or a later inject turn's trusted
-// URL after union), flipping a landed session to agent-blocked.
-const maxPullRequestCandidates = 64
+// Candidate URLs are kept without a bound: verification reads them in one
+// batched remote lookup, so a transcript full of URLs costs a single
+// ls-remote (bounded by pullRequestLookupTimeout) instead of stalling the
+// session end. Retention is bounded by the transcript itself — every
+// candidate consumes input bytes — and every hint the stream carried must
+// still be present when the verifier runs: the session pull request is
+// verified, not voted on. A bounded window let a flood of unrelated URLs
+// evict the genuine session pull request before verification (a narrative
+// hint oldest under tool-result chatter, or an earlier inject turn's hint
+// after union), flipping a landed session to agent-blocked.
 
 // pullRequestRefLookup reads refs from the checkout's origin remote and
 // returns the commit of each named ref that exists there.
@@ -732,8 +732,10 @@ func (r *Runner) acceptSessionPullRequest(ctx context.Context, v *sessionPullReq
 }
 
 // appendPullRequestCandidates records every GitHub pull request URL in text,
-// in order, keeping each URL once at its latest position and at most
-// maxPullRequestCandidates of them.
+// in order, keeping each URL once at its latest position. The list is
+// unbounded: dropping an older hint under a flood of newer URLs is what
+// flipped landed sessions to agent-blocked, so no hint is ever evicted.
+// Retention stays proportional to the transcript that carried the URLs.
 func appendPullRequestCandidates(candidates []string, text string) []string {
 	for _, u := range prURLRE.FindAllString(text, -1) {
 		for i, existing := range candidates {
@@ -743,9 +745,6 @@ func appendPullRequestCandidates(candidates []string, text string) []string {
 			}
 		}
 		candidates = append(candidates, u)
-		if len(candidates) > maxPullRequestCandidates {
-			candidates = candidates[len(candidates)-maxPullRequestCandidates:]
-		}
 	}
 	return candidates
 }

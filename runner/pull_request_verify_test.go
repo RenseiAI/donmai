@@ -313,19 +313,26 @@ func TestSessionPullRequestVerifier_SettleNewestVerifiedCandidateWins(t *testing
 	}
 }
 
-func TestAppendPullRequestCandidates_KeepsLatestPositionAndBound(t *testing.T) {
+func TestAppendPullRequestCandidates_KeepsLatestPositionUnbounded(t *testing.T) {
 	a := "https://github.com/o/r/pull/1"
 	b := "https://github.com/o/r/pull/2"
 	got := appendPullRequestCandidates(nil, a+" then "+b+" then "+a)
 	if strings.Join(got, ",") != b+","+a {
 		t.Fatalf("candidates = %v; want [%s %s]", got, b, a)
 	}
+	// No bound: a flood of unrelated URLs must never evict an earlier
+	// hint — eviction is what flipped landed sessions to agent-blocked.
+	// Seventy exceeds the old 64-entry window: every URL stays, oldest first.
 	var many []string
-	for i := 0; i < maxPullRequestCandidates+3; i++ {
+	const flood = 70
+	for i := 0; i < flood; i++ {
 		many = appendPullRequestCandidates(many, fmt.Sprintf("https://github.com/o/r/pull/%d", i+10))
 	}
-	if len(many) != maxPullRequestCandidates || !strings.HasSuffix(many[len(many)-1], "/pull/"+strconv.Itoa(maxPullRequestCandidates+12)) {
-		t.Fatalf("candidates = %v; want the newest %d", many, maxPullRequestCandidates)
+	if len(many) != flood || !strings.HasSuffix(many[len(many)-1], "/pull/"+strconv.Itoa(flood+9)) {
+		t.Fatalf("candidates = %v; want all %d in order", many, flood)
+	}
+	if many[0] != "https://github.com/o/r/pull/10" {
+		t.Fatalf("candidates[0] = %q; want the oldest hint retained", many[0])
 	}
 }
 

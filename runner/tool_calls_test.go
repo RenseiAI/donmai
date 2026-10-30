@@ -138,13 +138,14 @@ func TestRun_ToolCallsAndScalarsAcrossBufferedInjects(t *testing.T) {
 	}
 }
 
-// Earlier inject hint survives a later empty inject: first inject reports the
-// session PR in narrative, second reports nothing; the verified PR must stand.
-// The first trusted URL across buffered injects survives later chatter even
-// when the chatter would evict it from the candidate window. Inject 1 opens
-// the session PR #7; inject 2 reports eight unrelated PRs. Merging keeps the
-// first URL on the envelope so the batched verifier still finds #7; dropping
-// it (first := "") loses the session PR entirely.
+// Earlier inject hint survives a later inject's flood and a competing valid
+// URL: inject 1 opens the session PR #7, inject 2 opens #8 (also at the
+// session commit) then reports seventy unrelated PRs. The merged envelope
+// keeps the FIRST trusted URL so later chatter — or a later valid URL —
+// cannot displace it, and the batched verifier still checks every hint:
+// seventy exceeds the old 64-entry window, which evicted #7 from the
+// candidates. Dropping the first-URL preservation (first := "") settles #8
+// instead of #7 and fails this test.
 func TestRun_InjectFirstTrustedURLPreservedOverChatterOverflow(t *testing.T) {
 	platform := newRecordingPlatformServer(t)
 	platform.queueInject(heartbeat.InjectPayload{DeliveryID: "dlv-1", Text: "recall: first memory block"})
@@ -160,23 +161,24 @@ func TestRun_InjectFirstTrustedURLPreservedOverChatterOverflow(t *testing.T) {
 		t.Errorf("second inject was never buffered")
 	}
 	var chatter []agent.Event
-	pulls := map[int]string{7: pullAtSessionCommit}
-	for n := 101; n <= 108; n++ {
+	pulls := map[int]string{7: pullAtSessionCommit, 8: pullAtSessionCommit}
+	for n := 101; n <= 170; n++ {
 		u := fmt.Sprintf("https://github.com/example/repo/pull/%d", n)
 		chatter = append(chatter, toolUse("list", "gh pr list"), toolResult("list", "see "+u))
 		pulls[n] = pullAtOtherCommit
 	}
+	competing := "https://github.com/example/repo/pull/8"
 	res, _ := runScriptedSession(t, scriptedSession{
 		workType: "development", repository: followUpRepository, pulls: pulls,
 		heartbeatInterval: 10 * time.Millisecond, platform: platform,
 		turns: []verdictScriptTurn{
 			{text: "Working."},
 			{before: secondBuffered, events: []agent.Event{toolUse("pr", "gh pr create --fill"), toolResult("pr", followUpPR)}, text: "Opened session PR."},
-			{events: chatter, text: "Noted."},
+			{events: append([]agent.Event{toolUse("pr2", "gh pr create --fill"), toolResult("pr2", competing)}, chatter...), text: "Noted."},
 		},
 	})
 	if res.PullRequestURL != followUpPR {
-		t.Fatalf("PullRequestURL = %q; want verified %q (first inject wins over overflow chatter)", res.PullRequestURL, followUpPR)
+		t.Fatalf("PullRequestURL = %q; want the first inject's %q (first trusted URL wins over flood and later URLs)", res.PullRequestURL, followUpPR)
 	}
 }
 
