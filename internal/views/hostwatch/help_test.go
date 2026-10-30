@@ -430,6 +430,58 @@ func TestModel_HelpOverlayBoundsFrames(t *testing.T) {
 	})
 }
 
+// TestModel_ConfirmPromptKeepsActionWithoutHelpAnchor pins the destructive
+// prompt over the idle help anchor: while a stop/drain confirmation is
+// armed the footer keeps its leading action words ("stop", "drain host")
+// and never advertises "? help" (confirmation handling swallows "?").
+// Rebuilding the footer from the anchor (the mutant) truncates the head so
+// the 40-column stop prompt loses "stop" and the 80-column drain prompt
+// loses "drain host". Driven through production Update/View.
+func TestModel_ConfirmPromptKeepsActionWithoutHelpAnchor(t *testing.T) {
+	t.Run("40-col stop keeps action", func(t *testing.T) {
+		acts := newFakeHostActions()
+		m := newActionTestModel(t, actionTestSessions("session-xyz"), acts, 0)
+		mm, _ := m.Update(tea.WindowSizeMsg{Width: 40, Height: 40})
+		m = mm.(*Model)
+		feedKey(m, tea.KeyPressMsg{Code: 'x', Text: "x"})
+		if m.confirmKind != "stop" {
+			t.Fatalf("confirmKind = %q, want stop", m.confirmKind)
+		}
+		last := strings.Split(ansi.Strip(m.render()), "\n")
+		prompt := last[len(last)-1]
+		if !strings.Contains(prompt, "stop") {
+			t.Errorf("armed stop prompt lost action: %q", prompt)
+		}
+		if strings.Contains(prompt, "? help") {
+			t.Errorf("confirm footer advertises help that confirmation swallows: %q", prompt)
+		}
+		if w := lipgloss.Width(prompt); w > 40 {
+			t.Errorf("40-col stop footer width %d: %q", w, prompt)
+		}
+	})
+	t.Run("80-col drain keeps action", func(t *testing.T) {
+		acts := newFakeHostActions()
+		m := newActionTestModel(t, actionTestSessions("sess-a"), acts, 0)
+		mm, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 40})
+		m = mm.(*Model)
+		feedKey(m, tea.KeyPressMsg{Code: 'd', Text: "d"})
+		if m.confirmKind != "drain" {
+			t.Fatalf("confirmKind = %q, want drain", m.confirmKind)
+		}
+		last := strings.Split(ansi.Strip(m.render()), "\n")
+		prompt := last[len(last)-1]
+		if !strings.Contains(prompt, "drain host") {
+			t.Errorf("armed drain prompt lost action: %q", prompt)
+		}
+		if strings.Contains(prompt, "? help") {
+			t.Errorf("confirm footer advertises help that confirmation swallows: %q", prompt)
+		}
+		if w := lipgloss.Width(prompt); w > 80 {
+			t.Errorf("80-col drain footer width %d: %q", w, prompt)
+		}
+	})
+}
+
 func helpFrameName(width int, plain bool) string {
 	mode := "styled"
 	if plain {

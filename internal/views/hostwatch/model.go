@@ -1878,6 +1878,34 @@ func (m *Model) renderHelp() string {
 	case m.notice != "":
 		help = m.notice + "   " + helpText
 	}
+	// A pending stop/drain confirmation owns the footer: the prompt must
+	// keep its leading action words ("stop …", "drain host …") so the
+	// armed operation stays identified. The "? help" anchor is reserved
+	// for the idle footer — confirmation handling swallows "?", so
+	// advertising it here would promise a key that does nothing. Render
+	// the prompt head-truncated exactly as before the anchor existed.
+	if m.confirmKind != "" {
+		if m.filterActive {
+			suffix := "   filter: /" + m.filterQuery
+			if m.width > 0 {
+				avail := m.width - lipgloss.Width(suffix)
+				if avail < 0 {
+					help = truncateWidth(suffix, m.width)
+				} else {
+					help = truncateWidth(help, avail) + suffix
+					help = truncateWidth(help, m.width)
+				}
+			} else {
+				help += suffix
+			}
+		} else {
+			help = truncateWidth(help, m.width)
+		}
+		if m.opts.Plain {
+			return help
+		}
+		return lipgloss.NewStyle().Foreground(m.theme.TextTertiary).Render(help)
+	}
 	// The "?" opener stays visible at narrow widths even beside a long
 	// filter or notice: it is the footer's discoverability anchor. When
 	// the filter suffix alone overflows, the suffix keeps its tail (the
