@@ -51,6 +51,17 @@ function hasGoDockerfile(fileContextPath) {
   }
 }
 
+function hasNodePgDockerfile(fileContextPath) {
+  if (!fileContextPath) {
+    return false
+  }
+  try {
+    return fs.existsSync(path.join(fileContextPath, 'e2b.node-pg.Dockerfile'))
+  } catch {
+    return false
+  }
+}
+
 function parseDockerfileName(value) {
   if (!value) {
     return 'e2b.Dockerfile'
@@ -161,7 +172,7 @@ async function main(overrides = {}) {
   return buildInfo
 }
 
-module.exports = { buildTemplate, hasGoDockerfile, main, parseAdditionalTags, parseCpuCount, parseDockerfileName, parseMemoryMB }
+module.exports = { buildTemplate, hasGoDockerfile, hasNodePgDockerfile, main, parseAdditionalTags, parseCpuCount, parseDockerfileName, parseMemoryMB }
 
 if (require.main === module) {
   main().catch((error) => {

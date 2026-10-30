@@ -1,19 +1,24 @@
 name: e2b-template
 
-# Builds the `donmai-worker` and `donmai-worker-go` E2B sandbox templates in CI.
+# Builds the `donmai-worker`, `donmai-worker-go`, and `donmai-worker-node-pg`
+# E2B sandbox templates in CI.
 #
 # The Dockerfile build authenticates non-interactively with E2B_API_KEY (the
 # org/team API key from https://e2b.dev/dashboard?tab=keys).
 #
 # Every release writes the verified semantic version to explicit E2B targets
-# such as `donmai-worker:v0.53.0` and `donmai-worker-go:v0.53.0`. Automatic
-# stable tag pushes also assign `default` to the same builds, preserving the
-# rolling targets. Prereleases and manual retries rebuild only the versioned
-# targets, so neither can move `default`.
+# such as `donmai-worker:v0.53.0`, `donmai-worker-go:v0.53.0`, and
+# `donmai-worker-node-pg:v0.53.0`. Automatic stable tag pushes also assign
+# `default` to the same builds, preserving the rolling targets. Prereleases
+# and manual retries rebuild only the versioned targets, so neither can move
+# `default`.
 #
-# `donmai-worker` keeps E2B's default build resources and has no Go toolchain.
+# `donmai-worker` keeps E2B's default build resources and has no extra toolchain.
 # `donmai-worker-go` layers the pinned Go toolchain, golangci-lint and gofumpt
 # on the same base and builds at 4 vCPU / 8 GiB for `go test -race ./...`.
+# `donmai-worker-node-pg` layers pinned pnpm, a warm pnpm store, and Postgres 17
+# with pgvector on the same base and builds at 8 vCPU / 16 GiB for large
+# TypeScript repositories (vitest, 12 GiB-heap type checks, pgvector-backed suites).
 #
 # @e2b/cli 2.13.3 help confirms `template create` accepts only an untagged name
 # constrained to lowercase letters, numbers, dashes, and underscores. E2B's
@@ -129,6 +134,22 @@ jobs:
             echo "Go template absent in this release checkout; Go build and verification will be skipped (base-only retry)."
           fi
 
+      # Releases that predate the node-pg template have no
+      # worker/e2b/e2b.node-pg.Dockerfile. Gate the node-pg build and
+      # verification on the file the release actually contains so a historical
+      # retry that predates it still rebuilds the templates it has.
+      - name: Detect node-pg template in release checkout
+        id: node-pg-template
+        run: |
+          set -euo pipefail
+          if node -e "process.exit(require(process.env.RUNNER_TEMP + '/build-e2b-template.cjs').hasNodePgDockerfile('worker/e2b') ? 0 : 1)"; then
+            echo "present=true" >> "${GITHUB_OUTPUT}"
+            echo "node-pg template present in this release checkout."
+          else
+            echo "present=false" >> "${GITHUB_OUTPUT}"
+            echo "node-pg template absent in this release checkout; node-pg build and verification will be skipped (pre-node-pg retry)."
+          fi
+
       - name: Guard - require E2B_API_KEY secret
         env:
           E2B_API_KEY: ${{ secrets.E2B_API_KEY }}
@@ -204,6 +225,27 @@ jobs:
           DONMAI_VERSION: ${{ steps.release.outputs.tag }}
         run: node "${RUNNER_TEMP}/verify-e2b-template.cjs"
 
+      - name: Build versioned E2B node-pg template
+        if: steps.node-pg-template.outputs.present == 'true'
+        id: template-node-pg
+        working-directory: worker/e2b
+        env:
+          E2B_API_KEY: ${{ secrets.E2B_API_KEY }}
+          E2B_TEMPLATE_REF: donmai-worker-node-pg:${{ steps.release.outputs.tag }}
+          E2B_ADDITIONAL_TAGS: ${{ steps.release.outputs.e2b_additional_tags }}
+          E2B_DOCKERFILE: e2b.node-pg.Dockerfile
+          E2B_CPU_COUNT: 8
+          E2B_MEMORY_MB: 16384
+        run: node "${RUNNER_TEMP}/build-e2b-template.cjs"
+
+      - name: Assert published E2B node-pg template toolchain
+        if: steps.node-pg-template.outputs.present == 'true'
+        env:
+          E2B_API_KEY: ${{ secrets.E2B_API_KEY }}
+          E2B_TEMPLATE_REF: ${{ steps.template-node-pg.outputs.template_ref }}
+          DONMAI_VERSION: ${{ steps.release.outputs.tag }}
+        run: node "${RUNNER_TEMP}/verify-e2b-template.cjs"
+
       - name: Summarize E2B template build
         env:
           TEMPLATE_REF: ${{ steps.template.outputs.template_ref }}
@@ -212,6 +254,9 @@ jobs:
           GO_TEMPLATE_REF: ${{ steps.template-go.outputs.template_ref }}
           GO_TEMPLATE_ID: ${{ steps.template-go.outputs.template_id }}
           GO_BUILD_ID: ${{ steps.template-go.outputs.build_id }}
+          NODE_PG_TEMPLATE_REF: ${{ steps.template-node-pg.outputs.template_ref }}
+          NODE_PG_TEMPLATE_ID: ${{ steps.template-node-pg.outputs.template_id }}
+          NODE_PG_BUILD_ID: ${{ steps.template-node-pg.outputs.build_id }}
         run: |
           {
             printf '## E2B template release\n\n'
@@ -224,5 +269,12 @@ jobs:
               printf -- "- Go build ID: \`%s\`\n" "${GO_BUILD_ID}"
             else
               printf -- "- Go template: not present in this release (base-only retry)\n"
+            fi
+            if [[ -n "${NODE_PG_TEMPLATE_REF}" ]]; then
+              printf -- "- node-pg target: \`%s\`\n" "${NODE_PG_TEMPLATE_REF}"
+              printf -- "- node-pg template ID: \`%s\`\n" "${NODE_PG_TEMPLATE_ID}"
+              printf -- "- node-pg build ID: \`%s\`\n" "${NODE_PG_BUILD_ID}"
+            else
+              printf -- "- node-pg template: not present in this release (pre-node-pg retry)\n"
             fi
           } >> "${GITHUB_STEP_SUMMARY}"
