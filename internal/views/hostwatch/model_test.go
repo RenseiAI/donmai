@@ -223,6 +223,19 @@ func TestModel_MouseDetailAndInertRegions(t *testing.T) {
 		if m2.cursor != keep {
 			t.Fatal("gap click must do nothing")
 		}
+		// Gap in a row that does not contain the cursor must also do
+		// nothing. The same-row gap above pins the column but not the
+		// row: without the gap guard a gap click here selects that
+		// row's card (cursor 0 -> perRow).
+		if len(m2.visibleCards()) > perRow {
+			ygOther := mouseRowWith(t, m2, m2.visibleCards()[perRow].displayID())
+			if cmd := mouseClick(m2, xg, ygOther, tea.MouseLeft); cmd != nil {
+				t.Fatal("other-row gap click must not dispatch")
+			}
+			if m2.cursor != keep || m2.detail != keepDetail {
+				t.Fatalf("gap click in another row must do nothing (cursor=%d detail=%v)", m2.cursor, m2.detail)
+			}
+		}
 	}
 	mo := newMouseModel(t, 80, 12, 9)
 	keep = mo.cursor
@@ -297,6 +310,49 @@ func TestModel_MouseViewPolicy(t *testing.T) {
 	_, cmd = mu.Update(tea.MouseClickMsg{X: 10, Y: 3, Button: tea.MouseLeft})
 	if cmd != nil || mu.detail {
 		t.Fatal("unbounded views must ignore mouse input")
+	}
+	// Right-clicks must also be inert in plain/unbounded views, including
+	// with an active filter. Left-clicks are shadowed by sessionIndexAt's
+	// own plain guard, so only right-clicks pin handleMouseClick's guard:
+	// without it a right-click clears the filter like Escape.
+	for _, plainOpts := range []Options{
+		{Plain: true, HostLabel: "h", Now: func() time.Time { return fixtureNow }},
+		{Plain: true, UnboundedCards: true, HostLabel: "h", Now: func() time.Time { return fixtureNow }},
+	} {
+		pf := New(plainOpts)
+		_, _ = pf.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+		pf.applySnapshot(Snapshot{Cards: filterTestCards(), Counters: Counters{Sessions: 4, Running: 4}})
+		_, _ = pf.Update(tea.KeyPressMsg{Code: '/', Text: "/"})
+		feedQuery(pf, "development")
+		if !pf.filterActive || len(pf.visibleCards()) != 2 {
+			t.Fatalf("setup: filtered visible = %d, want 2", len(pf.visibleCards()))
+		}
+		pf.detail = true
+		keepQ, keepCursor := pf.filterQuery, pf.cursor
+		if _, cmd := pf.Update(tea.MouseClickMsg{X: 5, Y: 5, Button: tea.MouseRight}); cmd != nil {
+			t.Fatal("plain right-click must not dispatch")
+		}
+		if !pf.filterActive || pf.filterQuery != keepQ || pf.cursor != keepCursor || !pf.detail {
+			t.Fatalf("plain right-click must leave filter/cursor/detail unchanged (active=%v query=%q cursor=%d detail=%v)", pf.filterActive, pf.filterQuery, pf.cursor, pf.detail)
+		}
+	}
+	// Out-of-bounds right-clicks on the interactive view must do nothing,
+	// even with a filter and detail set. Without the bounds guard a
+	// right-click at (-1,-1) or x==width clears the filter/closes detail.
+	moob := New(Options{Plain: false, HostLabel: "h", Now: func() time.Time { return fixtureNow }})
+	_, _ = moob.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	moob.applySnapshot(Snapshot{Cards: filterTestCards(), Counters: Counters{Sessions: 4, Running: 4}})
+	_, _ = moob.Update(tea.KeyPressMsg{Code: '/', Text: "/"})
+	feedQuery(moob, "development")
+	moob.detail = true
+	keepQ, keepCursor := moob.filterQuery, moob.cursor
+	for _, pos := range [][2]int{{-1, -1}, {120, 5}, {5, 40}} {
+		if _, cmd := moob.Update(tea.MouseClickMsg{X: pos[0], Y: pos[1], Button: tea.MouseRight}); cmd != nil {
+			t.Fatalf("oob right-click at %v must not dispatch", pos)
+		}
+		if !moob.filterActive || moob.filterQuery != keepQ || moob.cursor != keepCursor || !moob.detail {
+			t.Fatalf("oob right-click at %v must leave filter/cursor/detail unchanged", pos)
+		}
 	}
 }
 
