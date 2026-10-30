@@ -388,8 +388,89 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyPressMsg:
 		return m.handleKey(msg)
+
+	case tea.MouseClickMsg:
+		return m.handleMouse(msg)
 	}
 	return m, nil
+}
+
+// mouseEnabled: only interactive (non-plain, bounded) output requests
+// mouse reporting; plain/piped output stays input-free.
+func (m *Model) mouseEnabled() bool {
+	return !m.opts.Plain && !m.opts.UnboundedCards
+}
+
+// handleMouse routes a button press through the keyboard's transitions:
+// left click selects (clicking the selected session toggles detail like
+// enter), right click follows escape. Hits are computed from current
+// state, so resize/filter/snapshot changes leave no stale target. Mouse
+// input never dispatches a lifecycle command; during a confirmation a
+// valid click cancels it and selects without toggling detail.
+func (m *Model) handleMouse(msg tea.MouseClickMsg) (tea.Model, tea.Cmd) {
+	if !m.mouseEnabled() {
+		return m, nil
+	}
+	mouse := msg.Mouse()
+	if mouse.X < 0 || mouse.Y < 0 || mouse.X >= m.width || m.height <= 0 || mouse.Y >= m.height {
+		return m, nil
+	}
+	switch mouse.Button {
+	case tea.MouseRight:
+		m.applyEscape()
+		return m, nil
+	case tea.MouseLeft:
+	default:
+		return m, nil
+	}
+	idx, ok := m.hitAt(mouse.X, mouse.Y)
+	if !ok {
+		return m, nil
+	}
+	if m.confirmKind != "" {
+		m.confirmKind, m.confirmStopID = "", ""
+		m.cursor = idx
+		return m, nil
+	}
+	if idx == m.cursor {
+		m.detail = !m.detail
+	} else {
+		m.cursor = idx
+	}
+	return m, nil
+}
+
+// hitAt returns the visible-card index under cell (x, y). The grid starts
+// below the one-line header; error views render no sessions.
+func (m *Model) hitAt(x, y int) (int, bool) {
+	if m.snapErr != nil {
+		return 0, false
+	}
+	gridH, _ := splitPaneHeights(m.height-2, m.split)
+	for _, r := range gridHitRegions(m.visibleCards(), m.cursor, m.width, gridH, 1, m.opts.Plain) {
+		if x >= r.x0 && x < r.x1 && y >= r.y0 && y < r.y1 {
+			return r.idx, true
+		}
+	}
+	return 0, false
+}
+
+// applyEscape: cancel a pending confirmation, else clear an active
+// filter (keeping the selection), else close detail.
+func (m *Model) applyEscape() {
+	if m.confirmKind != "" {
+		m.confirmKind, m.confirmStopID = "", ""
+		return
+	}
+	if m.filterActive {
+		keep := m.selectedVisibleID()
+		m.filterQuery = ""
+		m.filterActive = false
+		m.detail = false
+		m.reconcileVisibleCursor(keep)
+		return
+	}
+	m.detail = false
 }
 
 func (m *Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
@@ -1250,6 +1331,9 @@ func finiteNonnegative(value float64) bool {
 func (m *Model) View() tea.View {
 	v := tea.NewView(m.render())
 	v.AltScreen = !m.opts.Plain
+	if m.mouseEnabled() {
+		v.MouseMode = tea.MouseModeCellMotion
+	}
 	return v
 }
 
