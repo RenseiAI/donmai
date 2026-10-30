@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"syscall"
 
@@ -22,7 +24,7 @@ import (
 // declared files are archived: symlinks and identity changes between
 // validation and read are refused. The newest complete JSONL tail is kept
 // under explicit per-file and per-attempt caps, redacted with
-// diagnostic.Redact and every wipCheckpointSecretValues value, written
+// diagnostic.Redact and every session secret value, written
 // atomically with owner-only modes, and verified by readback. Any read,
 // validation, write, or readback failure returns preservation failure with
 // a value-free path-safe warning so the caller keeps the workarea.
@@ -103,6 +105,53 @@ func sameTranscriptFile(a, b os.FileInfo) bool {
 	return os.SameFile(a, b)
 }
 
+// transcriptEvidenceSecretValues collects every secret value the evidence
+// archiver must redact: the session bearers, ALL session env values, and
+// the process env values with secret-shaped names, plus any userinfo
+// password embedded in a URL-style value. Unlike the checkpoint content
+// gate it has no minimum-length floor: a short session secret that reaches
+// a transcript must still fail closed.
+func transcriptEvidenceSecretValues(qw QueuedWork) []string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(v string) {
+		if v == "" || len(v) > wipSecretMaxValueLen || seen[v] {
+			return
+		}
+		seen[v] = true
+		out = append(out, v)
+	}
+	add(qw.AuthToken)
+	add(qw.McpAuthToken)
+	for _, value := range qw.Env {
+		add(value)
+	}
+	for _, kv := range os.Environ() {
+		if name, value, ok := strings.Cut(kv, "="); ok && wipSecretEnvNameRE.MatchString(name) {
+			add(value)
+		}
+	}
+	for _, v := range append([]string{}, out...) {
+		if u, err := url.Parse(v); err == nil && u.User != nil {
+			if pw, ok := u.User.Password(); ok {
+				add(pw)
+			}
+		}
+	}
+	return out
+}
+
+// transcriptSensitiveKeyRE mirrors the shared output rail's secret-name
+// list for JSON-aware redaction. A string value under one of these keys is
+// replaced wholesale so an unknown password never survives with its JSON
+// quoting intact. Numeric, boolean, and null values are left alone so
+// ordinary token-usage counters stay valid JSON numbers.
+var transcriptSensitiveKeyRE = regexp.MustCompile(`(?i)(authorization|bearer|api[_-]?keys?|access[_-]?tokens?|refresh[_-]?tokens?|auth[_-]?tokens?|client[_-]?secrets?|private[_-]?keys?|secrets?|tokens?|passwords?|passwds?|credentials?|cookies?|sessions?)`)
+
+func isSensitiveTranscriptKey(k string) bool {
+	return transcriptSensitiveKeyRE.MatchString(k)
+}
+
 // readTranscriptTailBounded keeps the newest complete JSONL tail of an
 // opened transcript under perFileCap bytes: the last perFileCap bytes with
 // the leading partial line dropped and the trailing partial line (when the
@@ -177,14 +226,124 @@ func readTranscriptTailBounded(f *os.File, finfo os.FileInfo, perFileCap int64) 
 	return raw, nil
 }
 
-// redactTranscriptEvidence redacts one tail with both rails: the shared
-// output rail and every session secret value, including the value's
-// JSON-escaped form. A secret containing a newline, quote, or backslash is
-// stored escaped inside JSONL (for example a newline becomes backslash-n),
-// so replacing only the raw value would leave the escaped bytes
-// recoverably in the archive.
+// redactTranscriptEvidence redacts one tail with both rails while keeping
+// every archived record valid JSONL. Each complete line is decoded, its
+// string values are redacted in decoded form (so raw, JSON-escaped,
+// Unicode-escaped, and nested-JSON encodings of a secret all match the same
+// decoded bytes), and the record is re-encoded. Decoding first is what
+// makes short, Unicode-escaped, and doubly-encoded secrets unrecoverable:
+// after decoding there is only one form left to replace. Sensitive-keyed
+// string values are replaced wholesale so an unknown password keeps its
+// JSON quoting. Non-JSON lines fall back to text redaction.
 func redactTranscriptEvidence(tail string, values []string) string {
-	redacted := diagnostic.Redact(tail)
+	if tail == "" {
+		return ""
+	}
+	parts := strings.SplitAfter(tail, "\n")
+	var sb strings.Builder
+	for _, part := range parts {
+		if part == "" {
+			continue
+		}
+		if !strings.HasSuffix(part, "\n") {
+			continue
+		}
+		line := strings.TrimSuffix(part, "\n")
+		if line == "" {
+			sb.WriteString("\n")
+			continue
+		}
+		var v interface{}
+		if err := parseTranscriptJSONLine(line, &v); err == nil {
+			redacted := redactJSONValue(v, values)
+			b, err := json.Marshal(redacted)
+			if err == nil {
+				sb.Write(b)
+				sb.WriteByte('\n')
+				continue
+			}
+		}
+		sb.WriteString(redactTextWithSecrets(line, values))
+		sb.WriteByte('\n')
+	}
+	return sb.String()
+}
+
+// parseTranscriptJSONLine decodes one JSONL record preserving numbers.
+func parseTranscriptJSONLine(line string, out *interface{}) error {
+	dec := json.NewDecoder(strings.NewReader(line))
+	dec.UseNumber()
+	if err := dec.Decode(out); err != nil {
+		return err
+	}
+	var extra interface{}
+	if err := dec.Decode(&extra); err != io.EOF {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+
+// redactJSONValue redacts one decoded JSON value in place.
+func redactJSONValue(v interface{}, values []string) interface{} {
+	switch typed := v.(type) {
+	case string:
+		return redactJSONString(typed, values)
+	case map[string]interface{}:
+		for k, val := range typed {
+			if isSensitiveTranscriptKey(k) {
+				switch sv := val.(type) {
+				case string:
+					_ = sv
+					typed[k] = "[REDACTED]"
+				case map[string]interface{}, []interface{}:
+					typed[k] = redactJSONValue(val, values)
+				default:
+					// Numbers, booleans, and null under usage-style keys
+					// (for example input_tokens) are counters, not secrets.
+				}
+			} else {
+				typed[k] = redactJSONValue(val, values)
+			}
+		}
+		return typed
+	case []interface{}:
+		for i, e := range typed {
+			typed[i] = redactJSONValue(e, values)
+		}
+		return typed
+	default:
+		return v
+	}
+}
+
+// redactJSONString redacts one decoded string value. When the whole string
+// is itself JSON (a doubly-encoded record), the inner record is redacted
+// recursively so nested secrets cannot survive behind a second encoding.
+func redactJSONString(s string, values []string) string {
+	trimmed := strings.TrimSpace(s)
+	if len(trimmed) >= 2 && ((trimmed[0] == '{' && trimmed[len(trimmed)-1] == '}') || (trimmed[0] == '[' && trimmed[len(trimmed)-1] == ']')) {
+		var inner interface{}
+		if err := json.Unmarshal([]byte(trimmed), &inner); err == nil {
+			redacted := redactJSONValue(inner, values)
+			if b, err := json.Marshal(redacted); err == nil {
+				return string(b)
+			}
+		}
+	}
+	for _, v := range values {
+		if v != "" {
+			s = strings.ReplaceAll(s, v, "[REDACTED]")
+		}
+	}
+	return diagnostic.Redact(s)
+}
+
+// redactTextWithSecrets redacts one non-JSON line with both rails. Unicode
+// escapes are expanded first so a \\uXXXX-encoded secret matches its raw
+// form before replacement.
+func redactTextWithSecrets(text string, values []string) string {
+	text = expandTranscriptUnicodeEscapes(text)
+	redacted := diagnostic.Redact(text)
 	for _, v := range values {
 		if v == "" {
 			continue
@@ -197,7 +356,46 @@ func redactTranscriptEvidence(tail string, values []string) string {
 			redacted = strings.ReplaceAll(redacted, form, "[REDACTED]")
 		}
 	}
-	return redacted
+	return diagnostic.Redact(redacted)
+}
+
+// expandTranscriptUnicodeEscapes decodes \\uXXXX sequences so an encoded
+// secret matches its raw form. Invalid sequences are left as-is.
+func expandTranscriptUnicodeEscapes(s string) string {
+	var out strings.Builder
+	out.Grow(len(s))
+	for i := 0; i < len(s); {
+		if s[i] == '\\' && i+5 < len(s) && (s[i+1] == 'u' || s[i+1] == 'U') {
+			ok := true
+			var r rune
+			for j := i + 2; j < i+6; j++ {
+				c := s[j]
+				var d rune
+				switch {
+				case c >= '0' && c <= '9':
+					d = rune(c - '0')
+				case c >= 'a' && c <= 'f':
+					d = rune(c-'a') + 10
+				case c >= 'A' && c <= 'F':
+					d = rune(c-'A') + 10
+				default:
+					ok = false
+				}
+				if !ok {
+					break
+				}
+				r = r*16 + d
+			}
+			if ok {
+				out.WriteRune(r)
+				i += 6
+				continue
+			}
+		}
+		out.WriteByte(s[i])
+		i++
+	}
+	return out.String()
 }
 
 // transcriptEvidenceEscapedForms returns the JSON string-body encodings of
@@ -339,17 +537,11 @@ func writeTranscriptEvidenceAtomic(dir, name string, data []byte) error {
 }
 
 // verifyTranscriptEvidenceReadback re-reads a written evidence file and
-// proves it matches what was intended to be written.
+// proves it matches what was intended to be written. The type and mode are
+// checked before any read and the file is opened non-blocking so a
+// post-write swap to a FIFO without a writer cannot hang finalization.
 func verifyTranscriptEvidenceReadback(path string, expected []byte) error {
 	//nolint:gosec // G304: path is the runner-owned evidence file just written.
-	got, err := os.ReadFile(path)
-	if err != nil {
-		return fmt.Errorf("read back evidence file: %w", err)
-	}
-	if string(got) != string(expected) {
-		return fmt.Errorf("evidence readback mismatch")
-	}
-	//nolint:gosec // G304: path validated above as the runner-owned evidence file.
 	info, err := os.Lstat(path)
 	if err != nil {
 		return fmt.Errorf("stat evidence file: %w", err)
@@ -359,6 +551,36 @@ func verifyTranscriptEvidenceReadback(path string, expected []byte) error {
 	}
 	if info.Mode().Perm()&0o077 != 0 {
 		return fmt.Errorf("evidence file has unsafe mode %o", info.Mode().Perm())
+	}
+	//nolint:gosec // G304: path validated above as the runner-owned evidence file.
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return fmt.Errorf("read back evidence file: %w", err)
+	}
+	finfo, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return fmt.Errorf("stat evidence file: %w", err)
+	}
+	if !finfo.Mode().IsRegular() || finfo.Mode()&os.ModeSymlink != 0 {
+		_ = f.Close()
+		return fmt.Errorf("evidence file is not a regular file")
+	}
+	if !os.SameFile(info, finfo) {
+		_ = f.Close()
+		return fmt.Errorf("evidence file identity changed")
+	}
+	if finfo.Mode().Perm()&0o077 != 0 {
+		_ = f.Close()
+		return fmt.Errorf("evidence file has unsafe mode %o", finfo.Mode().Perm())
+	}
+	got, err := io.ReadAll(f)
+	_ = f.Close()
+	if err != nil {
+		return fmt.Errorf("read back evidence file: %w", err)
+	}
+	if string(got) != string(expected) {
+		return fmt.Errorf("evidence readback mismatch")
 	}
 	return nil
 }
@@ -375,7 +597,7 @@ func (r *Runner) archiveFailedSessionEvidence(qw QueuedWork, res *Result, dirFor
 	if len(res.terminalTranscripts) == 0 {
 		return true
 	}
-	values := wipCheckpointSecretValues(qw)
+	values := transcriptEvidenceSecretValues(qw)
 	remaining := transcriptEvidencePerAttemptCapBytes
 	for i, desc := range res.terminalTranscripts {
 		resolved, err := resolveTranscriptEvidencePath(desc.Path, res)
