@@ -448,25 +448,52 @@ func mapItemEvent(method string, params json.RawMessage, state *mapperState, raw
 		// The caller owns this input; forwarding would duplicate the
 		// prompt in the activity stream.
 		return nil
-	case ItemKindAgentMessage, ItemKindReasoning:
+	case ItemKindAgentMessage:
+		// Assistant text rides one complete message per item: the
+		// completion snapshot is authoritative and the ONLY
+		// AssistantTextEvent for the item. Started/updated snapshots
+		// and deltas are content-free liveness (StreamProgress), never
+		// text fragments: the runner scans each AssistantTextEvent for
+		// line-anchored verdict markers and stamps its summary from the
+		// latest one, so a marker split across fragments loses its
+		// verdict and the summary retains only the trailing fragment
+		// (the ResultEvent carries no Message to repair it). Buffer
+		// the running text only to bound retention; completion emits
+		// the full snapshot regardless of what streamed before it.
 		text := itemText(&item)
-		if item.Kind == ItemKindReasoning {
-			text = reasoningText(&item)
-		}
 		previous := state.textItems[item.ItemID]
-		// Snapshots are authoritative; forward only the unseen suffix when
-		// they extend the streaming text. A replacement is emitted in full.
+		switch {
+		case isCompleted:
+			delete(state.textItems, item.ItemID)
+			if text == "" {
+				return nil
+			}
+			return []agent.Event{agent.AssistantTextEvent{Text: text, Raw: raw}}
+		case len(text) <= 1<<20 && (previous.kind != "" || len(state.textItems) < 1024):
+			state.textItems[item.ItemID] = textItem{kind: item.Kind, text: text, field: "text"}
+			if text == "" {
+				return nil
+			}
+			return []agent.Event{agent.StreamProgressEvent()}
+		default:
+			delete(state.textItems, item.ItemID)
+			return []agent.Event{agent.StreamProgressEvent()}
+		}
+	case ItemKindReasoning:
+		// Reasoning streams as SystemEvents (never scanned for verdicts),
+		// so fragments are safe: forward only the unseen suffix when
+		// snapshots extend the streaming text, in full on replacement.
+		text := reasoningText(&item)
+		previous := state.textItems[item.ItemID]
 		unseen := strings.TrimPrefix(text, previous.text)
 		switch {
 		case isCompleted:
 			delete(state.textItems, item.ItemID)
 		case len(text) <= 1<<20 && (previous.kind != "" || len(state.textItems) < 1024):
 			field := "text"
-			if item.Kind == ItemKindReasoning {
-				var parts []string
-				if json.Unmarshal(item.Summary, &parts) == nil && len(parts) > 0 {
-					field = fmt.Sprintf("summary.%d", len(parts)-1)
-				}
+			var parts []string
+			if json.Unmarshal(item.Summary, &parts) == nil && len(parts) > 0 {
+				field = fmt.Sprintf("summary.%d", len(parts)-1)
 			}
 			state.textItems[item.ItemID] = textItem{kind: item.Kind, text: text, field: field}
 		default:
@@ -509,9 +536,14 @@ func mapItemEvent(method string, params json.RawMessage, state *mapperState, raw
 	}
 }
 
-// mapItemDelta forwards UTF-8 text appends for known open text items.
-// Unknown items/fields stay silent: a delta carries no item kind. Completion
-// still supplies the authoritative snapshot if the stream was saturated.
+// mapItemDelta forwards reasoning text appends as SystemEvents and maps
+// assistant-text appends to content-free liveness. Assistant deltas never
+// emit AssistantTextEvent fragments: the runner scans each such event for
+// line-anchored verdict markers, so a split marker would lose its verdict
+// and the summary would retain only the trailing fragment. The full text
+// still arrives on the matching item/completed snapshot. Unknown
+// items/fields stay silent. Completion supplies the authoritative snapshot
+// if the stream was saturated.
 func mapItemDelta(params json.RawMessage, state *mapperState, raw any) []agent.Event {
 	var p ItemDeltaParams
 	if json.Unmarshal(params, &p) != nil || p.ItemID == "" || state.gap != nil {
@@ -536,6 +568,11 @@ func mapItemDelta(params json.RawMessage, state *mapperState, raw any) []agent.E
 	item.field = field
 	item.text += delta
 	state.textItems[p.ItemID] = item
+	if item.kind != ItemKindReasoning {
+		// Assistant-text streaming is liveness only; the complete
+		// message arrives on item/completed.
+		return []agent.Event{agent.StreamProgressEvent()}
+	}
 	return textEvents(item.kind, delta, raw)
 }
 

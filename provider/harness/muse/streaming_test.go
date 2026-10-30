@@ -36,6 +36,7 @@ func TestSpawn_StreamingText(t *testing.T) {
 			}
 			events := drainEvents(t, h.Events(), 10*time.Second)
 			var text, reasoning []string
+			var progress int
 			for _, ev := range events {
 				switch e := ev.(type) {
 				case agent.AssistantTextEvent:
@@ -44,13 +45,23 @@ func TestSpawn_StreamingText(t *testing.T) {
 					if e.Subtype == "reasoning" {
 						reasoning = append(reasoning, e.Message)
 					}
+					if e.Subtype == agent.SystemSubtypeStreamProgress {
+						progress++
+					}
 				}
 			}
-			if want := []string{"first", " second", " third", " last", "final answer"}; !reflect.DeepEqual(text, want) {
+			// Assistant text rides one complete message per item: the
+			// two agentMessage items complete as two full messages.
+			// Fragments never surface as AssistantTextEvent (they would
+			// split line-anchored verdict markers and shard the summary).
+			if want := []string{"first second third last", "final answer"}; !reflect.DeepEqual(text, want) {
 				t.Errorf("assistant chunks = %q, want %q", text, want)
 			}
 			if want := []string{"first", " second", " third", "\nnext", " last"}; !reflect.DeepEqual(reasoning, want) {
 				t.Errorf("reasoning chunks = %q, want %q", reasoning, want)
+			}
+			if progress == 0 {
+				t.Errorf("no stream-progress liveness for assistant deltas")
 			}
 			if r, ok := terminalResult(events); !ok || !r.Success {
 				t.Errorf("terminal result: %+v", r)
@@ -74,6 +85,41 @@ func TestSpawn_StreamingText(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestStreaming_VerdictSplitSurvivesFragmentation(t *testing.T) {
+	// B1: a verdict marker split across streaming fragments must not lose
+	// its verdict or shard the summary. Assistant deltas are liveness
+	// only; the completion carries the full message in one event so the
+	// runner's per-message scan sees the complete marker.
+	state := newMapperState("model")
+	started, err := json.Marshal(map[string]any{"item": map[string]any{"itemId": "m1", "kind": "agentMessage", "revision": 1, "text": "Done.\nWORK_", "status": "inProgress"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := mapNotification("item/started", started, state, nil); len(got) != 1 {
+		t.Fatalf("started produced %v, want one liveness signal", kindsOf(got))
+	} else if sys, ok := got[0].(agent.SystemEvent); !ok || sys.Subtype != agent.SystemSubtypeStreamProgress {
+		t.Fatalf("started produced %T %+v, want stream_progress", got[0], got[0])
+	}
+	delta := json.RawMessage(`{"itemId":"m1","field":"text","delta":"RESULT:passed\n"}`)
+	if got := mapNotification("item/delta", delta, state, nil); len(got) != 1 {
+		t.Fatalf("delta produced %v, want one liveness signal", kindsOf(got))
+	} else if sys, ok := got[0].(agent.SystemEvent); !ok || sys.Subtype != agent.SystemSubtypeStreamProgress {
+		t.Fatalf("delta produced %T %+v, want stream_progress, not a text fragment", got[0], got[0])
+	}
+	completed, err := json.Marshal(map[string]any{"item": map[string]any{"itemId": "m1", "kind": "agentMessage", "revision": 2, "text": "Done.\nWORK_RESULT:passed\n", "status": "completed"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := mapNotification("item/completed", completed, state, nil)
+	if len(got) != 1 {
+		t.Fatalf("completion produced %v, want one complete message", kindsOf(got))
+	}
+	text, ok := got[0].(agent.AssistantTextEvent)
+	if !ok || text.Text != "Done.\nWORK_RESULT:passed\n" {
+		t.Fatalf("completion event=%+v, want the full snapshot in one message", got[0])
 	}
 }
 
@@ -125,16 +171,30 @@ func TestStreaming_GapAndBounds(t *testing.T) {
 		t.Fatalf("gap emitted %v", got)
 	}
 	state.gap = nil
+	// Assistant deltas are liveness only, never text fragments: the full
+	// message arrives on item/completed so verdict markers never split.
 	got := mapNotification("item/delta", delta, state, nil)
-	if len(got) != 1 || got[0].(agent.AssistantTextEvent).Text != " world" {
-		t.Fatalf("default text delta: %v", got)
+	if len(got) != 1 || got[0].(agent.SystemEvent).Subtype != agent.SystemSubtypeStreamProgress {
+		t.Fatalf("assistant delta must be liveness, got %v", got)
 	}
-	snapshot(2, strings.Repeat("x", 1<<20))
+	// Completion emits the full snapshot, not just the unseen suffix.
+	completed, err := json.Marshal(map[string]any{"item": map[string]any{"itemId": "open", "kind": "agentMessage", "revision": 2, "text": "hello world", "status": "completed"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got = mapNotification("item/completed", completed, state, nil)
+	if len(got) != 1 {
+		t.Fatalf("completion produced %v", kindsOf(got))
+	}
+	if text, ok := got[0].(agent.AssistantTextEvent); !ok || text.Text != "hello world" {
+		t.Fatalf("completion event=%+v, want full snapshot", got[0])
+	}
+	snapshot(3, strings.Repeat("x", 1<<20))
 	got = mapNotification("item/delta", delta, state, nil)
 	if len(got) != 1 || got[0].(agent.SystemEvent).Subtype != agent.SystemSubtypeStreamProgress {
 		t.Fatalf("oversized delta: %v", got)
 	}
-	params, err := json.Marshal(map[string]any{"item": map[string]any{"itemId": "open", "kind": "reasoning", "revision": 3, "summary": []string{strings.Repeat("x", (1<<20)-1)}}})
+	params, err := json.Marshal(map[string]any{"item": map[string]any{"itemId": "open", "kind": "reasoning", "revision": 4, "summary": []string{strings.Repeat("x", (1<<20)-1)}}})
 	if err != nil {
 		t.Fatal(err)
 	}
