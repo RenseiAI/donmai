@@ -326,6 +326,85 @@ func TestModel_HelpOverlayBoundsFrames(t *testing.T) {
 		}
 	})
 
+	t.Run("minimum 80x6 help shows entries", func(t *testing.T) {
+		for _, plain := range []bool{false, true} {
+			m := newFixtureModel(t, 80, 6, plain, 0)
+			feedKey(m, questionKey())
+			if !m.help {
+				t.Fatalf("plain=%v: \"?\" did not open help at 80x6", plain)
+			}
+			if got := m.helpBodyHeight(); got < 2 {
+				t.Fatalf("plain=%v: 80x6 help body height=%d, want >=2", plain, got)
+			}
+			rows := m.helpRows(m.helpContentWidth())
+			reachable := map[string]bool{}
+			for {
+				start, bodyH := m.helpScroll, m.helpBodyHeight()
+				end := start + bodyH
+				if end > len(rows) {
+					end = len(rows)
+				}
+				for _, r := range rows[start:end] {
+					reachable[r] = true
+				}
+				next := m.helpScroll
+				feedKey(m, tea.KeyPressMsg{Code: tea.KeyDown})
+				if m.helpScroll == next {
+					break
+				}
+			}
+			for _, r := range rows {
+				if !reachable[r] {
+					t.Fatalf("plain=%v: 80x6 help row never reachable: %q", plain, r)
+				}
+			}
+			// Every scrolled frame stays bounded and keeps chrome.
+			m.helpScroll = 0
+			m.clampHelpScroll()
+			for {
+				raw := m.render()
+				lines := strings.Split(raw, "\n")
+				if len(lines) != 6 {
+					t.Fatalf("plain=%v: 80x6 help frame has %d rows, want 6", plain, len(lines))
+				}
+				for i, line := range lines {
+					if w := lipgloss.Width(line); w > 80 {
+						t.Fatalf("plain=%v: 80x6 row %d width %d", plain, i, w)
+					}
+				}
+				if plain && strings.Contains(raw, "\x1b") {
+					t.Fatal("plain 80x6 help frame carries an escape")
+				}
+				next := m.helpScroll
+				feedKey(m, tea.KeyPressMsg{Code: tea.KeyDown})
+				if m.helpScroll == next {
+					break
+				}
+			}
+			// First and last entries each appear in some frame.
+			seenFirst, seenLast := false, false
+			m.helpScroll = 0
+			m.clampHelpScroll()
+			for {
+				view := ansi.Strip(m.render())
+				if strings.Contains(view, "select a session") {
+					seenFirst = true
+				}
+				if strings.Contains(view, "mouse") {
+					seenLast = true
+				}
+				next := m.helpScroll
+				feedKey(m, tea.KeyPressMsg{Code: tea.KeyDown})
+				if m.helpScroll == next {
+					break
+				}
+			}
+			if !seenFirst || !seenLast {
+				t.Fatalf("plain=%v: 80x6 frames missing entries first=%v last=%v", plain, seenFirst, seenLast)
+			}
+		}
+	})
+
 	t.Run("footer keeps anchor beside long filters and notices", func(t *testing.T) {
 		m := newFilterModel(t, 40, 40)
 		feedKey(m, tea.KeyPressMsg{Code: '/', Text: "/"})

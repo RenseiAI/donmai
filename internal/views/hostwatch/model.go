@@ -592,10 +592,23 @@ func (m *Model) clampHelpScroll() {
 	}
 }
 
+// helpCompact reports whether the overlay drops its border chrome to
+// keep help rows reachable on short terminals. Below eight rows the
+// four bordered chrome rows leave fewer than two body rows, so the
+// overlay renders borderless (title + body + hint) and reclaims the
+// two border rows for help text.
+func (m *Model) helpCompact() bool {
+	return m.height > 0 && m.height < 8
+}
+
 // helpContentWidth is the overlay's text width: the terminal width
 // minus its two border cells, floored so tiny terminals stay non-empty.
+// Compact (borderless) overlays use the full width.
 func (m *Model) helpContentWidth() int {
 	w := m.width - 2
+	if m.helpCompact() {
+		w = m.width
+	}
 	if w < 1 {
 		w = 1
 	}
@@ -604,14 +617,21 @@ func (m *Model) helpContentWidth() int {
 
 // helpBodyHeight is the overlay rows available for help text: the
 // content rows minus its title, hint and border rows, floored at zero
-// so short terminals scroll instead of overflowing.
+// so short terminals scroll instead of overflowing. Compact overlays
+// omit the top/bottom border rows, so they subtract only the title
+// and hint rows and keep two body rows at the minimum 80x6 geometry.
 func (m *Model) helpBodyHeight() int {
 	h := m.height - 2
 	if h < 0 {
 		h = 0
 	}
-	// Title row + closing hint row + top/bottom border rows.
-	h -= 4
+	if m.helpCompact() {
+		// Title row + closing hint row (no borders).
+		h -= 2
+	} else {
+		// Title row + closing hint row + top/bottom border rows.
+		h -= 4
+	}
 	if h < 0 {
 		h = 0
 	}
@@ -766,6 +786,8 @@ func ansiWidth(s string) int {
 // terminal: a bordered panel with a title, the scroll window of wrapped
 // help rows, and a closing hint. It never exceeds the frame width or
 // height and scrolls short terminals so every row stays reachable.
+// Below eight rows the borders are omitted so two body rows stay
+// visible at the minimum 80x6 geometry.
 func (m *Model) renderHelpOverlay() string {
 	width := m.width
 	if width < 1 {
@@ -790,6 +812,22 @@ func (m *Model) renderHelpOverlay() string {
 	}
 	title := "keyboard help  (? closes)"
 	hint := "↑↓ scroll · esc close"
+	if m.helpCompact() {
+		lines := make([]string, 0, len(visible)+2)
+		lines = append(lines, truncateWidth(fitCells(title, contentW), width))
+		for _, r := range visible {
+			lines = append(lines, truncateWidth(fitCells(r, contentW), width))
+		}
+		lines = append(lines, truncateWidth(fitCells(hint, contentW), width))
+		if m.opts.Plain {
+			return strings.Join(lines, "\n")
+		}
+		out := make([]string, 0, len(lines))
+		for _, ln := range lines {
+			out = append(out, lipgloss.NewStyle().Foreground(m.theme.TextTertiary).Render(ln))
+		}
+		return strings.Join(out, "\n")
+	}
 	lines := make([]string, 0, len(visible)+4)
 	top := "╭" + strings.Repeat("─", contentW) + "╮"
 	bottom := "╰" + strings.Repeat("─", contentW) + "╯"
