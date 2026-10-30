@@ -124,8 +124,15 @@ func snapshotPiTranscriptBaseline(root string) (map[string]struct{}, bool) {
 		return nil, true
 	}
 	clean := filepath.Clean(root)
-	if info, err := os.Lstat(clean); err != nil || !info.IsDir() {
-		return nil, false
+	info, err := os.Lstat(clean)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, false
+		}
+		return nil, true
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return nil, true
 	}
 	var baseline map[string]struct{}
 	if err := walkInteractiveTranscriptFiles(clean, func(path string, _ os.DirEntry) {
@@ -154,27 +161,50 @@ func (h *Handle) TerminalTranscripts() ([]agent.TerminalTranscriptDescriptor, er
 	if !h.stopped.Load() {
 		return nil, errors.New("pi: transcript evidence unavailable while session writers may still be active")
 	}
-	// Held until collection so a concurrent spawn in the same root
-	// contaminates before either side collects; released here so a later
-	// sequential reuse sees an empty set. The contaminated flag persists.
-	defer h.evidenceClaim.release()
+	h.evidenceMu.Lock()
+	defer h.evidenceMu.Unlock()
+	if h.evidenceDone {
+		if h.evidenceCachedErr != nil {
+			return nil, h.evidenceCachedErr
+		}
+		if len(h.evidenceCached) == 0 {
+			return nil, nil
+		}
+		cp := make([]agent.TerminalTranscriptDescriptor, len(h.evidenceCached))
+		copy(cp, h.evidenceCached)
+		return cp, nil
+	}
+	fail := func(err error) ([]agent.TerminalTranscriptDescriptor, error) {
+		h.evidenceDone = true
+		h.evidenceCachedErr = err
+		return nil, err
+	}
 	if h.evidenceIncomplete {
-		return nil, errors.New("pi: transcript evidence unavailable: pre-spawn transcript scan was incomplete")
+		return fail(errors.New("pi: transcript evidence unavailable: pre-spawn transcript scan was incomplete"))
 	}
 	if h.evidenceClaim.isContaminated() {
-		return nil, errors.New("pi: transcript evidence unavailable: concurrent session shared this state root")
+		return fail(errors.New("pi: transcript evidence unavailable: concurrent session shared this state root"))
 	}
 	root := h.stateRoot
 	if root == "" {
 		// No per-session root was recorded at spawn: fail closed rather
 		// than guessing ownership across a reused workarea.
+		h.evidenceDone = true
 		return nil, nil
 	}
-	descs := collectPiTranscriptDescriptors(root, h.evidenceBaseline)
+	descs, err := collectPiTranscriptDescriptors(root, h.evidenceBaseline)
+	if err != nil {
+		return fail(err)
+	}
 	if len(descs) == 0 {
+		h.evidenceDone = true
 		return nil, nil
 	}
-	return descs, nil
+	h.evidenceDone = true
+	h.evidenceCached = descs
+	cp := make([]agent.TerminalTranscriptDescriptor, len(descs))
+	copy(cp, descs)
+	return cp, nil
 }
 
 // TerminalTranscripts implements agent.TerminalTranscriptCapable for the
@@ -190,21 +220,47 @@ func (h *interactiveStateLossHandle) TerminalTranscripts() ([]agent.TerminalTran
 	default:
 		return nil, errors.New("pi: transcript evidence unavailable until the final transcript flush completes")
 	}
-	defer h.evidenceClaim.release()
+	h.evidenceMu.Lock()
+	defer h.evidenceMu.Unlock()
+	if h.evidenceDone {
+		if h.evidenceCachedErr != nil {
+			return nil, h.evidenceCachedErr
+		}
+		if len(h.evidenceCached) == 0 {
+			return nil, nil
+		}
+		cp := make([]agent.TerminalTranscriptDescriptor, len(h.evidenceCached))
+		copy(cp, h.evidenceCached)
+		return cp, nil
+	}
+	fail := func(err error) ([]agent.TerminalTranscriptDescriptor, error) {
+		h.evidenceDone = true
+		h.evidenceCachedErr = err
+		return nil, err
+	}
 	if h.evidenceIncomplete {
-		return nil, errors.New("pi: transcript evidence unavailable: pre-spawn transcript scan was incomplete")
+		return fail(errors.New("pi: transcript evidence unavailable: pre-spawn transcript scan was incomplete"))
 	}
 	if h.evidenceClaim.isContaminated() {
-		return nil, errors.New("pi: transcript evidence unavailable: concurrent session shared this state root")
+		return fail(errors.New("pi: transcript evidence unavailable: concurrent session shared this state root"))
 	}
 	if strings.TrimSpace(h.stateRoot) == "" {
+		h.evidenceDone = true
 		return nil, nil
 	}
-	descs := collectPiTranscriptDescriptors(h.stateRoot, h.evidenceBaseline)
+	descs, err := collectPiTranscriptDescriptors(h.stateRoot, h.evidenceBaseline)
+	if err != nil {
+		return fail(err)
+	}
 	if len(descs) == 0 {
+		h.evidenceDone = true
 		return nil, nil
 	}
-	return descs, nil
+	h.evidenceDone = true
+	h.evidenceCached = descs
+	cp := make([]agent.TerminalTranscriptDescriptor, len(descs))
+	copy(cp, descs)
+	return cp, nil
 }
 
 // collectPiTranscriptDescriptors returns path-only descriptors for the
@@ -218,15 +274,22 @@ func (h *interactiveStateLossHandle) TerminalTranscripts() ([]agent.TerminalTran
 // are absent. A missing, non-directory, or link-swapped root yields no
 // descriptors; a session with no transcript yields nil so callers keep
 // today's cleanup behavior with no empty evidence artifact.
-func collectPiTranscriptDescriptors(root string, baseline map[string]struct{}) (descs []agent.TerminalTranscriptDescriptor) {
+func collectPiTranscriptDescriptors(root string, baseline map[string]struct{}) ([]agent.TerminalTranscriptDescriptor, error) {
 	if strings.TrimSpace(root) == "" {
-		return nil
+		return nil, nil
 	}
 	clean := filepath.Clean(root)
 	info, err := os.Lstat(clean)
-	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return nil
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, errors.New("pi: transcript evidence unavailable: post-stop transcript scan was incomplete")
 	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return nil, nil
+	}
+	var descs []agent.TerminalTranscriptDescriptor
 	walkErr := walkInteractiveTranscriptFiles(clean, func(path string, _ os.DirEntry) {
 		// A transcript that already existed before this session started
 		// belongs to a previous session reusing this workarea, never to
@@ -257,13 +320,13 @@ func collectPiTranscriptDescriptors(root string, baseline map[string]struct{}) (
 		// The post-stop scan hit a read error: fail closed rather than
 		// returning a partial set that could hide this session's
 		// transcript or misattribute another's.
-		return nil
+		return nil, errors.New("pi: transcript evidence unavailable: post-stop transcript scan was incomplete")
 	}
 	if len(descs) == 0 {
-		return nil
+		return nil, nil
 	}
 	sort.Slice(descs, func(i, j int) bool { return descs[i].Path < descs[j].Path })
-	return descs
+	return descs, nil
 }
 
 // isEvidenceExcludedRel reports whether a layout-root-relative transcript

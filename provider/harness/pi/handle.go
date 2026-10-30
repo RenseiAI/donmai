@@ -183,7 +183,18 @@ type Handle struct {
 	evidenceIncomplete bool
 	// evidenceClaim is the per-handle lease on the layout root. It detects
 	// concurrent sessions sharing the root; a contaminated lease refuses.
+	// The lease is live from spawn until Stop releases it: sequential reuse
+	// after Stop sees an empty set, while overlap while both writers are
+	// live contaminates both sides. Collection never releases; it caches.
 	evidenceClaim *piEvidenceClaim
+	// evidenceMu guards the single-use collection cache below. The first
+	// TerminalTranscripts after Stop scans and caches; later calls return
+	// the cached outcome so a session started after the first collection
+	// can never pollute this handle's evidence.
+	evidenceMu        sync.Mutex
+	evidenceDone      bool
+	evidenceCached    []agent.TerminalTranscriptDescriptor
+	evidenceCachedErr error
 	// stopped closes once Stop has reaped the child and removed the
 	// session credential files: transcript writers have stopped and the
 	// state root is stable for evidence collection. TerminalTranscripts
@@ -418,6 +429,11 @@ func (h *Handle) Stop(ctx context.Context) error {
 		}
 	})
 	h.stopped.Store(true)
+	// Writers have stopped: release the overlap lease so a later sequential
+	// session in the same checkout is not falsely contaminated. The
+	// contamination flag persists on the claim, so a true overlap still
+	// refuses at collection.
+	h.evidenceClaim.release()
 	return nil
 }
 

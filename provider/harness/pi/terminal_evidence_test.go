@@ -256,7 +256,10 @@ func TestTerminalEvidence_Exclusions(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	descs := collectPiTranscriptDescriptors(root, nil)
+	descs, err := collectPiTranscriptDescriptors(root, nil)
+	if err != nil {
+		t.Fatalf("collectPiTranscriptDescriptors: %v", err)
+	}
 	got := make(map[string]bool, len(descs))
 	for _, d := range descs {
 		got[d.Path] = true
@@ -280,14 +283,14 @@ func TestTerminalEvidence_Exclusions(t *testing.T) {
 func TestTerminalEvidence_EmptyReturnsNil(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
-	if descs := collectPiTranscriptDescriptors(root, nil); len(descs) != 0 {
-		t.Fatalf("empty layout descriptors = %+v; want none", descs)
+	if descs, err := collectPiTranscriptDescriptors(root, nil); err != nil || len(descs) != 0 {
+		t.Fatalf("empty layout descriptors = %+v, err = %v; want none", descs, err)
 	}
-	if descs := collectPiTranscriptDescriptors(filepath.Join(root, "missing"), nil); len(descs) != 0 {
-		t.Fatalf("missing root descriptors = %+v; want none", descs)
+	if descs, err := collectPiTranscriptDescriptors(filepath.Join(root, "missing"), nil); err != nil || len(descs) != 0 {
+		t.Fatalf("missing root descriptors = %+v, err = %v; want none", descs, err)
 	}
-	if descs := collectPiTranscriptDescriptors("", nil); len(descs) != 0 {
-		t.Fatalf("empty root descriptors = %+v; want none", descs)
+	if descs, err := collectPiTranscriptDescriptors("", nil); err != nil || len(descs) != 0 {
+		t.Fatalf("empty root descriptors = %+v, err = %v; want none", descs, err)
 	}
 
 	// A handle stopped with no transcript reports no evidence, not a
@@ -710,5 +713,198 @@ sleep 5
 		if descs, err := capable.TerminalTranscripts(); err == nil || len(descs) != 0 {
 			t.Fatalf("handle %s TerminalTranscripts = %+v, err = %v; want refusal when sessions overlapped", name, descs, err)
 		}
+	}
+}
+
+// TestTerminalEvidence_WalkerContinuesPastUnreadableSibling pins B1: an
+// unreadable directory sorting before the live transcript must not hide the
+// live transcript from tailing, while evidence collection still refuses on
+// the incomplete scan.
+func TestTerminalEvidence_WalkerContinuesPastUnreadableSibling(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	unreadable := filepath.Join(root, "00-aaa-unreadable")
+	if err := os.MkdirAll(unreadable, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(unreadable, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.ReadDir(unreadable); err == nil {
+		_ = os.Chmod(unreadable, 0o700) //nolint:gosec // G302: test fixture dir restore needs the execute bit
+		t.Skip("unreadable-dir probe needs non-root EACCES; ReadDir succeeded")
+	}
+	restore := func() { _ = os.Chmod(unreadable, 0o700) } //nolint:gosec // G302: test fixture dir restore needs the execute bit
+	t.Cleanup(restore)
+	tailer := newInteractiveTranscriptTailer(root)
+	if !tailer.baselineIncomplete {
+		t.Fatal("tailer baseline must be incomplete when a sibling scan failed")
+	}
+	live := filepath.Join(root, "zz-live.jsonl")
+	writeTranscriptLine(t, live, transcriptMessage("live", map[string]any{
+		"role": "assistant", "content": []any{map[string]any{"type": "text", "text": "live"}},
+	}))
+	files, _ := tailer.pendingFiles()
+	found := false
+	for _, f := range files {
+		if f.path == live {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("pendingFiles missed live transcript beside unreadable sibling; got %+v", files)
+	}
+	if _, err := collectPiTranscriptDescriptors(root, tailer.baseline); err == nil {
+		t.Fatal("evidence collection must refuse when the post-stop scan is incomplete")
+	}
+}
+
+// TestTerminalEvidence_SnapshotRootLstatFailureIsIncomplete pins B3/B5: a root
+// whose Lstat fails (parent temporarily inaccessible) snapshots to an
+// incomplete baseline, never to a complete empty one.
+func TestTerminalEvidence_SnapshotRootLstatFailureIsIncomplete(t *testing.T) {
+	t.Parallel()
+	parent := t.TempDir()
+	root := filepath.Join(parent, "state")
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeTranscriptLine(t, filepath.Join(root, "old.jsonl"), transcriptMessage("old", map[string]any{
+		"role": "assistant", "content": []any{map[string]any{"type": "text", "text": "old"}},
+	}))
+	if err := os.Chmod(parent, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(root); err == nil {
+		_ = os.Chmod(parent, 0o700) //nolint:gosec // G302: test fixture dir restore needs the execute bit
+		t.Skip("Lstat EACCES probe needs non-root; Lstat succeeded")
+	}
+	_, incomplete := snapshotPiTranscriptBaseline(root)
+	_ = os.Chmod(parent, 0o700) //nolint:gosec // G302: test fixture dir restore needs the execute bit
+	if !incomplete {
+		t.Fatal("snapshot with inaccessible root must be incomplete, not a complete empty baseline")
+	}
+}
+
+// TestTerminalEvidence_PostStopScanFailureRefuses pins B4: a post-stop
+// traversal error is a typed refusal, not successful empty evidence, and the
+// refusal is cached for later collections.
+func TestTerminalEvidence_PostStopScanFailureRefuses(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	writeTranscriptLine(t, filepath.Join(root, "top.jsonl"), transcriptMessage("m", map[string]any{
+		"role": "assistant", "content": []any{map[string]any{"type": "text", "text": "x"}},
+	}))
+	sub := filepath.Join(root, "sessions")
+	if err := os.MkdirAll(sub, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeTranscriptLine(t, filepath.Join(sub, "old.jsonl"), transcriptMessage("old", map[string]any{
+		"role": "assistant", "content": []any{map[string]any{"type": "text", "text": "old"}},
+	}))
+	if err := os.Chmod(sub, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.ReadDir(sub); err == nil {
+		_ = os.Chmod(sub, 0o700) //nolint:gosec // G302: test fixture dir restore needs the execute bit
+		t.Skip("unreadable-dir probe needs non-root EACCES; ReadDir succeeded")
+	}
+	t.Cleanup(func() { _ = os.Chmod(sub, 0o700) }) //nolint:gosec // G302: test fixture dir restore needs the execute bit
+	if _, err := collectPiTranscriptDescriptors(root, nil); err == nil {
+		t.Fatal("post-stop scan failure must be a typed refusal, not empty success")
+	}
+	h := newHandle(nil, nil, agent.Spec{Cwd: root}, "token")
+	h.setStateRoot(root)
+	h.stopped.Store(true)
+	if _, err := h.TerminalTranscripts(); err == nil {
+		t.Fatal("TerminalTranscripts must refuse when the post-stop scan fails")
+	}
+	if _, err := h.TerminalTranscripts(); err == nil {
+		t.Fatal("second TerminalTranscripts must still refuse (cached), not return empty success")
+	}
+}
+
+// TestTerminalEvidence_SequentialStopReleasesLease pins B2 through the
+// production headless entry: stopping A without collecting, then spawning B
+// in the same checkout, leaves B clean.
+func TestTerminalEvidence_SequentialStopReleasesLease(t *testing.T) {
+	bin := buildEvidenceFakePi(t)
+	workdir := t.TempDir()
+	t.Setenv("FAKEPI_WRITE_TRANSCRIPT", "1")
+	t.Setenv("FAKEPI_TRANSCRIPT_LAST_LINE", "SEQUENTIAL_LEASE_RELEASE")
+	t.Setenv("FAKEPI_REPLY", "sequential turn done")
+	newHeadless := func() *Provider {
+		t.Helper()
+		p, err := New(Options{
+			PiBin:            bin,
+			HandshakeTimeout: 20 * time.Second,
+			VersionProbe:     func(context.Context, string) (string, error) { return PinnedVersion, nil },
+		})
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		t.Cleanup(func() { _ = p.Shutdown(context.Background()) })
+		return p
+	}
+	pA, pB := newHeadless(), newHeadless()
+	hA, err := pA.Spawn(context.Background(), agent.Spec{Cwd: workdir, Prompt: "go"})
+	if err != nil {
+		t.Fatalf("Spawn A: %v", err)
+	}
+	drainToTerminal(t, hA)
+	if err := hA.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop A: %v", err)
+	}
+	hB, err := pB.Spawn(context.Background(), agent.Spec{Cwd: workdir, Prompt: "go"})
+	if err != nil {
+		t.Fatalf("Spawn B: %v", err)
+	}
+	drainToTerminal(t, hB)
+	if err := hB.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop B: %v", err)
+	}
+	capable, ok := hB.(agent.TerminalTranscriptCapable)
+	if !ok {
+		t.Fatal("handle B does not expose the terminal-transcript capability")
+	}
+	descs, err := capable.TerminalTranscripts()
+	if err != nil {
+		t.Fatalf("sequential B TerminalTranscripts refused: %v", err)
+	}
+	if len(descs) == 0 {
+		t.Fatal("sequential B must expose its own transcript after A stopped without collecting")
+	}
+}
+
+// TestTerminalEvidence_RepeatedCollectionReturnsCached pins B6: collecting,
+// starting a later session, then collecting again returns the original
+// outcome, never the later session's transcript.
+func TestTerminalEvidence_RepeatedCollectionReturnsCached(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	aPath := filepath.Join(root, "a.jsonl")
+	writeTranscriptLine(t, aPath, transcriptMessage("a", map[string]any{
+		"role": "assistant", "content": []any{map[string]any{"type": "text", "text": "a"}},
+	}))
+	h := newHandle(nil, nil, agent.Spec{Cwd: root}, "token")
+	h.setStateRoot(root)
+	h.stopped.Store(true)
+	first, err := h.TerminalTranscripts()
+	if err != nil {
+		t.Fatalf("first TerminalTranscripts: %v", err)
+	}
+	if len(first) != 1 || first[0].Path != aPath {
+		t.Fatalf("first = %+v; want exactly [%q]", first, aPath)
+	}
+	bPath := filepath.Join(root, "b.jsonl")
+	writeTranscriptLine(t, bPath, transcriptMessage("b", map[string]any{
+		"role": "assistant", "content": []any{map[string]any{"type": "text", "text": "b"}},
+	}))
+	second, err := h.TerminalTranscripts()
+	if err != nil {
+		t.Fatalf("second TerminalTranscripts: %v", err)
+	}
+	if len(second) != 1 || second[0].Path != aPath {
+		t.Fatalf("second = %+v; want cached original [%q], not the later session's transcript", second, aPath)
 	}
 }

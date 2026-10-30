@@ -119,6 +119,15 @@ func newInteractiveTranscriptTailer(stateDir string) *interactiveTranscriptTaile
 		return t
 	}
 	t.stateDir = filepath.Clean(stateDir)
+	if info, err := os.Lstat(t.stateDir); err != nil {
+		if os.IsNotExist(err) {
+			return t
+		}
+		t.baselineIncomplete = true
+		return t
+	} else if !info.IsDir() {
+		return t
+	}
 	if err := walkInteractiveTranscriptFiles(t.stateDir, func(path string, _ os.DirEntry) {
 		t.baseline[path] = struct{}{}
 	}); err != nil {
@@ -250,13 +259,21 @@ func (t *interactiveTranscriptTailer) pendingFiles() (files []pendingTranscript,
 // recursing into subdirectories (older pi builds nest transcripts under
 // sessions/) but never into the per-session config home, the
 // injected-extensions dir, or the per-session tmp/cache dirs, which hold
-// no transcripts. It reports the first traversal error, if any: baseline
-// snapshots must know when the scan was incomplete, while best-effort
-// tailing sweeps ignore it.
+// no transcripts. It reports the first traversal error, if any, but keeps
+// visiting siblings: baseline snapshots must know when the scan was
+// incomplete, while best-effort tailing sweeps still see the files past an
+// unreadable entry.
 func walkInteractiveTranscriptFiles(dir string, fn func(path string, entry os.DirEntry)) error {
-	return filepath.WalkDir(dir, func(path string, entry os.DirEntry, err error) error {
+	var firstErr error
+	werr := filepath.WalkDir(dir, func(path string, entry os.DirEntry, err error) error {
 		if err != nil {
-			return err
+			if firstErr == nil {
+				firstErr = err
+			}
+			if entry != nil && entry.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
 		}
 		if entry.IsDir() {
 			switch entry.Name() {
@@ -271,6 +288,10 @@ func walkInteractiveTranscriptFiles(dir string, fn func(path string, entry os.Di
 		fn(path, entry)
 		return nil
 	})
+	if werr != nil && firstErr == nil {
+		firstErr = werr
+	}
+	return firstErr
 }
 
 // tail feeds each complete line appended to path since the last read to

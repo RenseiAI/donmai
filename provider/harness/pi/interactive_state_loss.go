@@ -164,6 +164,14 @@ type interactiveStateLossHandle struct {
 	// sessions sharing the root; a contaminated lease refuses.
 	evidenceIncomplete bool
 	evidenceClaim      *piEvidenceClaim
+	// evidenceMu guards the single-use collection cache: the first
+	// TerminalTranscripts after the final flush scans and caches; later
+	// calls return the cached outcome so a later session can never pollute
+	// this handle's evidence.
+	evidenceMu        sync.Mutex
+	evidenceDone      bool
+	evidenceCached    []agent.TerminalTranscriptDescriptor
+	evidenceCachedErr error
 	// activityFlushed closes once the transcript tailer has enqueued its
 	// final flush (or dropped it on a full channel) and returned.
 	activityFlushed chan struct{}
@@ -271,6 +279,15 @@ func newInteractiveStateLossHandle(handle *ptycli.Handle, stateDir string, taile
 // Events overrides ptycli.Handle.Events with the same coarse events plus the
 // typed state-loss condition and transcript activity above.
 func (h *interactiveStateLossHandle) Events() <-chan agent.Event { return h.events }
+
+// Stop reaps the PTY child then releases the overlap lease, mirroring the
+// headless lane: sequential reuse after writers stop is clean, while true
+// overlap stays contaminated via the persisted flag.
+func (h *interactiveStateLossHandle) Stop(ctx context.Context) error {
+	err := h.Handle.Stop(ctx)
+	h.evidenceClaim.release()
+	return err
+}
 
 // ActivityFlushed implements agent.InteractiveActivityFlusher: it closes once
 // the session's final transcript activity has been enqueued on Events.
