@@ -40,6 +40,17 @@ function parseMemoryMB(value) {
   return parsed
 }
 
+function hasGoDockerfile(fileContextPath) {
+  if (!fileContextPath) {
+    return false
+  }
+  try {
+    return fs.existsSync(path.join(fileContextPath, 'e2b.go.Dockerfile'))
+  } catch {
+    return false
+  }
+}
+
 function parseDockerfileName(value) {
   if (!value) {
     return 'e2b.Dockerfile'
@@ -150,7 +161,7 @@ async function main(overrides = {}) {
   return buildInfo
 }
 
-module.exports = { buildTemplate, main, parseAdditionalTags, parseCpuCount, parseDockerfileName, parseMemoryMB }
+module.exports = { buildTemplate, hasGoDockerfile, main, parseAdditionalTags, parseCpuCount, parseDockerfileName, parseMemoryMB }
 
 if (require.main === module) {
   main().catch((error) => {

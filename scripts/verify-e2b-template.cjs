@@ -116,6 +116,17 @@ function readGoDockerfileSource(repoRoot) {
   )
 }
 
+function hasGoTemplate(repoRoot) {
+  if (typeof repoRoot !== 'string' || repoRoot === '') {
+    return false
+  }
+  try {
+    return fs.existsSync(path.join(repoRoot, 'worker', 'e2b', 'e2b.go.Dockerfile'))
+  } catch {
+    return false
+  }
+}
+
 function isGoTemplateRef(templateRef) {
   return typeof templateRef === 'string' && templateRef.includes('donmai-worker-go')
 }
@@ -458,6 +469,7 @@ async function main(overrides = {}) {
 }
 
 module.exports = {
+  hasGoTemplate,
   assertGofumptVersionOutput,
   assertGolangciLintVersionOutput,
   assertGoVersionOutput,

@@ -80,6 +80,19 @@ jobs:
           install -m 0755 scripts/verify-e2b-template.cjs "${RUNNER_TEMP}/verify-e2b-template.cjs"
           install -m 0644 scripts/verify-e2b-template.test.cjs "${RUNNER_TEMP}/verify-e2b-template.test.cjs"
 
+      # Run the staged automation tests while the workspace still holds the
+      # automation checkout, so the version assertions stay paired with the
+      # fixtures they pin (go.mod, Dockerfiles, probe.go). A manual retry of a
+      # release that predates the Go template would otherwise run the current
+      # Go assertions against a historical checkout that lacks
+      # worker/e2b/e2b.go.Dockerfile and fail before the base build.
+      - name: Test E2B version assertion
+        env:
+          DONMAI_REPO_ROOT: ${{ github.workspace }}
+        run: |
+          node --test "${RUNNER_TEMP}/verify-e2b-template.test.cjs"
+          node --test "${RUNNER_TEMP}/build-e2b-template.test.cjs"
+
       - name: Checkout release tag
         uses: actions/checkout@v7
         with:
@@ -98,7 +111,22 @@ jobs:
             "${GITHUB_OUTPUT}" \
             "${GITHUB_ENV}"
           if [[ "${GITHUB_EVENT_NAME}" == workflow_dispatch ]]; then
-            echo "::notice::Manual retry rebuilds only donmai-worker:${RELEASE_TAG} and donmai-worker-go:${RELEASE_TAG}; default is unchanged."
+            echo "::notice::Manual retry rebuilds only versioned targets; default is unchanged."
+          fi
+
+      # Releases that predate the Go template have no worker/e2b/e2b.go.Dockerfile.
+      # Gate the Go build and verification on the file the release actually
+      # contains so a historical base-only retry still rebuilds the base template.
+      - name: Detect Go template in release checkout
+        id: go-template
+        run: |
+          set -euo pipefail
+          if [[ -f worker/e2b/e2b.go.Dockerfile ]]; then
+            echo "present=true" >> "${GITHUB_OUTPUT}"
+            echo "Go template present in this release checkout."
+          else
+            echo "present=false" >> "${GITHUB_OUTPUT}"
+            echo "Go template absent in this release checkout; Go build and verification will be skipped (base-only retry)."
           fi
 
       - name: Guard - require E2B_API_KEY secret
@@ -126,13 +154,6 @@ jobs:
           e2b --version
           printf 'NODE_PATH=%s\n' "$(npm root --global)" >> "${GITHUB_ENV}"
 
-      - name: Test E2B version assertion
-        env:
-          DONMAI_REPO_ROOT: ${{ github.workspace }}
-        run: |
-          node --test "${RUNNER_TEMP}/verify-e2b-template.test.cjs"
-          node --test "${RUNNER_TEMP}/build-e2b-template.test.cjs"
-
       - name: Cross-compile donmai binary (linux/amd64)
         env:
           VERSION: ${{ steps.release.outputs.tag }}
@@ -156,6 +177,7 @@ jobs:
         run: node "${RUNNER_TEMP}/build-e2b-template.cjs"
 
       - name: Build versioned E2B Go template
+        if: steps.go-template.outputs.present == 'true'
         id: template-go
         working-directory: worker/e2b
         env:
@@ -175,6 +197,7 @@ jobs:
         run: node "${RUNNER_TEMP}/verify-e2b-template.cjs"
 
       - name: Assert published E2B Go template toolchain
+        if: steps.go-template.outputs.present == 'true'
         env:
           E2B_API_KEY: ${{ secrets.E2B_API_KEY }}
           E2B_TEMPLATE_REF: ${{ steps.template-go.outputs.template_ref }}
@@ -195,7 +218,11 @@ jobs:
             printf -- "- Target: \`%s\`\n" "${TEMPLATE_REF}"
             printf -- "- Template ID: \`%s\`\n" "${TEMPLATE_ID}"
             printf -- "- Build ID: \`%s\`\n" "${BUILD_ID}"
-            printf -- "- Go target: \`%s\`\n" "${GO_TEMPLATE_REF}"
-            printf -- "- Go template ID: \`%s\`\n" "${GO_TEMPLATE_ID}"
-            printf -- "- Go build ID: \`%s\`\n" "${GO_BUILD_ID}"
+            if [[ -n "${GO_TEMPLATE_REF}" ]]; then
+              printf -- "- Go target: \`%s\`\n" "${GO_TEMPLATE_REF}"
+              printf -- "- Go template ID: \`%s\`\n" "${GO_TEMPLATE_ID}"
+              printf -- "- Go build ID: \`%s\`\n" "${GO_BUILD_ID}"
+            else
+              printf -- "- Go template: not present in this release (base-only retry)\n"
+            fi
           } >> "${GITHUB_STEP_SUMMARY}"

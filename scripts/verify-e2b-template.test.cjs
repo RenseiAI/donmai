@@ -14,6 +14,7 @@ const {
   assertVersionOutput,
   hasCToolchainForRace,
   hasE2bCompatibleGoPath,
+  hasGoTemplate,
   isGoTemplateRef,
   main,
   parseAptInstalledPackages,
@@ -23,6 +24,7 @@ const {
   parseGolangciLintVersion,
   parseGoVersion,
   parsePinnedPiVersion,
+  readGoDockerfileSource,
   readGoVersion,
   readPinnedPiVersion,
   resolveRepoRoot,
@@ -801,4 +803,79 @@ test('main() skips Go toolchain checks for the base template', async () => {
   })
   assert.equal(code, 0)
   assert.deepEqual(runs, ['donmai --version', 'pi --version'])
+})
+
+test('historical base-only checkout verifies the base template without Go checks', async () => {
+  // Mimics a release checkout that predates worker/e2b/e2b.go.Dockerfile.
+  // The production verifier must still verify the base template with only
+  // donmai/pi checks, while Go expectations stay gated on the file existing.
+  const historicalRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'verify-e2b-historical-'))
+  try {
+    fs.writeFileSync(path.join(historicalRoot, 'go.mod'), 'module example.com/x\n\ngo 1.26.10\n')
+    fs.mkdirSync(path.join(historicalRoot, 'worker', 'e2b'), { recursive: true })
+    fs.writeFileSync(
+      path.join(historicalRoot, 'worker', 'e2b', 'e2b.Dockerfile'),
+      'FROM debian:bookworm-slim\n'
+    )
+    fs.mkdirSync(path.join(historicalRoot, 'provider', 'harness', 'pi'), { recursive: true })
+    fs.writeFileSync(
+      path.join(historicalRoot, 'provider', 'harness', 'pi', 'probe.go'),
+      'package pi\n\nconst PinnedVersion = "0.80.10"\n'
+    )
+    assert.equal(hasGoTemplate(historicalRoot), false)
+    assert.throws(() => readGoDockerfileSource(historicalRoot), /could not find e2b\.go\.Dockerfile/)
+
+    const runs = []
+    const fakeSandbox = {
+      async create() {
+        return {
+          commands: {
+            async run(command) {
+              runs.push(command)
+              if (command === 'donmai --version') {
+                return { exitCode: 0, stdout: 'donmai version v0.53.0\n' }
+              }
+              if (command === 'pi --version') {
+                return { exitCode: 0, stdout: 'pi 0.80.10\n' }
+              }
+              throw new Error(`unexpected command: ${command}`)
+            },
+          },
+          async kill() {},
+        }
+      },
+    }
+    const code = await main({
+      env: {
+        E2B_TEMPLATE_REF: 'donmai-worker:v0.53.0',
+        DONMAI_VERSION: 'v0.53.0',
+        E2B_API_KEY: 'test-key',
+        DONMAI_REPO_ROOT: historicalRoot,
+      },
+      cwd: historicalRoot,
+      loadSandbox: () => fakeSandbox,
+      writeError: () => {},
+    })
+    assert.equal(code, 0)
+    assert.deepEqual(runs, ['donmai --version', 'pi --version'])
+  } finally {
+    fs.rmSync(historicalRoot, { recursive: true, force: true })
+  }
+})
+
+test('hasGoTemplate reports the Go template only when the Go Dockerfile exists', () => {
+  const withGo = fs.mkdtempSync(path.join(os.tmpdir(), 'verify-e2b-hasgo-'))
+  const withoutGo = fs.mkdtempSync(path.join(os.tmpdir(), 'verify-e2b-nogo-'))
+  try {
+    fs.mkdirSync(path.join(withGo, 'worker', 'e2b'), { recursive: true })
+    fs.writeFileSync(path.join(withGo, 'worker', 'e2b', 'e2b.go.Dockerfile'), 'FROM x\n')
+    fs.mkdirSync(path.join(withoutGo, 'worker', 'e2b'), { recursive: true })
+    assert.equal(hasGoTemplate(withGo), true)
+    assert.equal(hasGoTemplate(withoutGo), false)
+    assert.equal(hasGoTemplate(''), false)
+    assert.equal(hasGoTemplate(undefined), false)
+  } finally {
+    fs.rmSync(withGo, { recursive: true, force: true })
+    fs.rmSync(withoutGo, { recursive: true, force: true })
+  }
 })

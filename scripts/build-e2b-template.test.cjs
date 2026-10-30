@@ -9,6 +9,7 @@ const { spawnSync } = require('node:child_process')
 
 const {
   buildTemplate,
+  hasGoDockerfile,
   main,
   parseCpuCount,
   parseDockerfileName,
@@ -314,4 +315,61 @@ test('parseDockerfileName defaults to the base template and rejects traversal', 
   assert.equal(parseDockerfileName('e2b.go.Dockerfile'), 'e2b.go.Dockerfile')
   assert.throws(() => parseDockerfileName('../e2b.Dockerfile'), /E2B_DOCKERFILE/)
   assert.throws(() => parseDockerfileName('a/b.Dockerfile'), /E2B_DOCKERFILE/)
+})
+
+test('historical base-only checkout still builds the base template (no Go Dockerfile)', async () => {
+  // Mimics a release checkout that predates worker/e2b/e2b.go.Dockerfile:
+  // the base Dockerfile exists, the Go Dockerfile does not. The production
+  // builder must still build the base template with default resources, while
+  // a Go build in the same layout fails before the SDK so the workflow gates it.
+  const contextDir = fs.mkdtempSync(path.join(os.tmpdir(), 'build-e2b-historical-'))
+  fs.writeFileSync(path.join(contextDir, 'e2b.Dockerfile'), 'FROM debian:bookworm-slim # base\n')
+  const outputFile = path.join(contextDir, 'github-output')
+  fs.writeFileSync(outputFile, '')
+  const goDir = fs.mkdtempSync(path.join(os.tmpdir(), 'build-e2b-hasgo-'))
+  fs.writeFileSync(path.join(goDir, 'e2b.Dockerfile'), 'FROM debian:bookworm-slim # base\n')
+  fs.writeFileSync(path.join(goDir, 'e2b.go.Dockerfile'), 'FROM debian:bookworm-slim # go\n')
+  try {
+    assert.equal(hasGoDockerfile(contextDir), false)
+    assert.equal(hasGoDockerfile(goDir), true)
+
+    const calls = []
+    await main({
+      env: {
+        E2B_TEMPLATE_REF: 'donmai-worker:v0.53.0',
+        E2B_API_KEY: 'test-key',
+        E2B_ADDITIONAL_TAGS: '',
+        GITHUB_OUTPUT: outputFile,
+      },
+      cwd: contextDir,
+      loadSdk: () => makeSdk(calls),
+      stdout: nullStdout(),
+    })
+    const call = buildCallFor(calls)
+    assert.equal(call.target, 'donmai-worker:v0.53.0')
+    assert.ok(!('cpuCount' in call.options), 'cpuCount must be absent for the historical base build')
+    assert.ok(!('memoryMB' in call.options), 'memoryMB must be absent for the historical base build')
+    assert.match(dockerfileFor(calls), /# base/)
+
+    await assert.rejects(
+      main({
+        env: {
+          E2B_TEMPLATE_REF: 'donmai-worker-go:v0.53.0',
+          E2B_API_KEY: 'test-key',
+          E2B_ADDITIONAL_TAGS: '',
+          E2B_DOCKERFILE: 'e2b.go.Dockerfile',
+          E2B_CPU_COUNT: '4',
+          E2B_MEMORY_MB: '8192',
+          GITHUB_OUTPUT: outputFile,
+        },
+        cwd: contextDir,
+        loadSdk: () => makeSdk([]),
+        stdout: nullStdout(),
+      }),
+      /ENOENT|no such file/i,
+    )
+  } finally {
+    fs.rmSync(contextDir, { recursive: true, force: true })
+    fs.rmSync(goDir, { recursive: true, force: true })
+  }
 })
