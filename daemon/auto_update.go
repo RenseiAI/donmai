@@ -25,6 +25,17 @@ import (
 // pointing at any vendor's infrastructure.
 const UpdateCDNBase = ""
 
+// effectiveUpdateCDNBase resolves the update source the production updater
+// checks: the operator-configured autoUpdate.cdnBase when set, otherwise the
+// compiled default (empty in OSS builds, so auto-update stays disabled until
+// the operator opts in). Empty means no source is configured.
+func effectiveUpdateCDNBase(cfg AutoUpdateConfig) string {
+	if strings.TrimSpace(cfg.CDNBase) != "" {
+		return strings.TrimSpace(cfg.CDNBase)
+	}
+	return strings.TrimSpace(UpdateCDNBase)
+}
+
 // VersionManifest is the schema of <channel>/latest.json.
 type VersionManifest struct {
 	Version    string `json:"version"`
@@ -224,6 +235,15 @@ func (u *Updater) RunUpdate(ctx context.Context) (*UpdateResult, error) {
 	valid, reason := u.opts.Verifier.Verify(ctx, hash, signature)
 	if !valid {
 		return &UpdateResult{Updated: false, Version: u.opts.CurrentVersion, Reason: "sig-rejected: " + reason}, nil
+	}
+
+	// Consent bounds the swap itself, not just admission: the host-upgrade
+	// execution context expires at the request deadline, and verification
+	// can cross it. Check cancellation after verification and before any
+	// irreversible filesystem change so an expired request never replaces
+	// the binary and then reports a refusal.
+	if err := ctx.Err(); err != nil {
+		return &UpdateResult{Updated: false, Version: u.opts.CurrentVersion, Reason: "update-cancelled: " + err.Error()}, err
 	}
 
 	if u.opts.CurrentBinaryPath == "" {
