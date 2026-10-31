@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"reflect"
 	"strings"
@@ -275,4 +276,157 @@ drained:
 	if assistant == 0 || result == 0 {
 		t.Fatalf("burst lost final events: assistant=%d result=%d handlerDone=%v", assistant, result, done)
 	}
+}
+
+// TestBurstPreservesTerminal_Reasoning pins the reasoning-burst contract:
+// a slow consumer that never drains while 301 reasoning fragments stream
+// must still observe the authoritative assistant completion and the
+// terminal result. Reasoning is best-effort intermediate thought (never
+// verdict-scanned), so it never takes a reserved slot. Drives the
+// production Handle.handleNotification + emitter path with no concurrent
+// drain, mirroring TestBurstPreservesTerminal with summary.0 deltas.
+func TestBurstPreservesTerminal_Reasoning(t *testing.T) {
+	h := newHandle(nil, agent.Spec{Prompt: "x"}, NewSpawnPlan(agent.Spec{Prompt: "x"}, t.TempDir()), HandleOptions{})
+	sid := "55555555-5555-7555-8555-555555555555"
+	turnID := "66666666-6666-7466-8466-666666666666"
+	h.setSessionID(sid)
+	h.setCurrentTurnID(turnID)
+	reasonID := "r1"
+	answerID := "m1"
+	started, err := json.Marshal(map[string]any{
+		"sessionId": sid, "viewCursor": "cursor-0",
+		"item": map[string]any{"itemId": reasonID, "kind": "reasoning", "revision": 1, "status": "inProgress", "summary": []string{"seed"}, "turnId": turnID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.handleNotification(context.Background(), notification{Method: "item/started", Params: started})
+	const burst = 301
+	for i := 0; i < burst; i++ {
+		delta, err := json.Marshal(map[string]any{"sessionId": sid, "viewCursor": "cursor-0", "itemId": reasonID, "field": "summary.0", "delta": "a"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		h.handleNotification(context.Background(), notification{Method: "item/delta", Params: delta})
+	}
+	full := "final answer"
+	completed, err := json.Marshal(map[string]any{
+		"sessionId": sid, "viewCursor": "cursor-1",
+		"item": map[string]any{"itemId": answerID, "kind": "agentMessage", "revision": 1, "status": "completed", "text": full, "turnId": turnID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.handleNotification(context.Background(), notification{Method: "item/completed", Params: completed})
+	turnDone, err := json.Marshal(map[string]any{"sessionId": sid, "viewCursor": "cursor-end", "turnId": turnID, "terminal": "completed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := h.handleNotification(context.Background(), notification{Method: "turn/completed", Params: turnDone})
+	if !done {
+		t.Fatalf("turn/completed did not report terminal")
+	}
+	var assistant, result int
+	for {
+		select {
+		case ev := <-h.Events():
+			switch e := ev.(type) {
+			case agent.AssistantTextEvent:
+				if e.Text == full {
+					assistant++
+				}
+			case agent.ResultEvent:
+				if e.Success {
+					result++
+				}
+			}
+		default:
+			goto drainedReasoning
+		}
+	}
+drainedReasoning:
+	if assistant == 0 || result == 0 {
+		t.Fatalf("reasoning burst lost final events: assistant=%d result=%d handlerDone=%v", assistant, result, done)
+	}
+}
+
+// TestStreaming_SnapshotRetentionBounds pins the retained-text bounds:
+// snapshots larger than 1 MiB are never retained, and a 1,024-item map
+// admits no new item (updates to an open item still apply). Each guard is
+// asserted on retained state, not just the emitted event, so deleting
+// either ceiling is a failing mutant. Covers both the assistant and
+// reasoning snapshot branches.
+func TestStreaming_SnapshotRetentionBounds(t *testing.T) {
+	snapshotParams := func(itemID, kind string, rev int, text string) json.RawMessage {
+		t.Helper()
+		item := map[string]any{"itemId": itemID, "kind": kind, "revision": rev, "status": "inProgress"}
+		if kind == "reasoning" {
+			item["summary"] = []string{text}
+		} else {
+			item["text"] = text
+		}
+		params, err := json.Marshal(map[string]any{"item": item})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return params
+	}
+
+	t.Run("oversized assistant snapshot not retained", func(t *testing.T) {
+		state := newMapperState("model")
+		big := strings.Repeat("x", (1<<20)+1)
+		got := mapNotification("item/started", snapshotParams("big-agent", "agentMessage", 1, big), state, nil)
+		if len(got) != 1 || got[0].(agent.SystemEvent).Subtype != agent.SystemSubtypeStreamProgress {
+			t.Fatalf("oversized assistant snapshot emitted %v, want one stream_progress", kindsOf(got))
+		}
+		if _, ok := state.textItems["big-agent"]; ok {
+			t.Fatalf("oversized assistant snapshot retained %d bytes, want unretained", len(state.textItems["big-agent"].text))
+		}
+	})
+
+	t.Run("oversized reasoning snapshot not retained", func(t *testing.T) {
+		state := newMapperState("model")
+		big := strings.Repeat("y", (1<<20)+1)
+		mapNotification("item/started", snapshotParams("big-reason", "reasoning", 1, big), state, nil)
+		if _, ok := state.textItems["big-reason"]; ok {
+			t.Fatalf("oversized reasoning snapshot retained %d bytes, want unretained", len(state.textItems["big-reason"].text))
+		}
+	})
+
+	t.Run("admission ceiling drops new items but keeps open ones", func(t *testing.T) {
+		state := newMapperState("model")
+		for i := 0; i < 1024; i++ {
+			id := fmt.Sprintf("fill-%04d", i)
+			mapNotification("item/started", snapshotParams(id, "agentMessage", 1, "small"), state, nil)
+		}
+		if len(state.textItems) != 1024 {
+			t.Fatalf("retained %d items after fill, want 1024", len(state.textItems))
+		}
+		got := mapNotification("item/started", snapshotParams("one-too-many-agent", "agentMessage", 1, "small"), state, nil)
+		if len(got) != 1 || got[0].(agent.SystemEvent).Subtype != agent.SystemSubtypeStreamProgress {
+			t.Fatalf("over-capacity assistant snapshot emitted %v, want one stream_progress", kindsOf(got))
+		}
+		if _, ok := state.textItems["one-too-many-agent"]; ok {
+			t.Fatalf("over-capacity assistant snapshot retained, want unretained (retained=%d)", len(state.textItems))
+		}
+		if len(state.textItems) != 1024 {
+			t.Fatalf("retained %d items after over-capacity admit, want 1024", len(state.textItems))
+		}
+		got = mapNotification("item/started", snapshotParams("one-too-many-reason", "reasoning", 1, "small"), state, nil)
+		if _, ok := state.textItems["one-too-many-reason"]; ok {
+			t.Fatalf("over-capacity reasoning snapshot retained, want unretained (events=%v)", kindsOf(got))
+		}
+		if len(state.textItems) != 1024 {
+			t.Fatalf("retained %d items after reasoning over-capacity admit, want 1024", len(state.textItems))
+		}
+		// An update to an already-open item still applies at capacity
+		// (the previous.kind branch), pinning that half of the guard.
+		mapNotification("item/updated", snapshotParams("fill-0000", "agentMessage", 2, "updated"), state, nil)
+		if got := state.textItems["fill-0000"]; got.text != "updated" {
+			t.Fatalf("open item update at capacity retained %q, want %q", got.text, "updated")
+		}
+		if len(state.textItems) != 1024 {
+			t.Fatalf("retained %d items after open-item update, want 1024", len(state.textItems))
+		}
+	})
 }

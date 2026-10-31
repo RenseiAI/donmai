@@ -27,10 +27,10 @@ const stderrRetentionBytes = 8 * 1024
 
 // streamProgressReservedSlots reserves buffer slots for terminal-adjacent
 // events (assistant completion, turn usage, result) so a burst of
-// content-free stream-progress liveness can never fill the events channel
-// and silently drop the verdict. Progress is best-effort: it is dropped
-// once the buffer holds cap-reserved events, leaving the reserved tail
-// for the authoritative completion and terminal result.
+// best-effort streaming output can never fill the events channel
+// and silently drop the verdict. Streaming output is best-effort: it is
+// dropped once the buffer holds cap-reserved events, leaving the reserved
+// tail for the authoritative completion and terminal result.
 const streamProgressReservedSlots = 8
 
 // Handle is one live MSP session: exactly one `muse serve` child, one
@@ -823,7 +823,7 @@ func (h *Handle) closeEvents() {
 
 // emit publishes an event on the events channel without blocking. If
 // the channel is full, the event is dropped silently, except that
-// content-free stream-progress liveness never takes a reserved slot:
+// best-effort streaming output never takes a reserved slot:
 // once the buffer holds cap-reserved events it is dropped early so the
 // authoritative assistant completion and terminal result still fit.
 func (h *Handle) emit(ev agent.Event) {
@@ -832,7 +832,7 @@ func (h *Handle) emit(ev agent.Event) {
 	if h.eventsClosed.Load() {
 		return
 	}
-	if isStreamProgress(ev) {
+	if isBestEffortStreamEvent(ev) {
 		if n := cap(h.events); n > streamProgressReservedSlots && len(h.events) >= n-streamProgressReservedSlots {
 			return
 		}
@@ -844,13 +844,19 @@ func (h *Handle) emit(ev agent.Event) {
 	}
 }
 
-// isStreamProgress reports whether ev is content-free streaming liveness.
-// Such events exist only to disarm the runner stall detector; the complete
-// message still arrives on the completion event, so they are safe to drop
-// first when the buffer fills.
-func isStreamProgress(ev agent.Event) bool {
+// isBestEffortStreamEvent reports whether ev is best-effort streaming
+// output that may be dropped first when the buffer fills: content-free
+// stream-progress liveness, and reasoning fragments. Reasoning is never
+// verdict-scanned and replays only as intermediate thought, while the
+// authoritative assistant completion and terminal result must still fit;
+// under a slow consumer a reasoning burst would otherwise fill the channel
+// and silently drop the verdict.
+func isBestEffortStreamEvent(ev agent.Event) bool {
 	sys, ok := ev.(agent.SystemEvent)
-	return ok && sys.Subtype == agent.SystemSubtypeStreamProgress
+	if !ok {
+		return false
+	}
+	return sys.Subtype == agent.SystemSubtypeStreamProgress || sys.Subtype == "reasoning"
 }
 
 func approvalToolName(req ApprovalRequest) string {
