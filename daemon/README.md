@@ -357,7 +357,10 @@ manifest hourly (the fleet contract's release notification needs
 SaaS/webhook delivery, which an OSS host has no channel for — the hourly
 poll is the local approximation with the same observable contract).
 `manual` never schedules; the manual `POST /api/daemon/update` endpoint
-is unchanged.
+is unchanged. Editing `daemon.yaml` takes effect without a restart: the
+watcher adopts `autoUpdate` live, so clearing `source`, selecting
+`manual`, or removing `signers` stops the loop and the next tick is
+inert.
 
 Each tick checks the manifest BEFORE entering `Update`: an unchanged
 release performs no lifecycle transition and the machine never drains.
@@ -374,7 +377,7 @@ running/draining/updating states:
 | Update-phase timeout or failure after entering Update | update error | draining (explicit resume required) |
 | invalid signature | swap refused fail-closed | draining (explicit resume required) |
 | failed restart preflight | swap refused | draining (explicit resume required) |
-| newer signed release | swap applied, restart pending | draining until the caller's restart path runs |
+| newer signed release | swap applied, restart requested (exit 3); scheduler takes no further ticks | draining until the supervisor restarts into the new binary |
 
 A failed, timed-out, or refused attempt never resumes: the daemon stays
 draining until explicit resume, so a failure cannot silently undo a

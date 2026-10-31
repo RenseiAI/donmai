@@ -13,11 +13,14 @@ import (
 // An unconfigured daemon is inert: the scheduler only exists when the
 // operator explicitly opted in (see autoUpdateSchedulerWanted), and every
 // tick re-checks that opt-in against the live config before touching the
-// network. Each tick performs a lightweight manifest pre-check FIRST; only
-// a strictly newer release enters Update, so an unchanged release never
-// drains the machine. The actual work reuses Daemon.Update — restart
-// preflight, the fail-closed signer verification and the swap — with no
-// new lifecycle state: the outcomes below reuse the existing
+// network. The yaml watcher adopts AutoUpdate edits live, so a revoked
+// opt-in (cleared source, manual schedule, removed signers) stops the
+// loop without a restart and the next tick is inert. Each tick performs
+// a lightweight manifest pre-check FIRST; only a strictly newer release
+// enters Update, so an unchanged release never drains the machine. The
+// actual work reuses Daemon.Update — restart preflight, the fail-closed
+// signer verification and the swap — with no new lifecycle state: the
+// outcomes below reuse the existing
 // running/draining/updating states.
 //
 // State outcomes (existing states only):
@@ -30,8 +33,10 @@ import (
 //	Update-phase timeout/   Update error        draining (explicit resume required)
 //	failure                   after entering Update
 //	verification failed     swap refused        draining (explicit resume required)
-//	swap applied            restart pending     draining; the process exits only
-//	                                            via the caller's restart path
+//	swap applied            restart requested   draining until the supervisor
+//	(new signed release)  via exit code 3;      restarts into the new binary;
+//	                        scheduler takes     scheduler takes no further
+//	                        no further ticks    ticks (applied flag)
 //
 // A failed or refused attempt never resumes: finish leaves the daemon
 // draining, so a failure cannot silently undo a deliberate drain.
@@ -130,11 +135,17 @@ type autoUpdateScheduler struct {
 	// inFlight collapses overlapping ticks into one attempt: a tick that
 	// arrives while an attempt runs logs and returns without work.
 	inFlight atomic.Bool
+	// applied latches after a successful swap: the restart handoff below
+	// owns completion, so further ticks stop instead of re-applying the
+	// same release against the old running version.
+	applied atomic.Bool
 }
 
 // startAutoUpdateScheduler constructs and starts the scheduled-update loop
 // when the loaded config opts in; otherwise it leaves the daemon without
-// one (nil field = inert, no goroutine, no calls).
+// one (nil field = inert, no goroutine, no calls). Idempotent: a second
+// call while a loop runs keeps the existing loop (and cancels the spare
+// context) instead of leaking the old goroutine.
 func (d *Daemon) startAutoUpdateScheduler() {
 	if !autoUpdateSchedulerWanted(d.Config()) {
 		return
@@ -150,6 +161,11 @@ func (d *Daemon) startAutoUpdateScheduler() {
 	}
 	s.cancel = cancel
 	d.lifecycleMu.Lock()
+	if d.autoUpdateScheduler != nil {
+		d.lifecycleMu.Unlock()
+		cancel()
+		return
+	}
 	d.autoUpdateScheduler = s
 	d.lifecycleMu.Unlock()
 	go s.run()
@@ -215,9 +231,15 @@ func (s *autoUpdateScheduler) run() {
 // attemptOnce performs one scheduled check-and-update round: a lightweight
 // manifest pre-check first, then the full Update (preflight + verify +
 // swap) only when a strictly newer release exists. Overlapping ticks
-// return after the log line below; a revoked opt-in returns silently.
+// return after the log line below; a revoked opt-in or an already-applied
+// swap returns silently.
 func (s *autoUpdateScheduler) attemptOnce() {
 	if s == nil || s.daemon == nil {
+		return
+	}
+	if s.applied.Load() {
+		// Restart already requested for this release; never re-apply the
+		// same swap against the old running version.
 		return
 	}
 	if !s.inFlight.CompareAndSwap(false, true) {
@@ -242,11 +264,22 @@ func (s *autoUpdateScheduler) attemptOnce() {
 		// Up-to-date: no lifecycle transition, the machine never drains.
 		return
 	}
-	if _, err := d.Update(ctx); err != nil {
+	result, err := d.Update(ctx)
+	if err != nil {
 		// Update leaves the daemon draining on every exit path; never
 		// resume here — a failed attempt must not silently abandon a
 		// deliberately drained host.
 		slog.Warn("daemon: scheduled auto-update failed; daemon remains draining", "error", err)
+		return
+	}
+	if result != nil && result.Updated {
+		// The swap is on disk; the restart handoff below owns completion.
+		// Latch first so a second tick can never re-apply the same
+		// release, then ask the supervisor to exec the new binary. The
+		// daemon stays draining until that restart lands.
+		s.applied.Store(true)
+		slog.Info("daemon: scheduled auto-update applied; requesting restart", "version", result.Version)
+		d.requestAutoUpdateRestart()
 	}
 }
 

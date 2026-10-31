@@ -583,6 +583,12 @@ type Daemon struct {
 	// 5-minute run bound; production code never sets them.
 	autoUpdateClock    updateClock
 	autoUpdateRunBound time.Duration
+	// autoUpdateRestartHook, when non-nil, replaces the production
+	// process exit after a successful scheduled swap. Production leaves
+	// it nil so the swap hands off to the supervisor via ExitCodeRestart;
+	// tests inject a recorder so the restart handoff is observable
+	// without exiting the test process.
+	autoUpdateRestartHook func()
 
 	// credentials is the single refresher every lane draws its worker identity
 	// from, constructed in Start once registration has produced one. A durable-
@@ -2392,7 +2398,8 @@ func (d *Daemon) onYamlChanged(cfg *Config) {
 	// the previous generation stays), so checking for the change here only
 	// decides whether the reload path runs at all.
 	registrationTokenChanged := d.credentials != nil && cfg.Orchestrator.AuthToken != "" && cfg.Orchestrator.AuthToken != d.config.Orchestrator.AuthToken
-	if !projectsChanged && !localChanged && !capacityChanged && !seatBudgetChanged && !seatQoSChanged && !registrationTokenChanged && !usagePingChanged {
+	autoUpdateChanged := !reflect.DeepEqual(d.config.AutoUpdate, cfg.AutoUpdate)
+	if !projectsChanged && !localChanged && !capacityChanged && !seatBudgetChanged && !seatQoSChanged && !registrationTokenChanged && !usagePingChanged && !autoUpdateChanged {
 		d.mu.Unlock()
 		releasePolicy()
 		return
@@ -2463,6 +2470,18 @@ func (d *Daemon) onYamlChanged(cfg *Config) {
 			cancelUsagePing(DefaultUsagePingStatePath())
 		}
 	}
+	if autoUpdateChanged {
+		// The scheduled loop re-checks this block on every tick, so a
+		// revoked opt-in (cleared source, manual schedule, removed
+		// signers) goes inert without a restart. The watcher file was
+		// already validated on load, so adoption is unconditional.
+		d.config.AutoUpdate = cfg.AutoUpdate
+		if cfg.AutoUpdate.Signers != nil {
+			signers := make([]UpdateSigner, len(cfg.AutoUpdate.Signers))
+			copy(signers, cfg.AutoUpdate.Signers)
+			d.config.AutoUpdate.Signers = signers
+		}
+	}
 	var pendingRotation, rotationFiledPrevious string
 	var wantRotation bool
 	if projectsChanged || localChanged {
@@ -2518,6 +2537,20 @@ func (d *Daemon) onYamlChanged(cfg *Config) {
 	wantProjectPublish := wantRotation && (projectsChanged || localChanged)
 	d.mu.Unlock()
 	releasePolicy()
+
+	if autoUpdateChanged {
+		// Reconcile the loop outside d.mu: start takes the lifecycle
+		// metadata lock and reads the config, so holding the daemon
+		// lock across it would nest the two. A revoked opt-in stops the
+		// loop promptly; a fresh opt-in starts it without a restart.
+		// Both helpers are idempotent (start is a no-op when a loop
+		// already runs, stop when none does).
+		if autoUpdateSchedulerWanted(cfg) {
+			d.startAutoUpdateScheduler()
+		} else {
+			d.stopAutoUpdateScheduler()
+		}
+	}
 
 	if wantRotation && creds != nil {
 		ctx := reloadCtx
@@ -2852,6 +2885,18 @@ func (d *Daemon) drainTimeout() time.Duration {
 		timeout = time.Duration(cfg.AutoUpdate.DrainTimeoutSeconds) * time.Second
 	}
 	return timeout
+}
+
+// requestAutoUpdateRestart hands a successful scheduled swap to the
+// supervisor: the new binary is on disk and this process exits with the
+// restart code so the supervisor execs it. The hook seam lets tests
+// observe the handoff without exiting the test process.
+func (d *Daemon) requestAutoUpdateRestart() {
+	if d.autoUpdateRestartHook != nil {
+		d.autoUpdateRestartHook()
+		return
+	}
+	os.Exit(ExitCodeRestart)
 }
 
 // beginLandingStop fences future callback admission, cancels entered callbacks,

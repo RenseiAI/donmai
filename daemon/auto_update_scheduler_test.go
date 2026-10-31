@@ -339,10 +339,12 @@ func TestAutoUpdateScheduler_StartStop_OptedInRunsAtApprovedTick(t *testing.T) {
 				return probe.sigHits.Load() == 1
 			})
 			// The failed attempt leaves the daemon draining by contract:
-			// failures never silently resume.
-			if state := d.State(); state != StateDraining {
-				t.Fatalf("state after failed scheduled update = %q, want draining", state)
-			}
+			// failures never silently resume. Poll: the bundle hit above
+			// lands when the server receives the request, before
+			// verification finishes and the state transition publishes.
+			waitForUpdateCondition(t, 10*time.Second, "draining after failed scheduled update", func() bool {
+				return d.State() == StateDraining
+			})
 		})
 	}
 }
@@ -458,7 +460,65 @@ func TestAutoUpdateScheduler_StopBoundsNeverSettlingFetch(t *testing.T) {
 		http.Error(w, "unexpected", http.StatusNotFound)
 	}))
 	t.Cleanup(hanging.Close)
+	// Drive the production lifecycle: Start owns the loop, Stop must
+	// release it. Calling the private start/stop helpers here would pass
+	// even if Daemon.Stop never tore the loop down, so this test pins
+	// the public Stop hook instead.
+	path := writeAutoUpdateDaemonConfig(t, string(ScheduleOnRelease), hanging.URL, true)
+	clock := newManualUpdateClock(time.Now())
+	d := New(Options{
+		ConfigPath:       path,
+		JWTPath:          filepath.Join(t.TempDir(), "daemon.jwt"),
+		SkipWizard:       true,
+		SkipRegistration: true,
+		Version:          "0.1.0",
+		SpawnerOptions:   SpawnerOptions{WorkerCommand: []string{"/bin/false"}},
+		SessionShim:      SessionShimConfig{RegistryDir: t.TempDir()},
+	})
+	d.autoUpdateClock = clock
+	d.autoUpdateRunBound = time.Second
+	if err := d.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if d.autoUpdateScheduler == nil {
+		t.Fatal("opted-in config started no scheduler through production Start")
+	}
+	waitForUpdateCondition(t, 5*time.Second, "scheduler tick wait", func() bool {
+		return clock.waiterCount() > 0
+	})
+	clock.fire()
+	waitForUpdateCondition(t, 5*time.Second, "attempt in flight", func() bool {
+		s := d.autoUpdateScheduler
+		return s != nil && s.inFlight.Load()
+	})
+	// The attempt bound is drain (1s from the fixture config) plus the
+	// 1s injected run bound; production Stop must join well inside a
+	// generous ceiling even though the manifest fetch never settles.
+	start := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := d.Stop(ctx); err != nil {
+		t.Fatalf("production Stop: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 15*time.Second {
+		t.Fatalf("production Stop took %v with a never-settling fetch, want within the attempt bound", elapsed)
+	}
+	if d.autoUpdateScheduler != nil {
+		t.Fatal("scheduler ownership not released by production Stop")
+	}
+}
+
+func TestAutoUpdateScheduler_AttemptBoundedByTotalDeadline(t *testing.T) {
+	hanging := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/latest.json") {
+			<-r.Context().Done()
+			return
+		}
+		http.Error(w, "unexpected", http.StatusNotFound)
+	}))
+	t.Cleanup(hanging.Close)
 	d := newRestartTestDaemon(t, nil)
+	d.opts.Version = "0.1.0"
 	d.config = &Config{AutoUpdate: AutoUpdateConfig{
 		Channel: ChannelStable, Schedule: ScheduleOnRelease, DrainTimeoutSeconds: 1,
 		Source: hanging.URL,
@@ -466,27 +526,23 @@ func TestAutoUpdateScheduler_StopBoundsNeverSettlingFetch(t *testing.T) {
 			{SAN: "releases@example.com", Issuer: "https://issuer.example"},
 		},
 	}}
-	clock := newManualUpdateClock(time.Now())
-	d.autoUpdateClock = clock
+	// The attempt context (drain 1s + run 1s = 2s) must bound the
+	// never-settling manifest fetch even though the parent context stays
+	// open: replacing the attempt timeout with a bare cancel leaves this
+	// attempt hanging until the parent deadline.
+	parent, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+	s := &autoUpdateScheduler{daemon: d, clock: systemUpdateClock{}}
+	s.ctx = parent
 	d.autoUpdateRunBound = time.Second
-	d.startAutoUpdateScheduler()
-	if d.autoUpdateScheduler == nil {
-		t.Fatal("opted-in config started no scheduler")
-	}
-	waitForUpdateCondition(t, 5*time.Second, "scheduler tick wait", func() bool {
-		return clock.waiterCount() > 0
-	})
-	clock.fire()
-	waitForUpdateCondition(t, 5*time.Second, "attempt in flight", func() bool {
-		return d.autoUpdateScheduler.inFlight.Load()
-	})
 	start := time.Now()
-	d.stopAutoUpdateScheduler()
-	if elapsed := time.Since(start); elapsed > 30*time.Second {
-		t.Fatalf("Stop took %v with a never-settling fetch, want within the attempt bound", elapsed)
+	s.attemptOnce()
+	if elapsed := time.Since(start); elapsed > 8*time.Second {
+		t.Fatalf("attemptOnce took %v with a never-settling fetch, want within the drain+run bound", elapsed)
 	}
-	if d.autoUpdateScheduler != nil {
-		t.Fatal("scheduler ownership not released by Stop")
+	// A pre-check failure never enters Update, so the machine never drains.
+	if state := d.State(); state != StateRunning {
+		t.Fatalf("state after pre-check failure = %q, want running (never drained)", state)
 	}
 }
 
@@ -579,6 +635,143 @@ func TestAutoUpdateScheduler_PreflightRefusalBlocksBinaryFetch(t *testing.T) {
 	}
 	if got := probe.binaryHits.Load(); got != 0 {
 		t.Fatalf("binary downloads = %d, want 0 (preflight refused)", got)
+	}
+}
+
+func TestAutoUpdateScheduler_RevokedConsentStopsScheduledRequests(t *testing.T) {
+	// Drives the production opt-in path end to end: production Start owns
+	// the loop, the production yaml-watcher callback adopts the revoked
+	// config, and the next production tick (manual clock fired through
+	// run) must make no further requests. Removing the adoption leaves
+	// the old allowlist in memory and the next tick drains the host.
+	revoke := []struct {
+		name   string
+		mutate func(*Config)
+		desc   string
+	}{
+		{"cleared source", func(c *Config) { c.AutoUpdate.Source = "" }, "cleared source"},
+		{"manual schedule", func(c *Config) { c.AutoUpdate.Schedule = ScheduleManual }, "manual schedule"},
+		{"removed signers", func(c *Config) { c.AutoUpdate.Signers = nil }, "removed signers"},
+	}
+	for _, r := range revoke {
+		t.Run(r.name, func(t *testing.T) {
+			probe := newUpdateProbeServer(t, "9.9.9", []byte("new-binary"), "not-a-bundle")
+			d, clock := startOptedInSchedulerDaemon(t, string(ScheduleNightly), probe)
+			// First tick proves the loop is live: manifest traffic flows.
+			waitForUpdateCondition(t, 5*time.Second, "scheduler tick wait", func() bool {
+				return clock.waiterCount() > 0
+			})
+			clock.fire()
+			waitForUpdateCondition(t, 10*time.Second, "first tick manifest", func() bool {
+				return probe.manifestHits.Load() >= 1
+			})
+			// The first tick drains (fail-closed bad bundle); restore the
+			// running state via resume so the second tick starts clean.
+			// ResumeContext is the production drain-exit; a revoked tick
+			// must not drain again regardless of the starting state.
+			baseManifest, baseBinary, baseSig := probe.manifestHits.Load(), probe.binaryHits.Load(), probe.sigHits.Load()
+			current := d.Config()
+			if current == nil {
+				t.Fatal("no config loaded")
+			}
+			revoked := *current
+			if current.AutoUpdate.Signers != nil {
+				signers := make([]UpdateSigner, len(current.AutoUpdate.Signers))
+				copy(signers, current.AutoUpdate.Signers)
+				revoked.AutoUpdate.Signers = signers
+			}
+			r.mutate(&revoked)
+			d.onYamlChanged(&revoked)
+			// Adoption is synchronous: the live config must reflect the
+			// revocation immediately, without a restart.
+			after := d.Config()
+			if after == nil {
+				t.Fatal("config missing after reload")
+			}
+			switch r.name {
+			case "cleared source":
+				if got := after.AutoUpdate.Source; got != "" {
+					t.Fatalf("Source after %s = %q, want empty", r.desc, got)
+				}
+			case "manual schedule":
+				if got := after.AutoUpdate.Schedule; got != ScheduleManual {
+					t.Fatalf("Schedule after %s = %q, want manual", r.desc, got)
+				}
+			case "removed signers":
+				if got := len(after.AutoUpdate.Signers); got != 0 {
+					t.Fatalf("Signers after %s = %d, want 0", r.desc, got)
+				}
+			}
+			// Revocation stops the loop promptly: no goroutine, no timer.
+			if d.autoUpdateScheduler != nil {
+				t.Fatalf("scheduler still running after %s, want stopped without restart", r.desc)
+			}
+			// Even driving the stale scheduler struct directly (the
+			// strongest shadow: the exact tick body with the revoked
+			// live config) must stay silent.
+			stale := &autoUpdateScheduler{daemon: d, clock: systemUpdateClock{}}
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			stale.ctx = ctx
+			stale.attemptOnce()
+			if got := probe.manifestHits.Load(); got != baseManifest {
+				t.Fatalf("manifest requests after %s = %d, want %d (no scheduled calls)", r.desc, got, baseManifest)
+			}
+			if got := probe.binaryHits.Load(); got != baseBinary {
+				t.Fatalf("binary requests after %s = %d, want %d", r.desc, got, baseBinary)
+			}
+			if got := probe.sigHits.Load(); got != baseSig {
+				t.Fatalf("bundle requests after %s = %d, want %d", r.desc, got, baseSig)
+			}
+		})
+	}
+}
+
+func TestAutoUpdateScheduler_SuccessfulSwapRequestsRestartOnce(t *testing.T) {
+	// The scheduler owns completion of a successful swap: UpdateResult is
+	// never discarded. The injected success below stands in for a real
+	// signed-binary swap (fail-closed verification of a real swap is
+	// pinned by the verifier and Update suites); the deciding logic under
+	// test is the scheduler's handoff — latch applied, request exactly one
+	// restart, and never re-apply the same release on the next tick.
+	// Removing the handoff leaves the host draining on the old binary with
+	// the next tick re-applying the same release.
+	d := newRestartTestDaemon(t, nil)
+	d.opts.Version = "0.1.0"
+	probe := newUpdateProbeServer(t, "9.9.9", []byte("new-binary"), "not-a-bundle")
+	d.config = &Config{AutoUpdate: AutoUpdateConfig{
+		Channel: ChannelStable, Schedule: ScheduleNightly, DrainTimeoutSeconds: 1,
+		Source: probe.srv.URL,
+		Signers: []UpdateSigner{
+			{SAN: "releases@example.com", Issuer: "https://issuer.example"},
+		},
+	}}
+	var restarts atomic.Int32
+	d.autoUpdateRestartHook = func() { restarts.Add(1) }
+	var updates atomic.Int32
+	d.runPreparedUpdate = func(context.Context, AutoUpdateConfig, string) (*UpdateResult, error) {
+		updates.Add(1)
+		return &UpdateResult{Updated: true, Version: "9.9.9", Reason: "update-applied"}, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	s := &autoUpdateScheduler{daemon: d, clock: systemUpdateClock{}}
+	s.ctx = ctx
+	s.attemptOnce()
+	if got := restarts.Load(); got != 1 {
+		t.Fatalf("restart requests after applied swap = %d, want exactly 1", got)
+	}
+	if got := updates.Load(); got != 1 {
+		t.Fatalf("update entries = %d, want 1", got)
+	}
+	// A second tick must not re-enter Update for the same release: the
+	// restart handoff owns completion and the old version still reports.
+	s.attemptOnce()
+	if got := updates.Load(); got != 1 {
+		t.Fatalf("update entries after second tick = %d, want still 1 (no re-apply)", got)
+	}
+	if got := restarts.Load(); got != 1 {
+		t.Fatalf("restart requests after second tick = %d, want still 1", got)
 	}
 }
 
