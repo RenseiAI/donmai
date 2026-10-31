@@ -10,6 +10,24 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 No unreleased changes.
 
+## v0.72.94 — 2026-10-31
+
+### Fixes
+
+- Admit the canonical Muse harness selector
+
+### Chores
+
+- Preserve terminal evidence for failed and stopped sessions
+- Show terminal diagnostics in session detail output
+- Add Go toolchain E2B worker template at 4 vCPU / 8 GiB
+- Add guarded repair for legacy acquisition-store identity drift
+- Carry structured headless failure evidence to terminal status
+- Expose Pi transcripts to failed-session evidence archiving
+- Harden blocked classification against narrative pull request URLs
+- Add dismissible contextual host watch help overlay
+- Add mouse selection and detail navigation to host watch
+
 ## v0.72.93 — 2026-10-27
 
 ### Chores
