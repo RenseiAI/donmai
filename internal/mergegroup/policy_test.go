@@ -103,11 +103,97 @@ func TestValidateWorkflowRejectsExitZeroMasking(t *testing.T) {
 		"and-true": strings.Replace(base,
 			"go test -race -coverprofile=coverage.out -json ./...",
 			"go test -race -coverprofile=coverage.out -json ./... && true", 1),
+		"exit-single": strings.Replace(base,
+			"go test -race -coverprofile=coverage.out -json ./...",
+			"go test -race -coverprofile=coverage.out -json ./...; exit 0", 1),
+		"exit-tab": strings.Replace(base,
+			"go test -race -coverprofile=coverage.out -json ./...",
+			"go test -race -coverprofile=coverage.out -json ./...; exit\t0", 1),
+		"exit-double-space": strings.Replace(base,
+			"go test -race -coverprofile=coverage.out -json ./...",
+			"go test -race -coverprofile=coverage.out -json ./...; exit  0", 1),
+		"semicolon-bin-true": strings.Replace(base,
+			"go test -race -coverprofile=coverage.out -json ./...",
+			"go test -race -coverprofile=coverage.out -json ./...; /bin/true", 1),
+		"semicolon-usr-bin-true": strings.Replace(base,
+			"go test -race -coverprofile=coverage.out -json ./...",
+			"go test -race -coverprofile=coverage.out -json ./...; /usr/bin/true", 1),
+		"and-bin-true": strings.Replace(base,
+			"go test -race -coverprofile=coverage.out -json ./...",
+			"go test -race -coverprofile=coverage.out -json ./... && /bin/true", 1),
+		"set-plus-e": strings.Replace(base,
+			"set -o pipefail\n          go test -race -coverprofile=coverage.out -json ./...",
+			"set -o pipefail\n          set +e\n          go test -race -coverprofile=coverage.out -json ./...", 1),
 	}
 	for name, txt := range cases {
 		if err := ValidateWorkflow(txt); err == nil {
 			t.Errorf("ValidateWorkflow(%s) = nil, want error", name)
 		}
+	}
+}
+
+func TestValidateWorkflowRejectsPipeMasking(t *testing.T) {
+	base := repoWorkflow(t)
+	cases := map[string]string{
+		"pipe-cat": strings.Replace(base, "timeout-minutes: 30",
+			"timeout-minutes: 30\n      - name: Extra pipe\n        run: go test -race -coverprofile=coverage.out ./... | cat", 1),
+		"pipe-tee": strings.Replace(base, "timeout-minutes: 30",
+			"timeout-minutes: 30\n      - name: Extra pipe\n        run: go test -race -coverprofile=coverage.out ./... | tee out.log", 1),
+	}
+	for name, txt := range cases {
+		if err := ValidateWorkflow(txt); err == nil {
+			t.Errorf("ValidateWorkflow(%s) = nil, want error", name)
+		}
+	}
+}
+
+func TestValidateWorkflowRejectsAlwaysRerun(t *testing.T) {
+	base := repoWorkflow(t)
+	withRerun := strings.Replace(base, "timeout-minutes: 30",
+		"timeout-minutes: 30\n      - name: Follow-up checks\n        if: always()\n        run: go test -race -coverprofile=coverage.out -json ./...", 1)
+	if err := ValidateWorkflow(withRerun); err == nil {
+		t.Fatal("ValidateWorkflow with if: always() rerun = nil, want error")
+	}
+	// cancelled() does not run after a failure, so it must stay allowed.
+	withCancelled := strings.Replace(base, "timeout-minutes: 30",
+		"timeout-minutes: 30\n      - name: Cleanup\n        if: cancelled()\n        run: echo cleanup", 1)
+	if err := ValidateWorkflow(withCancelled); err != nil {
+		t.Fatalf("ValidateWorkflow with if: cancelled() cleanup = %v, want nil", err)
+	}
+}
+
+func TestValidateWorkflowRejectsMakeTestRerun(t *testing.T) {
+	base := repoWorkflow(t)
+	cases := map[string]string{
+		"failure-make-test": strings.Replace(base, "timeout-minutes: 30",
+			"timeout-minutes: 30\n      - name: Follow-up checks\n        if: failure()\n        run: make test", 1),
+		"always-make-test": strings.Replace(base, "timeout-minutes: 30",
+			"timeout-minutes: 30\n      - name: Follow-up checks\n        if: always()\n        run: make test", 1),
+	}
+	for name, txt := range cases {
+		if err := ValidateWorkflow(txt); err == nil {
+			t.Errorf("ValidateWorkflow(%s) = nil, want error", name)
+		}
+	}
+}
+
+func TestValidateWorkflowRejectsConfinementRunRemoval(t *testing.T) {
+	base := repoWorkflow(t)
+	macosRun := "go test -race -count=1 -timeout 15m -v ./runtime/confinement/..."
+	if !strings.Contains(base, macosRun) {
+		t.Fatalf("repo workflow missing macos run %q", macosRun)
+	}
+	withoutMacosRun := strings.Replace(base, macosRun, "echo holding-for-macos", 1)
+	if err := ValidateWorkflow(withoutMacosRun); err == nil {
+		t.Error("ValidateWorkflow without macos confinement run = nil, want error")
+	}
+	linuxRun := "go test -race -count=1 -timeout 15m -v -run 'TestLinux_|TestLandlockStage_|TestLandlockRuleset_|TestCheck_' ./runtime/confinement/"
+	if !strings.Contains(base, linuxRun) {
+		t.Fatalf("repo workflow missing linux run %q", linuxRun)
+	}
+	withoutLinuxRun := strings.Replace(base, linuxRun, "echo holding-for-linux", 1)
+	if err := ValidateWorkflow(withoutLinuxRun); err == nil {
+		t.Error("ValidateWorkflow without linux confinement run = nil, want error")
 	}
 }
 

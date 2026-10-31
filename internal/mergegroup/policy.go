@@ -63,9 +63,10 @@ var (
 	retryActionRe   = regexp.MustCompile(`(?i)uses\s*:\s*\S*retr(y|ies)`)
 	jobHeaderRe     = regexp.MustCompile(`^  [A-Za-z0-9_.-]+:`)
 	shellLoopRe     = regexp.MustCompile(`(?i)\bfor\s+\S+\s+in\b[^\n]*\bdo\b|\bwhile\b[^\n]*\bdo\b|\buntil\b[^\n]*\bdo\b`)
-	semicolonTrueRe = regexp.MustCompile(`;\s*true\b`)
+	semicolonTrueRe = regexp.MustCompile(`(?i);\s*(/bin/true|/usr/bin/true|true)\b`)
 	semicolonNoopRe = regexp.MustCompile(`;\s*:(?:\s|;|$)`)
-	andTrueRe       = regexp.MustCompile(`&&\s*true\b`)
+	andTrueRe       = regexp.MustCompile(`(?i)&&\s*(/bin/true|/usr/bin/true|true)\b`)
+	exitZeroRe      = regexp.MustCompile(`(?i)\bexit\s+0\b`)
 )
 
 func jobBlock(text, job string) (string, bool) {
@@ -196,31 +197,122 @@ func snippetActive(block, snippet string) bool {
 	return false
 }
 
+// stripQuoted removes single- and double-quoted segments so a -run
+// 'a|b' filter alternation is not mistaken for a shell pipe.
+func stripQuoted(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	var q byte
+	in := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !in && (c == '\'' || c == '"') {
+			in = true
+			q = c
+			continue
+		}
+		if in && c == q {
+			in = false
+			continue
+		}
+		if in {
+			continue
+		}
+		b.WriteByte(c)
+	}
+	return b.String()
+}
+
+// chunkHasUnprotectedPipe reports a shell pipe in a test chunk without
+// pipefail. The YAML `run: |` block marker is not a shell pipe, so the
+// run header carrying only that marker is skipped; quoted -run filters
+// are stripped before scanning.
+func chunkHasUnprotectedPipe(s string) bool {
+	if strings.Contains(strings.ToLower(s), "pipefail") {
+		return false
+	}
+	for _, line := range strings.Split(s, "\n") {
+		stripped := stripQuoted(line)
+		trim := strings.TrimSpace(stripped)
+		if strings.HasPrefix(trim, "run:") {
+			after := strings.TrimSpace(strings.TrimPrefix(trim, "run:"))
+			if after == "|" || after == "|-" || after == "|+" || after == "" {
+				continue
+			}
+			tmp := strings.ReplaceAll(after, "||", "")
+			if strings.Contains(tmp, "|") {
+				return true
+			}
+			continue
+		}
+		tmp := strings.ReplaceAll(stripped, "||", "")
+		if strings.Contains(tmp, "|") {
+			return true
+		}
+	}
+	return false
+}
+
+// hasConfinementRun requires the live test execution itself, not just the
+// guard grep that names the live file. Deleting the go test invocation
+// while keeping the grep must fail the check.
+func hasConfinementRun(block string) bool {
+	for _, s := range stepChunks(block) {
+		if !strings.Contains(s, "run:") {
+			continue
+		}
+		var kept []string
+		for _, l := range strings.Split(s, "\n") {
+			ll := strings.ToLower(l)
+			if strings.Contains(ll, "echo") || strings.Contains(ll, "printf") {
+				continue
+			}
+			kept = append(kept, l)
+		}
+		joined := strings.Join(kept, "\n")
+		if strings.Contains(joined, "go test") && strings.Contains(joined, "runtime/confinement") {
+			return true
+		}
+	}
+	return false
+}
+
 func hasShellRetry(code string) bool {
 	for _, s := range stepChunks(code) {
-		if !strings.Contains(s, "go test") {
+		hasGoTest := strings.Contains(s, "go test")
+		hasMakeTest := strings.Contains(s, "make test")
+		// Cross-step retry: a rerun-conditioned step re-executes the
+		// suite, whether it spells `go test` or the `make test` wrapper
+		// (which runs `go test -race ./...`). `cancelled()` does not run
+		// after a failure, so it is not a retry.
+		ll := strings.ToLower(s)
+		if strings.Contains(ll, "failure()") || strings.Contains(ll, "always()") {
+			if hasGoTest || hasMakeTest {
+				return true
+			}
+		}
+		if !hasGoTest && !hasMakeTest {
 			continue
 		}
 		if shellLoopRe.MatchString(s) {
 			return true
 		}
-		if strings.Count(s, "go test") > 1 {
+		if hasGoTest && strings.Count(s, "go test") > 1 {
 			return true
 		}
 		if strings.Contains(s, "||") {
 			return true
 		}
-		ll := strings.ToLower(s)
 		if strings.Contains(ll, "retry") || strings.Contains(ll, "attempt") {
-			if strings.Contains(s, "go test") {
-				return true
-			}
-		}
-		if strings.Contains(s, "exit 0") {
 			return true
 		}
-		// Exit-zero masking: "; true" / "; :" / "&& true" after the
-		// test run always succeeds, concealing a deterministic failure.
+		// Exit-zero masking in any whitespace or path spelling.
+		if exitZeroRe.FindString(s) != "" {
+			return true
+		}
+		// Exit-zero masking: "; true" / "; :" / "&& true" (and the
+		// /bin/true and /usr/bin/true spellings) after the test run
+		// always succeeds, concealing a deterministic failure.
 		if semicolonTrueRe.FindString(s) != "" {
 			return true
 		}
@@ -230,8 +322,14 @@ func hasShellRetry(code string) bool {
 		if andTrueRe.FindString(s) != "" {
 			return true
 		}
-		// Cross-step retry: a later step reruns the tests after failure.
-		if strings.Contains(ll, "failure()") {
+		// A single pipe without pipefail masks the test exit status
+		// even under `set -e`.
+		if chunkHasUnprotectedPipe(s) {
+			return true
+		}
+		// Disarming errexit in a test chunk lets a trailing
+		// `; true` or `; exit 0` mask a failure.
+		if strings.Contains(ll, "set +e") || strings.Contains(ll, "set +o errexit") {
 			return true
 		}
 	}
@@ -254,6 +352,9 @@ func ValidateWorkflow(text string) error {
 		}
 		if !snippetActive(block, e.Snippet) {
 			return fmt.Errorf("inventory job %q lost its active coverage %q", e.Job, e.Snippet)
+		}
+		if (e.Job == "macos-confinement" || e.Job == "linux-confinement") && !hasConfinementRun(block) {
+			return fmt.Errorf("inventory job %q lost its live test execution", e.Job)
 		}
 	}
 	if hasContinueOnError(code) {
