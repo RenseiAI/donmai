@@ -124,3 +124,23 @@ func TestValidateWorkflowRejectsRelocatedCoverage(t *testing.T) {
 		t.Fatal("ValidateWorkflow with relocated coverage = nil, want error")
 	}
 }
+
+func TestValidateWorkflowRejectsShadowBypasses(t *testing.T) {
+	base := repoWorkflow(t)
+	cases := map[string]string{
+		"commented-trigger": strings.Replace(base, "  merge_group:", "  # merge_group:", 1),
+		"disabled-confinement": strings.ReplaceAll(
+			base, "live_darwin_test.go", "# live_darwin_test.go",
+		),
+		"expression-continue-on-error": strings.Replace(base, "timeout-minutes: 30",
+			"timeout-minutes: 30\n      continue-on-error: ${{ true }}", 1),
+		"shell-retry": strings.Replace(base,
+			"go test -race -coverprofile=coverage.out -json ./...",
+			"for i in 1 2; do go test -race -coverprofile=coverage.out -json ./... && break; sleep 1; done", 1),
+	}
+	for name, txt := range cases {
+		if err := ValidateWorkflow(txt); err == nil {
+			t.Errorf("ValidateWorkflow(%s) = nil, want error", name)
+		}
+	}
+}

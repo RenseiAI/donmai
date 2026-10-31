@@ -1,13 +1,5 @@
 // Package mergegroup records and enforces the merge-queue flake policy.
-//
-// Decision: no-retry. The merge-group test jobs run once and never retry.
-// Causal repairs already address the known flakes: the test job is pinned to
-// a green runner image, the confinement jobs refuse to pass when their live
-// tests skip, and the suite pipes through a skip summary so a quietly
-// skipping test cannot stay green. A retry would rerun a deterministic
-// failure, consume merge-queue capacity, and hide the signal the queue
-// exists to provide. Required coverage stays in its own job; relocating it
-// requires updating the inventory below and the workflow text together.
+// Decision: no-retry. Merge-group test jobs run once and never retry.
 package mergegroup
 
 import (
@@ -16,12 +8,12 @@ import (
 	"strings"
 )
 
-// Decision is the recorded flake-policy choice. The workflow check fails
-// when the verified workflow stops carrying this marker.
-const Decision = "no-retry"
-
+// Decision is the recorded flake-policy choice.
 // MaxAttempts is the hard attempt bound every event gets under no-retry.
-const MaxAttempts = 1
+const (
+	Decision    = "no-retry"
+	MaxAttempts = 1
+)
 
 // Event names mirror the workflow trigger names.
 const (
@@ -32,16 +24,11 @@ const (
 
 // Entry is one inventory row: the job that must keep its coverage.
 type Entry struct {
-	// Job is the workflow job name holding the coverage.
-	Job string
-	// Snippet is a verbatim fragment of the coverage step the workflow
-	// must keep inside Job. Relocating the step without updating the
-	// inventory fails the check.
+	Job     string
 	Snippet string
 }
 
-// Inventory lists every merge-group test job and the coverage that must
-// stay inside it.
+// Inventory lists every merge-group test job and the coverage that must stay inside it.
 var Inventory = []Entry{
 	{Job: "test", Snippet: "go test -race -coverprofile=coverage.out"},
 	{Job: "macos-confinement", Snippet: "live_darwin_test.go"},
@@ -51,24 +38,19 @@ var Inventory = []Entry{
 // Marker is the verbatim decision line the verified workflow must carry.
 const Marker = "flake-policy-decision: no-retry"
 
-// MaxAttemptsFor returns the attempt bound for an event. Under no-retry
-// every event, including merge_group, runs once: no event gains retries.
+// MaxAttemptsFor returns the attempt bound for an event.
 func MaxAttemptsFor(event string) int {
 	_ = event
 	return MaxAttempts
 }
 
 // AllowsRetry reports whether an event may retry a failed attempt.
-// Under no-retry it is always false.
 func AllowsRetry(event string) bool {
 	_ = event
 	return false
 }
 
-// Resolve applies the no-retry bound to an injected exit sequence (0 is
-// pass, anything else is fail). It consumes at most one entry, so a
-// fail/pass flake still reports failure instead of being masked by a
-// second attempt.
+// Resolve applies the no-retry bound to an injected exit sequence.
 func Resolve(exits []int) (succeeded bool, attempts int) {
 	if len(exits) == 0 {
 		return false, 0
@@ -77,19 +59,18 @@ func Resolve(exits []int) (succeeded bool, attempts int) {
 }
 
 var (
-	continueOnErrorRe = regexp.MustCompile(`(?i)continue-on-error\s*:\s*true`)
-	maxAttemptsRe     = regexp.MustCompile(`(?i)max-attempts\s*:`)
-	retryActionRe     = regexp.MustCompile(`(?i)uses\s*:\s*\S*retr(y|ies)`)
-	jobHeaderRe       = regexp.MustCompile(`^  [A-Za-z0-9_.-]+:`)
+	maxAttemptsRe = regexp.MustCompile(`(?i)max-attempts\s*:`)
+	retryActionRe = regexp.MustCompile(`(?i)uses\s*:\s*\S*retr(y|ies)`)
+	jobHeaderRe   = regexp.MustCompile(`^  [A-Za-z0-9_.-]+:`)
+	shellLoopRe   = regexp.MustCompile(`(?i)\bfor\s+\S+\s+in\b[^\n]*\bdo\b|\bwhile\b[^\n]*\bdo\b|\buntil\b[^\n]*\bdo\b`)
 )
 
-// jobBlock returns one job's text; coverage must live inside its own job.
 func jobBlock(text, job string) (string, bool) {
 	lines := strings.Split(text, "\n")
 	header := "  " + job + ":"
 	start := -1
 	for i, line := range lines {
-		if line == header || strings.HasPrefix(line, header+" ") {
+		if line == header || strings.HasPrefix(line, header+" ") || strings.HasPrefix(line, header+"\t") {
 			start = i
 			break
 		}
@@ -107,10 +88,8 @@ func jobBlock(text, job string) (string, bool) {
 	return strings.Join(lines[start:end], "\n"), true
 }
 
-// stripComments drops full-line and trailing `#` comments so prose about
-// retries in comments never reads as a retry construct.
 func stripComments(text string) string {
-	var kept []string
+	kept := make([]string, 0, len(text)/40+1)
 	for _, line := range strings.Split(text, "\n") {
 		if i := strings.Index(line, "#"); i >= 0 {
 			line = line[:i]
@@ -120,28 +99,141 @@ func stripComments(text string) string {
 	return strings.Join(kept, "\n")
 }
 
-// ValidateWorkflow verifies the documented decision and the required
-// coverage for every inventory entry. It returns nil only when the
-// workflow carries the decision marker, keeps the merge_group trigger,
-// keeps each snippet, and adds no retry construct.
+func activeTrigger(code string) bool {
+	lines := strings.Split(code, "\n")
+	on, jobs := -1, -1
+	for i, l := range lines {
+		switch strings.TrimSpace(l) {
+		case "on:":
+			on = i
+		case "jobs:":
+			jobs = i
+		}
+		if on >= 0 && jobs > on {
+			break
+		}
+	}
+	if on < 0 {
+		return false
+	}
+	if jobs < 0 {
+		jobs = len(lines)
+	}
+	for _, l := range lines[on+1 : jobs] {
+		t := strings.TrimSpace(l)
+		if t == "merge_group:" || strings.HasPrefix(t, "merge_group: ") || strings.HasPrefix(t, "merge_group:\t") {
+			return true
+		}
+	}
+	return false
+}
+
+func hasContinueOnError(code string) bool {
+	for _, l := range strings.Split(code, "\n") {
+		ll := strings.ToLower(l)
+		i := strings.Index(ll, "continue-on-error")
+		if i < 0 {
+			continue
+		}
+		rest := ll[i+len("continue-on-error"):]
+		j := strings.Index(rest, ":")
+		if j < 0 {
+			continue
+		}
+		v := strings.TrimSpace(rest[j+1:])
+		v = strings.Trim(v, `"' `+"\t")
+		if v == "false" {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func stepChunks(code string) []string {
+	var chunks []string
+	var cur []string
+	flush := func() {
+		if len(cur) > 0 {
+			chunks = append(chunks, strings.Join(cur, "\n"))
+		}
+		cur = nil
+	}
+	for _, l := range strings.Split(code, "\n") {
+		if strings.HasPrefix(l, "      - ") {
+			flush()
+		}
+		cur = append(cur, l)
+	}
+	flush()
+	return chunks
+}
+
+func snippetActive(block, snippet string) bool {
+	for _, s := range stepChunks(block) {
+		if !strings.Contains(s, "run:") || !strings.Contains(s, snippet) {
+			continue
+		}
+		for _, l := range strings.Split(s, "\n") {
+			if !strings.Contains(l, snippet) {
+				continue
+			}
+			ll := strings.ToLower(l)
+			if strings.Contains(ll, "echo") || strings.Contains(ll, "printf") {
+				continue
+			}
+			return true
+		}
+	}
+	return false
+}
+
+func hasShellRetry(code string) bool {
+	for _, s := range stepChunks(code) {
+		if !strings.Contains(s, "go test") {
+			continue
+		}
+		if shellLoopRe.MatchString(s) {
+			return true
+		}
+		if strings.Count(s, "go test") > 1 {
+			return true
+		}
+		if strings.Contains(s, "||") {
+			return true
+		}
+		ll := strings.ToLower(s)
+		if strings.Contains(ll, "retry") || strings.Contains(ll, "attempt") {
+			if strings.Contains(s, "go test") {
+				return true
+			}
+		}
+		if strings.Contains(s, "exit 0") {
+			return true
+		}
+	}
+	return false
+}
+
+// ValidateWorkflow verifies the documented decision and required coverage.
 func ValidateWorkflow(text string) error {
 	if !strings.Contains(text, Marker) {
 		return fmt.Errorf("missing decision marker %q", Marker)
 	}
-	if !strings.Contains(text, "merge_group:") {
-		return fmt.Errorf("workflow must keep the merge_group trigger")
+	code := stripComments(text)
+	if !activeTrigger(code) {
+		return fmt.Errorf("workflow must keep the active merge_group trigger")
 	}
 	for _, e := range Inventory {
-		block, ok := jobBlock(text, e.Job)
+		block, ok := jobBlock(code, e.Job)
 		if !ok {
 			return fmt.Errorf("inventory job %q is missing", e.Job)
 		}
-		if !strings.Contains(block, e.Snippet) {
-			return fmt.Errorf("inventory job %q lost its coverage %q", e.Job, e.Snippet)
+		if !snippetActive(block, e.Snippet) {
+			return fmt.Errorf("inventory job %q lost its active coverage %q", e.Job, e.Snippet)
 		}
 	}
-	code := stripComments(text)
-	if continueOnErrorRe.FindString(code) != "" {
+	if hasContinueOnError(code) {
 		return fmt.Errorf("retry forbidden: workflow adds continue-on-error")
 	}
 	if maxAttemptsRe.FindString(code) != "" {
@@ -149,6 +241,9 @@ func ValidateWorkflow(text string) error {
 	}
 	if retryActionRe.FindString(code) != "" {
 		return fmt.Errorf("retry forbidden: workflow adds a retry action")
+	}
+	if hasShellRetry(code) {
+		return fmt.Errorf("retry forbidden: workflow adds a shell retry around tests")
 	}
 	return nil
 }
