@@ -1,7 +1,6 @@
 package runner
 
 import (
-	"errors"
 	"log/slog"
 
 	"github.com/RenseiAI/donmai/agent"
@@ -36,11 +35,6 @@ func (r *Runner) materializeContextPack(qw QueuedWork, workareaRoot string, res 
 	}
 	pack, err := workarea.DecodeContextPack(qw.ContextPack)
 	if err != nil {
-		var packErr *workarea.ContextPackError
-		if errors.As(err, &packErr) && packErr.Reason == workarea.ReasonContextPackSupport {
-			res.Status, res.FailureMode, res.Error = "failed", FailureWorktreeProvision, err.Error()
-			return err
-		}
 		res.Status, res.FailureMode, res.Error = "failed", FailureWorktreeProvision, err.Error()
 		return err
 	}

@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -45,6 +46,57 @@ func TestDecodeContextPackRoundTrip(t *testing.T) {
 	}
 }
 
+func TestDecodeContextPackRefusesMalformedCarrier(t *testing.T) {
+	pack := ContextPackV1{Version: ContextPackProtocol, PackID: "pack1", Documents: []ContextDocumentV1{testPackDoc(t, "doc.md", "x")}}
+	valid := encodePack(t, pack)
+	cases := map[string]struct {
+		carrier    []byte
+		wantReason ContextPackReason
+	}{
+		"unknown-field": {carrier: []byte(`{"version":"context-pack-v1","packId":"pack1","documents":[],"extra":1}`), wantReason: ReasonContextPackInvalid},
+		"trailing-data": {carrier: append(append([]byte{}, valid...), 'x'), wantReason: ReasonContextPackInvalid},
+		"empty":         {carrier: []byte{}, wantReason: ReasonContextPackLimit},
+		"oversize":      {carrier: make([]byte, maxContextPackCarrierBytes+1), wantReason: ReasonContextPackLimit},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := DecodeContextPack(tc.carrier)
+			if err == nil {
+				t.Fatalf("%s carrier accepted", name)
+			}
+			var packErr *ContextPackError
+			if !errors.As(err, &packErr) {
+				t.Fatalf("%s refusal is not a pack error: %v", name, err)
+			}
+			if packErr.Reason != tc.wantReason {
+				t.Fatalf("%s reason = %q, want %q (err=%v)", name, packErr.Reason, tc.wantReason, err)
+			}
+		})
+	}
+}
+
+func TestDecodeContextPackRefusesBadPackIdentity(t *testing.T) {
+	for _, packID := range []string{"../evil", "", ".hidden"} {
+		t.Run("packId="+strconv.Quote(packID), func(t *testing.T) {
+			pack := ContextPackV1{Version: ContextPackProtocol, PackID: packID, Documents: []ContextDocumentV1{testPackDoc(t, "doc.md", "x")}}
+			if _, err := DecodeContextPack(encodePack(t, pack)); err == nil {
+				t.Fatalf("packId %q accepted by Decode", packID)
+			}
+			root := RootPath(t.TempDir())
+			if _, err := MaterializeContextPack(root, pack); err == nil {
+				t.Fatalf("packId %q accepted by Materialize", packID)
+			}
+			if packID == "pack1" {
+				t.Fatal("unreachable")
+			}
+			// No session-owned context directory may appear for a refused identity.
+			if entries, _ := os.ReadDir(filepath.Join(string(root), DeclarationDirName, ContextPackDirName)); len(entries) != 0 {
+				t.Fatalf("refused pack identity left %d entries", len(entries))
+			}
+		})
+	}
+}
+
 func TestMaterializeContextPackPublishesBytes(t *testing.T) {
 	root := RootPath(t.TempDir())
 	pack := ContextPackV1{Version: ContextPackProtocol, PackID: "pack1", Documents: []ContextDocumentV1{
@@ -82,23 +134,43 @@ func TestMaterializeContextPackPublishesBytes(t *testing.T) {
 }
 
 func TestMaterializeContextPackRefusesUnsafe(t *testing.T) {
-	cases := map[string]ContextDocumentV1{
-		"traversal": testPackDoc(t, "../escape.md", "x"),
-		"absolute":  testPackDoc(t, "/abs.md", "x"),
-		"backslash": {Path: "a\\b.md", ContentBase64: base64.StdEncoding.EncodeToString([]byte("x")), Digest: "sha256:" + strings.Repeat("0", 64)},
-		"duplicate": testPackDoc(t, "dup.md", "x"),
-		"digest":    {Path: "ok.md", ContentBase64: base64.StdEncoding.EncodeToString([]byte("x")), Digest: "sha256:" + strings.Repeat("0", 64)},
+	longPath := strings.Repeat("a", 200) + "/" + strings.Repeat("b", 100) + ".md"
+	cases := map[string]struct {
+		doc        ContextDocumentV1
+		wantReason ContextPackReason
+		wantDetail string
+	}{
+		"traversal":         {doc: testPackDoc(t, "../escape.md", "x"), wantReason: ReasonContextPackUnsafe},
+		"absolute":          {doc: testPackDoc(t, "/abs.md", "x"), wantReason: ReasonContextPackUnsafe, wantDetail: "absolute path"},
+		"backslash":         {doc: testPackDoc(t, "a\\b.md", "x"), wantReason: ReasonContextPackUnsafe, wantDetail: "backslash in path"},
+		"empty-path":        {doc: testPackDoc(t, "", "x"), wantReason: ReasonContextPackLimit, wantDetail: "path length out of bounds"},
+		"long-path":         {doc: testPackDoc(t, longPath, "x"), wantReason: ReasonContextPackLimit, wantDetail: "path length out of bounds"},
+		"duplicate":         {doc: testPackDoc(t, "dup.md", "x"), wantReason: ReasonContextPackCollision},
+		"digest":            {doc: ContextDocumentV1{Path: "ok.md", ContentBase64: base64.StdEncoding.EncodeToString([]byte("x")), Digest: "sha256:" + strings.Repeat("0", 64)}, wantReason: ReasonContextPackDigest},
+		"bad-digest-format": {doc: ContextDocumentV1{Path: "ok.md", ContentBase64: base64.StdEncoding.EncodeToString([]byte("x")), Digest: "not-a-digest"}, wantReason: ReasonContextPackDigest},
+		"bad-base64":        {doc: ContextDocumentV1{Path: "ok.md", ContentBase64: "!!!not-base64!!!", Digest: "sha256:" + strings.Repeat("0", 64)}, wantReason: ReasonContextPackInvalid},
 	}
-	for name, doc := range cases {
+	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			root := RootPath(t.TempDir())
-			pack := ContextPackV1{Version: ContextPackProtocol, PackID: "pack1", Documents: []ContextDocumentV1{doc}}
+			pack := ContextPackV1{Version: ContextPackProtocol, PackID: "pack1", Documents: []ContextDocumentV1{tc.doc}}
 			if name == "duplicate" {
-				pack.Documents = append(pack.Documents, ContextDocumentV1{Path: "DUP.md", ContentBase64: doc.ContentBase64, Digest: doc.Digest})
+				pack.Documents = append(pack.Documents, ContextDocumentV1{Path: "DUP.md", ContentBase64: tc.doc.ContentBase64, Digest: tc.doc.Digest})
 			}
 			outside := filepath.Join(t.TempDir(), "outside.md")
-			if _, err := MaterializeContextPack(root, pack); err == nil {
+			_, err := MaterializeContextPack(root, pack)
+			if err == nil {
 				t.Fatal("unsafe pack accepted")
+			}
+			var packErr *ContextPackError
+			if !errors.As(err, &packErr) {
+				t.Fatalf("refusal is not a pack error: %v", err)
+			}
+			if packErr.Reason != tc.wantReason {
+				t.Fatalf("reason = %q, want %q (err=%v)", packErr.Reason, tc.wantReason, err)
+			}
+			if tc.wantDetail != "" && !strings.Contains(packErr.Detail, tc.wantDetail) {
+				t.Fatalf("detail = %q, want substring %q", packErr.Detail, tc.wantDetail)
 			}
 			if _, statErr := os.Stat(outside); !os.IsNotExist(statErr) {
 				t.Fatal("outside file changed")
@@ -123,6 +195,21 @@ func TestMaterializeContextPackRefusesLimits(t *testing.T) {
 	oversize := ContextPackV1{Version: ContextPackProtocol, PackID: "pack1", Documents: []ContextDocumentV1{testPackDoc(t, "big.md", big)}}
 	if _, err := MaterializeContextPack(root, oversize); err == nil {
 		t.Fatal("document size limit accepted")
+	}
+	// Total pack size exceeds the bound while each document stays under the
+	// per-document bound: 5 documents at the per-document maximum.
+	full := strings.Repeat("x", MaxContextPackBytesPerDocument)
+	totalPack := ContextPackV1{Version: ContextPackProtocol, PackID: "pack1"}
+	for i := 0; i < 5; i++ {
+		totalPack.Documents = append(totalPack.Documents, testPackDoc(t, "total-"+strconv.Itoa(i)+".md", full))
+	}
+	if _, err := MaterializeContextPack(root, totalPack); err == nil {
+		t.Fatal("total pack size limit accepted")
+	} else {
+		var packErr *ContextPackError
+		if !errors.As(err, &packErr) || packErr.Reason != ReasonContextPackLimit {
+			t.Fatalf("total refusal reason = %v, want %q", err, ReasonContextPackLimit)
+		}
 	}
 	if _, statErr := os.Stat(filepath.Join(string(root), DeclarationDirName, ContextPackDirName, "pack1")); !os.IsNotExist(statErr) {
 		t.Fatal("partial pack visible after limit refusal")
