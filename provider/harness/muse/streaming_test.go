@@ -524,3 +524,82 @@ drainedMixed:
 		t.Fatalf("mixed burst lost final events: assistant=%d usage=%d result=%d handlerDone=%v", assistant, usage, result, done)
 	}
 }
+
+// TestPureToolBurstPreservesTerminal pins the oldest-eviction fallback:
+// a turn flooded with only ordinary tool events (no best-effort
+// liveness/reasoning left to evict) fills the 256-event channel, so the
+// final assistant completion, aggregate usage and ResultEvent depend on
+// the kept[1:] oldest-eviction fallback. Drives the production
+// Handle.handleNotification + emitter path with 128 toolCall
+// started+completed pairs (256 ToolUse/ToolResult, no drain), then
+// assistant completion + turn/completed, asserting the verdict survives.
+// Kills the INVERT mutant `if !isTerminalAdjacentEvent(ev)` -> `if true`
+// in evictForTerminal (never evict oldest for terminal), which drops the
+// completion and terminal while handleNotification still reports success.
+func TestPureToolBurstPreservesTerminal(t *testing.T) {
+	h := newHandle(nil, agent.Spec{Prompt: "x"}, NewSpawnPlan(agent.Spec{Prompt: "x"}, t.TempDir()), HandleOptions{})
+	sid := "99999999-9999-7999-8999-999999999999"
+	turnID := "aaaaaaaa-aaaa-7aaa-8aaa-aaaaaaaaaaaa"
+	h.setSessionID(sid)
+	h.setCurrentTurnID(turnID)
+	// 128 ordinary tool calls fill the 256-event channel with no
+	// best-effort output left to evict (evicted==0 path).
+	for i := 0; i < 128; i++ {
+		id := fmt.Sprintf("pure-tool-%d", i)
+		sParams, err := json.Marshal(map[string]any{
+			"sessionId": sid, "viewCursor": "cursor-0",
+			"item": map[string]any{"itemId": id, "kind": "toolCall", "revision": 1, "status": "inProgress", "tool": "edit", "args": `{"path":"a.txt"}`, "turnId": turnID},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		h.handleNotification(context.Background(), notification{Method: "item/started", Params: sParams})
+		cParams, err := json.Marshal(map[string]any{
+			"sessionId": sid, "viewCursor": "cursor-0",
+			"item": map[string]any{"itemId": id, "kind": "toolCall", "revision": 2, "status": "completed", "tool": "edit", "visibleOutput": "ok", "turnId": turnID},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		h.handleNotification(context.Background(), notification{Method: "item/completed", Params: cParams})
+	}
+	full := "final answer"
+	completed, err := json.Marshal(map[string]any{
+		"sessionId": sid, "viewCursor": "cursor-1",
+		"item": map[string]any{"itemId": "m1", "kind": "agentMessage", "revision": 1, "status": "completed", "text": full, "turnId": turnID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.handleNotification(context.Background(), notification{Method: "item/completed", Params: completed})
+	turnDone, err := json.Marshal(map[string]any{"sessionId": sid, "viewCursor": "cursor-end", "turnId": turnID, "terminal": "completed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := h.handleNotification(context.Background(), notification{Method: "turn/completed", Params: turnDone})
+	if !done {
+		t.Fatalf("turn/completed did not report terminal")
+	}
+	var assistant, result int
+	for {
+		select {
+		case ev := <-h.Events():
+			switch e := ev.(type) {
+			case agent.AssistantTextEvent:
+				if e.Text == full {
+					assistant++
+				}
+			case agent.ResultEvent:
+				if e.Success {
+					result++
+				}
+			}
+		default:
+			goto drainedPureTool
+		}
+	}
+drainedPureTool:
+	if assistant != 1 || result != 1 {
+		t.Fatalf("pure-tool flood lost terminal: assistant=%d result=%d handlerDone=%v", assistant, result, done)
+	}
+}
