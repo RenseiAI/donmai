@@ -617,7 +617,7 @@ func TestConcurrentDrainPreservesToolOrder(t *testing.T) {
 	// Fill the buffer with ordinary tool traffic and no drain, so the
 	// terminal below must make room while a reader is active (the old
 	// drain-and-requeue window).
-	const tools = 128
+	const tools = 200
 	for i := 0; i < tools; i++ {
 		id := fmt.Sprintf("concurrent-tool-%d", i)
 		sParams, err := json.Marshal(map[string]any{
@@ -692,7 +692,8 @@ func TestConcurrentDrainPreservesToolOrder(t *testing.T) {
 	}
 	// The terminal ejects the oldest tool pair when the queue is full of
 	// ordinary traffic, so at least tools-1 pairs survive in order; every
-	// surviving result still follows its use.
+	// surviving result still follows its use. Two hundred pairs exceed the
+	// combined queue and channel budget, so eviction is exercised.
 	if len(useIdx) < tools-1 {
 		t.Fatalf("tool uses=%d, want at least %d (kinds=%v)", len(useIdx), tools-1, kindsOf(got))
 	}
