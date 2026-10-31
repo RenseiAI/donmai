@@ -1299,3 +1299,176 @@ func (v hostUpgradeSleepVerifier) Verify(_ context.Context, _, _ string) (bool, 
 	time.Sleep(v.delay)
 	return true, "test-sleep-verifier"
 }
+
+func TestHostUpgradeRetentionPreservesAppliedAcrossFlood(t *testing.T) {
+	t.Parallel()
+	d := hostUpgradeTestDaemon(t, nil)
+	var calls atomic.Int32
+	d.runPreparedUpdate = func(context.Context, AutoUpdateConfig, string) (*UpdateResult, error) {
+		calls.Add(1)
+		return &UpdateResult{Updated: true, Version: "2.0.0", Reason: "update-applied"}, nil
+	}
+	m := hostUpgradeMutation("up-keep-success", map[string]any{"consented": true})
+	applied, failures := d.applyPendingMutations(context.Background(), []PendingMutation{m})
+	if len(applied) != 0 || len(failures) != 0 {
+		t.Fatalf("first delivery applied/failures = %v/%v, want pending", applied, failures)
+	}
+	waitForHostUpgradeDone(t, d, "up-keep-success")
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("update calls = %d, want 1", got)
+	}
+	// Age the success past the second-precision CompletedAt so a
+	// count-based pruner would treat it as the oldest entry: this mirrors
+	// the probe, where the completed receipt grows older before the flood.
+	time.Sleep(1100 * time.Millisecond)
+	for i := 0; i < hostUpgradeMaxRetainedOutcomes; i++ {
+		flood := hostUpgradeMutation(fmt.Sprintf("up-flood-%04d", i), map[string]any{"consented": false})
+		applied, failures := d.applyPendingMutations(context.Background(), []PendingMutation{flood})
+		if len(applied) != 0 || len(failures) != 1 {
+			t.Fatalf("flood %d applied/failures = %v/%v, want refusal", i, applied, failures)
+		}
+	}
+	applied, failures = d.applyPendingMutations(context.Background(), []PendingMutation{m})
+	if len(applied) != 1 || applied[0] != "up-keep-success" || len(failures) != 0 {
+		t.Fatalf("redelivery applied/failures = %v/%v, want applied", applied, failures)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("update calls after flood redelivery = %d, want 1 (no second swap)", got)
+	}
+	reloaded, err := loadHostUpgradeOutcomes(hostUpgradeStatePath(d.opts.ConfigPath))
+	if err != nil {
+		t.Fatalf("reload durable: %v", err)
+	}
+	outcome, ok := reloaded["up-keep-success"]
+	if !ok || !outcome.Applied {
+		t.Fatalf("durable receipt for original = %+v present=%v, want applied", outcome, ok)
+	}
+}
+
+func TestHostUpgradeRetentionPreservesBusyRefusalAcrossFlood(t *testing.T) {
+	t.Parallel()
+	d := hostUpgradeTestDaemon(t, nil)
+	lease, ok := d.tryClaimLifecycle(lifecycleUpdate)
+	if !ok {
+		t.Fatal("could not claim lifecycle for manual holder")
+	}
+	var calls atomic.Int32
+	d.runPreparedUpdate = func(context.Context, AutoUpdateConfig, string) (*UpdateResult, error) {
+		calls.Add(1)
+		return &UpdateResult{Updated: true, Version: "x", Reason: "update-applied"}, nil
+	}
+	m := hostUpgradeMutation("up-busy-keep", map[string]any{"consented": true})
+	applied, failures := d.applyPendingMutations(context.Background(), []PendingMutation{m})
+	if len(applied) != 0 || len(failures) != 1 {
+		t.Fatalf("busy applied/failures = %v/%v, want refusal", applied, failures)
+	}
+	// Age the busy receipt past the second-precision CompletedAt so a
+	// count-based pruner would treat it as the oldest entry.
+	time.Sleep(1100 * time.Millisecond)
+	for i := 0; i < hostUpgradeMaxRetainedOutcomes; i++ {
+		flood := hostUpgradeMutation(fmt.Sprintf("up-bflood-%04d", i), map[string]any{"consented": false})
+		applied, failures := d.applyPendingMutations(context.Background(), []PendingMutation{flood})
+		if len(applied) != 0 || len(failures) != 1 {
+			t.Fatalf("flood %d applied/failures = %v/%v, want refusal", i, applied, failures)
+		}
+	}
+	// Release contention before redelivery: a terminal busy refusal must
+	// replay even when the host is free again. Under a count-based pruner
+	// the evicted receipt would re-validate to a fresh execution instead.
+	d.releaseLifecycle(lease)
+	applied, failures = d.applyPendingMutations(context.Background(), []PendingMutation{m})
+	if len(applied) != 0 || len(failures) != 1 || failures[0].ID != "up-busy-keep" {
+		t.Fatalf("redelivery applied/failures = %v/%v, want replayed busy refusal", applied, failures)
+	}
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("update calls = %d, want 0 (refused request must never execute)", got)
+	}
+}
+
+func TestHostUpgradeTwoRequestsSameHeartbeat(t *testing.T) {
+	t.Parallel()
+	d := hostUpgradeTestDaemon(t, nil)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var calls atomic.Int32
+	var once sync.Once
+	d.runPreparedUpdate = func(ctx context.Context, _ AutoUpdateConfig, _ string) (*UpdateResult, error) {
+		calls.Add(1)
+		once.Do(func() { close(entered) })
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		return &UpdateResult{Updated: true, Version: "3.0.0", Reason: "update-applied"}, nil
+	}
+	first := hostUpgradeMutation("up-same-a", map[string]any{"consented": true})
+	second := hostUpgradeMutation("up-same-b", map[string]any{"consented": true})
+	// One heartbeat carrying two requests: the first is admitted pending and
+	// the second must refuse immediately from the in-flight admission guard,
+	// before either background attempt claims the lifecycle lease.
+	applied, failures := d.applyPendingMutations(context.Background(), []PendingMutation{first, second})
+	if len(applied) != 0 {
+		t.Fatalf("same-beat applied = %v, want none yet", applied)
+	}
+	if len(failures) != 1 || failures[0].ID != "up-same-b" {
+		t.Fatalf("same-beat failures = %v, want immediate refusal for second", failures)
+	}
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first upgrade did not start")
+	}
+	close(release)
+	waitForHostUpgradeDone(t, d, "up-same-a")
+	applied, failures = d.applyPendingMutations(context.Background(), []PendingMutation{second})
+	if len(applied) != 0 || len(failures) != 1 || failures[0].ID != "up-same-b" {
+		t.Fatalf("post-contention redelivery applied/failures = %v/%v, want replayed refusal", applied, failures)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("update calls = %d, want 1 (no second swap)", got)
+	}
+}
+
+func TestPruneHostUpgradeLedgerKeepsActionableReceipts(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+	actionable := now.Add(time.Hour).UTC().Format(time.RFC3339Nano)
+	expired := now.Add(-time.Hour).UTC().Format(time.RFC3339Nano)
+	completed := now.UTC().Format(time.RFC3339Nano)
+	outcomes := map[string]hostUpgradeOutcome{
+		"applied": {Applied: true, CompletedAt: completed, ConsentUntil: actionable},
+		"busy":    {Applied: false, Error: "host.upgrade already in progress", CompletedAt: completed, ConsentUntil: actionable},
+		"old":     {Applied: false, Error: "host.upgrade refused: stale", CompletedAt: completed, Evictable: true, ConsentUntil: expired},
+	}
+	for i := 0; i < hostUpgradeMaxRetainedOutcomes; i++ {
+		outcomes[fmt.Sprintf("refuse-%04d", i)] = hostUpgradeOutcome{
+			Applied: false, Error: "host.upgrade requires consented:true",
+			CompletedAt: completed, Evictable: true,
+		}
+	}
+	pruneHostUpgradeLedgerAt(outcomes, now)
+	if _, ok := outcomes["applied"]; !ok {
+		t.Fatal("applied receipt evicted while consent actionable")
+	}
+	if _, ok := outcomes["busy"]; !ok {
+		t.Fatal("busy receipt evicted while consent actionable")
+	}
+	if len(outcomes) > hostUpgradeMaxRetainedOutcomes+2 {
+		t.Fatalf("ledger size = %d, want bounded", len(outcomes))
+	}
+	// Expired non-evictable receipts may be pruned: redelivery refuses via expiry anyway.
+	expiredOutcomes := map[string]hostUpgradeOutcome{
+		"applied-expired": {Applied: true, CompletedAt: completed, ConsentUntil: expired},
+	}
+	for i := 0; i < hostUpgradeMaxRetainedOutcomes; i++ {
+		expiredOutcomes[fmt.Sprintf("refuse-%04d", i)] = hostUpgradeOutcome{
+			Applied: false, Error: "host.upgrade requires consented:true",
+			CompletedAt: completed, Evictable: true,
+		}
+	}
+	pruneHostUpgradeLedgerAt(expiredOutcomes, now)
+	if _, ok := expiredOutcomes["applied-expired"]; ok && len(expiredOutcomes) > hostUpgradeMaxRetainedOutcomes {
+		t.Fatal("expired receipt should be evictable to enforce the bound")
+	}
+}

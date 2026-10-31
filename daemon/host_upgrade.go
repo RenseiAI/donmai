@@ -34,13 +34,23 @@ const hostUpgradeExecutionBound = 5 * time.Minute
 // updating a host the operator may no longer intend to move.
 const hostUpgradeMaxRequestedAge = 24 * time.Hour
 
-// hostUpgradeMaxRetainedOutcomes bounds how many terminal outcomes are
-// retained in memory and in the durable ledger. Every unique refusal was
-// retained forever, so a flood of unique IDs grew memory and disk without
-// bound and made each subsequent refusal re-encode and fsync an ever
-// larger file while holding the heartbeat mutation path. When the bound is
-// reached the oldest outcome is evicted to make room; a redelivery of an
-// evicted ID simply re-validates to the same refusal without a swap.
+// hostUpgradeMaxRetainedOutcomes bounds how many replay-safe validation
+// refusals are retained in memory and in the durable ledger. Every unique
+// refusal was retained forever, so a flood of unique IDs grew memory and
+// disk without bound and made each subsequent refusal re-encode and fsync
+// an ever larger file while holding the heartbeat mutation path. When the
+// bound is reached the oldest replay-safe refusal is evicted to make room;
+// a redelivery of an evicted validation refusal simply re-validates to the
+// same refusal without a swap.
+//
+// Outcomes that must survive to prevent a second swap are never evicted
+// while their consent is still actionable: applied successes, contention
+// (busy/in-progress) refusals, and every other execution-dependent outcome
+// (preflight, signature, durability, interrupted). Those carry
+// Evictable=false and a ConsentUntil deadline; the pruner evicts them only
+// after that deadline has passed, when a redelivery would refuse via expiry
+// without a swap anyway. When nothing is safely evictable the ledger is
+// allowed to grow past the bound rather than manufacture a second swap.
 const hostUpgradeMaxRetainedOutcomes = 128
 
 // hostUpgradeOutcome is the durable per-request outcome. Applied is true only
@@ -50,14 +60,27 @@ const hostUpgradeMaxRetainedOutcomes = 128
 // Pending marks a durable intent written before execution starts: a crash
 // between intent and final outcome must never run a second swap on
 // redelivery, so a pending record reloads as an interrupted failure.
+// Evictable marks request-shape validation refusals (malformed params,
+// missing consent, forbidden keys, expired/stale) that re-validate to the
+// identical refusal without durability: only those may be evicted to enforce
+// the retention bound. Every other outcome (applied, contention, preflight,
+// signature, durability, interrupted) carries Evictable=false so retention
+// can never resurrect an already-completed or already-refused request into
+// a second execution. ConsentUntil is the RFC3339 deadline after which the
+// original consent is no longer actionable (explicit expiresAt, else
+// requestedAt plus the maximum actionable age, empty when the request
+// carries no time bound): expired non-evictable receipts may be pruned
+// because a redelivery past that deadline refuses via expiry anyway.
 type hostUpgradeOutcome struct {
-	Applied     bool   `json:"applied"`
-	Error       string `json:"error,omitempty"`
-	Updated     bool   `json:"updated"`
-	Version     string `json:"version,omitempty"`
-	Reason      string `json:"reason,omitempty"`
-	CompletedAt string `json:"completedAt,omitempty"`
-	Pending     bool   `json:"pending,omitempty"`
+	Applied      bool   `json:"applied"`
+	Error        string `json:"error,omitempty"`
+	Updated      bool   `json:"updated"`
+	Version      string `json:"version,omitempty"`
+	Reason       string `json:"reason,omitempty"`
+	CompletedAt  string `json:"completedAt,omitempty"`
+	Pending      bool   `json:"pending,omitempty"`
+	Evictable    bool   `json:"evictable,omitempty"`
+	ConsentUntil string `json:"consentUntil,omitempty"`
 }
 
 // hostUpgradeForbiddenParams are request keys the daemon never honors. Any
@@ -370,13 +393,55 @@ func probeHostUpgradeDurability(path string) error {
 	return nil
 }
 
-// pruneHostUpgradeLedger evicts the oldest outcomes until the ledger fits
-// the retention bound. Oldest is by CompletedAt wall time; entries without
-// a parseable timestamp sort oldest-first so a corrupt clock cannot pin
-// them. Both the in-memory map and the durable file go through this so
-// neither grows without bound under a flood of unique IDs.
+// hostUpgradeConsentUntilString returns the RFC3339 consent deadline for one
+// request: the explicit expiresAt when present, otherwise requestedAt plus
+// the maximum actionable age. Empty means the request carries no time bound
+// and its receipt must be retained indefinitely: evicting it could never be
+// distinguished from a fresh validation to a second swap.
+func hostUpgradeConsentUntilString(m PendingMutation) string {
+	if deadline, ok := hostUpgradeConsentDeadline(m); ok {
+		return deadline.UTC().Format(time.RFC3339Nano)
+	}
+	return ""
+}
+
+// hostUpgradeReceiptExpired reports whether a retained receipt's consent is
+// no longer actionable, so evicting it cannot resurrect a second swap: a
+// redelivery past the deadline refuses via expiry without touching the
+// updater. Receipts without a deadline never expire.
+func hostUpgradeReceiptExpired(outcome hostUpgradeOutcome, now time.Time) bool {
+	deadlineRaw := strings.TrimSpace(outcome.ConsentUntil)
+	if deadlineRaw == "" {
+		return false
+	}
+	deadline, err := parseHostUpgradeTime(deadlineRaw)
+	if err != nil {
+		return false
+	}
+	return !now.Before(deadline)
+}
+
+// pruneHostUpgradeLedger evicts outcomes until the ledger fits the retention
+// bound without resurrecting a second swap. Eviction preference is:
+//  1. oldest replay-safe validation refusals (Evictable), which re-validate
+//     to the identical refusal without durability;
+//  2. oldest non-evictable receipts whose consent has expired, which would
+//     refuse via expiry on redelivery anyway.
+//
+// Applied successes, contention refusals and every other
+// execution-dependent outcome with still-actionable consent are never
+// evicted: when nothing is safely evictable the ledger is allowed to grow
+// past the bound rather than manufacture a second swap. Oldest is by
+// CompletedAt wall time; entries without a parseable timestamp sort
+// oldest-first so a corrupt clock cannot pin them. Both the in-memory map
+// and the durable file go through this so a flood of unique validation
+// refusals stays bounded.
 func pruneHostUpgradeLedger(outcomes map[string]hostUpgradeOutcome) {
-	for len(outcomes) > hostUpgradeMaxRetainedOutcomes {
+	pruneHostUpgradeLedgerAt(outcomes, time.Now())
+}
+
+func pruneHostUpgradeLedgerAt(outcomes map[string]hostUpgradeOutcome, now time.Time) {
+	oldestBy := func(allow func(hostUpgradeOutcome) bool) (string, bool) {
 		oldestID := ""
 		var oldestTime time.Time
 		oldestSet := false
@@ -384,10 +449,12 @@ func pruneHostUpgradeLedger(outcomes map[string]hostUpgradeOutcome) {
 			if outcome.Pending {
 				continue
 			}
+			if !allow(outcome) {
+				continue
+			}
 			completedAt, err := parseHostUpgradeTime(strings.TrimSpace(outcome.CompletedAt))
 			if err != nil {
-				oldestID = id
-				break
+				return id, true
 			}
 			if !oldestSet || completedAt.Before(oldestTime) || (completedAt.Equal(oldestTime) && id < oldestID) {
 				oldestID = id
@@ -395,18 +462,20 @@ func pruneHostUpgradeLedger(outcomes map[string]hostUpgradeOutcome) {
 				oldestSet = true
 			}
 		}
-		if oldestID == "" {
-			for id, outcome := range outcomes {
-				if !outcome.Pending {
-					oldestID = id
-					break
-				}
-			}
+		return oldestID, oldestSet
+	}
+	for len(outcomes) > hostUpgradeMaxRetainedOutcomes {
+		if id, ok := oldestBy(func(o hostUpgradeOutcome) bool { return o.Evictable }); ok {
+			delete(outcomes, id)
+			continue
 		}
-		if oldestID == "" {
-			return
+		if id, ok := oldestBy(func(o hostUpgradeOutcome) bool {
+			return !o.Evictable && hostUpgradeReceiptExpired(o, now)
+		}); ok {
+			delete(outcomes, id)
+			continue
 		}
-		delete(outcomes, oldestID)
+		return
 	}
 }
 
@@ -442,10 +511,11 @@ func (d *Daemon) initHostUpgradeStateLocked() {
 						completedAt = time.Now().UTC().Format(time.RFC3339)
 					}
 					outcome = hostUpgradeOutcome{
-						Applied:     false,
-						Error:       "host.upgrade interrupted: previous attempt did not complete",
-						Reason:      "interrupted",
-						CompletedAt: completedAt,
+						Applied:      false,
+						Error:        "host.upgrade interrupted: previous attempt did not complete",
+						Reason:       "interrupted",
+						CompletedAt:  completedAt,
+						ConsentUntil: strings.TrimSpace(outcome.ConsentUntil),
 					}
 				}
 				d.hostUpgradeDone[id] = outcome
@@ -493,7 +563,7 @@ func (d *Daemon) handleHostUpgradeMutation(m PendingMutation) (appliedID string,
 		if strings.TrimSpace(errText) == "" {
 			errText = "host.upgrade refused: durable state unavailable"
 		}
-		outcome := hostUpgradeOutcome{Applied: false, Error: errText, CompletedAt: now.UTC().Format(time.RFC3339)}
+		outcome := hostUpgradeOutcome{Applied: false, Error: errText, CompletedAt: now.UTC().Format(time.RFC3339), ConsentUntil: hostUpgradeConsentUntilString(m)}
 		d.hostUpgradeDone[m.ID] = outcome
 		pruneHostUpgradeLedger(d.hostUpgradeDone)
 		d.hostUpgradeMu.Unlock()
@@ -509,7 +579,7 @@ func (d *Daemon) handleHostUpgradeMutation(m PendingMutation) (appliedID string,
 	// already reported refused.
 	if len(d.hostUpgradeInFlight) > 0 {
 		errText := "host.upgrade already in progress"
-		outcome := hostUpgradeOutcome{Applied: false, Error: errText, CompletedAt: now.UTC().Format(time.RFC3339)}
+		outcome := hostUpgradeOutcome{Applied: false, Error: errText, CompletedAt: now.UTC().Format(time.RFC3339), ConsentUntil: hostUpgradeConsentUntilString(m)}
 		d.hostUpgradeDone[m.ID] = outcome
 		pruneHostUpgradeLedger(d.hostUpgradeDone)
 		if persistErr := persistHostUpgradeOutcome(statePath, m.ID, outcome); persistErr != nil {
@@ -524,7 +594,7 @@ func (d *Daemon) handleHostUpgradeMutation(m PendingMutation) (appliedID string,
 	d.lifecycleMu.Unlock()
 	if lifecycleBusy {
 		errText := "host.upgrade refused: lifecycle busy"
-		outcome := hostUpgradeOutcome{Applied: false, Error: errText, CompletedAt: now.UTC().Format(time.RFC3339)}
+		outcome := hostUpgradeOutcome{Applied: false, Error: errText, CompletedAt: now.UTC().Format(time.RFC3339), ConsentUntil: hostUpgradeConsentUntilString(m)}
 		d.hostUpgradeDone[m.ID] = outcome
 		pruneHostUpgradeLedger(d.hostUpgradeDone)
 		if persistErr := persistHostUpgradeOutcome(statePath, m.ID, outcome); persistErr != nil {
@@ -541,7 +611,7 @@ func (d *Daemon) handleHostUpgradeMutation(m PendingMutation) (appliedID string,
 	// shape refusal.
 	if !hostUpgradeOptedIn(d.configSnapshotForUpgrade()) {
 		err := "host.upgrade refused: machine-owner update consent is not configured (no signed source)"
-		outcome := hostUpgradeOutcome{Applied: false, Error: err, CompletedAt: now.UTC().Format(time.RFC3339)}
+		outcome := hostUpgradeOutcome{Applied: false, Error: err, CompletedAt: now.UTC().Format(time.RFC3339), ConsentUntil: hostUpgradeConsentUntilString(m)}
 		d.hostUpgradeDone[m.ID] = outcome
 		pruneHostUpgradeLedger(d.hostUpgradeDone)
 		if persistErr := persistHostUpgradeOutcome(statePath, m.ID, outcome); persistErr != nil {
@@ -557,7 +627,7 @@ func (d *Daemon) handleHostUpgradeMutation(m PendingMutation) (appliedID string,
 	// without a swap, never ACK applied.
 	if !d.hostUpgradeSourceConfigured() {
 		err := "host.upgrade refused: update source is not configured"
-		outcome := hostUpgradeOutcome{Applied: false, Error: err, CompletedAt: now.UTC().Format(time.RFC3339)}
+		outcome := hostUpgradeOutcome{Applied: false, Error: err, CompletedAt: now.UTC().Format(time.RFC3339), ConsentUntil: hostUpgradeConsentUntilString(m)}
 		d.hostUpgradeDone[m.ID] = outcome
 		pruneHostUpgradeLedger(d.hostUpgradeDone)
 		if persistErr := persistHostUpgradeOutcome(statePath, m.ID, outcome); persistErr != nil {
@@ -568,7 +638,7 @@ func (d *Daemon) handleHostUpgradeMutation(m PendingMutation) (appliedID string,
 		return "", &HeartbeatMutationFailure{ID: m.ID, Error: err}
 	}
 	if err := parseHostUpgradeParams(m, now); err != nil {
-		outcome := hostUpgradeOutcome{Applied: false, Error: err.Error(), CompletedAt: now.UTC().Format(time.RFC3339)}
+		outcome := hostUpgradeOutcome{Applied: false, Error: err.Error(), CompletedAt: now.UTC().Format(time.RFC3339), Evictable: true, ConsentUntil: hostUpgradeConsentUntilString(m)}
 		d.hostUpgradeDone[m.ID] = outcome
 		pruneHostUpgradeLedger(d.hostUpgradeDone)
 		if persistErr := persistHostUpgradeOutcome(statePath, m.ID, outcome); persistErr != nil {
@@ -579,7 +649,7 @@ func (d *Daemon) handleHostUpgradeMutation(m PendingMutation) (appliedID string,
 		return "", &HeartbeatMutationFailure{ID: m.ID, Error: err.Error()}
 	}
 	if err := probeHostUpgradeDurability(statePath); err != nil {
-		outcome := hostUpgradeOutcome{Applied: false, Error: err.Error(), CompletedAt: now.UTC().Format(time.RFC3339)}
+		outcome := hostUpgradeOutcome{Applied: false, Error: err.Error(), CompletedAt: now.UTC().Format(time.RFC3339), ConsentUntil: hostUpgradeConsentUntilString(m)}
 		d.hostUpgradeDone[m.ID] = outcome
 		pruneHostUpgradeLedger(d.hostUpgradeDone)
 		_ = persistHostUpgradeOutcome(statePath, m.ID, outcome)
@@ -590,10 +660,10 @@ func (d *Daemon) handleHostUpgradeMutation(m PendingMutation) (appliedID string,
 	// the final outcome must not lose request identity into a second swap.
 	// The intent reloads as an interrupted failure, never as completion and
 	// never as a fresh validation to a second swap.
-	pending := hostUpgradeOutcome{Pending: true, CompletedAt: now.UTC().Format(time.RFC3339)}
+	pending := hostUpgradeOutcome{Pending: true, CompletedAt: now.UTC().Format(time.RFC3339), ConsentUntil: hostUpgradeConsentUntilString(m)}
 	if persistErr := persistHostUpgradeOutcome(statePath, m.ID, pending); persistErr != nil {
 		errText := persistErr.Error()
-		outcome := hostUpgradeOutcome{Applied: false, Error: errText, CompletedAt: now.UTC().Format(time.RFC3339)}
+		outcome := hostUpgradeOutcome{Applied: false, Error: errText, CompletedAt: now.UTC().Format(time.RFC3339), ConsentUntil: hostUpgradeConsentUntilString(m)}
 		d.hostUpgradeDone[m.ID] = outcome
 		pruneHostUpgradeLedger(d.hostUpgradeDone)
 		d.hostUpgradeDurableBroken = true
@@ -635,6 +705,7 @@ func (d *Daemon) cancelHostUpgrades() {
 }
 
 func (d *Daemon) runHostUpgrade(m PendingMutation) {
+	consentUntil := hostUpgradeConsentUntilString(m)
 	ctx, cancel := hostUpgradeBoundedContext(m)
 	d.hostUpgradeMu.Lock()
 	d.initHostUpgradeStateLocked()
@@ -654,7 +725,7 @@ func (d *Daemon) runHostUpgrade(m PendingMutation) {
 	if err := parseHostUpgradeParams(m, time.Now()); err != nil {
 		d.finishHostUpgrade(m.ID, hostUpgradeOutcome{
 			Applied: false, Error: err.Error(),
-			CompletedAt: time.Now().UTC().Format(time.RFC3339),
+			CompletedAt: time.Now().UTC().Format(time.RFC3339), ConsentUntil: consentUntil,
 		})
 		return
 	}
@@ -662,7 +733,7 @@ func (d *Daemon) runHostUpgrade(m PendingMutation) {
 	if !ok {
 		d.finishHostUpgrade(m.ID, hostUpgradeOutcome{
 			Applied: false, Error: "host.upgrade refused: lifecycle busy",
-			CompletedAt: time.Now().UTC().Format(time.RFC3339),
+			CompletedAt: time.Now().UTC().Format(time.RFC3339), ConsentUntil: consentUntil,
 		})
 		return
 	}
@@ -676,13 +747,13 @@ func (d *Daemon) runHostUpgrade(m PendingMutation) {
 		if consentErr := parseHostUpgradeParams(m, time.Now()); consentErr != nil {
 			d.finishHostUpgrade(m.ID, hostUpgradeOutcome{
 				Applied: false, Error: consentErr.Error(),
-				CompletedAt: time.Now().UTC().Format(time.RFC3339),
+				CompletedAt: time.Now().UTC().Format(time.RFC3339), ConsentUntil: consentUntil,
 			})
 			return
 		}
 		d.finishHostUpgrade(m.ID, hostUpgradeOutcome{
 			Applied: false, Error: "host.upgrade preflight refused: " + err.Error(),
-			CompletedAt: time.Now().UTC().Format(time.RFC3339),
+			CompletedAt: time.Now().UTC().Format(time.RFC3339), ConsentUntil: consentUntil,
 		})
 		return
 	}
@@ -690,7 +761,7 @@ func (d *Daemon) runHostUpgrade(m PendingMutation) {
 		d.releaseLifecycle(lease)
 		d.finishHostUpgrade(m.ID, hostUpgradeOutcome{
 			Applied: false, Error: err.Error(),
-			CompletedAt: time.Now().UTC().Format(time.RFC3339),
+			CompletedAt: time.Now().UTC().Format(time.RFC3339), ConsentUntil: consentUntil,
 		})
 		return
 	}
@@ -704,7 +775,7 @@ func (d *Daemon) runHostUpgrade(m PendingMutation) {
 		d.releaseLifecycle(lease)
 		d.finishHostUpgrade(m.ID, hostUpgradeOutcome{
 			Applied: false, Error: "host.upgrade refused: lifecycle lost before update",
-			CompletedAt: time.Now().UTC().Format(time.RFC3339),
+			CompletedAt: time.Now().UTC().Format(time.RFC3339), ConsentUntil: consentUntil,
 		})
 		return
 	}
@@ -723,7 +794,7 @@ func (d *Daemon) runHostUpgrade(m PendingMutation) {
 		d.finishHostUpgrade(m.ID, hostUpgradeOutcome{
 			Applied: false, Error: consentErr.Error(),
 			Reason: reasonOfHostUpgradeResult(result), Version: versionOfHostUpgradeResult(result),
-			CompletedAt: time.Now().UTC().Format(time.RFC3339),
+			CompletedAt: time.Now().UTC().Format(time.RFC3339), ConsentUntil: consentUntil,
 		})
 		return
 	}
@@ -738,14 +809,14 @@ func (d *Daemon) runHostUpgrade(m PendingMutation) {
 		d.finishHostUpgrade(m.ID, hostUpgradeOutcome{
 			Applied: false, Error: "host.upgrade failed: " + runErr.Error(),
 			Reason: reasonOfHostUpgradeResult(result), Version: versionOfHostUpgradeResult(result),
-			CompletedAt: time.Now().UTC().Format(time.RFC3339),
+			CompletedAt: time.Now().UTC().Format(time.RFC3339), ConsentUntil: consentUntil,
 		})
 		return
 	}
 	if result == nil {
 		d.finishHostUpgrade(m.ID, hostUpgradeOutcome{
 			Applied: false, Error: "host.upgrade failed: empty update result",
-			CompletedAt: time.Now().UTC().Format(time.RFC3339),
+			CompletedAt: time.Now().UTC().Format(time.RFC3339), ConsentUntil: consentUntil,
 		})
 		return
 	}
@@ -756,7 +827,7 @@ func (d *Daemon) runHostUpgrade(m PendingMutation) {
 	if result.Updated || (result.Reason == "already-up-to-date" && d.hostUpgradeSourceConfigured()) {
 		d.finishHostUpgrade(m.ID, hostUpgradeOutcome{
 			Applied: true, Updated: result.Updated, Version: result.Version, Reason: result.Reason,
-			CompletedAt: time.Now().UTC().Format(time.RFC3339),
+			CompletedAt: time.Now().UTC().Format(time.RFC3339), ConsentUntil: consentUntil,
 		})
 		return
 	}
@@ -764,7 +835,7 @@ func (d *Daemon) runHostUpgrade(m PendingMutation) {
 		d.finishHostUpgrade(m.ID, hostUpgradeOutcome{
 			Applied: false, Error: "host.upgrade refused: update source is not configured",
 			Updated: result.Updated, Version: result.Version, Reason: result.Reason,
-			CompletedAt: time.Now().UTC().Format(time.RFC3339),
+			CompletedAt: time.Now().UTC().Format(time.RFC3339), ConsentUntil: consentUntil,
 		})
 		return
 	}
@@ -774,7 +845,7 @@ func (d *Daemon) runHostUpgrade(m PendingMutation) {
 	}
 	d.finishHostUpgrade(m.ID, hostUpgradeOutcome{
 		Applied: false, Error: errText, Updated: result.Updated, Version: result.Version, Reason: result.Reason,
-		CompletedAt: time.Now().UTC().Format(time.RFC3339),
+		CompletedAt: time.Now().UTC().Format(time.RFC3339), ConsentUntil: consentUntil,
 	})
 }
 
@@ -839,12 +910,13 @@ func (d *Daemon) finishHostUpgrade(id string, outcome hostUpgradeOutcome) {
 		// guard, so storing success here would emit applied without the
 		// claimed durable receipt.
 		outcome = hostUpgradeOutcome{
-			Applied:     false,
-			Error:       persistErr.Error(),
-			Updated:     false,
-			Version:     outcome.Version,
-			Reason:      outcome.Reason,
-			CompletedAt: outcome.CompletedAt,
+			Applied:      false,
+			Error:        persistErr.Error(),
+			Updated:      false,
+			Version:      outcome.Version,
+			Reason:       outcome.Reason,
+			CompletedAt:  outcome.CompletedAt,
+			ConsentUntil: outcome.ConsentUntil,
 		}
 	}
 	delete(d.hostUpgradeInFlight, id)
