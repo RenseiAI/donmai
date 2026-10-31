@@ -7,12 +7,13 @@ package muse
 //	muse schema generate-json-schema --out /tmp/muse-schema-gen
 //	# then reconcile the $defs below against msp.schema.json
 //
-// Source: msp.schema.json, schemaVersion 1, stable surface. The
+// Source: Muse Code 1.4.14 msp.schema.json, schemaVersion 1, stable surface. The
 // fingerprint of the exact export these types were generated from is
 // pinned in schema_fingerprint.go.
 //
 // Conventions:
-//   - Every struct mirrors one $def. Field names follow the schema's
+//   - Structs project $defs; opaque nested additions use json.RawMessage.
+//     Field names follow the schema's
 //     camelCase wire spelling via json tags.
 //   - Open enums are plain strings; closed enums get a typed string +
 //     constants so the compiler catches typos on the request path.
@@ -83,15 +84,17 @@ const (
 
 // InitializeResult is $defs/InitializeResult.
 type InitializeResult struct {
-	ExperimentalAPI     bool               `json:"experimentalApi"`
-	GrantedCapabilities []CapabilityName   `json:"grantedCapabilities"`
-	MuseHome            string             `json:"museHome"`
-	PlatformFamily      string             `json:"platformFamily"`
-	PlatformOS          string             `json:"platformOs"`
-	Schema              SchemaInfo         `json:"schema"`
-	ServerInfo          ServerInfo         `json:"serverInfo"`
-	UserAgent           string             `json:"userAgent"`
-	SessionDurability   *SessionDurability `json:"sessionDurability,omitempty"`
+	ExperimentalAPI          bool                      `json:"experimentalApi"`
+	GrantedCapabilities      []CapabilityName          `json:"grantedCapabilities"`
+	MuseHome                 string                    `json:"museHome"`
+	PlatformFamily           string                    `json:"platformFamily"`
+	PlatformOS               string                    `json:"platformOs"`
+	Schema                   SchemaInfo                `json:"schema"`
+	ServerInfo               ServerInfo                `json:"serverInfo"`
+	UserAgent                string                    `json:"userAgent"`
+	SessionDurability        *SessionDurability        `json:"sessionDurability,omitempty"`
+	SandboxAvailability      *SandboxAvailability      `json:"sandboxAvailability,omitempty"`
+	SandboxUnavailableReason *SandboxUnavailableReason `json:"sandboxUnavailableReason,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -325,24 +328,51 @@ type SessionConfig struct {
 
 // SessionStartParams is $defs/SessionStartParams.
 type SessionStartParams struct {
-	ApprovalMode      *ApprovalMode  `json:"approvalMode,omitempty"`
-	CommandID         string         `json:"commandId"`
-	Config            *SessionConfig `json:"config,omitempty"`
-	ModelID           *string        `json:"modelId,omitempty"`
-	PermissionProfile *string        `json:"permissionProfile,omitempty"`
-	ProviderID        *string        `json:"providerId,omitempty"`
-	SessionID         *string        `json:"sessionId,omitempty"`
-	WorkspaceRoot     *string        `json:"workspaceRoot,omitempty"`
-	WorkspaceRoots    []string       `json:"workspaceRoots,omitempty"`
+	ApprovalMode      *ApprovalMode   `json:"approvalMode,omitempty"`
+	CommandID         string          `json:"commandId"`
+	Config            *SessionConfig  `json:"config,omitempty"`
+	ModelID           *string         `json:"modelId,omitempty"`
+	PermissionProfile *string         `json:"permissionProfile,omitempty"`
+	ProviderID        *string         `json:"providerId,omitempty"`
+	SessionID         *string         `json:"sessionId,omitempty"`
+	WorkspaceRoot     *string         `json:"workspaceRoot,omitempty"`
+	WorkspaceRoots    []string        `json:"workspaceRoots,omitempty"`
+	PreviousSessionID *string         `json:"previousSessionId,omitempty"`
+	RecoveryMode      *RecoveryMode   `json:"recoveryMode,omitempty"`
+	SpawnedBy         json.RawMessage `json:"spawnedBy,omitempty"`
 }
 
 // Session is $defs/Session (subset of stable members we read).
 type Session struct {
-	SessionID    string          `json:"sessionId"`
-	Status       SessionStatus   `json:"status"`
-	ActiveTurnID *string         `json:"activeTurnId"`
-	ModelID      *string         `json:"modelId,omitempty"`
-	ApprovalMode json.RawMessage `json:"approvalMode,omitempty"`
+	SessionID       string             `json:"sessionId"`
+	Status          SessionStatus      `json:"status"`
+	ActiveTurnID    *string            `json:"activeTurnId"`
+	ModelID         *string            `json:"modelId,omitempty"`
+	ApprovalMode    json.RawMessage    `json:"approvalMode,omitempty"`
+	Attention       json.RawMessage    `json:"attention,omitempty"`
+	Branch          *string            `json:"branch,omitempty"`
+	CreatedAt       string             `json:"createdAt"`
+	CreatedByClient json.RawMessage    `json:"createdByClient,omitempty"`
+	DriveHolder     json.RawMessage    `json:"driveHolder,omitempty"`
+	FirstUserPrompt *string            `json:"firstUserPrompt,omitempty"`
+	ForkedFrom      json.RawMessage    `json:"forkedFrom"`
+	GeneratedName   *string            `json:"generatedName,omitempty"`
+	ItemCount       *int64             `json:"itemCount,omitempty"`
+	Kind            *SessionKind       `json:"kind,omitempty"`
+	LastActivityAt  *string            `json:"lastActivityAt,omitempty"`
+	LogBytes        *int64             `json:"logBytes,omitempty"`
+	Name            *string            `json:"name,omitempty"`
+	NameOrigin      *SessionNameOrigin `json:"nameOrigin,omitempty"`
+	ParentSessionID *string            `json:"parentSessionId,omitempty"`
+	Path            string             `json:"path"`
+	ProviderID      json.RawMessage    `json:"providerId"`
+	ResumedByClient json.RawMessage    `json:"resumedByClient,omitempty"`
+	SideFrom        json.RawMessage    `json:"sideFrom,omitempty"`
+	SpawnedBy       json.RawMessage    `json:"spawnedBy,omitempty"`
+	Title           *string            `json:"title,omitempty"`
+	TurnCount       int64              `json:"turnCount"`
+	UpdatedAt       string             `json:"updatedAt"`
+	WorkspaceRoot   json.RawMessage    `json:"workspaceRoot"`
 }
 
 // SessionStartResult is $defs/SessionStartResult.
@@ -353,12 +383,15 @@ type SessionStartResult struct {
 
 // SessionResumeParams is $defs/SessionResumeParams.
 type SessionResumeParams struct {
-	CommandID    string             `json:"commandId"`
-	Config       *SessionConfig     `json:"config,omitempty"`
-	Cursor       *string            `json:"cursor,omitempty"`
-	ExcludeItems *bool              `json:"excludeItems,omitempty"`
-	History      *HistoryPreference `json:"history,omitempty"`
-	SessionID    string             `json:"sessionId"`
+	CommandID         string             `json:"commandId"`
+	Config            *SessionConfig     `json:"config,omitempty"`
+	Cursor            *string            `json:"cursor,omitempty"`
+	ExcludeItems      *bool              `json:"excludeItems,omitempty"`
+	History           *HistoryPreference `json:"history,omitempty"`
+	SessionID         string             `json:"sessionId"`
+	ModelID           *string            `json:"modelId,omitempty"`
+	PermissionProfile *string            `json:"permissionProfile,omitempty"`
+	RecoveryMode      *RecoveryMode      `json:"recoveryMode,omitempty"`
 }
 
 // SessionResumeResult is $defs/SessionResumeResult (subset).
@@ -367,6 +400,8 @@ type SessionResumeResult struct {
 	ViewCursor      string            `json:"viewCursor"`
 	PendingRequests []json.RawMessage `json:"pendingRequests"`
 	LastTurn        *LastTurn         `json:"lastTurn,omitempty"`
+	BlockedPrompt   json.RawMessage   `json:"blockedPrompt,omitempty"`
+	History         json.RawMessage   `json:"history"`
 }
 
 // LastTurn is $defs/LastTurn.
@@ -379,10 +414,11 @@ type LastTurn struct {
 
 // TurnError is $defs/TurnError.
 type TurnError struct {
-	Kind      string          `json:"kind"`
-	Message   string          `json:"message"`
-	Retryable bool            `json:"retryable"`
-	Quota     json.RawMessage `json:"quota,omitempty"`
+	Kind          string          `json:"kind"`
+	Message       string          `json:"message"`
+	Retryable     bool            `json:"retryable"`
+	Quota         json.RawMessage `json:"quota,omitempty"`
+	RequestDenied *bool           `json:"requestDenied,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -391,15 +427,16 @@ type TurnError struct {
 
 // TurnInputPart is $defs/TurnInputPart (flat discriminated object).
 type TurnInputPart struct {
-	Type       string  `json:"type"`
-	Text       *string `json:"text,omitempty"`
-	Base64Data *string `json:"base64Data,omitempty"`
-	MediaType  *string `json:"mediaType,omitempty"`
-	Width      *int    `json:"width,omitempty"`
-	Height     *int    `json:"height,omitempty"`
-	Selector   *string `json:"selector,omitempty"`
-	Arguments  *string `json:"arguments,omitempty"`
-	UploadID   *string `json:"uploadId,omitempty"`
+	Type       string                 `json:"type"`
+	Text       *string                `json:"text,omitempty"`
+	Base64Data *string                `json:"base64Data,omitempty"`
+	MediaType  *string                `json:"mediaType,omitempty"`
+	Width      *int                   `json:"width,omitempty"`
+	Height     *int                   `json:"height,omitempty"`
+	Selector   *string                `json:"selector,omitempty"`
+	Arguments  *string                `json:"arguments,omitempty"`
+	UploadID   *string                `json:"uploadId,omitempty"`
+	Source     *SkillInvocationSource `json:"source,omitempty"`
 }
 
 // TurnInputPartType is $defs/TurnInputPartType.
@@ -425,6 +462,7 @@ type TurnStartParams struct {
 	ReasoningEffort *ReasoningEffort `json:"reasoningEffort,omitempty"`
 	SessionID       string           `json:"sessionId"`
 	WorkspaceRoots  []string         `json:"workspaceRoots,omitempty"`
+	UserShell       json.RawMessage  `json:"userShell,omitempty"`
 }
 
 // TurnStartResult is $defs/TurnStartResult.
@@ -457,8 +495,8 @@ type TurnSteerParams struct {
 // Items (revision-versioned transcript)
 // ---------------------------------------------------------------------------
 
-// Item is $defs/Item: one transcript item at one revision. Only the
-// members the event mapper reads are decoded; the rest ride Raw.
+// Item is $defs/Item: one transcript item at one revision. Nested
+// extensions not consumed by the mapper retain their opaque JSON.
 type Item struct {
 	ItemID         string          `json:"itemId"`
 	Kind           ItemKind        `json:"kind"`
@@ -491,28 +529,100 @@ type Item struct {
 	TokensAfter    *int64          `json:"tokensAfter,omitempty"`
 
 	// Raw carries the full item object for diagnostics.
-	Raw json.RawMessage `json:"-"`
+	Raw                          json.RawMessage        `json:"-"`
+	AgentPath                    *string                `json:"agentPath,omitempty"`
+	Attachments                  json.RawMessage        `json:"attachments,omitempty"`
+	Background                   *bool                  `json:"background,omitempty"`
+	BackgroundInitiator          *BackgroundInitiator   `json:"backgroundInitiator,omitempty"`
+	BackgroundTerminalCompletion json.RawMessage        `json:"backgroundTerminalCompletion,omitempty"`
+	Blocking                     *bool                  `json:"blocking,omitempty"`
+	CallID                       *string                `json:"callId,omitempty"`
+	ChildPromptRefs              json.RawMessage        `json:"childPromptRefs,omitempty"`
+	ChildSessionLogPath          *string                `json:"childSessionLogPath,omitempty"`
+	Children                     json.RawMessage        `json:"children,omitempty"`
+	ControlStatus                *SubagentControlStatus `json:"controlStatus,omitempty"`
+	CutOff                       *bool                  `json:"cutOff,omitempty"`
+	DamagedRange                 json.RawMessage        `json:"damagedRange,omitempty"`
+	DeclaredPhase                *string                `json:"declaredPhase,omitempty"`
+	DeliveryNumber               *int64                 `json:"deliveryNumber,omitempty"`
+	Depth                        *int64                 `json:"depth,omitempty"`
+	DisplayLabel                 json.RawMessage        `json:"displayLabel,omitempty"`
+	EarlierHistory               json.RawMessage        `json:"earlierHistory,omitempty"`
+	EntryID                      *string                `json:"entryId,omitempty"`
+	Event                        *HookEventName         `json:"event,omitempty"`
+	ExitSignal                   *int64                 `json:"exitSignal,omitempty"`
+	GenerationID                 *int64                 `json:"generationId,omitempty"`
+	Held                         *bool                  `json:"held,omitempty"`
+	HeldFor                      *HeldFor               `json:"heldFor,omitempty"`
+	HookKey                      *string                `json:"hookKey,omitempty"`
+	JobID                        *string                `json:"jobId,omitempty"`
+	Label                        *string                `json:"label,omitempty"`
+	MessagePhase                 *MessagePhase          `json:"messagePhase,omitempty"`
+	ModelVisibleContent          json.RawMessage        `json:"modelVisibleContent,omitempty"`
+	MonitorDescription           *string                `json:"monitorDescription,omitempty"`
+	MonitorID                    *string                `json:"monitorId,omitempty"`
+	NextFireAtMs                 *int64                 `json:"nextFireAtMs,omitempty"`
+	OutputRef                    json.RawMessage        `json:"outputRef,omitempty"`
+	PatchRef                     json.RawMessage        `json:"patchRef,omitempty"`
+	PatchSummary                 json.RawMessage        `json:"patchSummary,omitempty"`
+	Paused                       *bool                  `json:"paused,omitempty"`
+	ProviderItemID               *string                `json:"providerItemId,omitempty"`
+	Reason                       *string                `json:"reason,omitempty"`
+	RecordedAt                   *string                `json:"recordedAt,omitempty"`
+	ReminderAgentID              *string                `json:"reminderAgentId,omitempty"`
+	ReplayHint                   json.RawMessage        `json:"replayHint,omitempty"`
+	Result                       json.RawMessage        `json:"result,omitempty"`
+	ResumeFromRunID              *string                `json:"resumeFromRunId,omitempty"`
+	Role                         *string                `json:"role,omitempty"`
+	RunStatus                    *HookRunStatus         `json:"runStatus,omitempty"`
+	ScheduledFireAtMs            *int64                 `json:"scheduledFireAtMs,omitempty"`
+	ScriptID                     *string                `json:"scriptId,omitempty"`
+	SideSessionID                *string                `json:"sideSessionId,omitempty"`
+	StatusAttempt                json.RawMessage        `json:"statusAttempt,omitempty"`
+	StatusChildren               json.RawMessage        `json:"statusChildren,omitempty"`
+	StatusHealth                 json.RawMessage        `json:"statusHealth,omitempty"`
+	StatusLine                   *string                `json:"statusLine,omitempty"`
+	StatusPhase                  *string                `json:"statusPhase,omitempty"`
+	StatusProgress               json.RawMessage        `json:"statusProgress,omitempty"`
+	StatusStep                   json.RawMessage        `json:"statusStep,omitempty"`
+	StopAvailable                *bool                  `json:"stopAvailable,omitempty"`
+	StrategyID                   *string                `json:"strategyId,omitempty"`
+	SummarizedThrough            *string                `json:"summarizedThrough,omitempty"`
+	TaskID                       *string                `json:"taskId,omitempty"`
+	TerminalRowAfterItemID       *string                `json:"terminalRowAfterItemId,omitempty"`
+	TokenBudget                  json.RawMessage        `json:"tokenBudget,omitempty"`
+	ToolReceipt                  json.RawMessage        `json:"toolReceipt,omitempty"`
+	Trigger                      *CompactionTrigger     `json:"trigger,omitempty"`
+	TriggerSource                *string                `json:"triggerSource,omitempty"`
+	Truncated                    *bool                  `json:"truncated,omitempty"`
+	Usage                        json.RawMessage        `json:"usage,omitempty"`
+	WakeSourceDescriptions       json.RawMessage        `json:"wakeSourceDescriptions,omitempty"`
+	WorkID                       *string                `json:"workId,omitempty"`
+	WorkflowRunID                *string                `json:"workflowRunId,omitempty"`
 }
 
 // ItemStartedParams is $defs/ItemStartedParams.
 type ItemStartedParams struct {
-	Item       json.RawMessage `json:"item"`
-	SessionID  string          `json:"sessionId"`
-	ViewCursor string          `json:"viewCursor"`
+	Item        json.RawMessage `json:"item"`
+	SessionID   string          `json:"sessionId"`
+	ViewCursor  string          `json:"viewCursor"`
+	SourceRange json.RawMessage `json:"sourceRange,omitempty"`
 }
 
 // ItemUpdatedParams is $defs/ItemUpdatedParams.
 type ItemUpdatedParams struct {
-	Item       json.RawMessage `json:"item"`
-	SessionID  string          `json:"sessionId"`
-	ViewCursor string          `json:"viewCursor"`
+	Item        json.RawMessage `json:"item"`
+	SessionID   string          `json:"sessionId"`
+	ViewCursor  string          `json:"viewCursor"`
+	SourceRange json.RawMessage `json:"sourceRange"`
 }
 
 // ItemCompletedParams is $defs/ItemCompletedParams.
 type ItemCompletedParams struct {
-	Item       json.RawMessage `json:"item"`
-	SessionID  string          `json:"sessionId"`
-	ViewCursor string          `json:"viewCursor"`
+	Item        json.RawMessage `json:"item"`
+	SessionID   string          `json:"sessionId"`
+	ViewCursor  string          `json:"viewCursor"`
+	SourceRange json.RawMessage `json:"sourceRange"`
 }
 
 // ItemDeltaParams is $defs/ItemDeltaParams.
@@ -565,15 +675,18 @@ type SessionTokenUsageParams struct {
 	TotalTokens  int64                `json:"totalTokens"`
 	FinishReason *string              `json:"finishReason,omitempty"`
 	ViewCursor   string               `json:"viewCursor"`
+	DurationMs   *int64               `json:"durationMs,omitempty"`
+	SourceRange  json.RawMessage      `json:"sourceRange"`
 }
 
 // SessionContextUsageParams is $defs/SessionContextUsageParams.
 type SessionContextUsageParams struct {
-	Pressure     string `json:"pressure"`
-	SessionID    string `json:"sessionId"`
-	UsedTokens   int64  `json:"usedTokens"`
-	WindowTokens *int64 `json:"windowTokens,omitempty"`
-	ViewCursor   string `json:"viewCursor"`
+	Pressure     string          `json:"pressure"`
+	SessionID    string          `json:"sessionId"`
+	UsedTokens   int64           `json:"usedTokens"`
+	WindowTokens *int64          `json:"windowTokens,omitempty"`
+	ViewCursor   string          `json:"viewCursor"`
+	SourceRange  json.RawMessage `json:"sourceRange"`
 }
 
 // ---------------------------------------------------------------------------
@@ -582,29 +695,34 @@ type SessionContextUsageParams struct {
 
 // TurnCompletedParams is $defs/TurnCompletedParams.
 type TurnCompletedParams struct {
-	DurationMs *int64       `json:"durationMs,omitempty"`
-	Error      *TurnError   `json:"error,omitempty"`
-	Reason     *string      `json:"reason,omitempty"`
-	SessionID  string       `json:"sessionId"`
-	Terminal   TurnTerminal `json:"terminal"`
-	TurnID     string       `json:"turnId"`
-	Usage      *TokenUsage  `json:"usage,omitempty"`
-	ViewCursor string       `json:"viewCursor"`
+	DurationMs         *int64          `json:"durationMs,omitempty"`
+	Error              *TurnError      `json:"error,omitempty"`
+	Reason             *string         `json:"reason,omitempty"`
+	SessionID          string          `json:"sessionId"`
+	Terminal           TurnTerminal    `json:"terminal"`
+	TurnID             string          `json:"turnId"`
+	Usage              *TokenUsage     `json:"usage,omitempty"`
+	ViewCursor         string          `json:"viewCursor"`
+	SourceRange        json.RawMessage `json:"sourceRange"`
+	TimeToFirstTokenMs *int64          `json:"timeToFirstTokenMs,omitempty"`
 }
 
 // TurnStartedParams carries turn/started (sessionId + turnId).
 type TurnStartedParams struct {
-	SessionID  string `json:"sessionId"`
-	TurnID     string `json:"turnId"`
-	ViewCursor string `json:"viewCursor"`
+	SessionID   string          `json:"sessionId"`
+	TurnID      string          `json:"turnId"`
+	ViewCursor  string          `json:"viewCursor"`
+	CommandID   string          `json:"commandId"`
+	SourceRange json.RawMessage `json:"sourceRange"`
 }
 
 // TurnForegroundCompletedParams is $defs/TurnForegroundCompletedParams.
 type TurnForegroundCompletedParams struct {
-	BlockingAgents []string `json:"blockingAgents"`
-	SessionID      string   `json:"sessionId"`
-	TurnID         string   `json:"turnId"`
-	ViewCursor     string   `json:"viewCursor"`
+	BlockingAgents []string        `json:"blockingAgents"`
+	SessionID      string          `json:"sessionId"`
+	TurnID         string          `json:"turnId"`
+	ViewCursor     string          `json:"viewCursor"`
+	SourceRange    json.RawMessage `json:"sourceRange"`
 }
 
 // SessionStartedParams is $defs/SessionStartedParams.
@@ -614,9 +732,10 @@ type SessionStartedParams struct {
 
 // SessionStatusChangedParams is $defs/SessionStatusChangedParams.
 type SessionStatusChangedParams struct {
-	SessionID  string        `json:"sessionId"`
-	Status     SessionStatus `json:"status"`
-	ViewCursor *string       `json:"viewCursor"`
+	SessionID  string          `json:"sessionId"`
+	Status     SessionStatus   `json:"status"`
+	ViewCursor *string         `json:"viewCursor"`
+	Attention  json.RawMessage `json:"attention,omitempty"`
 }
 
 // ViewGapParams is $defs/ViewGapParams.
@@ -635,11 +754,12 @@ type TodoItem struct {
 
 // SessionTodoListChangedParams is $defs/SessionTodoListChangedParams.
 type SessionTodoListChangedParams struct {
-	Items      []TodoItem `json:"items"`
-	Revision   int        `json:"revision"`
-	SessionID  string     `json:"sessionId"`
-	SourceTool string     `json:"sourceTool"`
-	ViewCursor string     `json:"viewCursor"`
+	Items       []TodoItem      `json:"items"`
+	Revision    int             `json:"revision"`
+	SessionID   string          `json:"sessionId"`
+	SourceTool  string          `json:"sourceTool"`
+	ViewCursor  string          `json:"viewCursor"`
+	SourceRange json.RawMessage `json:"sourceRange"`
 }
 
 // ---------------------------------------------------------------------------
@@ -659,6 +779,7 @@ type ApprovalChoice struct {
 	Decision        MSPApprovalDecision `json:"decision"`
 	Label           string              `json:"label"`
 	Scope           string              `json:"scope"`
+	RulePreview     *string             `json:"rulePreview,omitempty"`
 }
 
 // ApprovalSubject is $defs/ApprovalSubject (open union; kind + extras).
@@ -692,6 +813,12 @@ type ApprovalRequestParams struct {
 	TurnID               string                 `json:"turnId"`
 	RawArgs              string                 `json:"rawArgs"`
 	ViewCursor           string                 `json:"viewCursor"`
+	CuaCardFacts         json.RawMessage        `json:"cuaCardFacts,omitempty"`
+	JudgeEscalated       bool                   `json:"judgeEscalated"`
+	ProtectedWrite       bool                   `json:"protectedWrite"`
+	ReviewerReason       *string                `json:"reviewerReason,omitempty"`
+	SourceRange          json.RawMessage        `json:"sourceRange"`
+	SubagentOrigin       json.RawMessage        `json:"subagentOrigin,omitempty"`
 }
 
 // ApprovalDecideParams is $defs/ApprovalDecideParams.
@@ -714,23 +841,34 @@ type ApprovalDecideResult struct {
 
 // ApprovalResolvedParams is $defs/ApprovalResolvedParams (subset).
 type ApprovalResolvedParams struct {
-	ApprovalID string              `json:"approvalId"`
-	Decision   MSPApprovalDecision `json:"decision"`
-	ItemID     string              `json:"itemId"`
-	SessionID  string              `json:"sessionId"`
-	TurnID     string              `json:"turnId"`
-	ViewCursor string              `json:"viewCursor"`
+	ApprovalID         string               `json:"approvalId"`
+	Decision           MSPApprovalDecision  `json:"decision"`
+	ItemID             string               `json:"itemId"`
+	SessionID          string               `json:"sessionId"`
+	TurnID             string               `json:"turnId"`
+	ViewCursor         string               `json:"viewCursor"`
+	Amendment          json.RawMessage      `json:"amendment,omitempty"`
+	DecidedAt          *string              `json:"decidedAt,omitempty"`
+	DecidedByCommandID *string              `json:"decidedByCommandId,omitempty"`
+	PolicyResult       ApprovalPolicyResult `json:"policyResult"`
+	ResolvedBy         ApprovalResolvedBy   `json:"resolvedBy"`
+	SourceRange        json.RawMessage      `json:"sourceRange"`
+	StageEvidence      json.RawMessage      `json:"stageEvidence"`
+	SubagentOrigin     json.RawMessage      `json:"subagentOrigin,omitempty"`
 }
 
 // UserInputRequestParams is $defs/UserInputRequestParams (subset).
 type UserInputRequestParams struct {
-	ItemID      string `json:"itemId"`
-	SessionID   string `json:"sessionId"`
-	ToolCallID  string `json:"toolCallId"`
-	ToolName    string `json:"toolName"`
-	TurnID      string `json:"turnId"`
-	UserInputID string `json:"userInputId"`
-	ViewCursor  string `json:"viewCursor"`
+	ItemID           string          `json:"itemId"`
+	SessionID        string          `json:"sessionId"`
+	ToolCallID       string          `json:"toolCallId"`
+	ToolName         string          `json:"toolName"`
+	TurnID           string          `json:"turnId"`
+	UserInputID      string          `json:"userInputId"`
+	ViewCursor       string          `json:"viewCursor"`
+	AutoResolutionMs *int64          `json:"autoResolutionMs,omitempty"`
+	Questions        json.RawMessage `json:"questions"`
+	SourceRange      json.RawMessage `json:"sourceRange,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -753,7 +891,10 @@ type SessionCompactResult struct {
 
 // ModelSelection is $defs/ModelSelection.
 type ModelSelection struct {
-	ModelID string `json:"modelId"`
+	ModelID      string          `json:"modelId"`
+	DisplayLabel *string         `json:"displayLabel,omitempty"`
+	ProfileID    json.RawMessage `json:"profileId,omitempty"`
+	ProviderID   *string         `json:"providerId,omitempty"`
 }
 
 // SessionSetModelParams is $defs/SessionSetModelParams.
@@ -771,15 +912,20 @@ type SessionSetModelResult struct {
 
 // ModelCatalogEntry is $defs/ModelCatalogEntry (subset).
 type ModelCatalogEntry struct {
-	ModelID      string  `json:"modelId"`
-	DisplayLabel string  `json:"displayLabel"`
-	IsActive     bool    `json:"isActive"`
-	IsDefault    bool    `json:"isDefault"`
-	ProviderID   string  `json:"providerId"`
-	ProfileID    *string `json:"profileId"`
-	Description  *string `json:"description,omitempty"`
-	ContextLimit *int64  `json:"contextLimit"`
-	OutputLimit  *int64  `json:"outputLimit"`
+	ModelID                 string           `json:"modelId"`
+	DisplayLabel            string           `json:"displayLabel"`
+	IsActive                bool             `json:"isActive"`
+	IsDefault               bool             `json:"isDefault"`
+	ProviderID              string           `json:"providerId"`
+	ProfileID               *string          `json:"profileId"`
+	Description             *string          `json:"description,omitempty"`
+	ContextLimit            *int64           `json:"contextLimit"`
+	OutputLimit             *int64           `json:"outputLimit"`
+	Cost                    json.RawMessage  `json:"cost"`
+	DefaultReasoningEffort  *ReasoningEffort `json:"defaultReasoningEffort,omitempty"`
+	ReasoningEffortVariants json.RawMessage  `json:"reasoningEffortVariants,omitempty"`
+	ReleaseDate             json.RawMessage  `json:"releaseDate"`
+	Variants                json.RawMessage  `json:"variants,omitempty"`
 }
 
 // ModelListResult is $defs/ModelListResult.
@@ -796,7 +942,271 @@ type ModelListResult struct {
 
 // ErrorData is $defs/ErrorData.
 type ErrorData struct {
-	Kind    ErrorKind       `json:"kind"`
-	Reason  *string         `json:"reason,omitempty"`
-	Details json.RawMessage `json:"details,omitempty"`
+	Kind                 ErrorKind       `json:"kind"`
+	Reason               *string         `json:"reason,omitempty"`
+	Details              json.RawMessage `json:"details,omitempty"`
+	AlignedNextOffset    *int64          `json:"alignedNextOffset,omitempty"`
+	Anchor               json.RawMessage `json:"anchor,omitempty"`
+	ApprovalID           *string         `json:"approvalId,omitempty"`
+	Availability         *string         `json:"availability,omitempty"`
+	Capability           *CapabilityName `json:"capability,omitempty"`
+	Capacity             *int64          `json:"capacity,omitempty"`
+	ChoiceID             *string         `json:"choiceId,omitempty"`
+	CommandID            *string         `json:"commandId,omitempty"`
+	CurrentRequirementID json.RawMessage `json:"currentRequirementId,omitempty"`
+	Descriptor           *string         `json:"descriptor,omitempty"`
+	EarliestCursor       json.RawMessage `json:"earliestCursor,omitempty"`
+	ItemID               *string         `json:"itemId,omitempty"`
+	LastTurnID           *string         `json:"lastTurnId,omitempty"`
+	LatestBoundaryCursor json.RawMessage `json:"latestBoundaryCursor,omitempty"`
+	LimitBytes           *int64          `json:"limitBytes,omitempty"`
+	Marketplace          *string         `json:"marketplace,omitempty"`
+	Name                 *string         `json:"name,omitempty"`
+	OutputRef            *string         `json:"outputRef,omitempty"`
+	Paths                json.RawMessage `json:"paths,omitempty"`
+	RecoveryObservation  json.RawMessage `json:"recoveryObservation,omitempty"`
+	Resolution           json.RawMessage `json:"resolution,omitempty"`
+	Retryable            *bool           `json:"retryable,omitempty"`
+	SeedFallbackReason   *string         `json:"seedFallbackReason,omitempty"`
+	SeedPath             *string         `json:"seedPath,omitempty"`
+	Selector             *string         `json:"selector,omitempty"`
+	SessionID            *string         `json:"sessionId,omitempty"`
+	Settlement           json.RawMessage `json:"settlement,omitempty"`
+	UploadID             *string         `json:"uploadId,omitempty"`
+	UserInputID          *string         `json:"userInputId,omitempty"`
+	ViewCursor           *string         `json:"viewCursor,omitempty"`
 }
+
+// Additional CapabilityName wire values from the stable export.
+const (
+	CapabilityNameComputerUseHostSetup CapabilityName = "computerUseHostSetup"
+	CapabilityNameSessionRename        CapabilityName = "sessionRename"
+)
+
+// ItemKind wire values from the stable export.
+const (
+	ItemKindMonitorFeed                  ItemKind = "monitorFeed"
+	ItemKindDamagedRange                 ItemKind = "damagedRange"
+	ItemKindScheduledFire                ItemKind = "scheduledFire"
+	ItemKindBackgroundTerminalCompletion ItemKind = "backgroundTerminalCompletion"
+	ItemKindOverdueNotice                ItemKind = "overdueNotice"
+	ItemKindEarlierHistory               ItemKind = "earlierHistory"
+)
+
+// ErrorKind wire values from the stable export.
+const (
+	ErrorKindParseError                  ErrorKind = "parseError"
+	ErrorKindInvalidRequest              ErrorKind = "invalidRequest"
+	ErrorKindNotInitialized              ErrorKind = "notInitialized"
+	ErrorKindAlreadyInitialized          ErrorKind = "alreadyInitialized"
+	ErrorKindMethodNotFound              ErrorKind = "methodNotFound"
+	ErrorKindInvalidParams               ErrorKind = "invalidParams"
+	ErrorKindExperimentalRequired        ErrorKind = "experimentalRequired"
+	ErrorKindInternal                    ErrorKind = "internal"
+	ErrorKindPageEventTooLarge           ErrorKind = "pageEventTooLarge"
+	ErrorKindOutputResultTooLarge        ErrorKind = "outputResultTooLarge"
+	ErrorKindOverloaded                  ErrorKind = "overloaded"
+	ErrorKindInputTooLarge               ErrorKind = "inputTooLarge"
+	ErrorKindCapabilityRequired          ErrorKind = "capabilityRequired"
+	ErrorKindInterrupted                 ErrorKind = "interrupted"
+	ErrorKindCancelled                   ErrorKind = "cancelled"
+	ErrorKindSessionInUse                ErrorKind = "sessionInUse"
+	ErrorKindSessionAmbiguous            ErrorKind = "sessionAmbiguous"
+	ErrorKindForkBoundaryInvalid         ErrorKind = "forkBoundaryInvalid"
+	ErrorKindSessionNotLoaded            ErrorKind = "sessionNotLoaded"
+	ErrorKindSessionStreamMismatch       ErrorKind = "sessionStreamMismatch"
+	ErrorKindCommandRejected             ErrorKind = "commandRejected"
+	ErrorKindBackpressured               ErrorKind = "backpressured"
+	ErrorKindSkillNotFound               ErrorKind = "skillNotFound"
+	ErrorKindComputerUseUnavailable      ErrorKind = "computerUseUnavailable"
+	ErrorKindMarketplaceNotFound         ErrorKind = "marketplaceNotFound"
+	ErrorKindPluginNotFound              ErrorKind = "pluginNotFound"
+	ErrorKindMarketplaceAlreadyExists    ErrorKind = "marketplaceAlreadyExists"
+	ErrorKindPluginMutationsDisabled     ErrorKind = "pluginMutationsDisabled"
+	ErrorKindUploadNotFound              ErrorKind = "uploadNotFound"
+	ErrorKindViewTruncated               ErrorKind = "viewTruncated"
+	ErrorKindOutputUnavailable           ErrorKind = "outputUnavailable"
+	ErrorKindBoundaryPruned              ErrorKind = "boundaryPruned"
+	ErrorKindBoundaryUnusable            ErrorKind = "boundaryUnusable"
+	ErrorKindNoBoundary                  ErrorKind = "noBoundary"
+	ErrorKindApprovalNotFound            ErrorKind = "approvalNotFound"
+	ErrorKindApprovalAlreadyResolved     ErrorKind = "approvalAlreadyResolved"
+	ErrorKindApprovalChoiceInvalid       ErrorKind = "approvalChoiceInvalid"
+	ErrorKindApprovalRequirementStale    ErrorKind = "approvalRequirementStale"
+	ErrorKindApprovalReviewerUnavailable ErrorKind = "approvalReviewerUnavailable"
+	ErrorKindUserInputNotFound           ErrorKind = "userInputNotFound"
+	ErrorKindUserInputAlreadySettled     ErrorKind = "userInputAlreadySettled"
+	ErrorKindUserInputAnswerInvalid      ErrorKind = "userInputAnswerInvalid"
+)
+
+// SessionMCPStdioFraming wire values from the stable export.
+const (
+	SessionMCPStdioFramingAuto              SessionMCPStdioFraming = "auto"
+	SessionMCPStdioFramingContentLength     SessionMCPStdioFraming = "contentLength"
+	SessionMCPStdioFramingLineDelimitedJSON SessionMCPStdioFraming = "lineDelimitedJson"
+)
+
+// SandboxAvailability is $defs/SandboxAvailability.
+type SandboxAvailability string
+
+// SandboxAvailability wire values from the stable export.
+const (
+	SandboxAvailabilityAvailable   SandboxAvailability = "available"
+	SandboxAvailabilityUnavailable SandboxAvailability = "unavailable"
+)
+
+// SandboxUnavailableReason is $defs/SandboxUnavailableReason.
+type SandboxUnavailableReason string
+
+// SandboxUnavailableReason wire values from the stable export.
+const (
+	SandboxUnavailableReasonUserNamespacesDenied  SandboxUnavailableReason = "userNamespacesDenied"
+	SandboxUnavailableReasonBubblewrapUnavailable SandboxUnavailableReason = "bubblewrapUnavailable"
+)
+
+// RecoveryMode is $defs/RecoveryMode.
+type RecoveryMode string
+
+// RecoveryMode wire values from the stable export.
+const (
+	RecoveryModeOn  RecoveryMode = "on"
+	RecoveryModeOff RecoveryMode = "off"
+)
+
+// SessionKind is $defs/SessionKind.
+type SessionKind string
+
+// SessionKind wire values from the stable export.
+const (
+	SessionKindRoot     SessionKind = "root"
+	SessionKindSubagent SessionKind = "subagent"
+)
+
+// SessionNameOrigin is $defs/SessionNameOrigin.
+type SessionNameOrigin string
+
+// Additional SessionNameOrigin wire values from the stable export.
+const (
+	SessionNameOriginAutomatic SessionNameOrigin = "automatic"
+	SessionNameOriginCustom    SessionNameOrigin = "custom"
+)
+
+// SkillInvocationSource is $defs/SkillInvocationSource.
+type SkillInvocationSource string
+
+// Additional SkillInvocationSource wire values from the stable export.
+const (
+	SkillInvocationSourceBundled SkillInvocationSource = "bundled"
+	SkillInvocationSourceUser    SkillInvocationSource = "user"
+	SkillInvocationSourceProject SkillInvocationSource = "project"
+	SkillInvocationSourcePlugin  SkillInvocationSource = "plugin"
+)
+
+// BackgroundInitiator is $defs/BackgroundInitiator.
+type BackgroundInitiator string
+
+// BackgroundInitiator wire values from the stable export.
+const (
+	BackgroundInitiatorUser    BackgroundInitiator = "user"
+	BackgroundInitiatorTimeout BackgroundInitiator = "timeout"
+)
+
+// SubagentControlStatus is $defs/SubagentControlStatus.
+type SubagentControlStatus string
+
+// SubagentControlStatus wire values from the stable export.
+const (
+	SubagentControlStatusAccepted             SubagentControlStatus = "accepted"
+	SubagentControlStatusStarting             SubagentControlStatus = "starting"
+	SubagentControlStatusRunning              SubagentControlStatus = "running"
+	SubagentControlStatusResultReady          SubagentControlStatus = "resultReady"
+	SubagentControlStatusClosing              SubagentControlStatus = "closing"
+	SubagentControlStatusClosed               SubagentControlStatus = "closed"
+	SubagentControlStatusRecoveryPending      SubagentControlStatus = "recoveryPending"
+	SubagentControlStatusManualReconciliation SubagentControlStatus = "manualReconciliation"
+)
+
+// HookEventName is $defs/HookEventName.
+type HookEventName string
+
+// HookEventName wire values from the stable export.
+const (
+	HookEventNameSessionStart       HookEventName = "sessionStart"
+	HookEventNameUserPromptSubmit   HookEventName = "userPromptSubmit"
+	HookEventNamePreToolUse         HookEventName = "preToolUse"
+	HookEventNamePermissionRequest  HookEventName = "permissionRequest"
+	HookEventNamePostToolUse        HookEventName = "postToolUse"
+	HookEventNamePreLLMCall         HookEventName = "preLLMCall"
+	HookEventNamePostLLMCall        HookEventName = "postLLMCall"
+	HookEventNamePreCompact         HookEventName = "preCompact"
+	HookEventNamePostCompact        HookEventName = "postCompact"
+	HookEventNameSubagentStart      HookEventName = "subagentStart"
+	HookEventNameSubagentStop       HookEventName = "subagentStop"
+	HookEventNameStop               HookEventName = "stop"
+	HookEventNameSessionEnd         HookEventName = "sessionEnd"
+	HookEventNameNotification       HookEventName = "notification"
+	HookEventNamePostToolUseFailure HookEventName = "postToolUseFailure"
+	HookEventNameStopFailure        HookEventName = "stopFailure"
+	HookEventNamePostToolBatch      HookEventName = "postToolBatch"
+	HookEventNameInterrupt          HookEventName = "interrupt"
+	HookEventNameSessionFork        HookEventName = "sessionFork"
+	HookEventNameToolUseStart       HookEventName = "toolUseStart"
+)
+
+// HeldFor is $defs/HeldFor.
+type HeldFor string
+
+// Additional HeldFor wire values from the stable export.
+const (
+	HeldForApproval HeldFor = "approval"
+	HeldForHook     HeldFor = "hook"
+)
+
+// MessagePhase is $defs/MessagePhase.
+type MessagePhase string
+
+// MessagePhase wire values from the stable export.
+const (
+	MessagePhaseCommentary  MessagePhase = "commentary"
+	MessagePhaseFinalAnswer MessagePhase = "finalAnswer"
+)
+
+// HookRunStatus is $defs/HookRunStatus.
+type HookRunStatus string
+
+// Additional HookRunStatus wire values from the stable export.
+const (
+	HookRunStatusCompleted HookRunStatus = "completed"
+	HookRunStatusBlocked   HookRunStatus = "blocked"
+	HookRunStatusFailed    HookRunStatus = "failed"
+	HookRunStatusTimedOut  HookRunStatus = "timedOut"
+	HookRunStatusCancelled HookRunStatus = "cancelled"
+)
+
+// CompactionTrigger is $defs/CompactionTrigger.
+type CompactionTrigger string
+
+// Additional CompactionTrigger wire values from the stable export.
+const (
+	CompactionTriggerManual CompactionTrigger = "manual"
+	CompactionTriggerAuto   CompactionTrigger = "auto"
+)
+
+// ApprovalPolicyResult is $defs/ApprovalPolicyResult.
+type ApprovalPolicyResult string
+
+// Additional ApprovalPolicyResult wire values from the stable export.
+const (
+	ApprovalPolicyResultAllow ApprovalPolicyResult = "allow"
+	ApprovalPolicyResultDeny  ApprovalPolicyResult = "deny"
+)
+
+// ApprovalResolvedBy is $defs/ApprovalResolvedBy.
+type ApprovalResolvedBy string
+
+// ApprovalResolvedBy wire values from the stable export.
+const (
+	ApprovalResolvedByUser     ApprovalResolvedBy = "user"
+	ApprovalResolvedByPolicy   ApprovalResolvedBy = "policy"
+	ApprovalResolvedByLlmJudge ApprovalResolvedBy = "llmJudge"
+)

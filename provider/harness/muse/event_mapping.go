@@ -40,6 +40,12 @@ type mapperState struct {
 	// applies (the host guarantees item/completed is authoritative,
 	// including for itemIds never opened on this connection).
 	items map[string]int
+	// progressSent records the itemIds that already emitted their
+	// single best-effort progress event. Started/updated emit at most
+	// one StreamProgress per item; deltas emit nothing; completion
+	// emits the final text. This bounds intermediate output to one
+	// event per item instead of one per streaming fragment.
+	progressSent map[string]struct{}
 
 	// pendingToolUse records ToolUseEvents emitted for open toolCall /
 	// userShell items so completion can pair the result.
@@ -64,6 +70,7 @@ func newMapperState(model string) *mapperState {
 		model:          model,
 		turnStarted:    make(map[string]int64),
 		items:          make(map[string]int),
+		progressSent:   make(map[string]struct{}),
 		pendingToolUse: make(map[string]pendingTool),
 		seenTurns:      make(map[string]struct{}),
 	}
@@ -441,19 +448,49 @@ func mapItemEvent(method string, params json.RawMessage, state *mapperState, raw
 		// prompt in the activity stream.
 		return nil
 	case ItemKindAgentMessage:
+		// Assistant text rides one complete message per item: the
+		// completion snapshot is authoritative and the ONLY
+		// AssistantTextEvent for the item. Started/updated emit at
+		// most one content-free liveness event (StreamProgress) per
+		// item, never text fragments: the runner scans each
+		// AssistantTextEvent for line-anchored verdict markers, so a
+		// marker split across fragments would lose its verdict and
+		// the summary would retain only the trailing fragment (the
+		// ResultEvent carries no Message to repair it). Deltas emit
+		// nothing; completion emits the full snapshot.
 		if isCompleted {
+			delete(state.progressSent, item.ItemID)
 			if text := itemText(&item); text != "" {
 				return []agent.Event{agent.AssistantTextEvent{Text: text, Raw: raw}}
 			}
+			return nil
 		}
-		return nil
+		if _, ok := state.progressSent[item.ItemID]; ok {
+			return nil
+		}
+		if state.progressSent == nil {
+			state.progressSent = make(map[string]struct{})
+		}
+		state.progressSent[item.ItemID] = struct{}{}
+		return []agent.Event{agent.StreamProgressEvent()}
 	case ItemKindReasoning:
+		// Reasoning completes as a single SystemEvent; started/updated
+		// emit at most one liveness event per item, deltas nothing.
 		if isCompleted {
+			delete(state.progressSent, item.ItemID)
 			if msg := reasoningText(&item); msg != "" {
 				return []agent.Event{agent.SystemEvent{Subtype: "reasoning", Message: msg, Raw: raw}}
 			}
+			return nil
 		}
-		return nil
+		if _, ok := state.progressSent[item.ItemID]; ok {
+			return nil
+		}
+		if state.progressSent == nil {
+			state.progressSent = make(map[string]struct{})
+		}
+		state.progressSent[item.ItemID] = struct{}{}
+		return []agent.Event{agent.StreamProgressEvent()}
 	case ItemKindToolCall:
 		return mapToolCall(item, method, isCompleted, state, raw)
 	case ItemKindUserShell:
@@ -490,10 +527,9 @@ func mapItemEvent(method string, params json.RawMessage, state *mapperState, raw
 	}
 }
 
-// mapItemDelta appends a streaming delta to an open item's field. Deltas
-// never bump revision and never emit agent events directly (the full
-// text arrives on item/completed); they are tracked only to prove the
-// item is live. Deltas during a gap are dropped.
+// mapItemDelta never emits agent events directly: the full text arrives
+// on item/completed, so deltas are tracked only to prove the item is
+// live. Deltas during a gap are dropped.
 func mapItemDelta(params json.RawMessage, state *mapperState, raw any) []agent.Event {
 	_ = raw
 	var p ItemDeltaParams
@@ -518,7 +554,12 @@ func itemText(item *Item) string {
 }
 
 func reasoningText(item *Item) string {
-	// summary is an array of parts; join text members.
+	// Current hosts export summary as an array of strings. Older hosts
+	// used text-bearing parts; retain that decoding for existing sessions.
+	var summary []string
+	if json.Unmarshal(item.Summary, &summary) == nil && len(summary) > 0 {
+		return strings.Join(summary, "\n")
+	}
 	if len(item.Summary) > 0 {
 		var parts []struct {
 			Text *string `json:"text"`

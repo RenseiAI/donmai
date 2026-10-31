@@ -146,8 +146,10 @@ func sessionResumeParams(sessionID, commandID string, mcpServers map[string]Sess
 // promptInput translates Spec.Prompt (+ optional Spec.InitialContext and
 // BaseInstructions) into the MSP turn/start input array.
 //
-// MSP has no system-prompt channel, so instructions ride a leading text
-// part ahead of the prompt. Spec.InitialContext (e.g. recalled agent
+// The stable Muse Code 1.4.14 schema has no instructions/system field on
+// session/start, session/resume or turn/start; SessionConfig admits only
+// mcpServers. Unknown config keys are ignored, so they cannot deliver system
+// instructions. Keep instructions in a leading text part ahead of the prompt. Spec.InitialContext (e.g. recalled agent
 // memory) is its own text part so it is delivered once with the first
 // turn and then lives in conversation history.
 func promptInput(spec agent.Spec) []TurnInputPart {
