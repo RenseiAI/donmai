@@ -2561,9 +2561,13 @@ func (d *Daemon) onYamlChanged(cfg *Config) {
 		// Reconcile the loop outside d.mu: start takes the lifecycle
 		// metadata lock and reads the config, so holding the daemon
 		// lock across it would nest the two. A revoked opt-in stops the
-		// loop promptly; a fresh opt-in starts it without a restart.
-		// Both helpers are idempotent (start is a no-op when a loop
-		// already runs, stop when none does). A queued watcher callback
+		// loop promptly; a fresh opt-in starts it without a restart; a
+		// change between two opted-in schedules restarts the loop so the
+		// outstanding timer is rearmed (keeping the old loop would
+		// retain its already-computed wait, e.g. nightly keeping a
+		// 23-hour wait after a reload to hourly). Stop-then-start is
+		// idempotent (stop is a no-op when none runs) and re-reads the
+		// live config for the new cadence. A queued watcher callback
 		// that waited behind yamlReloadMu while Stop completed must not
 		// recreate the loop after terminal publication: start itself
 		// refuses once a stop generation exists, and this reconcile is
@@ -2573,6 +2577,7 @@ func (d *Daemon) onYamlChanged(cfg *Config) {
 		d.lifecycleMu.Unlock()
 		if !stopping {
 			if autoUpdateSchedulerWanted(cfg) {
+				d.stopAutoUpdateScheduler()
 				d.startAutoUpdateScheduler()
 			} else {
 				d.stopAutoUpdateScheduler()
@@ -4056,14 +4061,23 @@ func (d *Daemon) Update(ctx context.Context) (*UpdateResult, error) {
 	if cfg == nil {
 		return nil, errors.New("no config loaded")
 	}
-	return d.updateWithConfig(ctx, cfg)
+	// Direct/manual updates never fence Resume: only the scheduled loop
+	// owns a restart handoff (exit code 3) that gives a fenced swap a
+	// completion owner. A fenced manual swap would leave the old process
+	// draining with no restart and an explicit resume refused.
+	return d.updateWithConfig(ctx, cfg, false)
 }
 
 // updateWithConfig runs one update attempt against a snapshot config. The
 // scheduled tick passes the snapshot it pre-checked so a live reload
 // cannot change the trust root between the pre-check construction and the
-// Update construction; the manual door passes the live config.
-func (d *Daemon) updateWithConfig(ctx context.Context, cfg *Config) (*UpdateResult, error) {
+// Update construction; the manual door passes the live config. fenceSwap
+// is true only for the scheduled loop: a fenced swap latches
+// updateSwapApplied so Resume refuses and the restart handoff owns
+// completion. Manual updates leave the latch clear so the retained
+// manual-update contract (swap on disk, daemon draining, explicit resume
+// reopens admission) still holds.
+func (d *Daemon) updateWithConfig(ctx context.Context, cfg *Config, fenceSwap bool) (*UpdateResult, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -4074,7 +4088,7 @@ func (d *Daemon) updateWithConfig(ctx context.Context, cfg *Config) (*UpdateResu
 	if err != nil {
 		return nil, err
 	}
-	return attempt.runWithConfig(ctx, cfg)
+	return attempt.runWithConfig(ctx, cfg, fenceSwap)
 }
 
 // updateAttempt transfers the one lifecycle lease from synchronous restart
@@ -4129,18 +4143,22 @@ func (a *updateAttempt) run(ctx context.Context) (*UpdateResult, error) {
 	if cfg == nil {
 		return nil, errors.New("no config loaded")
 	}
-	return a.runWithConfig(ctx, cfg)
+	// The manual HTTP door never fences: see updateWithConfig.
+	return a.runWithConfig(ctx, cfg, false)
 }
 
 // runWithConfig executes the leased update against a snapshot config with a
-// single post-swap fence. Both the test-injected prepared-update path and
-// the production updater path share this one latch, so the fence cannot
-// disappear from one path without the other's tests detecting it. The
-// production updater construction (trust-root file read plus executable
-// resolution) runs under the attempt context via newUpdaterWithContext:
-// a FIFO trust root with no writer releases the waiter at the attempt
-// deadline instead of holding the lifecycle lease indefinitely.
-func (a *updateAttempt) runWithConfig(ctx context.Context, cfg *Config) (*UpdateResult, error) {
+// single post-swap fence shared by both the test-injected prepared-update
+// path and the production updater path, so the fence cannot disappear
+// from one path without the other's tests detecting it. fenceSwap is true
+// only for scheduled attempts: the latch is set while the update lease is
+// still held (deferred finish releases it), so a Resume that acquires the
+// lease afterwards observes the fence with no window. Manual attempts pass
+// false and leave Resume available. Production updater construction is
+// non-blocking (loadUpdateTrustRoot refuses non-regular files without
+// opening them), so no waiter goroutine or attempt-deadline select is
+// needed here.
+func (a *updateAttempt) runWithConfig(ctx context.Context, cfg *Config, fenceSwap bool) (*UpdateResult, error) {
 	if a == nil || a.daemon == nil {
 		return nil, errors.New("update attempt is not initialized")
 	}
@@ -4167,7 +4185,7 @@ func (a *updateAttempt) runWithConfig(ctx context.Context, cfg *Config) (*Update
 		}
 		res, err = updater.RunUpdate(ctx)
 	}
-	if err == nil && res != nil && res.Updated {
+	if fenceSwap && err == nil && res != nil && res.Updated {
 		// Latched while the update lease is still held (deferred
 		// finish releases it), so a Resume that acquires the lease
 		// afterwards observes the fence with no window.
@@ -4176,48 +4194,32 @@ func (a *updateAttempt) runWithConfig(ctx context.Context, cfg *Config) (*Update
 	return res, err
 }
 
-// newUpdaterWithContext builds the production updater without holding the
-// attempt past its bound. The trust-root file read blocks without
-// cancellation (an operator-configured FIFO with no writer), so
-// construction runs in a waiter goroutine and the attempt deadline — or
-// Stop's scheduler cancel — releases the waiter while the lifecycle lease
-// is still held. The worker goroutine stays blocked until the path
-// unblocks, mirroring checkAutoUpdateRelease.
-func (d *Daemon) newUpdaterWithContext(ctx context.Context, cfg *Config) (*Updater, error) {
-	type updaterResult struct {
-		u *Updater
-	}
-	ch := make(chan updaterResult, 1)
+// newUpdaterWithContext builds the production updater. Construction is
+// non-blocking (see loadUpdateTrustRoot), so this returns directly with
+// no waiter goroutine to leak and no attempt-deadline select: the
+// returned updater's network calls observe ctx themselves.
+func (d *Daemon) newUpdaterWithContext(_ context.Context, cfg *Config) (*Updater, error) {
 	currentVersion := d.EffectiveVersion()
 	autoCfg := cfg.AutoUpdate
 	source := strings.TrimSpace(cfg.AutoUpdate.Source)
 	verifier := d.autoUpdateVerifier
 	binaryPath := d.autoUpdateBinaryPath
-	go func() {
-		opts := UpdaterOptions{
-			CurrentVersion: currentVersion,
-			Config:         autoCfg,
-			// The explicitly configured update origin reaches the production
-			// updater here; empty keeps the updater inert (up-to-date
-			// without a request) on both the manual and scheduled paths.
-			CDNBase:  source,
-			SkipExit: true, // HTTP-driven update: caller decides to exit.
-		}
-		if verifier != nil {
-			opts.Verifier = verifier
-		}
-		if binaryPath != "" {
-			opts.CurrentBinaryPath = binaryPath
-		}
-		u := NewUpdater(opts)
-		ch <- updaterResult{u: u}
-	}()
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case r := <-ch:
-		return r.u, nil
+	opts := UpdaterOptions{
+		CurrentVersion: currentVersion,
+		Config:         autoCfg,
+		// The explicitly configured update origin reaches the production
+		// updater here; empty keeps the updater inert (up-to-date
+		// without a request) on both the manual and scheduled paths.
+		CDNBase:  source,
+		SkipExit: true, // HTTP-driven update: caller decides to exit.
 	}
+	if verifier != nil {
+		opts.Verifier = verifier
+	}
+	if binaryPath != "" {
+		opts.CurrentBinaryPath = binaryPath
+	}
+	return NewUpdater(opts), nil
 }
 
 // recordOSSRoutingDecision feeds the routing trace store with the

@@ -2,6 +2,8 @@ package daemon
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -186,5 +188,134 @@ func TestAutoUpdateSchedulerProductionSwapFencesResume(t *testing.T) {
 	}
 	if got := probe.manifestHits.Load(); got != baseManifest {
 		t.Fatalf("manifest checks after second tick = %d, want %d (applied flag stops re-apply)", got, baseManifest)
+	}
+}
+
+// A successful manual HTTP update leaves Resume available: only the
+// scheduled loop owns a restart handoff (exit code 3), so a fenced
+// manual swap would strand the old process draining with no completion
+// owner (no scheduler to request exit 3, explicit resume refused).
+// Drives both real HTTP routes with the production updater branch
+// (pass-through verifier plus temp binary): without the scheduled-only
+// fence this test goes RED with resume 409 and updateSwapApplied set.
+func TestManualHTTPUpdateSwapLeavesResumeAvailable(t *testing.T) {
+	probe := newUpdateProbeServer(t, "9.9.9", []byte("new-binary"), "test-bundle")
+	d := newRestartTestDaemon(t, nil)
+	d.opts.Version = "0.1.0"
+	d.config = &Config{AutoUpdate: AutoUpdateConfig{
+		Channel: ChannelStable, Schedule: ScheduleManual, DrainTimeoutSeconds: 1,
+		Source: probe.srv.URL,
+		Signers: []UpdateSigner{
+			{SAN: "releases@example.com", Issuer: "https://issuer.example"},
+		},
+	}}
+	current := filepath.Join(t.TempDir(), "donmai-daemon")
+	if err := os.WriteFile(current, []byte("old-binary"), 0o600); err != nil {
+		t.Fatalf("write current binary: %v", err)
+	}
+	d.autoUpdateVerifier = passVerifier{}
+	d.autoUpdateBinaryPath = current
+	if d.runPreparedUpdate != nil {
+		t.Fatal("runPreparedUpdate must stay nil to exercise the production updater branch")
+	}
+	server := httptest.NewServer(NewServer(d).httpd.Handler)
+	t.Cleanup(server.Close)
+	res, err := http.Post(server.URL+"/api/daemon/update", "application/json", nil) //nolint:gosec
+	if err != nil {
+		t.Fatalf("POST update: %v", err)
+	}
+	_ = res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("POST update = %d, want 200", res.StatusCode)
+	}
+	// The handler runs the production swap asynchronously; poll for the
+	// on-disk replacement plus the Update re-check.
+	waitForUpdateCondition(t, 10*time.Second, "manual production swap applied", func() bool {
+		data, err := os.ReadFile(current) //nolint:gosec
+		return err == nil && string(data) == "new-binary"
+	})
+	waitForUpdateCondition(t, 10*time.Second, "manual update reached downloads", func() bool {
+		return probe.manifestHits.Load() >= 1 && probe.binaryHits.Load() == 1
+	})
+	waitForUpdateCondition(t, 10*time.Second, "manual update settled to draining", func() bool {
+		return d.State() == StateDraining
+	})
+	if d.updateSwapApplied.Load() {
+		t.Fatal("manual swap latched updateSwapApplied: scheduled-only fence leaked to the manual path")
+	}
+	if got := d.State(); got != StateDraining {
+		t.Fatalf("state after manual swap = %q, want draining", got)
+	}
+	resume, err := http.Post(server.URL+"/api/daemon/resume", "application/json", nil) //nolint:gosec
+	if err != nil {
+		t.Fatalf("POST resume: %v", err)
+	}
+	_ = resume.Body.Close()
+	if resume.StatusCode != http.StatusOK {
+		t.Fatalf("POST resume after manual swap = %d, want 200 (manual completion owner is explicit resume)", resume.StatusCode)
+	}
+	if got := d.State(); got != StateRunning {
+		t.Fatalf("state after manual resume = %q, want running", got)
+	}
+}
+
+// Changing between two opted-in schedules restarts the loop so the
+// outstanding timer is rearmed: keeping the old loop would retain its
+// already-computed wait (nightly keeping a 23-hour wait after a reload
+// to hourly; hourly still firing the old daytime tick after a reload to
+// nightly). Drives the production yaml-watcher callback; without the
+// stop-then-start reconcile the scheduler pointer is unchanged.
+func TestAutoUpdateSchedulerReloadBetweenEnabledSchedulesRearmsTimer(t *testing.T) {
+	probe := newUpdateProbeServer(t, "9.9.9", []byte("new-binary"), "not-a-bundle")
+	path := writeAutoUpdateDaemonConfig(t, string(ScheduleNightly), probe.srv.URL, true)
+	clock := newManualUpdateClock(time.Now())
+	d := New(Options{
+		ConfigPath:       path,
+		JWTPath:          t.TempDir() + "/jwt",
+		SkipWizard:       true,
+		SkipRegistration: true,
+		Version:          "0.1.0",
+		SpawnerOptions:   SpawnerOptions{WorkerCommand: []string{"/bin/false"}},
+		SessionShim:      SessionShimConfig{RegistryDir: t.TempDir()},
+	})
+	d.autoUpdateClock = clock
+	d.autoUpdateRunBound = time.Second
+	if err := d.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = d.Stop(ctx)
+	})
+	if d.autoUpdateScheduler == nil {
+		t.Fatal("opted-in config started no scheduler through Start")
+	}
+	waitForUpdateCondition(t, 5*time.Second, "scheduler tick wait", func() bool {
+		return clock.waiterCount() > 0
+	})
+	first := d.autoUpdateScheduler
+	// Nightly -> on-release: still opted in, but the cadence changed, so
+	// the loop must restart (new instance, new timer).
+	reloaded := *d.Config()
+	reloaded.AutoUpdate.Schedule = ScheduleOnRelease
+	d.onYamlChanged(&reloaded)
+	if d.autoUpdateScheduler == nil {
+		t.Fatal("scheduler missing after nightly -> on-release reload")
+	}
+	if d.autoUpdateScheduler == first {
+		t.Fatal("scheduler instance unchanged after nightly -> on-release reload: old 23-hour timer retained")
+	}
+	// On-release -> nightly: the daytime hourly timer must not survive;
+	// the loop restarts again for the 03:00 cadence.
+	second := d.autoUpdateScheduler
+	reloaded2 := *d.Config()
+	reloaded2.AutoUpdate.Schedule = ScheduleNightly
+	d.onYamlChanged(&reloaded2)
+	if d.autoUpdateScheduler == nil {
+		t.Fatal("scheduler missing after on-release -> nightly reload")
+	}
+	if d.autoUpdateScheduler == second {
+		t.Fatal("scheduler instance unchanged after on-release -> nightly reload: old daytime timer retained")
 	}
 }

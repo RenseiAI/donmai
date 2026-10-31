@@ -298,9 +298,10 @@ func (s *autoUpdateScheduler) attemptOnce() {
 	}
 	// Reuse the pre-checked snapshot so a live reload cannot change the
 	// trust root between the pre-check construction and the Update
-	// construction; the attempt deadline bounds both constructions and
-	// Stop's scheduler cancel releases either waiter.
-	result, err := d.updateWithConfig(ctx, cfg)
+	// construction. Construction is non-blocking (see
+	// checkAutoUpdateRelease), so the attempt deadline only bounds the
+	// network half.
+	result, err := d.updateWithConfig(ctx, cfg, true)
 	if err != nil {
 		// Update leaves the daemon draining on every exit path; never
 		// resume here — a failed attempt must not silently abandon a
@@ -323,31 +324,17 @@ func (s *autoUpdateScheduler) attemptOnce() {
 // production updater construction (60-second per-request client) and
 // reports whether a strictly newer release exists. A nil manifest with a
 // nil error means up-to-date. Construction itself (trust-root file read
-// plus executable resolution) runs under the attempt context: a blocked
-// read — for example an operator-configured FIFO with no writer — does
-// not hold the attempt past its bound, and Stop's cancel releases the
-// waiter even though the construction goroutine stays blocked until the
-// path unblocks.
+// plus executable resolution) is non-blocking: loadUpdateTrustRoot
+// refuses non-regular files without opening them, so no FIFO open can
+// hold the attempt past its bound and no construction goroutine can leak.
+// The manifest fetch below already observes ctx (per-request client
+// bound plus the attempt deadline), so no waiter goroutine is needed.
 func (d *Daemon) checkAutoUpdateRelease(ctx context.Context, cfg *Config) (*VersionManifest, error) {
-	type checkResult struct {
-		manifest *VersionManifest
-		err      error
-	}
-	ch := make(chan checkResult, 1)
-	go func() {
-		u := NewUpdater(UpdaterOptions{
-			CurrentVersion: d.EffectiveVersion(),
-			Config:         cfg.AutoUpdate,
-			CDNBase:        strings.TrimSpace(cfg.AutoUpdate.Source),
-			SkipExit:       true,
-		})
-		m, err := u.CheckForUpdate(ctx)
-		ch <- checkResult{manifest: m, err: err}
-	}()
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case r := <-ch:
-		return r.manifest, r.err
-	}
+	u := NewUpdater(UpdaterOptions{
+		CurrentVersion: d.EffectiveVersion(),
+		Config:         cfg.AutoUpdate,
+		CDNBase:        strings.TrimSpace(cfg.AutoUpdate.Source),
+		SkipExit:       true,
+	})
+	return u.CheckForUpdate(ctx)
 }

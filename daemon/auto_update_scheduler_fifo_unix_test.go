@@ -14,11 +14,12 @@ import (
 	"time"
 )
 
-// A blocked trust-root read must not hold shutdown past the caller's
-// deadline. Construction runs under the attempt context, so Stop's cancel
-// releases the waiter even though the construction goroutine stays blocked
-// until the path unblocks; the Stop join itself is bounded by the Stop
-// context.
+// A FIFO trust-root path must not hold shutdown past the caller's
+// deadline. loadUpdateTrustRoot refuses non-regular files without
+// opening them, so construction never blocks on the FIFO: the attempt
+// runs to fail-closed verification and Stop joins promptly. Without the
+// stat guard the pre-check construction blocks inside os.ReadFile until
+// a writer appears, leaking the worker even after the attempt deadline.
 func TestAutoUpdateSchedulerBlockedTrustRootRespectsStopDeadline(t *testing.T) {
 	fifo := t.TempDir() + "/trustroot"
 	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
@@ -41,6 +42,14 @@ func TestAutoUpdateSchedulerBlockedTrustRootRespectsStopDeadline(t *testing.T) {
 	if err := d.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
+	// Stub the restart-preflight audit writer: the production writer
+	// chmods the RegistryDir TempDir, which races TempDir cleanup under
+	// -race when the scheduler fires concurrently. The other
+	// Start-based scheduler tests avoid this by asserting only manifest
+	// traffic; here the FIFO attempt must reach Update downloads, so
+	// preflight must succeed deterministically.
+	d.shims.restartStateWriter = func(restartPreparationAudit) error { return nil }
+	d.shims.restartID = func() (string, error) { return "rp_test", nil }
 	d.mu.Lock()
 	d.config.AutoUpdate.TrustRootPath = fifo
 	d.config.AutoUpdate.DrainTimeoutSeconds = 1
@@ -52,10 +61,19 @@ func TestAutoUpdateSchedulerBlockedTrustRootRespectsStopDeadline(t *testing.T) {
 		return clock.waiterCount() > 0
 	})
 	clock.fire()
-	waitForUpdateCondition(t, 5*time.Second, "attempt in flight", func() bool {
-		s := d.autoUpdateScheduler
-		return s != nil && s.inFlight.Load()
+	// The FIFO trust root is refused without opening it, so the attempt
+	// completes (fail-closed verification, draining) instead of wedging
+	// with inFlight true. Without the stat guard this wait times out:
+	// construction blocks on the FIFO with no writer.
+	waitForUpdateCondition(t, 10*time.Second, "FIFO attempt completed to draining", func() bool {
+		return d.State() == StateDraining
 	})
+	if got := probe.manifestHits.Load(); got < 2 {
+		t.Fatalf("manifest checks = %d, want pre-check plus Update re-check (FIFO refused without blocking)", got)
+	}
+	if got := probe.binaryHits.Load(); got != 1 {
+		t.Fatalf("binary downloads = %d, want 1 (Update reached downloads despite FIFO trust root)", got)
+	}
 	start := time.Now()
 	stopCtx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
@@ -64,13 +82,10 @@ func TestAutoUpdateSchedulerBlockedTrustRootRespectsStopDeadline(t *testing.T) {
 	if elapsed := time.Since(start); elapsed > 3500*time.Millisecond {
 		t.Fatalf("Stop took %v with a 50ms deadline, want within the attempt bound", elapsed)
 	}
-	// Pin the pre-check construction bound, not just the Stop join: the
-	// waiter must observe the scheduler cancel and release inFlight,
-	// letting run exit and close done even though the construction
-	// goroutine stays blocked on the FIFO until unblocked below. Without
-	// the select on ctx.Done() the attempt wedges with inFlight true
-	// forever and every later tick is skipped.
-	waitForUpdateCondition(t, 5*time.Second, "pre-check released inFlight after Stop cancel", func() bool {
+	// The attempt already completed, so inFlight is clear and the loop is
+	// joinable: Stop must terminate well within the attempt bound even
+	// with the short caller deadline below.
+	waitForUpdateCondition(t, 5*time.Second, "pre-check released inFlight", func() bool {
 		return !sched.inFlight.Load()
 	})
 	waitForUpdateCondition(t, 5*time.Second, "scheduler done closed after Stop cancel", func() bool {
@@ -81,24 +96,17 @@ func TestAutoUpdateSchedulerBlockedTrustRootRespectsStopDeadline(t *testing.T) {
 			return false
 		}
 	})
-	// Unblock the construction read so the leaked goroutine can finish.
-	go func() {
-		fd, err := syscall.Open(fifo, syscall.O_WRONLY|syscall.O_NONBLOCK, 0)
-		if err != nil {
-			return
-		}
-		_ = syscall.Close(fd)
-	}()
-	time.Sleep(200 * time.Millisecond)
+	// No writer is needed: construction never opened the FIFO, so no
+	// leaked goroutine remains to unblock.
 }
 
-// The Update phase construction is bounded by the same attempt deadline as
-// the pre-check: with a newer manifest, the second NewUpdater (trust-root
-// read while the lifecycle lease is held) must not hold the attempt past
-// its bound, and Stop must reach its deadline-aware scheduler join instead
-// of waiting for that lease first. The FIFO supplies one writer for the
-// pre-check read; the Update read has no writer and would block forever
-// without the bound. Drives production Start/tick/Stop.
+// The Update phase construction never blocks on a FIFO trust root:
+// loadUpdateTrustRoot refuses non-regular files without opening them,
+// so both the pre-check and the Update construction fail closed to
+// verification and the attempt runs to draining with downloads. Without
+// the guard the second NewUpdater blocks on the FIFO with no writer
+// while holding the lifecycle lease, and Stop waits for the full attempt
+// bound. Drives production Start/tick/Stop.
 func TestAutoUpdateSchedulerUpdateConstructionBoundedByAttemptDeadline(t *testing.T) {
 	fifo := t.TempDir() + "/trustroot-update"
 	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
@@ -121,6 +129,10 @@ func TestAutoUpdateSchedulerUpdateConstructionBoundedByAttemptDeadline(t *testin
 	if err := d.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
+	// See the stub above: deterministic preflight so the FIFO attempt
+	// reaches downloads.
+	d.shims.restartStateWriter = func(restartPreparationAudit) error { return nil }
+	d.shims.restartID = func() (string, error) { return "rp_test", nil }
 	d.mu.Lock()
 	d.config.AutoUpdate.TrustRootPath = fifo
 	d.config.AutoUpdate.DrainTimeoutSeconds = 5
@@ -128,41 +140,20 @@ func TestAutoUpdateSchedulerUpdateConstructionBoundedByAttemptDeadline(t *testin
 	if d.autoUpdateScheduler == nil {
 		t.Fatal("opted-in config started no scheduler through Start")
 	}
-	// One writer for the pre-check construction only: it blocks until the
-	// first reader opens, writes the embedded root, then exits so the
-	// Update construction has no writer and would block indefinitely.
-	go func() {
-		fd, err := syscall.Open(fifo, syscall.O_WRONLY, 0)
-		if err != nil {
-			return
-		}
-		data := append([]byte(nil), embeddedTrustRoot...)
-		for len(data) > 0 {
-			n, err := syscall.Write(fd, data)
-			if err != nil {
-				break
-			}
-			data = data[n:]
-		}
-		_ = syscall.Close(fd)
-	}()
 	waitForUpdateCondition(t, 5*time.Second, "scheduler tick wait", func() bool {
 		return clock.waiterCount() > 0
 	})
 	clock.fire()
-	// The tick entered Update: pre-check saw the newer release (one
-	// manifest hit) and Update now holds the lease while blocked in the
-	// second construction.
-	waitForUpdateCondition(t, 5*time.Second, "update entered", func() bool {
-		return d.State() == StateUpdating
+	// Both constructions refuse the FIFO without opening it: the tick
+	// reaches Update (draining), performs the manifest re-check and the
+	// downloads, then fails closed at verification. A blocking
+	// construction would wedge here in StateUpdating with one manifest
+	// hit and zero binaries.
+	waitForUpdateCondition(t, 10*time.Second, "update reached draining despite FIFO", func() bool {
+		return d.State() == StateDraining
 	})
-	// Stop while the Update construction is blocked must still terminate
-	// within the caller's deadline: the early scheduler cancel (before
-	// waiting for the lifecycle lease) releases the construction waiter,
-	// which releases the lease. The attempt bound is drain 5s + run 5s
-	// (10s); the Stop deadline below (5s) is shorter, so without the
-	// early cancel Stop would wait for the full attempt and exceed its
-	// deadline.
+	// Stop after the completed attempt terminates promptly within the
+	// caller's deadline.
 	start := time.Now()
 	stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -175,23 +166,16 @@ func TestAutoUpdateSchedulerUpdateConstructionBoundedByAttemptDeadline(t *testin
 	if got := d.State(); got != StateStopped {
 		t.Fatalf("state = %q, want stopped after bounded Stop", got)
 	}
-	// The pre-check used the single writer; the Update construction never
-	// reached its manifest re-check.
-	if got := probe.manifestHits.Load(); got != 1 {
-		t.Fatalf("manifest checks = %d, want exactly the pre-check (Update blocked in construction)", got)
+	// Both constructions ran: pre-check plus the Update re-check, then
+	// the binary download on the way to fail-closed verification. A
+	// blocking Update construction would leave exactly one manifest hit
+	// and zero binaries.
+	if got := probe.manifestHits.Load(); got < 2 {
+		t.Fatalf("manifest checks = %d, want pre-check plus Update re-check (FIFO refused without blocking)", got)
 	}
-	if got := probe.binaryHits.Load(); got != 0 {
-		t.Fatalf("binary downloads = %d, want 0 (Update never reached downloads)", got)
+	if got := probe.binaryHits.Load(); got != 1 {
+		t.Fatalf("binary downloads = %d, want 1 (Update reached downloads despite FIFO trust root)", got)
 	}
-	// Unblock the leaked construction goroutine so it can finish.
-	go func() {
-		fd, err := syscall.Open(fifo, syscall.O_WRONLY|syscall.O_NONBLOCK, 0)
-		if err != nil {
-			return
-		}
-		_ = syscall.Close(fd)
-	}()
-	time.Sleep(200 * time.Millisecond)
 }
 
 // A live reload that swaps the trust root to a FIFO between the pre-check
