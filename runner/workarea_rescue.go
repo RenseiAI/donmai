@@ -305,18 +305,28 @@ func (r *Runner) finalizeTeardownPreservation(qw QueuedWork, pres *teardownPrese
 // evidence when the terminal status owns preservation (failed or stopped):
 // the evidence shares this teardown's archive directory, so evidence-only
 // and patch-bearing attempts count together under rescueKeepPerSession.
-// Evidence is best-effort and never flips the return: a teardown with no
-// unpublished work still tears down when the evidence cannot be written.
+// Descriptor evidence is best-effort and never flips the return: a teardown
+// with no unpublished work still tears down when the descriptor evidence
+// cannot be written. For failed sessions it additionally archives bounded
+// redacted transcript tails into the same attempt; a tail failure is
+// fail-closed and keeps the workarea, including an evidence-only attempt
+// when there is no unpublished work.
 func (r *Runner) preserveUnpublishedWork(qw QueuedWork, res *Result) bool {
 	if res == nil {
 		return true
 	}
 	wantEvidence := shouldPreserveTerminalEvidence(res.Status) && len(res.terminalTranscripts) > 0
-	if len(res.rescueTargets) == 0 && !wantEvidence {
+	wantTails := res.Status == "failed" && len(res.terminalTranscripts) > 0
+	if len(res.rescueTargets) == 0 && !wantEvidence && !wantTails {
 		return true
 	}
 	pres := r.newTeardownPreservation(qw.SessionID)
 	preserved := r.preservePatches(qw, res, pres)
+	if wantTails {
+		if !r.archiveFailedSessionEvidence(qw, res, pres.dirFor) {
+			preserved = false
+		}
+	}
 	if wantEvidence {
 		r.preserveTerminalEvidenceFinal(qw, res, pres)
 	}
