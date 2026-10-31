@@ -704,6 +704,32 @@ type CostData struct {
 	NumTurns          int     `json:"numTurns,omitempty"`
 }
 
+// DependencyPreparation is the bounded outcome of post-acquire
+// dependency preparation. Status is one of the closed vocabulary
+// below; Ecosystems names the detected ecosystems the status applies
+// to (subset of "pnpm", "go", in detection order). It carries no
+// command output and no error text by construction.
+type DependencyPreparation struct {
+	Status string `json:"status"`
+	// Ecosystems names the detected ecosystems the status applies to.
+	// Omitted when empty; never carries paths, output, or error text.
+	Ecosystems []string `json:"ecosystems,omitempty"`
+}
+
+// Closed dependency-preparation outcome vocabulary. ready means every
+// detected install exited zero; failed means a non-zero exit or start
+// error; timed_out means the install context expired (including parent
+// cancellation mid-install); the skipped pair means no install was
+// attempted for a detected ecosystem. A nil *DependencyPreparation
+// (omitted on the wire) means no ecosystem was detected.
+const (
+	DependencyPreparationReady             = "ready"
+	DependencyPreparationFailed            = "failed"
+	DependencyPreparationTimedOut          = "timed_out"
+	DependencyPreparationSkippedReadOnly   = "skipped_read_only"
+	DependencyPreparationSkippedRestricted = "skipped_restricted"
+)
+
 // Result is the runner's final session-result shape, distinct from the
 // per-provider terminal ResultEvent.
 //
@@ -908,6 +934,19 @@ type Result struct {
 	// never recorded the phase stays byte-identical. Additive — old
 	// platforms ignore it.
 	PreparationSeconds int64 `json:"preparationSeconds,omitempty"`
+
+	// DependencyPreparation is the bounded outcome of post-acquire
+	// dependency preparation (runner dependency install step). It names
+	// whether the detected ecosystems installed cleanly: ready when every
+	// install exited zero, failed on a non-zero exit or start error,
+	// timed_out when the install context expired, skipped_read_only when
+	// the selected repository forbids writes, skipped_restricted when the
+	// execution-security gate forbids host installs. Nil when no
+	// ecosystem was detected (nothing to prepare) so old results stay
+	// byte-identical. Bounded by construction: status plus the detected
+	// ecosystem names only, never raw tool output or error text.
+	// Additive — old platforms ignore it.
+	DependencyPreparation *DependencyPreparation `json:"dependencyPreparation,omitempty"`
 
 	// ExitCode is the headless process exit when one existed. Nil when no
 	// process existed (a spawn failure) or the harness reported none:

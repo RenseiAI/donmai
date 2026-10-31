@@ -1817,3 +1817,134 @@ func TestPosterPost_StatusHeadlessFailureEvidenceSerialized(t *testing.T) {
 		})
 	}
 }
+
+// TestPosterPost_StatusDependencyPreparationSerialized pins that the
+// production poster carries the exact bounded preparation report, omits
+// it for old/no-report results, and never interpolates raw installer
+// output. Dropping the poster assignment or interpolating installer
+// errors fails it (AC-4 RED).
+func TestPosterPost_StatusDependencyPreparationSerialized(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		in   *agent.DependencyPreparation
+		want string
+	}{
+		{name: "omitted when no report", in: nil, want: ""},
+		{name: "ready", in: &agent.DependencyPreparation{Status: agent.DependencyPreparationReady, Ecosystems: []string{"pnpm", "go"}}, want: `{"status":"ready","ecosystems":["pnpm","go"]}`},
+		{name: "failed", in: &agent.DependencyPreparation{Status: agent.DependencyPreparationFailed, Ecosystems: []string{"pnpm"}}, want: `{"status":"failed","ecosystems":["pnpm"]}`},
+		{name: "timed out", in: &agent.DependencyPreparation{Status: agent.DependencyPreparationTimedOut, Ecosystems: []string{"go"}}, want: `{"status":"timed_out","ecosystems":["go"]}`},
+		{name: "skipped read-only", in: &agent.DependencyPreparation{Status: agent.DependencyPreparationSkippedReadOnly, Ecosystems: []string{"pnpm"}}, want: `{"status":"skipped_read_only","ecosystems":["pnpm"]}`},
+		{name: "skipped restricted", in: &agent.DependencyPreparation{Status: agent.DependencyPreparationSkippedRestricted, Ecosystems: []string{"go"}}, want: `{"status":"skipped_restricted","ecosystems":["go"]}`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var statusBody []byte
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, _ := io.ReadAll(r.Body)
+				if strings.HasSuffix(r.URL.Path, "/status") {
+					statusBody = body
+				}
+				w.WriteHeader(http.StatusOK)
+			}))
+			t.Cleanup(srv.Close)
+			p := newPoster(t, srv.URL, 0)
+			r := goodResult()
+			r.DependencyPreparation = tc.in
+			if err := p.Post(context.Background(), "sess-depprep", r); err != nil {
+				t.Fatalf("Post: %v", err)
+			}
+			var body map[string]json.RawMessage
+			if err := json.Unmarshal(statusBody, &body); err != nil {
+				t.Fatalf("status body not JSON: %v (raw %q)", err, statusBody)
+			}
+			got, present := body["dependencyPreparation"]
+			if present != (tc.want != "") {
+				t.Fatalf("dependencyPreparation present = %v; want %v (body %s)", present, tc.want != "", statusBody)
+			}
+			if present && string(got) != tc.want {
+				t.Errorf("dependencyPreparation = %s; want %s", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestPosterPost_StatusDependencyPreparationOmitsRawErrors proves the
+// bounded report never carries raw installer output even when the
+// terminal error does: error-output sentinels appear in error.message
+// but never in dependencyPreparation.
+func TestPosterPost_StatusDependencyPreparationOmitsRawErrors(t *testing.T) {
+	t.Parallel()
+	var statusBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if strings.HasSuffix(r.URL.Path, "/status") {
+			statusBody = body
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+	p := newPoster(t, srv.URL, 0)
+	r := goodResult()
+	r.Error = "install failed: SENTINEL-install-stdout with output SENTINEL-raw-bytes"
+	r.DependencyPreparation = &agent.DependencyPreparation{Status: agent.DependencyPreparationFailed, Ecosystems: []string{"pnpm"}}
+	if err := p.Post(context.Background(), "sess-depprep-sentinel", r); err != nil {
+		t.Fatalf("Post: %v", err)
+	}
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(statusBody, &body); err != nil {
+		t.Fatalf("status body not JSON: %v (raw %q)", err, statusBody)
+	}
+	got, present := body["dependencyPreparation"]
+	if !present {
+		t.Fatalf("dependencyPreparation missing (body %s)", statusBody)
+	}
+	for _, sentinel := range []string{"SENTINEL-install-stdout", "SENTINEL-raw-bytes"} {
+		if strings.Contains(string(got), sentinel) {
+			t.Errorf("dependencyPreparation leaks raw installer text %q: %s", sentinel, got)
+		}
+	}
+}
+
+// TestPosterPreparedBodyPreservesDependencyPreparation pins the
+// prepared/replayed contract: the immutable prepared status bytes carry
+// the exact bounded report and replay preserves it.
+func TestPosterPreparedBodyPreservesDependencyPreparation(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+	p := newPoster(t, srv.URL, 0)
+	r := goodResult()
+	r.DependencyPreparation = &agent.DependencyPreparation{Status: agent.DependencyPreparationTimedOut, Ecosystems: []string{"pnpm", "go"}}
+	prepared, err := p.PrepareTerminalStatusBody(context.Background(), "sess-depprep-prepared", r, nil)
+	if err != nil {
+		t.Fatalf("PrepareTerminalStatusBody: %v", err)
+	}
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(prepared, &body); err != nil {
+		t.Fatalf("prepared body not JSON: %v (raw %q)", err, prepared)
+	}
+	got, present := body["dependencyPreparation"]
+	if !present {
+		t.Fatalf("prepared body omits dependencyPreparation: %s", prepared)
+	}
+	want := `{"status":"timed_out","ecosystems":["pnpm","go"]}`
+	if string(got) != want {
+		t.Fatalf("prepared dependencyPreparation = %s; want %s", got, want)
+	}
+	// An old/no-report result prepares without the key (byte-compatible).
+	plain, err := p.PrepareTerminalStatusBody(context.Background(), "sess-depprep-plain", goodResult(), nil)
+	if err != nil {
+		t.Fatalf("PrepareTerminalStatusBody: %v", err)
+	}
+	var plainBody map[string]json.RawMessage
+	if err := json.Unmarshal(plain, &plainBody); err != nil {
+		t.Fatalf("prepared body not JSON: %v (raw %q)", err, plain)
+	}
+	if _, present := plainBody["dependencyPreparation"]; present {
+		t.Fatalf("prepared body carries dependencyPreparation for old result: %s", plain)
+	}
+}

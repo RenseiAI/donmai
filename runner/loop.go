@@ -781,10 +781,15 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// (step 2b) and before spawn: a pnpm lockfile triggers
 	// `pnpm install --prefer-offline --frozen-lockfile`, a go.mod
 	// triggers `go mod download`. Bounded by one timeout; a failure is
-	// logged and the run continues. Skipped when the kit hook already
-	// installed (node_modules/.bin present) and when the selected
-	// repository is read-only.
-	r.installSessionDependencies(ctx, qw, wpath, selectedRepositoryReadOnly)
+	// logged and the run continues with whatever is on disk
+	// (best-effort spawn). The bounded outcome is retained on the
+	// terminal result; failed/timed_out outcomes also render a short
+	// runner-authored recovery handoff in the delivered harness protocol
+	// (step 5b), never an automatic second install. Skipped when the
+	// selected repository is read-only or the execution-security gate
+	// requires confinement; omitted when no manifest is detected.
+	depsPrep := r.installSessionDependencies(ctx, qw, wpath, selectedRepositoryReadOnly)
+	res.DependencyPreparation = depsPrep
 
 	// 2c. Post-clone kit skill + prompt-fragment re-detection.
 	//
@@ -1047,6 +1052,17 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// no-op when the block is absent (byte-identical prompt to today).
 	composition.HarnessProtocol = injectCodeIntelPartialForDelivery(composition.HarnessProtocol, caps, qw.CodeIntel, codeIntelDelivery)
 	composition.HarnessProtocol = injectWorkareaProtocolPartial(composition.HarnessProtocol, repositoryDeclaration != nil)
+	// Failed or timed-out dependency preparation hands an explicit,
+	// bounded recovery instruction to the model-driving harness: the
+	// checkout is not ready, repair with permitted tools before relying
+	// on dependency-based checks, report blocked when repair cannot
+	// finish. Ready, skipped, and no-manifest outcomes add nothing;
+	// a bare shell never receives executable recovery prose (its user
+	// surface executes commands, so no non-user authority is projected
+	// there) — it keeps the terminal report as evidence only.
+	if provider.Name() != agent.ProviderShell {
+		composition.HarnessProtocol = injectDependencyPreparationPartial(composition.HarnessProtocol, depsPrep)
+	}
 	if signalGuard.degraded {
 		composition.HarnessProtocol = injectSignalGuardDegradedProtocolPartial(composition.HarnessProtocol)
 	} else {
@@ -1154,6 +1170,19 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 			}
 		}
 		spec = applyPreparedSourceAuthority(spec, preparedSource, preparedPlan)
+		// preparedSource was compiled during admission, before dependency
+		// installation ran, so it cannot carry the recovery handoff: the
+		// authority replacement above would otherwise drop the failed or
+		// timed-out instruction the legacy lane delivers. Re-project the
+		// bounded handoff onto the authoritative prepared surfaces. Ready,
+		// skipped, and no-manifest outcomes are no-ops; the bare-shell lane
+		// stays excluded, matching the composition gate above.
+		if provider.Name() != agent.ProviderShell && dependencyPreparationNeedsRecovery(depsPrep) {
+			if spec.PromptPlan != nil && spec.PromptPlan.HarnessProtocol != nil {
+				spec.PromptPlan.HarnessProtocol.Text = injectDependencyPreparationPartial(spec.PromptPlan.HarnessProtocol.Text, depsPrep)
+			}
+			spec.SystemPromptAppend = injectDependencyPreparationPartial(spec.SystemPromptAppend, depsPrep)
+		}
 	} else {
 		spec.OnPromptAdapted = func(receipt agent.PromptDeliveryReceipt) error {
 			_, err := r.store.Update(runnerStatePath, func(s *state.State) error {
