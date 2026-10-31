@@ -1170,6 +1170,19 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 			}
 		}
 		spec = applyPreparedSourceAuthority(spec, preparedSource, preparedPlan)
+		// preparedSource was compiled during admission, before dependency
+		// installation ran, so it cannot carry the recovery handoff: the
+		// authority replacement above would otherwise drop the failed or
+		// timed-out instruction the legacy lane delivers. Re-project the
+		// bounded handoff onto the authoritative prepared surfaces. Ready,
+		// skipped, and no-manifest outcomes are no-ops; the bare-shell lane
+		// stays excluded, matching the composition gate above.
+		if provider.Name() != agent.ProviderShell && dependencyPreparationNeedsRecovery(depsPrep) {
+			if spec.PromptPlan != nil && spec.PromptPlan.HarnessProtocol != nil {
+				spec.PromptPlan.HarnessProtocol.Text = injectDependencyPreparationPartial(spec.PromptPlan.HarnessProtocol.Text, depsPrep)
+			}
+			spec.SystemPromptAppend = injectDependencyPreparationPartial(spec.SystemPromptAppend, depsPrep)
+		}
 	} else {
 		spec.OnPromptAdapted = func(receipt agent.PromptDeliveryReceipt) error {
 			_, err := r.store.Update(runnerStatePath, func(s *state.State) error {
