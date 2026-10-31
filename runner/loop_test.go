@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -2635,4 +2636,322 @@ func TestLoop_ExecutionSecurityReportWaitsForAcceptance(t *testing.T) {
 			t.Fatalf("spawns = %d, want one", spawns.Load())
 		}
 	})
+}
+
+// depsPromptCapturingProvider wraps the stub harness and records the
+// delivered Spec so Run-level dependency-preparation tests can assert on
+// the prompt plan the provider actually received.
+type depsPromptCapturingProvider struct {
+	agent.HarnessProvider
+	spec   agent.Spec
+	spawns int
+}
+
+func (p *depsPromptCapturingProvider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, error) {
+	p.spec = spec
+	p.spawns++
+	return p.HarnessProvider.Spawn(ctx, spec)
+}
+
+// shellDepsProvider reports the shell name so the runner takes the
+// bare-shell lane (no harness protocol), while still delegating to the
+// stub harness for manifest and spawn behavior.
+type shellDepsProvider struct {
+	agent.HarnessProvider
+	spec agent.Spec
+}
+
+func (p *shellDepsProvider) Name() agent.ProviderName { return agent.ProviderShell }
+
+func depsDiscardLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+func (p *shellDepsProvider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, error) {
+	p.spec = spec
+	return p.HarnessProvider.Spawn(ctx, spec)
+}
+
+// seedManifestsWithBin commits a pnpm lockfile, a go.mod, and a leftover
+// node_modules/.bin directory so the Run-level stale-.bin test proves the
+// installer still runs instead of reading the leftover as ready.
+func seedManifestsWithBin(t *testing.T, bareRepo string) {
+	t.Helper()
+	work := t.TempDir()
+	runGitFixture(t, "", "clone", "-q", bareRepo, work)
+	writeFile(t, work, "pnpm-lock.yaml", "lockfileVersion: 9.0\n")
+	writeFile(t, work, "go.mod", "module example.test/seed\n\ngo 1.24\n")
+	writeFile(t, work, filepath.Join("node_modules", ".bin", "keep"), "")
+	for _, args := range [][]string{
+		{"-C", work, "config", "user.email", "test@example.com"},
+		{"-C", work, "config", "user.name", "test"},
+		{"-C", work, "add", "pnpm-lock.yaml", "go.mod", filepath.Join("node_modules", ".bin", "keep")},
+		{"-C", work, "commit", "-q", "-m", "seed dependency manifests with stale bin"},
+		{"-C", work, "push", "-q", "origin", "HEAD:main"},
+	} {
+		runGitFixture(t, "", args...)
+	}
+}
+
+func depsCapturingHarness(t *testing.T, h *runnerHarness, provider *depsPromptCapturingProvider) {
+	t.Helper()
+	inner, err := stub.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider.HarnessProvider = inner.(agent.HarnessProvider)
+	reg := NewRegistry()
+	if err := reg.Register(provider); err != nil {
+		t.Fatal(err)
+	}
+	h.runner.registry = reg
+}
+
+// TestRun_DependencyPreparationReadyAddsNoRecovery drives the production
+// Run path with a lockfile plus a pre-existing empty/partial .bin: the
+// installer still runs before spawn, the terminal result reports ready,
+// and no recovery instruction is added. Restoring the .bin skip or
+// removing the Run call leaves zero install calls or no ready report and
+// fails it (AC-1 RED).
+func TestRun_DependencyPreparationReadyAddsNoRecovery(t *testing.T) {
+	h := newRunnerHarness(t)
+	h.runner.logger = depsDiscardLogger()
+	provider := &depsPromptCapturingProvider{}
+	depsCapturingHarness(t, h, provider)
+	execer := &recordingDepsExecer{}
+	h.runner.depsExecer = execer
+	seedManifestsWithBin(t, h.bareRepo)
+
+	qw := h.queuedWork("DEPS-READY-RUN")
+	qw.ExecutionSecurity = executionSecuritySection(nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := h.runner.Run(ctx, qw)
+	if err != nil || res.Status != "completed" {
+		t.Fatalf("Run status=%q err=%v (%s); want completed", res.Status, err, res.Error)
+	}
+	if calls := execer.recorded(); len(calls) != 2 {
+		t.Fatalf("install calls = %d; want pnpm then go despite .bin", len(calls))
+	}
+	if res.DependencyPreparation == nil || res.DependencyPreparation.Status != agent.DependencyPreparationReady {
+		t.Fatalf("DependencyPreparation = %+v; want ready", res.DependencyPreparation)
+	}
+	if provider.spec.PromptPlan == nil || provider.spec.PromptPlan.HarnessProtocol == nil {
+		t.Fatalf("prompt plan missing harness protocol: %+v", provider.spec.PromptPlan)
+	}
+	if strings.Contains(provider.spec.PromptPlan.HarnessProtocol.Text, "Dependency preparation did not complete") {
+		t.Fatalf("ready preparation must add no recovery instruction: %q", provider.spec.PromptPlan.HarnessProtocol.Text)
+	}
+	if provider.spec.PromptPlan.UserPrompt.Text == "" || !strings.Contains(provider.spec.PromptPlan.UserPrompt.Text, "This is a test issue body.") {
+		t.Fatalf("original user task lost in prompt plan: %+v", provider.spec.PromptPlan.UserPrompt)
+	}
+}
+
+// TestRun_DependencyPreparationFailureHandsRecovery drives Run with a
+// failing installer: best-effort spawn still completes, the terminal
+// result reports failed, and the delivered prompt plan carries the
+// recovery instruction while preserving the original task. Discarding
+// the outcome or omitting the protocol injection fails it (AC-2 RED).
+func TestRun_DependencyPreparationFailureHandsRecovery(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		execer   *recordingDepsExecer
+		wantStat string
+	}{
+		{name: "nonzero exit", execer: &recordingDepsExecer{exitCode: 1}, wantStat: agent.DependencyPreparationFailed},
+		{name: "start error", execer: &recordingDepsExecer{err: errors.New("SENTINEL-start-error")}, wantStat: agent.DependencyPreparationFailed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newRunnerHarness(t)
+			h.runner.logger = depsDiscardLogger()
+			provider := &depsPromptCapturingProvider{}
+			depsCapturingHarness(t, h, provider)
+			h.runner.depsExecer = tc.execer
+			seedManifestsInBareRepo(t, h.bareRepo)
+
+			qw := h.queuedWork("DEPS-FAIL-" + tc.name)
+			qw.ExecutionSecurity = executionSecuritySection(nil)
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			res, err := h.runner.Run(ctx, qw)
+			if err != nil || res.Status != "completed" {
+				t.Fatalf("Run status=%q err=%v (%s); want completed despite install failure", res.Status, err, res.Error)
+			}
+			if res.DependencyPreparation == nil || res.DependencyPreparation.Status != tc.wantStat {
+				t.Fatalf("DependencyPreparation = %+v; want %q", res.DependencyPreparation, tc.wantStat)
+			}
+			if provider.spec.PromptPlan == nil || provider.spec.PromptPlan.HarnessProtocol == nil {
+				t.Fatalf("prompt plan missing harness protocol: %+v", provider.spec.PromptPlan)
+			}
+			text := provider.spec.PromptPlan.HarnessProtocol.Text
+			for _, want := range []string{"Dependency preparation did not complete", "Dependencies are not ready.", "report blocked with the reason"} {
+				if !strings.Contains(text, want) {
+					t.Errorf("recovery instruction missing %q: %q", want, text)
+				}
+			}
+			if !strings.Contains(provider.spec.PromptPlan.UserPrompt.Text, "This is a test issue body.") {
+				t.Errorf("original user task lost in prompt plan: %+v", provider.spec.PromptPlan.UserPrompt)
+			}
+			if strings.Contains(text, "SENTINEL-start-error") {
+				t.Errorf("recovery prompt leaks raw installer error: %q", text)
+			}
+			if res.DependencyPreparation != nil {
+				raw, _ := json.Marshal(res.DependencyPreparation)
+				if strings.Contains(string(raw), "SENTINEL-start-error") {
+					t.Errorf("preparation report leaks raw installer error: %s", raw)
+				}
+			}
+		})
+	}
+}
+
+// TestRun_DependencyPreparationTimeoutHandsRecovery drives Run with a
+// wedged installer under a short step timeout: the bounded cancellation
+// still fires, best-effort spawn completes, and the handoff reports
+// timed_out with the recovery instruction.
+func TestRun_DependencyPreparationTimeoutHandsRecovery(t *testing.T) {
+	h := newRunnerHarness(t)
+	h.runner.logger = depsDiscardLogger()
+	provider := &depsPromptCapturingProvider{}
+	depsCapturingHarness(t, h, provider)
+	blocking := &contextBlockingExecer{}
+	h.runner.depsExecer = blocking
+	h.runner.depsInstallTimeout = 100 * time.Millisecond
+	seedManifestsInBareRepo(t, h.bareRepo)
+
+	qw := h.queuedWork("DEPS-TIMEOUT-RUN")
+	qw.ExecutionSecurity = executionSecuritySection(nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := h.runner.Run(ctx, qw)
+	if err != nil || res.Status != "completed" {
+		t.Fatalf("Run status=%q err=%v (%s); want completed despite timeout", res.Status, err, res.Error)
+	}
+	if res.DependencyPreparation == nil || res.DependencyPreparation.Status != agent.DependencyPreparationTimedOut {
+		t.Fatalf("DependencyPreparation = %+v; want timed_out", res.DependencyPreparation)
+	}
+	if provider.spec.PromptPlan == nil || provider.spec.PromptPlan.HarnessProtocol == nil {
+		t.Fatalf("prompt plan missing harness protocol: %+v", provider.spec.PromptPlan)
+	}
+	if !strings.Contains(provider.spec.PromptPlan.HarnessProtocol.Text, "Dependency preparation did not complete") {
+		t.Fatalf("timed_out preparation must hand recovery: %q", provider.spec.PromptPlan.HarnessProtocol.Text)
+	}
+	if !strings.Contains(provider.spec.PromptPlan.HarnessProtocol.Text, agent.DependencyPreparationTimedOut) {
+		t.Errorf("recovery handoff missing bounded status timed_out: %q", provider.spec.PromptPlan.HarnessProtocol.Text)
+	}
+}
+
+// TestRun_DependencyPreparationSkipsAddNoBypass drives Run under a
+// restricted execution-security gate: no installer runs, the report is
+// the skipped outcome, and no bypass instruction is delivered.
+// Removing the authority guard fails it (AC-3 RED).
+func TestRun_DependencyPreparationSkipsAddNoBypass(t *testing.T) {
+	h := newRunnerHarness(t)
+	h.runner.logger = depsDiscardLogger()
+	inner, err := stub.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	capturing := &depsPromptCapturingProvider{HarnessProvider: inner.(agent.HarnessProvider)}
+	// The stub alone cannot render a restricted network level; wrap the
+	// capturing harness with the restricted-level manifest so the run
+	// reaches the install gate instead of refusing at pre-spawn.
+	gated := &depsSecurityProvider{HarnessProvider: capturing, dimension: agent.ExecutionSecurityNetwork, level: agent.NetworkLogged}
+	reg := NewRegistry()
+	if err := reg.Register(gated); err != nil {
+		t.Fatal(err)
+	}
+	h.runner.registry = reg
+	provider := capturing
+	execer := &recordingDepsExecer{}
+	h.runner.depsExecer = execer
+	seedManifestsInBareRepo(t, h.bareRepo)
+
+	qw := h.queuedWork("DEPS-SKIP-RUN")
+	qw.ExecutionSecurity = executionSecuritySection(nil)
+	qw.ExecutionSecurity.Levels.Network = agent.NetworkLogged
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := h.runner.Run(ctx, qw)
+	if err != nil || res.Status != "completed" {
+		t.Fatalf("Run status=%q err=%v (%s); want completed", res.Status, err, res.Error)
+	}
+	if calls := execer.recorded(); len(calls) != 0 {
+		t.Fatalf("install calls = %v; want none under restricted execution", calls)
+	}
+	if res.DependencyPreparation == nil || res.DependencyPreparation.Status != agent.DependencyPreparationSkippedRestricted {
+		t.Fatalf("DependencyPreparation = %+v; want skipped_restricted", res.DependencyPreparation)
+	}
+	if provider.spec.PromptPlan != nil && provider.spec.PromptPlan.HarnessProtocol != nil &&
+		strings.Contains(provider.spec.PromptPlan.HarnessProtocol.Text, "Dependency preparation did not complete") {
+		t.Fatalf("skipped preparation must not hand recovery: %q", provider.spec.PromptPlan.HarnessProtocol.Text)
+	}
+}
+
+// TestRun_ShellGetsEvidenceOnly proves the shell lane carries the bounded
+// report as evidence but never executable recovery prose: a failing
+// install still completes, the result reports failed, and the shell spec
+// has no harness protocol to project instructions onto.
+func TestRun_ShellGetsEvidenceOnly(t *testing.T) {
+	h := newRunnerHarness(t)
+	h.runner.logger = depsDiscardLogger()
+	inner, err := stub.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	shell := &shellDepsProvider{HarnessProvider: inner.(agent.HarnessProvider)}
+	reg := NewRegistry()
+	if err := reg.Register(shell); err != nil {
+		t.Fatal(err)
+	}
+	h.runner.registry = reg
+	h.runner.depsExecer = &recordingDepsExecer{exitCode: 1}
+	seedManifestsInBareRepo(t, h.bareRepo)
+
+	qw := h.queuedWork("DEPS-SHELL-RUN")
+	qw.ExecutionSecurity = executionSecuritySection(nil)
+	qw.ResolvedProfile.Provider = agent.ProviderShell
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := h.runner.Run(ctx, qw)
+	if err != nil || res.Status != "completed" {
+		t.Fatalf("Run status=%q err=%v (%s); want completed", res.Status, err, res.Error)
+	}
+	if res.DependencyPreparation == nil || res.DependencyPreparation.Status != agent.DependencyPreparationFailed {
+		t.Fatalf("DependencyPreparation = %+v; want failed evidence on shell run", res.DependencyPreparation)
+	}
+	if shell.spec.PromptPlan != nil && shell.spec.PromptPlan.HarnessProtocol != nil {
+		t.Fatalf("shell prompt plan must carry no harness protocol: %+v", shell.spec.PromptPlan.HarnessProtocol)
+	}
+}
+
+// TestRun_NoManifestOmitsPreparation pins the byte-compatible path: a
+// worktree with no manifests omits the report and leaves the protocol
+// unchanged.
+func TestRun_NoManifestOmitsPreparation(t *testing.T) {
+	h := newRunnerHarness(t)
+	h.runner.logger = depsDiscardLogger()
+	provider := &depsPromptCapturingProvider{}
+	depsCapturingHarness(t, h, provider)
+	execer := &recordingDepsExecer{}
+	h.runner.depsExecer = execer
+	// No seedManifestsInBareRepo: the bare repo has no manifests.
+	qw := h.queuedWork("DEPS-NOMANIFEST-RUN")
+	qw.ExecutionSecurity = executionSecuritySection(nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := h.runner.Run(ctx, qw)
+	if err != nil || res.Status != "completed" {
+		t.Fatalf("Run status=%q err=%v (%s); want completed", res.Status, err, res.Error)
+	}
+	if calls := execer.recorded(); len(calls) != 0 {
+		t.Fatalf("install calls = %v; want none with no manifests", calls)
+	}
+	if res.DependencyPreparation != nil {
+		t.Fatalf("DependencyPreparation = %+v; want nil (omitted)", res.DependencyPreparation)
+	}
+	if provider.spec.PromptPlan != nil && provider.spec.PromptPlan.HarnessProtocol != nil &&
+		strings.Contains(provider.spec.PromptPlan.HarnessProtocol.Text, "Dependency preparation did not complete") {
+		t.Fatalf("no-manifest run must not hand recovery: %q", provider.spec.PromptPlan.HarnessProtocol.Text)
+	}
 }
