@@ -72,6 +72,14 @@ type Handle struct {
 	mcpRelease   func() error
 	mcpOnce      sync.Once
 	mcpErr       error
+	// stopErr records the terminal-stop shutdown acknowledgement: any
+	// turn/interrupt or thread/unsubscribe failure (timeout, rejection,
+	// transport error) proves the owned writers may still be live. It is
+	// written once inside closeOnce and joined into Stop's return so a
+	// nil Stop means both shutdown RPCs were acknowledged, never merely
+	// that config cleanup succeeded. Callers gate quiescence evidence on
+	// that nil; an unproved shutdown stays unquiesced (fail-closed).
+	stopErr error
 
 	state *mapperState
 
@@ -144,20 +152,28 @@ func (h *Handle) Inject(_ context.Context, _ string) error {
 }
 
 // Stop interrupts the active turn (if any), unsubscribes the thread,
-// and closes the events channel. Idempotent.
+// and closes the events channel. Idempotent. Any turn/interrupt or
+// thread/unsubscribe failure is joined into the return: a nil Stop
+// means both shutdown RPCs were acknowledged and the owned writers were
+// stopped and reaped. A timeout or rejection leaves the writers possibly
+// live, so the caller must treat a non-nil Stop as unproved shutdown
+// (unquiesced evidence, never refused). Config cleanup success alone
+// never certifies quiescence.
 func (h *Handle) Stop(ctx context.Context) error {
 	h.closeOnce.Do(func() {
 		threadID := h.SessionID()
 		if h.client != nil && threadID != "" {
-			// Best-effort: interrupt + unsubscribe. Ignore errors —
-			// the codex side may have already torn down the thread.
-			_, _ = h.client.Request(ctx, "turn/interrupt", map[string]any{
+			if _, err := h.client.Request(ctx, "turn/interrupt", map[string]any{
 				"threadId": threadID,
 				"turnId":   "current",
-			}, h.rpcTimeout)
-			_, _ = h.client.Request(ctx, "thread/unsubscribe", map[string]any{
+			}, h.rpcTimeout); err != nil {
+				h.stopErr = errors.Join(h.stopErr, fmt.Errorf("codex stop: turn/interrupt: %w", err))
+			}
+			if _, err := h.client.Request(ctx, "thread/unsubscribe", map[string]any{
 				"threadId": threadID,
-			}, h.rpcTimeout)
+			}, h.rpcTimeout); err != nil {
+				h.stopErr = errors.Join(h.stopErr, fmt.Errorf("codex stop: thread/unsubscribe: %w", err))
+			}
 			h.client.Unsubscribe(threadID)
 		}
 	})
@@ -170,7 +186,7 @@ func (h *Handle) Stop(ctx context.Context) error {
 	// forwarder defer or failNow has already run.
 	h.signalClosed()
 	h.closeEvents()
-	return cleanupErr
+	return errors.Join(h.stopErr, cleanupErr)
 }
 
 // failNow marks the handle terminal with an ErrorEvent and closes the

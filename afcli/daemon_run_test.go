@@ -3,6 +3,7 @@ package afcli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"net"
 	"net/http"
@@ -804,5 +805,59 @@ func TestResolveQuotaProbeBinaries_CodexClaudePathLookup(t *testing.T) {
 	}
 	if _, ok := got["claude"]; ok {
 		t.Errorf("claude probe binary = %q, want no key without a binary on PATH", got["claude"])
+	}
+}
+
+// TestForwardArchiveRootToRegistryCarriesQuiescence pins the daemon
+// adapter's evidence forwarding: the production mapping from the
+// manager's provider-neutral spec to the registry commit must carry
+// Quiesced into the committed manifest's CaptureQuiesced. A dropped
+// field would silently relabel quiesced captures as unquiesced (the
+// M6 mutant: forward Quiesced:false unconditionally), so the test
+// drives the real adapter plus the real registry in both directions.
+func TestForwardArchiveRootToRegistryCarriesQuiescence(t *testing.T) {
+	t.Parallel()
+
+	commit := func(t *testing.T, id string, quiesced bool) map[string]any {
+		t.Helper()
+		archiveRoot := t.TempDir()
+		source := t.TempDir()
+		for name, body := range map[string]string{"a.txt": "generation-one-a", "b.txt": "generation-one-b"} {
+			if err := os.WriteFile(filepath.Join(source, name), []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		registry := daemon.NewWorkareaArchiveRegistry(daemon.WorkareaArchiveOptions{Root: archiveRoot})
+		forward := forwardArchiveRootToRegistry(registry)
+		if _, err := forward(context.Background(), worktree.ArchiveRootSpec{
+			WorkareaID: id, SessionID: "quiescence-session",
+			WorkareaRoot: source, SelectedPath: source, Quiesced: quiesced,
+		}); err != nil {
+			t.Fatalf("forwarded archive commit: %v", err)
+		}
+		data, err := os.ReadFile(filepath.Join(archiveRoot, id, "manifest.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var manifest map[string]any
+		if err := json.Unmarshal(data, &manifest); err != nil {
+			t.Fatal(err)
+		}
+		return manifest
+	}
+
+	quiesced := commit(t, "wa_fwd_quiesced", true)
+	if quiesced["captureQuiesced"] != true {
+		t.Fatalf("quiesced forward manifest captureQuiesced = %v, want true", quiesced["captureQuiesced"])
+	}
+	if quiesced["captureStableGeneration"] == nil || quiesced["captureStableGeneration"] == "" {
+		t.Fatal("quiesced forward manifest carries no stability witness")
+	}
+	if quiesced["captureStableGeneration"] != quiesced["treeDigest"] {
+		t.Fatalf("quiesced forward witness %v != digest %v", quiesced["captureStableGeneration"], quiesced["treeDigest"])
+	}
+	unquiesced := commit(t, "wa_fwd_unquiesced", false)
+	if quiescedFlag, _ := unquiesced["captureQuiesced"].(bool); quiescedFlag {
+		t.Fatal("unquiesced forward manifest recorded quiescence it never proved")
 	}
 }
