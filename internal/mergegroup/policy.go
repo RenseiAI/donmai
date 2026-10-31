@@ -59,8 +59,14 @@ func Resolve(exits []int) (succeeded bool, attempts int) {
 }
 
 var (
-	maxAttemptsRe   = regexp.MustCompile(`(?i)max-attempts\s*:`)
-	retryActionRe   = regexp.MustCompile(`(?i)uses\s*:\s*\S*retr(y|ies)`)
+	maxAttemptsRe = regexp.MustCompile(`(?i)max-attempts\s*:`)
+	retryActionRe = regexp.MustCompile(`(?i)uses\s*:\s*\S*retr(y|ies)`)
+	// Deny-by-default rerun guards. Any job- or step-level `if:` that
+	// runs on failure()/always() is a rerun gate however it is spelled,
+	// and any `set +` disarms errexit wherever it sits. Both are judged
+	// on the raw lines, not on whether a test command shares the chunk.
+	rerunCondRe     = regexp.MustCompile(`(?i)^\s*if\s*:.*(failure\(\)|always\(\))`)
+	setPlusRe       = regexp.MustCompile(`set\s+\+`)
 	jobHeaderRe     = regexp.MustCompile(`^  [A-Za-z0-9_.-]+:`)
 	shellLoopRe     = regexp.MustCompile(`(?i)\bfor\s+\S+\s+in\b[^\n]*\bdo\b|\bwhile\b[^\n]*\bdo\b|\buntil\b[^\n]*\bdo\b`)
 	semicolonTrueRe = regexp.MustCompile(`(?i);\s*(/bin/true|/usr/bin/true|true)\b`)
@@ -365,6 +371,14 @@ func ValidateWorkflow(text string) error {
 	}
 	if retryActionRe.FindString(code) != "" {
 		return fmt.Errorf("retry forbidden: workflow adds a retry action")
+	}
+	for _, l := range strings.Split(code, "\n") {
+		if rerunCondRe.MatchString(l) {
+			return fmt.Errorf("retry forbidden: workflow adds a rerun condition")
+		}
+	}
+	if setPlusRe.FindString(code) != "" {
+		return fmt.Errorf("retry forbidden: workflow disarms errexit")
 	}
 	if hasShellRetry(code) {
 		return fmt.Errorf("retry forbidden: workflow adds a shell retry around tests")

@@ -207,6 +207,38 @@ func TestValidateWorkflowRejectsFailureRerun(t *testing.T) {
 	}
 }
 
+func TestValidateWorkflowRejectsJobLevelRerun(t *testing.T) {
+	base := repoWorkflow(t)
+	// A rerun job gated on failure()/always() re-executes the suite even
+	// though the condition sits at job level, away from any test chunk.
+	cases := map[string]string{
+		"failure-needs": base + "\n  rerun-tests:\n    needs: test\n    if: failure()\n    runs-on: ubuntu-latest\n    steps:\n      - name: Rerun tests\n        run: go test -race ./...\n",
+		"always-needs":  base + "\n  rerun-tests:\n    needs: test\n    if: always()\n    runs-on: ubuntu-latest\n    steps:\n      - name: Rerun tests\n        run: go test -race ./...\n",
+	}
+	for name, txt := range cases {
+		if err := ValidateWorkflow(txt); err == nil {
+			t.Errorf("ValidateWorkflow(%s) = nil, want error", name)
+		}
+	}
+}
+
+func TestValidateWorkflowRejectsSetPlusAnywhere(t *testing.T) {
+	base := repoWorkflow(t)
+	// `set +` disarms errexit wherever it sits, even in a step that never
+	// names the suite and even with non-single spacing.
+	cases := map[string]string{
+		"set-plus-e-alone": strings.Replace(base, "timeout-minutes: 30",
+			"timeout-minutes: 30\n      - name: Loosen shell\n        run: set +e", 1),
+		"set-plus-double-space": strings.Replace(base, "timeout-minutes: 30",
+			"timeout-minutes: 30\n      - name: Loosen shell\n        run: set  +e", 1),
+	}
+	for name, txt := range cases {
+		if err := ValidateWorkflow(txt); err == nil {
+			t.Errorf("ValidateWorkflow(%s) = nil, want error", name)
+		}
+	}
+}
+
 func TestValidateWorkflowRejectsMissingDecision(t *testing.T) {
 	base := repoWorkflow(t)
 	stripped := strings.ReplaceAll(base, Marker, "")
