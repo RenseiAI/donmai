@@ -4032,6 +4032,7 @@ func (a *updateAttempt) run(ctx context.Context) (*UpdateResult, error) {
 	updater := NewUpdater(UpdaterOptions{
 		CurrentVersion: d.EffectiveVersion(),
 		Config:         cfg.AutoUpdate,
+		CDNBase:        effectiveUpdateCDNBase(cfg.AutoUpdate),
 		SkipExit:       true, // HTTP-driven update: caller decides to exit.
 	})
 	return updater.RunUpdate(ctx)

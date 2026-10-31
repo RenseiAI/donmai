@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -983,6 +984,147 @@ func TestHostUpgradeExpiryAfterPreflightRefusesWithoutSwap(t *testing.T) {
 	}
 	if got := calls.Load(); got != 0 {
 		t.Fatalf("update calls = %d, want 0 (no swap after expiry)", got)
+	}
+	applied, failures := d.applyPendingMutations(context.Background(), []PendingMutation{m})
+	if len(applied) != 0 || len(failures) != 1 {
+		t.Fatalf("redelivery applied/failures = %v/%v, want failure", applied, failures)
+	}
+}
+
+func TestHostUpgradeProductionSourceWithConfiguredCDN(t *testing.T) {
+	t.Parallel()
+	// Production path with no test seam: an operator-configured CDN base
+	// serving the current version must report applied (durable
+	// no-swap-needed) instead of refusing for a missing source.
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "daemon.yaml")
+	d := newRestartTestDaemon(t, nil)
+	d.opts.ConfigPath = cfgPath
+	d.opts.Version = "9.9.9-test"
+	current := d.EffectiveVersion()
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"version": current, "sha256": "abc", "releasedAt": time.Now().UTC().Format(time.RFC3339),
+		})
+	}))
+	t.Cleanup(srv.Close)
+	d.config = &Config{
+		AutoUpdate: AutoUpdateConfig{
+			Channel: ChannelStable, Schedule: ScheduleManual,
+			Signers: []UpdateSigner{{SAN: "test@example.com", Issuer: "https://example.test"}},
+			CDNBase: srv.URL,
+		},
+	}
+	d.runPreparedUpdate = nil
+	m := hostUpgradeMutation("up-prod-source", map[string]any{"consented": true})
+	applied, failures := d.applyPendingMutations(context.Background(), []PendingMutation{m})
+	if len(applied) != 0 || len(failures) != 0 {
+		t.Fatalf("first applied/failures = %v/%v, want pending", applied, failures)
+	}
+	outcome := waitForHostUpgradeDone(t, d, "up-prod-source")
+	if !outcome.Applied {
+		t.Fatalf("production-source outcome = %+v, want applied (already-up-to-date via configured CDN)", outcome)
+	}
+	if hits.Load() == 0 {
+		t.Fatal("configured CDN was never contacted")
+	}
+	applied, failures = d.applyPendingMutations(context.Background(), []PendingMutation{m})
+	if len(applied) != 1 || applied[0] != "up-prod-source" || len(failures) != 0 {
+		t.Fatalf("redelivery applied/failures = %v/%v, want applied", applied, failures)
+	}
+}
+
+func TestHostUpgradeNullDurableRefusesWithoutSwap(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "daemon.yaml")
+	if err := os.WriteFile(hostUpgradeStatePath(cfgPath), []byte("null"), 0o600); err != nil {
+		t.Fatalf("write null state: %v", err)
+	}
+	d := newRestartTestDaemon(t, nil)
+	d.opts.ConfigPath = cfgPath
+	d.config = &Config{
+		AutoUpdate: AutoUpdateConfig{
+			Channel: ChannelStable, Schedule: ScheduleManual,
+			Signers: []UpdateSigner{{SAN: "test@example.com", Issuer: "https://example.test"}},
+		},
+	}
+	var calls atomic.Int32
+	d.runPreparedUpdate = func(context.Context, AutoUpdateConfig, string) (*UpdateResult, error) {
+		calls.Add(1)
+		return &UpdateResult{Updated: true, Version: "x", Reason: "update-applied"}, nil
+	}
+	m := hostUpgradeMutation("up-null", map[string]any{"consented": true})
+	applied, failures := d.applyPendingMutations(context.Background(), []PendingMutation{m})
+	if len(applied) != 0 || len(failures) != 1 {
+		t.Fatalf("null-durable applied/failures = %v/%v, want failure", applied, failures)
+	}
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("null-durable update calls = %d, want 0", got)
+	}
+}
+
+func TestHostUpgradeConcurrentLedgerNoLostUpdate(t *testing.T) {
+	t.Parallel()
+	d := hostUpgradeTestDaemon(t, nil)
+	const n = 20
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			id := fmt.Sprintf("up-concurrent-ledger-%02d", i)
+			d.finishHostUpgrade(id, hostUpgradeOutcome{
+				Applied: false, Error: "busy", CompletedAt: time.Now().UTC().Format(time.RFC3339),
+			})
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	d.hostUpgradeMu.Lock()
+	count := len(d.hostUpgradeDone)
+	d.hostUpgradeMu.Unlock()
+	if count != n {
+		t.Fatalf("in-memory outcomes = %d, want %d (lost update under concurrency)", count, n)
+	}
+	reloaded, err := loadHostUpgradeOutcomes(hostUpgradeStatePath(d.opts.ConfigPath))
+	if err != nil {
+		t.Fatalf("reload durable: %v", err)
+	}
+	if len(reloaded) != n {
+		t.Fatalf("durable outcomes = %d, want %d (lost update overwrote ledger)", len(reloaded), n)
+	}
+}
+
+func TestHostUpgradeExpiryDuringDownloadRefusesWithoutSwap(t *testing.T) {
+	t.Parallel()
+	d := hostUpgradeTestDaemon(t, nil)
+	var calls atomic.Int32
+	d.runPreparedUpdate = func(context.Context, AutoUpdateConfig, string) (*UpdateResult, error) {
+		calls.Add(1)
+		// Ignore context on purpose: a slow download that runs past consent
+		// must still refuse via the post-execution expiry revalidation.
+		time.Sleep(3 * time.Second)
+		return &UpdateResult{Updated: true, Version: "8.8.8", Reason: "update-applied"}, nil
+	}
+	expiresAt := time.Now().Add(1 * time.Second).UTC().Format(time.RFC3339)
+	m := hostUpgradeMutation("up-expiry-download", map[string]any{"consented": true, "expiresAt": expiresAt})
+	if applied, failures := d.applyPendingMutations(context.Background(), []PendingMutation{m}); len(applied) != 0 || len(failures) != 0 {
+		t.Fatalf("first applied/failures = %v/%v, want pending (valid at admission)", applied, failures)
+	}
+	outcome := waitForHostUpgradeDone(t, d, "up-expiry-download")
+	if outcome.Applied {
+		t.Fatalf("expired-during-download outcome = %+v, want refusal", outcome)
+	}
+	if !strings.Contains(strings.ToLower(outcome.Error), "expired") {
+		t.Fatalf("failure %q should name expiry", outcome.Error)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("update calls = %d, want 1 (attempt ran, outcome refused)", got)
 	}
 	applied, failures := d.applyPendingMutations(context.Background(), []PendingMutation{m})
 	if len(applied) != 0 || len(failures) != 1 {

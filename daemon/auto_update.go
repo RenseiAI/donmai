@@ -25,6 +25,17 @@ import (
 // pointing at any vendor's infrastructure.
 const UpdateCDNBase = ""
 
+// effectiveUpdateCDNBase resolves the update source the production updater
+// checks: the operator-configured autoUpdate.cdnBase when set, otherwise the
+// compiled default (empty in OSS builds, so auto-update stays disabled until
+// the operator opts in). Empty means no source is configured.
+func effectiveUpdateCDNBase(cfg AutoUpdateConfig) string {
+	if strings.TrimSpace(cfg.CDNBase) != "" {
+		return strings.TrimSpace(cfg.CDNBase)
+	}
+	return strings.TrimSpace(UpdateCDNBase)
+}
+
 // VersionManifest is the schema of <channel>/latest.json.
 type VersionManifest struct {
 	Version    string `json:"version"`

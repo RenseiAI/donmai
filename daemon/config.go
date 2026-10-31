@@ -524,6 +524,14 @@ type AutoUpdateConfig struct {
 	// deployments. Empty = the embedded public Sigstore production trust
 	// root (the same root kit verification uses; see kit_trust.go).
 	TrustRootPath string `yaml:"trustRootPath,omitempty" json:"trustRootPath,omitempty"`
+
+	// CDNBase is the operator-configured base URL for release manifests
+	// and binaries (<cdnBase>/<channel>/latest.json). Empty means
+	// auto-update is disabled: the OSS binary ships with no default CDN
+	// (see UpdateCDNBase) and never dials a vendor default. A host
+	// upgrade refuses without a swap until the operator sets this
+	// alongside the signer allowlist.
+	CDNBase string `yaml:"cdnBase,omitempty" json:"cdnBase,omitempty"`
 }
 
 // UpdateSigner pins one identity trusted to sign release binaries.

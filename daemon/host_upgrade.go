@@ -131,14 +131,59 @@ func hostUpgradeOptedIn(cfg *Config) bool {
 // manifest check and reports already-up-to-date without contacting any
 // release. Treating that disabled response as applied would falsely ACK
 // success for a host that never checked a release, so admission refuses
-// without a swap when no source is configured. A test seam
-// (runPreparedUpdate) counts as a source because the test provides the
-// release implementation.
+// without a swap when no source is configured. The source is the
+// operator-configured autoUpdate.cdnBase (see effectiveUpdateCDNBase). A
+// test seam (runPreparedUpdate) counts as a source because the test provides
+// the release implementation.
 func (d *Daemon) hostUpgradeSourceConfigured() bool {
 	if d.runPreparedUpdate != nil {
 		return true
 	}
-	return strings.TrimSpace(UpdateCDNBase) != ""
+	cfg := d.Config()
+	if cfg == nil {
+		return false
+	}
+	return strings.TrimSpace(effectiveUpdateCDNBase(cfg.AutoUpdate)) != ""
+}
+
+// hostUpgradeConsentDeadline returns the wall-clock deadline after which the
+// request must refuse without a swap: the explicit expiresAt when present,
+// otherwise requestedAt plus the maximum actionable age. The execution
+// context is bounded by this deadline so a manifest or binary download that
+// runs past consent cannot still replace the binary.
+func hostUpgradeConsentDeadline(m PendingMutation) (time.Time, bool) {
+	if len(bytes.TrimSpace(m.Params)) != 0 {
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal(m.Params, &raw); err == nil {
+			var params hostUpgradeParams
+			if err := json.Unmarshal(m.Params, &params); err == nil {
+				if strings.TrimSpace(params.ExpiresAt) != "" {
+					if deadline, err := time.Parse(time.RFC3339, strings.TrimSpace(params.ExpiresAt)); err == nil {
+						return deadline, true
+					}
+				}
+			}
+		}
+	}
+	if strings.TrimSpace(m.RequestedAt) != "" {
+		if requested, err := time.Parse(time.RFC3339, strings.TrimSpace(m.RequestedAt)); err == nil {
+			return requested.Add(hostUpgradeMaxRequestedAge), true
+		}
+	}
+	return time.Time{}, false
+}
+
+// hostUpgradeBoundedContext returns an execution context bounded both by the
+// shutdown/cancellation parent and by consent: the deadline is the earlier of
+// the consent deadline and now plus the execution bound. A nil deadline
+// falls back to the execution bound alone.
+func hostUpgradeBoundedContext(m PendingMutation) (context.Context, context.CancelFunc) {
+	now := time.Now()
+	bound := now.Add(hostUpgradeExecutionBound)
+	if deadline, ok := hostUpgradeConsentDeadline(m); ok && deadline.Before(bound) {
+		bound = deadline
+	}
+	return context.WithDeadline(context.Background(), bound)
 }
 
 // hostUpgradeStatePath is the durable outcome file. It lives beside
@@ -172,6 +217,9 @@ func loadHostUpgradeOutcomes(path string) (map[string]hostUpgradeOutcome, error)
 	var decoded map[string]hostUpgradeOutcome
 	if err := json.Unmarshal(data, &decoded); err != nil {
 		return outcomes, fmt.Errorf("host.upgrade refused: durable state corrupt: %w", err)
+	}
+	if decoded == nil {
+		return outcomes, fmt.Errorf("host.upgrade refused: durable state corrupt: empty ledger")
 	}
 	for id, outcome := range decoded {
 		if strings.TrimSpace(id) == "" {
@@ -469,7 +517,7 @@ func (d *Daemon) cancelHostUpgrades() {
 }
 
 func (d *Daemon) runHostUpgrade(m PendingMutation) {
-	ctx, cancel := context.WithTimeout(context.Background(), hostUpgradeExecutionBound)
+	ctx, cancel := hostUpgradeBoundedContext(m)
 	d.hostUpgradeMu.Lock()
 	d.initHostUpgradeStateLocked()
 	d.hostUpgradeCancels[m.ID] = cancel
@@ -504,6 +552,16 @@ func (d *Daemon) runHostUpgrade(m PendingMutation) {
 	_ = preparation
 	if err != nil {
 		d.releaseLifecycle(lease)
+		// When consent lapses during the preflight wait the bounded
+		// context expires first: report the consent deadline, not the
+		// generic preflight wait, so the refusal names expiry.
+		if consentErr := parseHostUpgradeParams(m, time.Now()); consentErr != nil {
+			d.finishHostUpgrade(m.ID, hostUpgradeOutcome{
+				Applied: false, Error: consentErr.Error(),
+				CompletedAt: time.Now().UTC().Format(time.RFC3339),
+			})
+			return
+		}
 		d.finishHostUpgrade(m.ID, hostUpgradeOutcome{
 			Applied: false, Error: "host.upgrade preflight refused: " + err.Error(),
 			CompletedAt: time.Now().UTC().Format(time.RFC3339),
@@ -534,6 +592,23 @@ func (d *Daemon) runHostUpgrade(m PendingMutation) {
 	}
 
 	result, runErr := d.executeHostUpgrade(ctx)
+	// Consent bounds the swap itself, not just admission and preflight: a
+	// download that runs past expiry must not become an applied outcome,
+	// even when the release seam ignores context cancellation.
+	if consentErr := parseHostUpgradeParams(m, time.Now()); consentErr != nil {
+		d.lifecycleMu.Lock()
+		if d.ownsLifecycleLocked(lease) && d.stopGen == nil && d.State() == StateUpdating {
+			d.setState(StateDraining)
+		}
+		d.lifecycleMu.Unlock()
+		d.releaseLifecycle(lease)
+		d.finishHostUpgrade(m.ID, hostUpgradeOutcome{
+			Applied: false, Error: consentErr.Error(),
+			Reason: reasonOfHostUpgradeResult(result), Version: versionOfHostUpgradeResult(result),
+			CompletedAt: time.Now().UTC().Format(time.RFC3339),
+		})
+		return
+	}
 	d.lifecycleMu.Lock()
 	if d.ownsLifecycleLocked(lease) && d.stopGen == nil && d.State() == StateUpdating {
 		d.setState(StateDraining)
@@ -600,14 +675,16 @@ func (d *Daemon) executeHostUpgrade(ctx context.Context) (*UpdateResult, error) 
 		return d.runPreparedUpdate(ctx, cfg.AutoUpdate, d.EffectiveVersion())
 	}
 	// Fail closed when the production updater has no source to check: with
-	// an empty CDN base the updater would report already-up-to-date without
-	// contacting any release, which must never become an applied ACK.
-	if strings.TrimSpace(UpdateCDNBase) == "" {
+	// no configured CDN base the updater would report already-up-to-date
+	// without contacting any release, which must never become an applied ACK.
+	cdnBase := effectiveUpdateCDNBase(cfg.AutoUpdate)
+	if strings.TrimSpace(cdnBase) == "" {
 		return &UpdateResult{Updated: false, Version: d.EffectiveVersion(), Reason: "update-source-not-configured"}, fmt.Errorf("host.upgrade refused: update source is not configured")
 	}
 	updater := NewUpdater(UpdaterOptions{
 		CurrentVersion: d.EffectiveVersion(),
 		Config:         cfg.AutoUpdate,
+		CDNBase:        cdnBase,
 		SkipExit:       true,
 	})
 	return updater.RunUpdate(ctx)
@@ -629,9 +706,13 @@ func (d *Daemon) finishHostUpgrade(id string, outcome hostUpgradeOutcome) {
 		outcome.Error = "host.upgrade failed without a swap"
 	}
 	outcome.Pending = false
-	persistErr := persistHostUpgradeOutcome(hostUpgradeStatePath(d.opts.ConfigPath), id, outcome)
+	// Serialize the read-modify-rename ledger under the shared mutex:
+	// admission persists already hold this mutex, so completing outside it
+	// lets a concurrent busy refusal overwrite a success (or vice versa)
+	// and lose the durable receipt into a second swap after restart.
 	d.hostUpgradeMu.Lock()
 	d.initHostUpgradeStateLocked()
+	persistErr := persistHostUpgradeOutcome(hostUpgradeStatePath(d.opts.ConfigPath), id, outcome)
 	if persistErr != nil {
 		d.hostUpgradeDurableBroken = true
 		d.hostUpgradeDurableError = persistErr.Error()
