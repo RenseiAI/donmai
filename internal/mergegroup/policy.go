@@ -59,10 +59,13 @@ func Resolve(exits []int) (succeeded bool, attempts int) {
 }
 
 var (
-	maxAttemptsRe = regexp.MustCompile(`(?i)max-attempts\s*:`)
-	retryActionRe = regexp.MustCompile(`(?i)uses\s*:\s*\S*retr(y|ies)`)
-	jobHeaderRe   = regexp.MustCompile(`^  [A-Za-z0-9_.-]+:`)
-	shellLoopRe   = regexp.MustCompile(`(?i)\bfor\s+\S+\s+in\b[^\n]*\bdo\b|\bwhile\b[^\n]*\bdo\b|\buntil\b[^\n]*\bdo\b`)
+	maxAttemptsRe   = regexp.MustCompile(`(?i)max-attempts\s*:`)
+	retryActionRe   = regexp.MustCompile(`(?i)uses\s*:\s*\S*retr(y|ies)`)
+	jobHeaderRe     = regexp.MustCompile(`^  [A-Za-z0-9_.-]+:`)
+	shellLoopRe     = regexp.MustCompile(`(?i)\bfor\s+\S+\s+in\b[^\n]*\bdo\b|\bwhile\b[^\n]*\bdo\b|\buntil\b[^\n]*\bdo\b`)
+	semicolonTrueRe = regexp.MustCompile(`;\s*true\b`)
+	semicolonNoopRe = regexp.MustCompile(`;\s*:(?:\s|;|$)`)
+	andTrueRe       = regexp.MustCompile(`&&\s*true\b`)
 )
 
 func jobBlock(text, job string) (string, bool) {
@@ -160,7 +163,12 @@ func stepChunks(code string) []string {
 		cur = nil
 	}
 	for _, l := range strings.Split(code, "\n") {
-		if strings.HasPrefix(l, "      - ") {
+		// Split on job headers as well as steps so a chunk never spans
+		// two jobs. Without this, a header line (e.g. max-attempts)
+		// glues to the previous job's go test and trips the wrong guard.
+		if jobHeaderRe.MatchString(l) {
+			flush()
+		} else if strings.HasPrefix(l, "      - ") {
 			flush()
 		}
 		cur = append(cur, l)
@@ -209,6 +217,21 @@ func hasShellRetry(code string) bool {
 			}
 		}
 		if strings.Contains(s, "exit 0") {
+			return true
+		}
+		// Exit-zero masking: "; true" / "; :" / "&& true" after the
+		// test run always succeeds, concealing a deterministic failure.
+		if semicolonTrueRe.FindString(s) != "" {
+			return true
+		}
+		if semicolonNoopRe.FindString(s) != "" {
+			return true
+		}
+		if andTrueRe.FindString(s) != "" {
+			return true
+		}
+		// Cross-step retry: a later step reruns the tests after failure.
+		if strings.Contains(ll, "failure()") {
 			return true
 		}
 	}

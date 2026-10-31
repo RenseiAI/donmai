@@ -73,13 +73,51 @@ func TestValidateWorkflowRejectsRetry(t *testing.T) {
 	base := repoWorkflow(t)
 	withRetry := strings.Replace(base, "timeout-minutes: 30",
 		"timeout-minutes: 30\n      continue-on-error: true", 1)
-	if err := ValidateWorkflow(withRetry); err == nil {
+	err := ValidateWorkflow(withRetry)
+	if err == nil {
 		t.Fatal("ValidateWorkflow with continue-on-error = nil, want error")
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), "continue-on-error") {
+		t.Fatalf("ValidateWorkflow with continue-on-error = %v, want continue-on-error error", err)
 	}
 	withAttempts := strings.Replace(base, "timeout-minutes: 30",
 		"timeout-minutes: 30\n      max-attempts: 3", 1)
-	if err := ValidateWorkflow(withAttempts); err == nil {
+	err = ValidateWorkflow(withAttempts)
+	if err == nil {
 		t.Fatal("ValidateWorkflow with max-attempts = nil, want error")
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), "max-attempts") {
+		t.Fatalf("ValidateWorkflow with max-attempts = %v, want max-attempts error", err)
+	}
+}
+
+func TestValidateWorkflowRejectsExitZeroMasking(t *testing.T) {
+	base := repoWorkflow(t)
+	cases := map[string]string{
+		"semicolon-true": strings.Replace(base,
+			"go test -race -coverprofile=coverage.out -json ./...",
+			"go test -race -coverprofile=coverage.out -json ./...; true", 1),
+		"semicolon-noop": strings.Replace(base,
+			"go test -race -coverprofile=coverage.out -json ./...",
+			"go test -race -coverprofile=coverage.out -json ./...; :", 1),
+		"and-true": strings.Replace(base,
+			"go test -race -coverprofile=coverage.out -json ./...",
+			"go test -race -coverprofile=coverage.out -json ./... && true", 1),
+	}
+	for name, txt := range cases {
+		if err := ValidateWorkflow(txt); err == nil {
+			t.Errorf("ValidateWorkflow(%s) = nil, want error", name)
+		}
+	}
+}
+
+func TestValidateWorkflowRejectsFailureRerun(t *testing.T) {
+	base := repoWorkflow(t)
+	// Neutral step name: no retry/attempt word, only if: failure() + go test.
+	withRerun := strings.Replace(base, "timeout-minutes: 30",
+		"timeout-minutes: 30\n      - name: Follow-up checks\n        if: failure()\n        run: go test -race -coverprofile=coverage.out -json ./...", 1)
+	if err := ValidateWorkflow(withRerun); err == nil {
+		t.Fatal("ValidateWorkflow with if: failure() rerun = nil, want error")
 	}
 }
 
