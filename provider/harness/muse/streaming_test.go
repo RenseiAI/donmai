@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -252,27 +253,25 @@ func TestBurstPreservesTerminal(t *testing.T) {
 	if !done {
 		t.Fatalf("turn/completed did not report terminal")
 	}
+	// The pump moves queued events to Events() in order; close then drain
+	// blocks until the ordered prefix (including the terminal) arrives.
+	h.closeEvents()
+	events := drainEvents(t, h.Events(), 5*time.Second)
 	var assistant, result int
-	for {
-		select {
-		case ev := <-h.Events():
-			switch e := ev.(type) {
-			case agent.AssistantTextEvent:
-				if e.Text != full {
-					t.Errorf("assistant text len=%d, want %d", len(e.Text), len(full))
-				} else {
-					assistant++
-				}
-			case agent.ResultEvent:
-				if e.Success {
-					result++
-				}
+	for _, ev := range events {
+		switch e := ev.(type) {
+		case agent.AssistantTextEvent:
+			if e.Text != full {
+				t.Errorf("assistant text len=%d, want %d", len(e.Text), len(full))
+			} else {
+				assistant++
 			}
-		default:
-			goto drained
+		case agent.ResultEvent:
+			if e.Success {
+				result++
+			}
 		}
 	}
-drained:
 	if assistant == 0 || result == 0 {
 		t.Fatalf("burst lost final events: assistant=%d result=%d handlerDone=%v", assistant, result, done)
 	}
@@ -326,25 +325,21 @@ func TestBurstPreservesTerminal_Reasoning(t *testing.T) {
 	if !done {
 		t.Fatalf("turn/completed did not report terminal")
 	}
+	h.closeEvents()
+	events := drainEvents(t, h.Events(), 5*time.Second)
 	var assistant, result int
-	for {
-		select {
-		case ev := <-h.Events():
-			switch e := ev.(type) {
-			case agent.AssistantTextEvent:
-				if e.Text == full {
-					assistant++
-				}
-			case agent.ResultEvent:
-				if e.Success {
-					result++
-				}
+	for _, ev := range events {
+		switch e := ev.(type) {
+		case agent.AssistantTextEvent:
+			if e.Text == full {
+				assistant++
 			}
-		default:
-			goto drainedReasoning
+		case agent.ResultEvent:
+			if e.Success {
+				result++
+			}
 		}
 	}
-drainedReasoning:
 	if assistant == 0 || result == 0 {
 		t.Fatalf("reasoning burst lost final events: assistant=%d result=%d handlerDone=%v", assistant, result, done)
 	}
@@ -499,27 +494,23 @@ func TestMixedBurstPreservesTerminal(t *testing.T) {
 	if !done {
 		t.Fatalf("turn/completed did not report terminal")
 	}
+	h.closeEvents()
+	events := drainEvents(t, h.Events(), 5*time.Second)
 	var assistant, usage, result int
-	for {
-		select {
-		case ev := <-h.Events():
-			switch e := ev.(type) {
-			case agent.AssistantTextEvent:
-				if e.Text == full {
-					assistant++
-				}
-			case agent.LlmCallEvent:
-				usage++
-			case agent.ResultEvent:
-				if e.Success {
-					result++
-				}
+	for _, ev := range events {
+		switch e := ev.(type) {
+		case agent.AssistantTextEvent:
+			if e.Text == full {
+				assistant++
 			}
-		default:
-			goto drainedMixed
+		case agent.LlmCallEvent:
+			usage++
+		case agent.ResultEvent:
+			if e.Success {
+				result++
+			}
 		}
 	}
-drainedMixed:
 	if assistant == 0 || usage == 0 || result == 0 {
 		t.Fatalf("mixed burst lost final events: assistant=%d usage=%d result=%d handlerDone=%v", assistant, usage, result, done)
 	}
@@ -580,26 +571,145 @@ func TestPureToolBurstPreservesTerminal(t *testing.T) {
 	if !done {
 		t.Fatalf("turn/completed did not report terminal")
 	}
+	h.closeEvents()
+	events := drainEvents(t, h.Events(), 5*time.Second)
 	var assistant, result int
-	for {
-		select {
-		case ev := <-h.Events():
-			switch e := ev.(type) {
-			case agent.AssistantTextEvent:
-				if e.Text == full {
-					assistant++
-				}
-			case agent.ResultEvent:
-				if e.Success {
-					result++
-				}
+	for _, ev := range events {
+		switch e := ev.(type) {
+		case agent.AssistantTextEvent:
+			if e.Text == full {
+				assistant++
 			}
-		default:
-			goto drainedPureTool
+		case agent.ResultEvent:
+			if e.Success {
+				result++
+			}
 		}
 	}
-drainedPureTool:
 	if assistant != 1 || result != 1 {
 		t.Fatalf("pure-tool flood lost terminal: assistant=%d result=%d handlerDone=%v", assistant, result, done)
+	}
+}
+
+// TestConcurrentDrainPreservesToolOrder pins the B1 ordering contract:
+// a slow concurrent Events() reader draining while the forwarder floods
+// best-effort liveness plus tool traffic must still observe every tool
+// use before its result. The pump owns the only send path to Events()
+// in FIFO order and eviction applies to the queue, so a concurrent
+// receive can never interleave with a drain and flip use/result (which
+// keeps a finished tool marked running in the runner). Drives the
+// production Handle.handleNotification path with a concurrent drain.
+
+// TestConcurrentDrainPreservesToolOrder pins the B1 ordering contract:
+// filling the buffer without a drain, then emitting the terminal while a
+// concurrent Events() reader drains, must still observe every tool use
+// before its result. The pump owns the only send path to Events() in FIFO
+// order and eviction applies to the queue, so a concurrent receive can
+// never interleave with a drain and flip use/result (which keeps a
+// finished tool marked running in the runner). Drives the production
+// Handle.handleNotification path with a concurrent drain.
+func TestConcurrentDrainPreservesToolOrder(t *testing.T) {
+	h := newHandle(nil, agent.Spec{Prompt: "x"}, NewSpawnPlan(agent.Spec{Prompt: "x"}, t.TempDir()), HandleOptions{})
+	sid := "b0b0b0b0-b0b0-7b0b-8b0b-b0b0b0b0b0b0"
+	turnID := "c1c1c1c1-c1c1-7c1c-8c1c-c1c1c1c1c1c1"
+	h.setSessionID(sid)
+	h.setCurrentTurnID(turnID)
+	// Fill the buffer with ordinary tool traffic and no drain, so the
+	// terminal below must make room while a reader is active (the old
+	// drain-and-requeue window).
+	const tools = 128
+	for i := 0; i < tools; i++ {
+		id := fmt.Sprintf("concurrent-tool-%d", i)
+		sParams, err := json.Marshal(map[string]any{
+			"sessionId": sid, "viewCursor": "cursor-0",
+			"item": map[string]any{"itemId": id, "kind": "toolCall", "revision": 1, "status": "inProgress", "tool": "edit", "args": `{"path":"a.txt"}`, "turnId": turnID},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		h.handleNotification(context.Background(), notification{Method: "item/started", Params: sParams})
+		cParams, err := json.Marshal(map[string]any{
+			"sessionId": sid, "viewCursor": "cursor-0",
+			"item": map[string]any{"itemId": id, "kind": "toolCall", "revision": 2, "status": "completed", "tool": "edit", "visibleOutput": "ok", "turnId": turnID},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		h.handleNotification(context.Background(), notification{Method: "item/completed", Params: cParams})
+	}
+	var mu sync.Mutex
+	var got []agent.Event
+	drained := make(chan struct{})
+	go func() {
+		defer close(drained)
+		for ev := range h.Events() {
+			mu.Lock()
+			got = append(got, ev)
+			mu.Unlock()
+		}
+	}()
+	full := "final answer"
+	completed, err := json.Marshal(map[string]any{
+		"sessionId": sid, "viewCursor": "cursor-1",
+		"item": map[string]any{"itemId": "concurrent-m1", "kind": "agentMessage", "revision": 1, "status": "completed", "text": full, "turnId": turnID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.handleNotification(context.Background(), notification{Method: "item/completed", Params: completed})
+	turnDone, err := json.Marshal(map[string]any{"sessionId": sid, "viewCursor": "cursor-end", "turnId": turnID, "terminal": "completed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if done := h.handleNotification(context.Background(), notification{Method: "turn/completed", Params: turnDone}); !done {
+		t.Fatalf("turn/completed did not report terminal")
+	}
+	h.closeEvents()
+	select {
+	case <-drained:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("concurrent drain did not finish")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	useIdx := map[string]int{}
+	for idx, ev := range got {
+		switch e := ev.(type) {
+		case agent.ToolUseEvent:
+			if _, dup := useIdx[e.ToolUseID]; !dup {
+				useIdx[e.ToolUseID] = idx
+			}
+		case agent.ToolResultEvent:
+			u, ok := useIdx[e.ToolUseID]
+			if !ok {
+				t.Errorf("tool result without preceding use: %q at index %d", e.ToolUseID, idx)
+				continue
+			}
+			if u > idx {
+				t.Errorf("tool %q use at %d delivered after result at %d", e.ToolUseID, u, idx)
+			}
+		}
+	}
+	// The terminal ejects the oldest tool pair when the queue is full of
+	// ordinary traffic, so at least tools-1 pairs survive in order; every
+	// surviving result still follows its use.
+	if len(useIdx) < tools-1 {
+		t.Fatalf("tool uses=%d, want at least %d (kinds=%v)", len(useIdx), tools-1, kindsOf(got))
+	}
+	var assistant, result int
+	for _, ev := range got {
+		switch e := ev.(type) {
+		case agent.AssistantTextEvent:
+			if e.Text == full {
+				assistant++
+			}
+		case agent.ResultEvent:
+			if e.Success {
+				result++
+			}
+		}
+	}
+	if assistant == 0 || result == 0 {
+		t.Fatalf("concurrent drain lost terminal: assistant=%d result=%d events=%d", assistant, result, len(got))
 	}
 }

@@ -75,6 +75,18 @@ type Handle struct {
 	events   chan agent.Event
 	notifyCh chan notification
 
+	// queue is the ordered overflow buffer between the forwarder and
+	// Events(). emit appends under queueMu (applying the drop/evict
+	// policy); exactly one pump goroutine moves entries to events in
+	// FIFO order. Eviction never touches events, so a concurrent
+	// Events() reader cannot interleave with a drain and reorder
+	// (tool result before its use). queue is bounded by cap(events).
+	queueMu     sync.Mutex
+	queue       []agent.Event
+	queueNotify chan struct{}
+	queueClosed bool
+	pumpDone    chan struct{}
+
 	// decidedApprovals dedupes approval decisions by approvalId: the
 	// host may present the same approval as both an
 	// approval/requested notification and an approval/request
@@ -135,7 +147,7 @@ func newHandle(p *Provider, spec agent.Spec, plan SpawnPlan, opts HandleOptions)
 	if opts.EventBuffer == 0 {
 		opts.EventBuffer = 256
 	}
-	return &Handle{
+	h := &Handle{
 		provider:         p,
 		bridge:           NewApprovalBridge(spec.PermissionConfig),
 		spec:             spec,
@@ -143,10 +155,14 @@ func newHandle(p *Provider, spec agent.Spec, plan SpawnPlan, opts HandleOptions)
 		rpcTimeout:       opts.RPCTimeout,
 		events:           make(chan agent.Event, opts.EventBuffer),
 		notifyCh:         make(chan notification, 256),
+		queueNotify:      make(chan struct{}, 1),
+		pumpDone:         make(chan struct{}),
 		closed:           make(chan struct{}),
 		state:            newMapperState(resolveModel(spec)),
 		decidedApprovals: make(map[string]struct{}),
 	}
+	go h.pump()
+	return h
 }
 
 // setConfinement attaches the plan a confined spawn runs under. The
@@ -801,18 +817,21 @@ func (h *Handle) signalClosed() {
 	h.closedOnce.Do(func() { close(h.closed) })
 }
 
-// closeEvents closes h.events exactly once. The flag is set FIRST
-// under the write lock so concurrent emit() callers cannot race past
-// the check and send to the closed channel.
+// closeEvents stops intake and arranges the ordered close: it marks the
+// queue closed and wakes the pump, which drains the queued events to
+// Events() in order before closing the channel. Child teardown and
+// confinement release run immediately so Stop does not wait for a slow
+// consumer to drain. Idempotent.
 func (h *Handle) closeEvents() {
-	h.eventsMu.Lock()
-	if h.eventsClosed.Load() {
-		h.eventsMu.Unlock()
-		return
+	h.queueMu.Lock()
+	if !h.queueClosed {
+		h.queueClosed = true
+		select {
+		case h.queueNotify <- struct{}{}:
+		default:
+		}
 	}
-	h.eventsClosed.Store(true)
-	close(h.events)
-	h.eventsMu.Unlock()
+	h.queueMu.Unlock()
 
 	if h.provider != nil {
 		h.provider.unregisterHandle(h)
@@ -821,104 +840,134 @@ func (h *Handle) closeEvents() {
 	h.releaseConfinement()
 }
 
-// emit publishes an event on the events channel without blocking.
-// Best-effort streaming output never takes a reserved slot: once the
-// buffer holds cap-reserved events it is dropped early so the
-// authoritative assistant completion and terminal result still fit.
-// When a non-best-effort event arrives at a full buffer, emit evicts
-// queued best-effort output to make room; a fixed reservation alone only
-// moves the failure threshold once ordinary traffic (tool calls) fills
-// the reserved tail. When no best-effort output remains, a high-priority
-// terminal-adjacent event (assistant completion, usage, result/error)
-// evicts the oldest queued event rather than dropping the verdict.
+// finalCloseEvents closes h.events exactly once. Only the pump calls
+// it, after the queue has drained, so Events() readers observe every
+// queued event in FIFO order before the close.
+
+// emit enqueues an event on the ordered queue without blocking. The
+// pump moves queued events to Events() in FIFO order, so a concurrent
+// Events() reader always observes tool use before its result. Eviction
+// applies to the queue (never the channel): best-effort streaming
+// output never takes a reserved slot, queued best-effort output is
+// dropped first when the queue is full, and a terminal-adjacent event
+// (assistant completion, usage, result/error) evicts the oldest queued
+// event when no best-effort remains rather than dropping the verdict.
 func (h *Handle) emit(ev agent.Event) {
-	h.eventsMu.Lock()
-	defer h.eventsMu.Unlock()
-	if h.eventsClosed.Load() {
+	h.queueMu.Lock()
+	if h.queueClosed || h.eventsClosed.Load() {
+		h.queueMu.Unlock()
 		return
 	}
 	if isBestEffortStreamEvent(ev) {
-		if n := cap(h.events); n > streamProgressReservedSlots && len(h.events) >= n-streamProgressReservedSlots {
+		if n := cap(h.events); n > streamProgressReservedSlots && len(h.queue) >= n-streamProgressReservedSlots {
+			h.queueMu.Unlock()
 			return
 		}
-		select {
-		case h.events <- ev:
-		case <-h.closed:
-		default:
-		}
+		h.queue = append(h.queue, ev)
+		h.queueMu.Unlock()
+		h.signalPump()
 		return
 	}
-	select {
-	case h.events <- ev:
+	if len(h.queue) < cap(h.events) {
+		h.queue = append(h.queue, ev)
+		h.queueMu.Unlock()
+		h.signalPump()
 		return
-	case <-h.closed:
-		return
-	default:
 	}
 	if h.evictForTerminal(ev) {
-		select {
-		case h.events <- ev:
-		case <-h.closed:
-		default:
-		}
+		h.queue = append(h.queue, ev)
+	}
+	h.queueMu.Unlock()
+	h.signalPump()
+}
+
+// signalPump wakes the pump without blocking.
+func (h *Handle) signalPump() {
+	select {
+	case h.queueNotify <- struct{}{}:
+	default:
 	}
 }
 
-// evictForTerminal makes room for ev on a full events channel by
-// dropping queued best-effort output first. It must be called with
-// eventsMu held and only when the non-blocking send above failed.
-// Reports whether room was made. Drained normal events are re-queued in
-// order; only best-effort output — or, for high-priority terminal-
-// adjacent events with no best-effort left, the single oldest event —
-// is lost.
+// evictForTerminal makes room for ev in a full queue by dropping
+// queued best-effort output first. It must be called with queueMu held
+// and only when the queue is full. Reports whether room was made:
+// ordinary events are dropped when no best-effort remains, while a
+// terminal-adjacent event evicts the single oldest queued event rather
+// than dropping the verdict. Queued order is otherwise preserved.
 func (h *Handle) evictForTerminal(ev agent.Event) bool {
-	n := len(h.events)
+	n := len(h.queue)
 	if n == 0 {
 		return true
 	}
-	kept := make([]agent.Event, 0, n)
+	kept := h.queue[:0]
 	evicted := 0
-	for {
-		select {
-		case e := <-h.events:
-			if isBestEffortStreamEvent(e) {
-				evicted++
-				continue
-			}
-			kept = append(kept, e)
-		default:
-			goto drained
+	for _, e := range h.queue {
+		if isBestEffortStreamEvent(e) {
+			evicted++
+			continue
 		}
+		kept = append(kept, e)
 	}
-drained:
-	if evicted == 0 {
-		if !isTerminalAdjacentEvent(ev) {
-			for _, e := range kept {
-				select {
-				case h.events <- e:
-				case <-h.closed:
-					return false
-				default:
-					return false
-				}
-			}
-			return false
-		}
-		if len(kept) == 0 {
-			return true
-		}
-		kept = kept[1:]
+	// Clear the dropped tail so best-effort payloads can be collected.
+	for i := len(kept); i < n; i++ {
+		h.queue[i] = nil
 	}
-	for _, e := range kept {
-		select {
-		case h.events <- e:
-		case <-h.closed:
-			return false
-		default:
-			return false
-		}
+	h.queue = kept
+	if evicted > 0 {
+		return true
 	}
+	if !isTerminalAdjacentEvent(ev) {
+		return false
+	}
+	if len(h.queue) == 0 {
+		return true
+	}
+	copy(h.queue, h.queue[1:])
+	h.queue[len(h.queue)-1] = nil
+	h.queue = h.queue[:len(h.queue)-1]
 	return true
+}
+
+// pump is the single goroutine that moves queued events to Events() in
+// FIFO order. It exits after the queue is closed and drained, closing
+// Events() only then so readers observe the full ordered prefix.
+func (h *Handle) pump() {
+	defer close(h.pumpDone)
+	for {
+		h.queueMu.Lock()
+		for len(h.queue) == 0 {
+			if h.queueClosed {
+				h.queueMu.Unlock()
+				h.finalCloseEvents()
+				return
+			}
+			h.queueMu.Unlock()
+			select {
+			case <-h.queueNotify:
+			case <-h.closed:
+			}
+			h.queueMu.Lock()
+		}
+		ev := h.queue[0]
+		h.queue[0] = nil
+		h.queue = h.queue[1:]
+		h.queueMu.Unlock()
+		// Blocking send preserves FIFO: only the pump sends on events,
+		// so a concurrent Events() reader cannot reorder use/result.
+		h.events <- ev
+	}
+}
+
+// finalCloseEvents closes h.events exactly once. Only the pump calls
+// it, after the queue has drained.
+func (h *Handle) finalCloseEvents() {
+	h.eventsMu.Lock()
+	if !h.eventsClosed.Load() {
+		h.eventsClosed.Store(true)
+		close(h.events)
+	}
+	h.eventsMu.Unlock()
 }
 
 // isTerminalAdjacentEvent reports whether ev is terminal-adjacent and
