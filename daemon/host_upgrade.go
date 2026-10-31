@@ -34,6 +34,15 @@ const hostUpgradeExecutionBound = 5 * time.Minute
 // updating a host the operator may no longer intend to move.
 const hostUpgradeMaxRequestedAge = 24 * time.Hour
 
+// hostUpgradeMaxRetainedOutcomes bounds how many terminal outcomes are
+// retained in memory and in the durable ledger. Every unique refusal was
+// retained forever, so a flood of unique IDs grew memory and disk without
+// bound and made each subsequent refusal re-encode and fsync an ever
+// larger file while holding the heartbeat mutation path. When the bound is
+// reached the oldest outcome is evicted to make room; a redelivery of an
+// evicted ID simply re-validates to the same refusal without a swap.
+const hostUpgradeMaxRetainedOutcomes = 128
+
 // hostUpgradeOutcome is the durable per-request outcome. Applied is true only
 // when the attempt reached its defined durable point (binary swapped or host
 // already current); every refusal or failed attempt records Applied false
@@ -97,7 +106,7 @@ func parseHostUpgradeParams(m PendingMutation, now time.Time) error {
 		return fmt.Errorf("host.upgrade requires consented:true")
 	}
 	if strings.TrimSpace(params.ExpiresAt) != "" {
-		deadline, err := time.Parse(time.RFC3339, strings.TrimSpace(params.ExpiresAt))
+		deadline, err := parseHostUpgradeTime(strings.TrimSpace(params.ExpiresAt))
 		if err != nil {
 			return fmt.Errorf("host.upgrade expiresAt is malformed: %w", err)
 		}
@@ -107,7 +116,7 @@ func parseHostUpgradeParams(m PendingMutation, now time.Time) error {
 		return nil
 	}
 	if strings.TrimSpace(m.RequestedAt) != "" {
-		requested, err := time.Parse(time.RFC3339, strings.TrimSpace(m.RequestedAt))
+		requested, err := parseHostUpgradeTime(strings.TrimSpace(m.RequestedAt))
 		if err != nil {
 			return fmt.Errorf("host.upgrade requestedAt is malformed: %w", err)
 		}
@@ -116,6 +125,17 @@ func parseHostUpgradeParams(m PendingMutation, now time.Time) error {
 		}
 	}
 	return nil
+}
+
+// parseHostUpgradeTime parses request timestamps. RFC3339Nano is accepted
+// so sub-second deadlines keep their full margin: formatting an expiry with
+// second precision can truncate almost a whole second off the admission
+// margin and turn a valid request into a flaky admission.
+func parseHostUpgradeTime(s string) (time.Time, error) {
+	if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
+		return t, nil
+	}
+	return time.Parse(time.RFC3339, s)
 }
 
 // hostUpgradeOptedIn reports the independent machine-owner opt-in: the host
@@ -158,7 +178,7 @@ func hostUpgradeConsentDeadline(m PendingMutation) (time.Time, bool) {
 			var params hostUpgradeParams
 			if err := json.Unmarshal(m.Params, &params); err == nil {
 				if strings.TrimSpace(params.ExpiresAt) != "" {
-					if deadline, err := time.Parse(time.RFC3339, strings.TrimSpace(params.ExpiresAt)); err == nil {
+					if deadline, err := parseHostUpgradeTime(strings.TrimSpace(params.ExpiresAt)); err == nil {
 						return deadline, true
 					}
 				}
@@ -166,7 +186,7 @@ func hostUpgradeConsentDeadline(m PendingMutation) (time.Time, bool) {
 		}
 	}
 	if strings.TrimSpace(m.RequestedAt) != "" {
-		if requested, err := time.Parse(time.RFC3339, strings.TrimSpace(m.RequestedAt)); err == nil {
+		if requested, err := parseHostUpgradeTime(strings.TrimSpace(m.RequestedAt)); err == nil {
 			return requested.Add(hostUpgradeMaxRequestedAge), true
 		}
 	}
@@ -214,16 +234,31 @@ func loadHostUpgradeOutcomes(path string) (map[string]hostUpgradeOutcome, error)
 		}
 		return outcomes, fmt.Errorf("host.upgrade refused: durable state unreadable: %w", err)
 	}
-	var decoded map[string]hostUpgradeOutcome
-	if err := json.Unmarshal(data, &decoded); err != nil {
+	var rawLedger map[string]json.RawMessage
+	if err := json.Unmarshal(data, &rawLedger); err != nil {
 		return outcomes, fmt.Errorf("host.upgrade refused: durable state corrupt: %w", err)
 	}
-	if decoded == nil {
+	if rawLedger == nil {
 		return outcomes, fmt.Errorf("host.upgrade refused: durable state corrupt: empty ledger")
 	}
-	for id, outcome := range decoded {
+	for id, raw := range rawLedger {
 		if strings.TrimSpace(id) == "" {
 			continue
+		}
+		// A JSON null entry decodes into a zero-valued outcome without an
+		// error. Normal writers never emit null, so a null (or any entry
+		// that decodes to a zero value with no pending/applied/error
+		// signal) is corruption: fail closed instead of treating it as a
+		// healthy empty ledger that would let a new request execute.
+		if strings.TrimSpace(string(bytes.TrimSpace(raw))) == "null" {
+			return outcomes, fmt.Errorf("host.upgrade refused: durable state corrupt: null entry for %q", id)
+		}
+		var outcome hostUpgradeOutcome
+		if err := json.Unmarshal(raw, &outcome); err != nil {
+			return outcomes, fmt.Errorf("host.upgrade refused: durable state corrupt: %w", err)
+		}
+		if !outcome.Pending && !outcome.Applied && strings.TrimSpace(outcome.Error) == "" {
+			return outcomes, fmt.Errorf("host.upgrade refused: durable state corrupt: empty outcome for %q", id)
 		}
 		outcomes[id] = outcome
 	}
@@ -243,6 +278,7 @@ func persistHostUpgradeOutcome(path, id string, outcome hostUpgradeOutcome) erro
 		return err
 	}
 	outcomes[id] = outcome
+	pruneHostUpgradeLedger(outcomes)
 	data, err := json.Marshal(outcomes)
 	if err != nil {
 		return fmt.Errorf("host.upgrade refused: durable state encode failed: %w", err)
@@ -276,10 +312,21 @@ func persistHostUpgradeOutcome(path, id string, outcome hostUpgradeOutcome) erro
 	}
 	// Sync the directory entry so the rename itself is durable: without
 	// this a crash between rename and directory flush can lose the outcome
-	// and a redelivery would run a second swap.
-	if dirFile, err := os.Open(dir); err == nil { //nolint:gosec
-		_ = dirFile.Sync()
-		_ = dirFile.Close()
+	// and a redelivery would run a second swap. Directory sync failures
+	// are errors, not best-effort: with a write-only directory the file
+	// rename can succeed while the entry never becomes durable, so
+	// ignoring this error would run without durability into a second swap.
+	dirFile, err := os.Open(dir) //nolint:gosec
+	if err != nil {
+		return fmt.Errorf("host.upgrade refused: durable state directory not syncable: %w", err)
+	}
+	syncErr := dirFile.Sync()
+	closeErr := dirFile.Close()
+	if syncErr != nil {
+		return fmt.Errorf("host.upgrade refused: durable state directory sync failed: %w", syncErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("host.upgrade refused: durable state directory sync failed: %w", closeErr)
 	}
 	return nil
 }
@@ -303,7 +350,64 @@ func probeHostUpgradeDurability(path string) error {
 	name := tmp.Name()
 	_ = tmp.Close()
 	_ = os.Remove(name) //nolint:gosec
+	// The directory entry itself must be syncable: with a write-only
+	// directory file creation and rename can succeed while opening the
+	// directory for fsync fails, leaving the intent undurable. A crash
+	// before the unsynced rename becomes durable would lose the intent
+	// into a second execution, so probe this before admitting a swap.
+	dirFile, err := os.Open(dir) //nolint:gosec
+	if err != nil {
+		return fmt.Errorf("host.upgrade refused: durable state directory not syncable: %w", err)
+	}
+	syncErr := dirFile.Sync()
+	closeErr := dirFile.Close()
+	if syncErr != nil {
+		return fmt.Errorf("host.upgrade refused: durable state directory sync failed: %w", syncErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("host.upgrade refused: durable state directory sync failed: %w", closeErr)
+	}
 	return nil
+}
+
+// pruneHostUpgradeLedger evicts the oldest outcomes until the ledger fits
+// the retention bound. Oldest is by CompletedAt wall time; entries without
+// a parseable timestamp sort oldest-first so a corrupt clock cannot pin
+// them. Both the in-memory map and the durable file go through this so
+// neither grows without bound under a flood of unique IDs.
+func pruneHostUpgradeLedger(outcomes map[string]hostUpgradeOutcome) {
+	for len(outcomes) > hostUpgradeMaxRetainedOutcomes {
+		oldestID := ""
+		var oldestTime time.Time
+		oldestSet := false
+		for id, outcome := range outcomes {
+			if outcome.Pending {
+				continue
+			}
+			completedAt, err := parseHostUpgradeTime(strings.TrimSpace(outcome.CompletedAt))
+			if err != nil {
+				oldestID = id
+				break
+			}
+			if !oldestSet || completedAt.Before(oldestTime) || (completedAt.Equal(oldestTime) && id < oldestID) {
+				oldestID = id
+				oldestTime = completedAt
+				oldestSet = true
+			}
+		}
+		if oldestID == "" {
+			for id, outcome := range outcomes {
+				if !outcome.Pending {
+					oldestID = id
+					break
+				}
+			}
+		}
+		if oldestID == "" {
+			return
+		}
+		delete(outcomes, oldestID)
+	}
 }
 
 // initHostUpgradeState lazily initializes the in-memory upgrade maps and
@@ -346,6 +450,7 @@ func (d *Daemon) initHostUpgradeStateLocked() {
 				}
 				d.hostUpgradeDone[id] = outcome
 			}
+			pruneHostUpgradeLedger(d.hostUpgradeDone)
 		}
 		d.hostUpgradeLoaded = true
 	}
@@ -390,6 +495,7 @@ func (d *Daemon) handleHostUpgradeMutation(m PendingMutation) (appliedID string,
 		}
 		outcome := hostUpgradeOutcome{Applied: false, Error: errText, CompletedAt: now.UTC().Format(time.RFC3339)}
 		d.hostUpgradeDone[m.ID] = outcome
+		pruneHostUpgradeLedger(d.hostUpgradeDone)
 		d.hostUpgradeMu.Unlock()
 		return "", &HeartbeatMutationFailure{ID: m.ID, Error: errText}
 	}
@@ -405,6 +511,7 @@ func (d *Daemon) handleHostUpgradeMutation(m PendingMutation) (appliedID string,
 		errText := "host.upgrade already in progress"
 		outcome := hostUpgradeOutcome{Applied: false, Error: errText, CompletedAt: now.UTC().Format(time.RFC3339)}
 		d.hostUpgradeDone[m.ID] = outcome
+		pruneHostUpgradeLedger(d.hostUpgradeDone)
 		if persistErr := persistHostUpgradeOutcome(statePath, m.ID, outcome); persistErr != nil {
 			d.hostUpgradeDurableBroken = true
 			d.hostUpgradeDurableError = persistErr.Error()
@@ -419,6 +526,7 @@ func (d *Daemon) handleHostUpgradeMutation(m PendingMutation) (appliedID string,
 		errText := "host.upgrade refused: lifecycle busy"
 		outcome := hostUpgradeOutcome{Applied: false, Error: errText, CompletedAt: now.UTC().Format(time.RFC3339)}
 		d.hostUpgradeDone[m.ID] = outcome
+		pruneHostUpgradeLedger(d.hostUpgradeDone)
 		if persistErr := persistHostUpgradeOutcome(statePath, m.ID, outcome); persistErr != nil {
 			d.hostUpgradeDurableBroken = true
 			d.hostUpgradeDurableError = persistErr.Error()
@@ -426,20 +534,16 @@ func (d *Daemon) handleHostUpgradeMutation(m PendingMutation) (appliedID string,
 		d.hostUpgradeMu.Unlock()
 		return "", &HeartbeatMutationFailure{ID: m.ID, Error: errText}
 	}
-	if err := parseHostUpgradeParams(m, now); err != nil {
-		outcome := hostUpgradeOutcome{Applied: false, Error: err.Error(), CompletedAt: now.UTC().Format(time.RFC3339)}
-		d.hostUpgradeDone[m.ID] = outcome
-		if persistErr := persistHostUpgradeOutcome(statePath, m.ID, outcome); persistErr != nil {
-			d.hostUpgradeDurableBroken = true
-			d.hostUpgradeDurableError = persistErr.Error()
-		}
-		d.hostUpgradeMu.Unlock()
-		return "", &HeartbeatMutationFailure{ID: m.ID, Error: err.Error()}
-	}
+	// Machine-owner opt-in and the configured update source are checked
+	// before request-shape validation so an unauthenticated flood against a
+	// host with no signed source cannot grow the retained ledger: the
+	// refusal names the missing opt-in instead of persisting a per-ID
+	// shape refusal.
 	if !hostUpgradeOptedIn(d.configSnapshotForUpgrade()) {
 		err := "host.upgrade refused: machine-owner update consent is not configured (no signed source)"
 		outcome := hostUpgradeOutcome{Applied: false, Error: err, CompletedAt: now.UTC().Format(time.RFC3339)}
 		d.hostUpgradeDone[m.ID] = outcome
+		pruneHostUpgradeLedger(d.hostUpgradeDone)
 		if persistErr := persistHostUpgradeOutcome(statePath, m.ID, outcome); persistErr != nil {
 			d.hostUpgradeDurableBroken = true
 			d.hostUpgradeDurableError = persistErr.Error()
@@ -455,6 +559,7 @@ func (d *Daemon) handleHostUpgradeMutation(m PendingMutation) (appliedID string,
 		err := "host.upgrade refused: update source is not configured"
 		outcome := hostUpgradeOutcome{Applied: false, Error: err, CompletedAt: now.UTC().Format(time.RFC3339)}
 		d.hostUpgradeDone[m.ID] = outcome
+		pruneHostUpgradeLedger(d.hostUpgradeDone)
 		if persistErr := persistHostUpgradeOutcome(statePath, m.ID, outcome); persistErr != nil {
 			d.hostUpgradeDurableBroken = true
 			d.hostUpgradeDurableError = persistErr.Error()
@@ -462,9 +567,21 @@ func (d *Daemon) handleHostUpgradeMutation(m PendingMutation) (appliedID string,
 		d.hostUpgradeMu.Unlock()
 		return "", &HeartbeatMutationFailure{ID: m.ID, Error: err}
 	}
+	if err := parseHostUpgradeParams(m, now); err != nil {
+		outcome := hostUpgradeOutcome{Applied: false, Error: err.Error(), CompletedAt: now.UTC().Format(time.RFC3339)}
+		d.hostUpgradeDone[m.ID] = outcome
+		pruneHostUpgradeLedger(d.hostUpgradeDone)
+		if persistErr := persistHostUpgradeOutcome(statePath, m.ID, outcome); persistErr != nil {
+			d.hostUpgradeDurableBroken = true
+			d.hostUpgradeDurableError = persistErr.Error()
+		}
+		d.hostUpgradeMu.Unlock()
+		return "", &HeartbeatMutationFailure{ID: m.ID, Error: err.Error()}
+	}
 	if err := probeHostUpgradeDurability(statePath); err != nil {
 		outcome := hostUpgradeOutcome{Applied: false, Error: err.Error(), CompletedAt: now.UTC().Format(time.RFC3339)}
 		d.hostUpgradeDone[m.ID] = outcome
+		pruneHostUpgradeLedger(d.hostUpgradeDone)
 		_ = persistHostUpgradeOutcome(statePath, m.ID, outcome)
 		d.hostUpgradeMu.Unlock()
 		return "", &HeartbeatMutationFailure{ID: m.ID, Error: err.Error()}
@@ -478,6 +595,7 @@ func (d *Daemon) handleHostUpgradeMutation(m PendingMutation) (appliedID string,
 		errText := persistErr.Error()
 		outcome := hostUpgradeOutcome{Applied: false, Error: errText, CompletedAt: now.UTC().Format(time.RFC3339)}
 		d.hostUpgradeDone[m.ID] = outcome
+		pruneHostUpgradeLedger(d.hostUpgradeDone)
 		d.hostUpgradeDurableBroken = true
 		d.hostUpgradeDurableError = persistErr.Error()
 		d.hostUpgradeMu.Unlock()
@@ -731,6 +849,7 @@ func (d *Daemon) finishHostUpgrade(id string, outcome hostUpgradeOutcome) {
 	}
 	delete(d.hostUpgradeInFlight, id)
 	d.hostUpgradeDone[id] = outcome
+	pruneHostUpgradeLedger(d.hostUpgradeDone)
 	d.hostUpgradeMu.Unlock()
 }
 

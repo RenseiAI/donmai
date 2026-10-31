@@ -237,6 +237,15 @@ func (u *Updater) RunUpdate(ctx context.Context) (*UpdateResult, error) {
 		return &UpdateResult{Updated: false, Version: u.opts.CurrentVersion, Reason: "sig-rejected: " + reason}, nil
 	}
 
+	// Consent bounds the swap itself, not just admission: the host-upgrade
+	// execution context expires at the request deadline, and verification
+	// can cross it. Check cancellation after verification and before any
+	// irreversible filesystem change so an expired request never replaces
+	// the binary and then reports a refusal.
+	if err := ctx.Err(); err != nil {
+		return &UpdateResult{Updated: false, Version: u.opts.CurrentVersion, Reason: "update-cancelled: " + err.Error()}, err
+	}
+
 	if u.opts.CurrentBinaryPath == "" {
 		return &UpdateResult{Updated: false, Version: u.opts.CurrentVersion, Reason: "no current-binary-path"}, errors.New("currentBinaryPath unresolved")
 	}

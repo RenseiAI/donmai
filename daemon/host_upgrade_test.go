@@ -961,10 +961,11 @@ func TestHostUpgradeExpiryAfterPreflightRefusesWithoutSwap(t *testing.T) {
 		calls.Add(1)
 		return &UpdateResult{Updated: true, Version: "8.0.0", Reason: "update-applied"}, nil
 	}
-	// RFC3339 truncates to seconds, so allow a full second of margin on
-	// both sides: admission must see a future deadline despite truncation,
-	// and the preflight wait must land safely past it.
-	expiresAt := time.Now().Add(2 * time.Second).UTC().Format(time.RFC3339)
+	// RFC3339Nano keeps the sub-second margin: second-precision formatting
+	// can truncate almost a whole second off the admission margin. A 2s
+	// deadline with Nano keeps ~2s of margin while the 3s wait still lands
+	// safely past it.
+	expiresAt := time.Now().Add(2 * time.Second).UTC().Format(time.RFC3339Nano)
 	m := hostUpgradeMutation("up-expiry-preflight", map[string]any{"consented": true, "expiresAt": expiresAt})
 	if applied, failures := d.applyPendingMutations(context.Background(), []PendingMutation{m}); len(applied) != 0 || len(failures) != 0 {
 		t.Fatalf("first applied/failures = %v/%v, want pending (valid at admission)", applied, failures)
@@ -1111,7 +1112,11 @@ func TestHostUpgradeExpiryDuringDownloadRefusesWithoutSwap(t *testing.T) {
 		time.Sleep(3 * time.Second)
 		return &UpdateResult{Updated: true, Version: "8.8.8", Reason: "update-applied"}, nil
 	}
-	expiresAt := time.Now().Add(1 * time.Second).UTC().Format(time.RFC3339)
+	// RFC3339Nano keeps the sub-second margin: second-precision formatting
+	// can truncate almost a whole second off a 1s margin and flake
+	// admission. A 2s deadline with Nano keeps ~2s of margin while still
+	// expiring before the 3s seam returns.
+	expiresAt := time.Now().Add(2 * time.Second).UTC().Format(time.RFC3339Nano)
 	m := hostUpgradeMutation("up-expiry-download", map[string]any{"consented": true, "expiresAt": expiresAt})
 	if applied, failures := d.applyPendingMutations(context.Background(), []PendingMutation{m}); len(applied) != 0 || len(failures) != 0 {
 		t.Fatalf("first applied/failures = %v/%v, want pending (valid at admission)", applied, failures)
@@ -1130,4 +1135,167 @@ func TestHostUpgradeExpiryDuringDownloadRefusesWithoutSwap(t *testing.T) {
 	if len(applied) != 0 || len(failures) != 1 {
 		t.Fatalf("redelivery applied/failures = %v/%v, want failure", applied, failures)
 	}
+}
+
+func TestUpdaterRunUpdateExpiredContextDoesNotSwap(t *testing.T) {
+	t.Parallel()
+	// Consent bounds the swap itself: when the bounded context expires
+	// during verification, RunUpdate must abort before the irreversible
+	// rename instead of swapping and letting the caller report a refusal.
+	newBinary := []byte("new-binary-content")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/latest.json"):
+			_ = json.NewEncoder(w).Encode(VersionManifest{Version: "9.9.9", SHA256: hexSHA256(newBinary)})
+		case strings.HasSuffix(r.URL.Path, ".sigstore"):
+			_, _ = w.Write([]byte("test-bundle"))
+		default:
+			_, _ = w.Write(newBinary)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	current := filepath.Join(t.TempDir(), "donmai-daemon")
+	if err := os.WriteFile(current, []byte("old-binary-content"), 0o755); err != nil {
+		t.Fatalf("write current binary: %v", err)
+	}
+	// A verifier that waits past the consent deadline, then reports valid:
+	// without a post-verification cancellation check the rename would
+	// still run. The expired context must stop it. The deadline is after
+	// the fast local download but before verification returns, isolating
+	// the post-verification window (an already-expired context would fail
+	// earlier at download and never reach the rename).
+	type sleepVerifier struct{ sleep time.Duration }
+	_ = sleepVerifier{}
+	deadline := time.Now().Add(300 * time.Millisecond)
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	defer cancel()
+	u := NewUpdater(UpdaterOptions{
+		CurrentVersion:    "0.1.0",
+		CurrentBinaryPath: current,
+		Config:            AutoUpdateConfig{Channel: ChannelStable},
+		CDNBase:           srv.URL,
+		Verifier:          hostUpgradeSleepVerifier{delay: time.Second},
+		SkipExit:          true,
+	})
+	res, err := u.RunUpdate(ctx)
+	if err == nil {
+		t.Fatalf("RunUpdate with expired context should fail, got %+v", res)
+	}
+	if res != nil && res.Updated {
+		t.Fatalf("expired RunUpdate must not report Updated, got %+v", res)
+	}
+	swapped, err := os.ReadFile(current)
+	if err != nil {
+		t.Fatalf("read current binary: %v", err)
+	}
+	if string(swapped) != "old-binary-content" {
+		t.Fatalf("binary swapped after expiry: %q", swapped)
+	}
+}
+
+func TestHostUpgradeNullLedgerEntryRefusesWithoutSwap(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "daemon.yaml")
+	// A ledger entry that is JSON null decodes to a zero-valued outcome
+	// without an error. It must fail closed instead of letting a new
+	// request execute.
+	if err := os.WriteFile(hostUpgradeStatePath(cfgPath), []byte(`{"other":null}`), 0o600); err != nil {
+		t.Fatalf("write null-entry state: %v", err)
+	}
+	d := newRestartTestDaemon(t, nil)
+	d.opts.ConfigPath = cfgPath
+	d.config = &Config{
+		AutoUpdate: AutoUpdateConfig{
+			Channel: ChannelStable, Schedule: ScheduleManual,
+			Signers: []UpdateSigner{{SAN: "test@example.com", Issuer: "https://example.test"}},
+		},
+	}
+	var calls atomic.Int32
+	d.runPreparedUpdate = func(context.Context, AutoUpdateConfig, string) (*UpdateResult, error) {
+		calls.Add(1)
+		return &UpdateResult{Updated: true, Version: "x", Reason: "update-applied"}, nil
+	}
+	m := hostUpgradeMutation("up-null-entry", map[string]any{"consented": true})
+	applied, failures := d.applyPendingMutations(context.Background(), []PendingMutation{m})
+	if len(applied) != 0 || len(failures) != 1 {
+		t.Fatalf("null-entry applied/failures = %v/%v, want failure", applied, failures)
+	}
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("null-entry update calls = %d, want 0 (no swap on corrupt ledger)", got)
+	}
+}
+
+func TestHostUpgradeRetentionBound(t *testing.T) {
+	t.Parallel()
+	d := hostUpgradeTestDaemon(t, nil)
+	d.runPreparedUpdate = func(context.Context, AutoUpdateConfig, string) (*UpdateResult, error) {
+		return &UpdateResult{Updated: true, Version: "x", Reason: "update-applied"}, nil
+	}
+	const total = hostUpgradeMaxRetainedOutcomes + 32
+	for i := 0; i < total; i++ {
+		m := hostUpgradeMutation(fmt.Sprintf("up-flood-%04d", i), map[string]any{"consented": false})
+		applied, failures := d.applyPendingMutations(context.Background(), []PendingMutation{m})
+		if len(applied) != 0 || len(failures) != 1 {
+			t.Fatalf("flood %d applied/failures = %v/%v, want refusal", i, applied, failures)
+		}
+	}
+	d.hostUpgradeMu.Lock()
+	retained := len(d.hostUpgradeDone)
+	d.hostUpgradeMu.Unlock()
+	if retained > hostUpgradeMaxRetainedOutcomes {
+		t.Fatalf("retained outcomes = %d, want at most %d", retained, hostUpgradeMaxRetainedOutcomes)
+	}
+	reloaded, err := loadHostUpgradeOutcomes(hostUpgradeStatePath(d.opts.ConfigPath))
+	if err != nil {
+		t.Fatalf("reload durable: %v", err)
+	}
+	if len(reloaded) > hostUpgradeMaxRetainedOutcomes {
+		t.Fatalf("durable outcomes = %d, want at most %d", len(reloaded), hostUpgradeMaxRetainedOutcomes)
+	}
+}
+
+func TestHostUpgradeDirectoryNotSyncableRefusesWithoutSwap(t *testing.T) {
+	t.Parallel()
+	if os.Geteuid() == 0 {
+		t.Skip("directory permission probe requires a non-root user")
+	}
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "daemon.yaml")
+	stateDir := filepath.Dir(hostUpgradeStatePath(cfgPath))
+	if err := os.MkdirAll(stateDir, 0o755); err != nil {
+		t.Fatalf("mkdir state dir: %v", err)
+	}
+	if err := os.Chmod(stateDir, 0o300); err != nil {
+		t.Fatalf("chmod state dir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(stateDir, 0o755) })
+	d := newRestartTestDaemon(t, nil)
+	d.opts.ConfigPath = cfgPath
+	d.config = &Config{
+		AutoUpdate: AutoUpdateConfig{
+			Channel: ChannelStable, Schedule: ScheduleManual,
+			Signers: []UpdateSigner{{SAN: "test@example.com", Issuer: "https://example.test"}},
+		},
+	}
+	var calls atomic.Int32
+	d.runPreparedUpdate = func(context.Context, AutoUpdateConfig, string) (*UpdateResult, error) {
+		calls.Add(1)
+		return &UpdateResult{Updated: true, Version: "x", Reason: "update-applied"}, nil
+	}
+	m := hostUpgradeMutation("up-dir-sync", map[string]any{"consented": true})
+	applied, failures := d.applyPendingMutations(context.Background(), []PendingMutation{m})
+	if len(applied) != 0 || len(failures) != 1 {
+		t.Fatalf("dir-sync applied/failures = %v/%v, want failure", applied, failures)
+	}
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("dir-sync update calls = %d, want 0 (no swap without durable dir)", got)
+	}
+}
+
+type hostUpgradeSleepVerifier struct{ delay time.Duration }
+
+func (v hostUpgradeSleepVerifier) Verify(_ context.Context, _, _ string) (bool, string) {
+	time.Sleep(v.delay)
+	return true, "test-sleep-verifier"
 }
