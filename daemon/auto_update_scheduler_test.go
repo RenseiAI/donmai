@@ -662,13 +662,20 @@ func TestAutoUpdateScheduler_RevokedConsentStopsScheduledRequests(t *testing.T) 
 				return clock.waiterCount() > 0
 			})
 			clock.fire()
-			waitForUpdateCondition(t, 10*time.Second, "first tick manifest", func() bool {
-				return probe.manifestHits.Load() >= 1
+			// Wait for the first attempt to settle before capturing the
+			// baseline: a live tick performs the manifest pre-check (1)
+			// plus Update's own re-check (1), then the binary and bundle
+			// downloads on the way to fail-closed verification. Capturing
+			// after only >=1 manifest races the second fetch under load:
+			// it lands after the capture and is miscounted as a
+			// post-revocation call. Poll for the full settled shape
+			// (as the opted-in tick test does) before revoking.
+			waitForUpdateCondition(t, 10*time.Second, "first tick settled", func() bool {
+				return probe.manifestHits.Load() >= 2 && probe.binaryHits.Load() == 1 && probe.sigHits.Load() == 1
 			})
-			// The first tick drains (fail-closed bad bundle); restore the
-			// running state via resume so the second tick starts clean.
-			// ResumeContext is the production drain-exit; a revoked tick
-			// must not drain again regardless of the starting state.
+			waitForUpdateCondition(t, 10*time.Second, "draining after first tick", func() bool {
+				return d.State() == StateDraining
+			})
 			baseManifest, baseBinary, baseSig := probe.manifestHits.Load(), probe.binaryHits.Load(), probe.sigHits.Load()
 			current := d.Config()
 			if current == nil {
