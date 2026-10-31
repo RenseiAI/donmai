@@ -155,8 +155,11 @@ func TestMapItem_RevisionRuleDropsStale(t *testing.T) {
 	started := func(rev int) json.RawMessage {
 		return json.RawMessage(`{"sessionId":"s","viewCursor":"c","item":{"itemId":"i1","kind":"agentMessage","revision":` + itoa(rev) + `,"status":"inProgress","text":"hi"}}`)
 	}
-	// item/started at rev 1 emits its initial text and records the revision.
-	mapNotification("item/started", started(1), state, nil)
+	// item/started at rev 1 emits the single progress event for the item
+	// and records the revision.
+	if got := mapNotification("item/started", started(1), state, nil); len(got) != 1 {
+		t.Fatalf("started produced %v, want one progress event", kindsOf(got))
+	}
 	// A stale item/updated at rev 1 after rev 2 applied must drop.
 	mapNotification("item/updated", started(2), state, nil)
 	stale := mapNotification("item/updated", started(1), state, nil)

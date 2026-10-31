@@ -4,9 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"log/slog"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -53,17 +53,21 @@ func TestSpawn_StreamingText(t *testing.T) {
 				}
 			}
 			// Assistant text rides one complete message per item: the
-			// two agentMessage items complete as two full messages.
-			// Fragments never surface as AssistantTextEvent (they would
-			// split line-anchored verdict markers and shard the summary).
+			// agentMessage item completes with its full snapshot and
+			// the final agentMessage completes with the answer.
+			// Fragments never surface as AssistantTextEvent.
 			if want := []string{"first second third last", "final answer"}; !reflect.DeepEqual(text, want) {
 				t.Errorf("assistant chunks = %q, want %q", text, want)
 			}
-			if want := []string{"first", " second", " third", "\nnext", " last"}; !reflect.DeepEqual(reasoning, want) {
+			// Reasoning completes once with its full snapshot, not one
+			// event per fragment.
+			if want := []string{"first second third\nnext last"}; !reflect.DeepEqual(reasoning, want) {
 				t.Errorf("reasoning chunks = %q, want %q", reasoning, want)
 			}
-			if progress == 0 {
-				t.Errorf("no stream-progress liveness for assistant deltas")
+			// One liveness event per streaming item (agentMessage and
+			// reasoning started), never one per fragment.
+			if progress != 2 {
+				t.Errorf("stream progress events = %d, want exactly 2 (one per item)", progress)
 			}
 			if r, ok := terminalResult(events); !ok || !r.Success {
 				t.Errorf("terminal result: %+v", r)
@@ -91,10 +95,9 @@ func TestSpawn_StreamingText(t *testing.T) {
 }
 
 func TestStreaming_VerdictSplitSurvivesFragmentation(t *testing.T) {
-	// B1: a verdict marker split across streaming fragments must not lose
-	// its verdict or shard the summary. Assistant deltas are liveness
-	// only; the completion carries the full message in one event so the
-	// runner's per-message scan sees the complete marker.
+	// A verdict marker split across streaming fragments must not lose
+	// its verdict: deltas emit nothing and the completion carries the
+	// full message in one event so the per-message scan sees it whole.
 	state := newMapperState("model")
 	started, err := json.Marshal(map[string]any{"item": map[string]any{"itemId": "m1", "kind": "agentMessage", "revision": 1, "text": "Done.\nWORK_", "status": "inProgress"}})
 	if err != nil {
@@ -106,10 +109,8 @@ func TestStreaming_VerdictSplitSurvivesFragmentation(t *testing.T) {
 		t.Fatalf("started produced %T %+v, want stream_progress", got[0], got[0])
 	}
 	delta := json.RawMessage(`{"itemId":"m1","field":"text","delta":"RESULT:passed\n"}`)
-	if got := mapNotification("item/delta", delta, state, nil); len(got) != 1 {
-		t.Fatalf("delta produced %v, want one liveness signal", kindsOf(got))
-	} else if sys, ok := got[0].(agent.SystemEvent); !ok || sys.Subtype != agent.SystemSubtypeStreamProgress {
-		t.Fatalf("delta produced %T %+v, want stream_progress, not a text fragment", got[0], got[0])
+	if got := mapNotification("item/delta", delta, state, nil); len(got) != 0 {
+		t.Fatalf("delta produced %v, want nothing (completion carries the full text)", kindsOf(got))
 	}
 	completed, err := json.Marshal(map[string]any{"item": map[string]any{"itemId": "m1", "kind": "agentMessage", "revision": 2, "text": "Done.\nWORK_RESULT:passed\n", "status": "completed"}})
 	if err != nil {
@@ -157,7 +158,7 @@ func TestWire_CurrentExportRoundTrip(t *testing.T) {
 	}
 }
 
-func TestStreaming_GapAndBounds(t *testing.T) {
+func TestStreaming_GapDropsDeltaThenRecovers(t *testing.T) {
 	state := newMapperState("model")
 	snapshot := func(rev int, text string) {
 		params, err := json.Marshal(map[string]any{"item": map[string]any{"itemId": "open", "kind": "agentMessage", "revision": rev, "text": text}})
@@ -173,464 +174,105 @@ func TestStreaming_GapAndBounds(t *testing.T) {
 		t.Fatalf("gap emitted %v", got)
 	}
 	state.gap = nil
-	// Assistant deltas are liveness only, never text fragments: the full
-	// message arrives on item/completed so verdict markers never split.
-	got := mapNotification("item/delta", delta, state, nil)
-	if len(got) != 1 || got[0].(agent.SystemEvent).Subtype != agent.SystemSubtypeStreamProgress {
-		t.Fatalf("assistant delta must be liveness, got %v", got)
+	// Deltas emit nothing; the completion carries the full snapshot.
+	if got := mapNotification("item/delta", delta, state, nil); len(got) != 0 {
+		t.Fatalf("delta emitted %v, want nothing", kindsOf(got))
 	}
-	// Completion emits the full snapshot, not just the unseen suffix.
 	completed, err := json.Marshal(map[string]any{"item": map[string]any{"itemId": "open", "kind": "agentMessage", "revision": 2, "text": "hello world", "status": "completed"}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	got = mapNotification("item/completed", completed, state, nil)
+	got := mapNotification("item/completed", completed, state, nil)
 	if len(got) != 1 {
 		t.Fatalf("completion produced %v", kindsOf(got))
 	}
 	if text, ok := got[0].(agent.AssistantTextEvent); !ok || text.Text != "hello world" {
 		t.Fatalf("completion event=%+v, want full snapshot", got[0])
 	}
-	snapshot(3, strings.Repeat("x", 1<<20))
-	got = mapNotification("item/delta", delta, state, nil)
-	if len(got) != 1 || got[0].(agent.SystemEvent).Subtype != agent.SystemSubtypeStreamProgress {
-		t.Fatalf("oversized delta: %v", got)
-	}
-	params, err := json.Marshal(map[string]any{"item": map[string]any{"itemId": "open", "kind": "reasoning", "revision": 4, "summary": []string{strings.Repeat("x", (1<<20)-1)}}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	mapNotification("item/updated", params, state, nil)
-	got = mapNotification("item/delta", json.RawMessage(`{"itemId":"open","field":"summary.1","delta":"y"}`), state, nil)
-	if len(got) != 1 || got[0].(agent.SystemEvent).Subtype != agent.SystemSubtypeStreamProgress {
-		t.Fatalf("summary boundary exceeded retained-text bound: %v", got)
-	}
 }
 
-// TestBurstPreservesTerminal pins the burst-overflow contract: a slow
-// consumer that never drains while 301 assistant deltas stream must still
-// observe the authoritative assistant completion and the terminal result.
-// Progress liveness is best-effort and never takes a reserved slot, so the
-// completion and terminal still fit after the burst. Drives the production
-// Handle.handleNotification + emitter path with no concurrent drain.
-func TestBurstPreservesTerminal(t *testing.T) {
+// TestStreaming_PerItemProgressEmitsOnce drives the production
+// Handle.handleNotification path: one progress event per item, deltas
+// silent, completion carrying the final text. A second started/updated
+// for the same item emits nothing.
+func TestStreaming_PerItemProgressEmitsOnce(t *testing.T) {
 	h := newHandle(nil, agent.Spec{Prompt: "x"}, NewSpawnPlan(agent.Spec{Prompt: "x"}, t.TempDir()), HandleOptions{})
 	sid := "33333333-3333-7333-8333-333333333333"
 	turnID := "44444444-4444-7444-8444-444444444444"
 	h.setSessionID(sid)
 	h.setCurrentTurnID(turnID)
-	itemID := "m1"
-	started, err := json.Marshal(map[string]any{
-		"sessionId": sid, "viewCursor": "cursor-0",
-		"item": map[string]any{"itemId": itemID, "kind": "agentMessage", "revision": 1, "status": "inProgress", "text": "", "turnId": turnID},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	h.handleNotification(context.Background(), notification{Method: "item/started", Params: started})
-	const burst = 301
-	for i := 0; i < burst; i++ {
-		delta, err := json.Marshal(map[string]any{"sessionId": sid, "viewCursor": "cursor-0", "itemId": itemID, "field": "text", "delta": "a"})
-		if err != nil {
-			t.Fatal(err)
-		}
-		h.handleNotification(context.Background(), notification{Method: "item/delta", Params: delta})
-	}
-	full := strings.Repeat("a", burst)
-	completed, err := json.Marshal(map[string]any{
-		"sessionId": sid, "viewCursor": "cursor-1",
-		"item": map[string]any{"itemId": itemID, "kind": "agentMessage", "revision": 2, "status": "completed", "text": full, "turnId": turnID},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	h.handleNotification(context.Background(), notification{Method: "item/completed", Params: completed})
-	turnDone, err := json.Marshal(map[string]any{"sessionId": sid, "viewCursor": "cursor-end", "turnId": turnID, "terminal": "completed"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	done := h.handleNotification(context.Background(), notification{Method: "turn/completed", Params: turnDone})
-	if !done {
-		t.Fatalf("turn/completed did not report terminal")
-	}
-	// The pump moves queued events to Events() in order; close then drain
-	// blocks until the ordered prefix (including the terminal) arrives.
-	h.closeEvents()
-	events := drainEvents(t, h.Events(), 5*time.Second)
-	var assistant, result int
-	for _, ev := range events {
-		switch e := ev.(type) {
-		case agent.AssistantTextEvent:
-			if e.Text != full {
-				t.Errorf("assistant text len=%d, want %d", len(e.Text), len(full))
-			} else {
-				assistant++
-			}
-		case agent.ResultEvent:
-			if e.Success {
-				result++
-			}
-		}
-	}
-	if assistant == 0 || result == 0 {
-		t.Fatalf("burst lost final events: assistant=%d result=%d handlerDone=%v", assistant, result, done)
-	}
-}
+	ctx := context.Background()
 
-// TestBurstPreservesTerminal_Reasoning pins the reasoning-burst contract:
-// a slow consumer that never drains while 301 reasoning fragments stream
-// must still observe the authoritative assistant completion and the
-// terminal result. Reasoning is best-effort intermediate thought (never
-// verdict-scanned), so it never takes a reserved slot. Drives the
-// production Handle.handleNotification + emitter path with no concurrent
-// drain, mirroring TestBurstPreservesTerminal with summary.0 deltas.
-func TestBurstPreservesTerminal_Reasoning(t *testing.T) {
-	h := newHandle(nil, agent.Spec{Prompt: "x"}, NewSpawnPlan(agent.Spec{Prompt: "x"}, t.TempDir()), HandleOptions{})
-	sid := "55555555-5555-7555-8555-555555555555"
-	turnID := "66666666-6666-7466-8466-666666666666"
-	h.setSessionID(sid)
-	h.setCurrentTurnID(turnID)
-	reasonID := "r1"
-	answerID := "m1"
-	started, err := json.Marshal(map[string]any{
-		"sessionId": sid, "viewCursor": "cursor-0",
-		"item": map[string]any{"itemId": reasonID, "kind": "reasoning", "revision": 1, "status": "inProgress", "summary": []string{"seed"}, "turnId": turnID},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	h.handleNotification(context.Background(), notification{Method: "item/started", Params: started})
-	const burst = 301
-	for i := 0; i < burst; i++ {
-		delta, err := json.Marshal(map[string]any{"sessionId": sid, "viewCursor": "cursor-0", "itemId": reasonID, "field": "summary.0", "delta": "a"})
-		if err != nil {
-			t.Fatal(err)
-		}
-		h.handleNotification(context.Background(), notification{Method: "item/delta", Params: delta})
-	}
-	full := "final answer"
-	completed, err := json.Marshal(map[string]any{
-		"sessionId": sid, "viewCursor": "cursor-1",
-		"item": map[string]any{"itemId": answerID, "kind": "agentMessage", "revision": 1, "status": "completed", "text": full, "turnId": turnID},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	h.handleNotification(context.Background(), notification{Method: "item/completed", Params: completed})
-	turnDone, err := json.Marshal(map[string]any{"sessionId": sid, "viewCursor": "cursor-end", "turnId": turnID, "terminal": "completed"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	done := h.handleNotification(context.Background(), notification{Method: "turn/completed", Params: turnDone})
-	if !done {
-		t.Fatalf("turn/completed did not report terminal")
-	}
-	h.closeEvents()
-	events := drainEvents(t, h.Events(), 5*time.Second)
-	var assistant, result int
-	for _, ev := range events {
-		switch e := ev.(type) {
-		case agent.AssistantTextEvent:
-			if e.Text == full {
-				assistant++
-			}
-		case agent.ResultEvent:
-			if e.Success {
-				result++
-			}
-		}
-	}
-	if assistant == 0 || result == 0 {
-		t.Fatalf("reasoning burst lost final events: assistant=%d result=%d handlerDone=%v", assistant, result, done)
-	}
-}
-
-// TestStreaming_SnapshotRetentionBounds pins the retained-text bounds:
-// snapshots larger than 1 MiB are never retained, and a 1,024-item map
-// admits no new item (updates to an open item still apply). Each guard is
-// asserted on retained state, not just the emitted event, so deleting
-// either ceiling is a failing mutant. Covers both the assistant and
-// reasoning snapshot branches.
-func TestStreaming_SnapshotRetentionBounds(t *testing.T) {
-	snapshotParams := func(itemID, kind string, rev int, text string) json.RawMessage {
+	notify := func(method, itemID, kind string, rev int, text string) []agent.Event {
 		t.Helper()
-		item := map[string]any{"itemId": itemID, "kind": kind, "revision": rev, "status": "inProgress"}
-		if kind == "reasoning" {
-			item["summary"] = []string{text}
-		} else {
-			item["text"] = text
+		item := map[string]any{"itemId": itemID, "kind": kind, "revision": rev, "status": "inProgress", "turnId": turnID}
+		if text != "" {
+			if kind == "reasoning" {
+				item["summary"] = []string{text}
+			} else {
+				item["text"] = text
+			}
 		}
-		params, err := json.Marshal(map[string]any{"item": item})
+		params, err := json.Marshal(map[string]any{"sessionId": sid, "viewCursor": "c", "item": item})
 		if err != nil {
 			t.Fatal(err)
 		}
-		return params
+		h.handleNotification(ctx, notification{Method: method, Params: params})
+		return drainAvailable(h.Events())
 	}
 
-	t.Run("oversized assistant snapshot not retained", func(t *testing.T) {
-		state := newMapperState("model")
-		big := strings.Repeat("x", (1<<20)+1)
-		got := mapNotification("item/started", snapshotParams("big-agent", "agentMessage", 1, big), state, nil)
-		if len(got) != 1 || got[0].(agent.SystemEvent).Subtype != agent.SystemSubtypeStreamProgress {
-			t.Fatalf("oversized assistant snapshot emitted %v, want one stream_progress", kindsOf(got))
-		}
-		if _, ok := state.textItems["big-agent"]; ok {
-			t.Fatalf("oversized assistant snapshot retained %d bytes, want unretained", len(state.textItems["big-agent"].text))
-		}
-	})
-
-	t.Run("oversized reasoning snapshot not retained", func(t *testing.T) {
-		state := newMapperState("model")
-		big := strings.Repeat("y", (1<<20)+1)
-		mapNotification("item/started", snapshotParams("big-reason", "reasoning", 1, big), state, nil)
-		if _, ok := state.textItems["big-reason"]; ok {
-			t.Fatalf("oversized reasoning snapshot retained %d bytes, want unretained", len(state.textItems["big-reason"].text))
-		}
-	})
-
-	t.Run("admission ceiling drops new items but keeps open ones", func(t *testing.T) {
-		state := newMapperState("model")
-		for i := 0; i < 1024; i++ {
-			id := fmt.Sprintf("fill-%04d", i)
-			mapNotification("item/started", snapshotParams(id, "agentMessage", 1, "small"), state, nil)
-		}
-		if len(state.textItems) != 1024 {
-			t.Fatalf("retained %d items after fill, want 1024", len(state.textItems))
-		}
-		got := mapNotification("item/started", snapshotParams("one-too-many-agent", "agentMessage", 1, "small"), state, nil)
-		if len(got) != 1 || got[0].(agent.SystemEvent).Subtype != agent.SystemSubtypeStreamProgress {
-			t.Fatalf("over-capacity assistant snapshot emitted %v, want one stream_progress", kindsOf(got))
-		}
-		if _, ok := state.textItems["one-too-many-agent"]; ok {
-			t.Fatalf("over-capacity assistant snapshot retained, want unretained (retained=%d)", len(state.textItems))
-		}
-		if len(state.textItems) != 1024 {
-			t.Fatalf("retained %d items after over-capacity admit, want 1024", len(state.textItems))
-		}
-		got = mapNotification("item/started", snapshotParams("one-too-many-reason", "reasoning", 1, "small"), state, nil)
-		if _, ok := state.textItems["one-too-many-reason"]; ok {
-			t.Fatalf("over-capacity reasoning snapshot retained, want unretained (events=%v)", kindsOf(got))
-		}
-		if len(state.textItems) != 1024 {
-			t.Fatalf("retained %d items after reasoning over-capacity admit, want 1024", len(state.textItems))
-		}
-		// An update to an already-open item still applies at capacity
-		// (the previous.kind branch), pinning that half of the guard.
-		mapNotification("item/updated", snapshotParams("fill-0000", "agentMessage", 2, "updated"), state, nil)
-		if got := state.textItems["fill-0000"]; got.text != "updated" {
-			t.Fatalf("open item update at capacity retained %q, want %q", got.text, "updated")
-		}
-		if len(state.textItems) != 1024 {
-			t.Fatalf("retained %d items after open-item update, want 1024", len(state.textItems))
-		}
-	})
-}
-
-// TestMixedBurstPreservesTerminal pins the mixed-traffic overflow
-// contract: streaming liveness fills the best-effort budget, ordinary
-// tool traffic then fills the reserved tail, and the final assistant
-// message, aggregate usage, and terminal result must still be delivered.
-// A fixed reservation alone only moves the threshold — four tool calls
-// consume eight reserved slots — so terminal-adjacent events evict queued
-// best-effort output. Drives the production Handle.handleNotification +
-// emitter path with no concurrent drain.
-func TestMixedBurstPreservesTerminal(t *testing.T) {
-	h := newHandle(nil, agent.Spec{Prompt: "x"}, NewSpawnPlan(agent.Spec{Prompt: "x"}, t.TempDir()), HandleOptions{})
-	sid := "77777777-7777-7777-8777-777777777777"
-	turnID := "88888888-8888-7888-8888-888888888888"
-	h.setSessionID(sid)
-	h.setCurrentTurnID(turnID)
-	answerID := "m1"
-	started, err := json.Marshal(map[string]any{
-		"sessionId": sid, "viewCursor": "cursor-0",
-		"item": map[string]any{"itemId": answerID, "kind": "agentMessage", "revision": 1, "status": "inProgress", "text": "", "turnId": turnID},
-	})
+	// First started emits the single progress for the item.
+	got := notify("item/started", "m1", "agentMessage", 1, "hello")
+	if len(got) != 1 {
+		t.Fatalf("started produced %v, want one progress event", kindsOf(got))
+	}
+	if sys, ok := got[0].(agent.SystemEvent); !ok || sys.Subtype != agent.SystemSubtypeStreamProgress {
+		t.Fatalf("started produced %T %+v, want stream_progress", got[0], got[0])
+	}
+	// Updated and deltas for the same item stay silent.
+	got = notify("item/updated", "m1", "agentMessage", 2, "hello world")
+	if len(got) != 0 {
+		t.Fatalf("second update produced %v, want nothing (at most one progress per item)", kindsOf(got))
+	}
+	deltaParams, err := json.Marshal(map[string]any{"sessionId": sid, "viewCursor": "c", "itemId": "m1", "field": "text", "delta": " more"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	h.handleNotification(context.Background(), notification{Method: "item/started", Params: started})
-	// Fill the best-effort budget with assistant streaming liveness.
-	for i := 0; i < 248; i++ {
-		delta, err := json.Marshal(map[string]any{"sessionId": sid, "viewCursor": "cursor-0", "itemId": answerID, "field": "text", "delta": "a"})
-		if err != nil {
-			t.Fatal(err)
-		}
-		h.handleNotification(context.Background(), notification{Method: "item/delta", Params: delta})
+	h.handleNotification(ctx, notification{Method: "item/delta", Params: deltaParams})
+	if got := drainAvailable(h.Events()); len(got) != 0 {
+		t.Fatalf("delta produced %v, want nothing", kindsOf(got))
 	}
-	// Four ordinary tool calls consume the reserved tail.
-	for i := 0; i < 4; i++ {
-		id := fmt.Sprintf("tool-%d", i)
-		sParams, err := json.Marshal(map[string]any{
-			"sessionId": sid, "viewCursor": "cursor-0",
-			"item": map[string]any{"itemId": id, "kind": "toolCall", "revision": 1, "status": "inProgress", "tool": "edit", "args": `{"path":"a.txt"}`, "turnId": turnID},
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		h.handleNotification(context.Background(), notification{Method: "item/started", Params: sParams})
-		cParams, err := json.Marshal(map[string]any{
-			"sessionId": sid, "viewCursor": "cursor-0",
-			"item": map[string]any{"itemId": id, "kind": "toolCall", "revision": 2, "status": "completed", "tool": "edit", "visibleOutput": "ok", "turnId": turnID},
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		h.handleNotification(context.Background(), notification{Method: "item/completed", Params: cParams})
-	}
-	full := "final answer"
+	// Completion emits the final text exactly once.
 	completed, err := json.Marshal(map[string]any{
-		"sessionId": sid, "viewCursor": "cursor-1",
-		"item": map[string]any{"itemId": answerID, "kind": "agentMessage", "revision": 2, "status": "completed", "text": full, "turnId": turnID},
+		"sessionId": sid, "viewCursor": "c",
+		"item": map[string]any{"itemId": "m1", "kind": "agentMessage", "revision": 3, "status": "completed", "text": "hello world", "turnId": turnID},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	h.handleNotification(context.Background(), notification{Method: "item/completed", Params: completed})
-	turnDone, err := json.Marshal(map[string]any{"sessionId": sid, "viewCursor": "cursor-end", "turnId": turnID, "terminal": "completed"})
-	if err != nil {
-		t.Fatal(err)
+	h.handleNotification(ctx, notification{Method: "item/completed", Params: completed})
+	got = drainAvailable(h.Events())
+	if len(got) != 1 {
+		t.Fatalf("completion produced %v, want one final message", kindsOf(got))
 	}
-	done := h.handleNotification(context.Background(), notification{Method: "turn/completed", Params: turnDone})
-	if !done {
-		t.Fatalf("turn/completed did not report terminal")
+	if text, ok := got[0].(agent.AssistantTextEvent); !ok || text.Text != "hello world" {
+		t.Fatalf("completion event=%+v, want the full snapshot", got[0])
 	}
 	h.closeEvents()
-	events := drainEvents(t, h.Events(), 5*time.Second)
-	var assistant, usage, result int
-	for _, ev := range events {
-		switch e := ev.(type) {
-		case agent.AssistantTextEvent:
-			if e.Text == full {
-				assistant++
-			}
-		case agent.LlmCallEvent:
-			usage++
-		case agent.ResultEvent:
-			if e.Success {
-				result++
-			}
-		}
-	}
-	if assistant == 0 || usage == 0 || result == 0 {
-		t.Fatalf("mixed burst lost final events: assistant=%d usage=%d result=%d handlerDone=%v", assistant, usage, result, done)
-	}
 }
 
-// TestPureToolBurstPreservesTerminal pins the oldest-eviction fallback:
-// a turn flooded with only ordinary tool events (no best-effort
-// liveness/reasoning left to evict) overflows the combined queue(256) +
-// channel(256) = 512-event budget, so the final assistant completion and
-// ResultEvent depend on the kept[1:] oldest-eviction fallback. Drives
-// the production Handle.handleNotification + emitter path with 300
-// toolCall started+completed pairs (600 ToolUse/ToolResult, no drain),
-// then assistant completion + turn/completed, asserting the verdict
-// survives. Kills the INVERT mutant
-// `if !isTerminalAdjacentEvent(ev)` -> `if true` in evictForTerminal
-// (never evict oldest for terminal), which drops the completion and
-// terminal while handleNotification still reports success.
-func TestPureToolBurstPreservesTerminal(t *testing.T) {
-	h := newHandle(nil, agent.Spec{Prompt: "x"}, NewSpawnPlan(agent.Spec{Prompt: "x"}, t.TempDir()), HandleOptions{})
-	sid := "99999999-9999-7999-8999-999999999999"
-	turnID := "aaaaaaaa-aaaa-7aaa-8aaa-aaaaaaaaaaaa"
-	h.setSessionID(sid)
-	h.setCurrentTurnID(turnID)
-	// 300 ordinary tool calls overflow the combined 512-event queue +
-	// channel budget with no best-effort output left to evict
-	// (evicted==0 path), so the terminal below must use the
-	// oldest-eviction fallback.
-	for i := 0; i < 300; i++ {
-		id := fmt.Sprintf("pure-tool-%d", i)
-		sParams, err := json.Marshal(map[string]any{
-			"sessionId": sid, "viewCursor": "cursor-0",
-			"item": map[string]any{"itemId": id, "kind": "toolCall", "revision": 1, "status": "inProgress", "tool": "edit", "args": `{"path":"a.txt"}`, "turnId": turnID},
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		h.handleNotification(context.Background(), notification{Method: "item/started", Params: sParams})
-		cParams, err := json.Marshal(map[string]any{
-			"sessionId": sid, "viewCursor": "cursor-0",
-			"item": map[string]any{"itemId": id, "kind": "toolCall", "revision": 2, "status": "completed", "tool": "edit", "visibleOutput": "ok", "turnId": turnID},
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		h.handleNotification(context.Background(), notification{Method: "item/completed", Params: cParams})
-	}
-	full := "final answer"
-	completed, err := json.Marshal(map[string]any{
-		"sessionId": sid, "viewCursor": "cursor-1",
-		"item": map[string]any{"itemId": "m1", "kind": "agentMessage", "revision": 1, "status": "completed", "text": full, "turnId": turnID},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	h.handleNotification(context.Background(), notification{Method: "item/completed", Params: completed})
-	turnDone, err := json.Marshal(map[string]any{"sessionId": sid, "viewCursor": "cursor-end", "turnId": turnID, "terminal": "completed"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	done := h.handleNotification(context.Background(), notification{Method: "turn/completed", Params: turnDone})
-	if !done {
-		t.Fatalf("turn/completed did not report terminal")
-	}
-	h.closeEvents()
-	events := drainEvents(t, h.Events(), 5*time.Second)
-	var assistant, result int
-	for _, ev := range events {
-		switch e := ev.(type) {
-		case agent.AssistantTextEvent:
-			if e.Text == full {
-				assistant++
-			}
-		case agent.ResultEvent:
-			if e.Success {
-				result++
-			}
-		}
-	}
-	if assistant != 1 || result != 1 {
-		t.Fatalf("pure-tool flood lost terminal: assistant=%d result=%d handlerDone=%v", assistant, result, done)
-	}
-}
-
-// TestConcurrentDrainPreservesToolOrder pins the B1 ordering contract:
-// filling the buffer without a drain, then emitting the terminal while a
-// concurrent Events() reader drains, must still observe every tool use
-// before its result. The pump owns the only send path to Events() in FIFO
-// order and eviction applies to the queue, so a concurrent receive can
-// never interleave with a drain and flip use/result (which keeps a
-// finished tool marked running in the runner). Drives the production
-// Handle.handleNotification path with a concurrent drain.
+// TestConcurrentDrainPreservesToolOrder drives the production
+// Handle.handleNotification + Events path with a concurrent reader:
+// every tool result must follow its use in delivery order.
 func TestConcurrentDrainPreservesToolOrder(t *testing.T) {
-	h := newHandle(nil, agent.Spec{Prompt: "x"}, NewSpawnPlan(agent.Spec{Prompt: "x"}, t.TempDir()), HandleOptions{})
+	h := newHandle(nil, agent.Spec{Prompt: "x"}, NewSpawnPlan(agent.Spec{Prompt: "x"}, t.TempDir()), HandleOptions{EventBuffer: 64})
 	sid := "b0b0b0b0-b0b0-7b0b-8b0b-b0b0b0b0b0b0"
 	turnID := "c1c1c1c1-c1c1-7c1c-8c1c-c1c1c1c1c1c1"
 	h.setSessionID(sid)
 	h.setCurrentTurnID(turnID)
-	// Fill the buffer with ordinary tool traffic and no drain, so the
-	// terminal below must make room while a reader is active (the old
-	// drain-and-requeue window).
-	const tools = 200
-	for i := 0; i < tools; i++ {
-		id := fmt.Sprintf("concurrent-tool-%d", i)
-		sParams, err := json.Marshal(map[string]any{
-			"sessionId": sid, "viewCursor": "cursor-0",
-			"item": map[string]any{"itemId": id, "kind": "toolCall", "revision": 1, "status": "inProgress", "tool": "edit", "args": `{"path":"a.txt"}`, "turnId": turnID},
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		h.handleNotification(context.Background(), notification{Method: "item/started", Params: sParams})
-		cParams, err := json.Marshal(map[string]any{
-			"sessionId": sid, "viewCursor": "cursor-0",
-			"item": map[string]any{"itemId": id, "kind": "toolCall", "revision": 2, "status": "completed", "tool": "edit", "visibleOutput": "ok", "turnId": turnID},
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		h.handleNotification(context.Background(), notification{Method: "item/completed", Params: cParams})
-	}
+	ctx := context.Background()
+
+	const tools = 20
 	var mu sync.Mutex
 	var got []agent.Event
 	drained := make(chan struct{})
@@ -642,21 +284,24 @@ func TestConcurrentDrainPreservesToolOrder(t *testing.T) {
 			mu.Unlock()
 		}
 	}()
-	full := "final answer"
-	completed, err := json.Marshal(map[string]any{
-		"sessionId": sid, "viewCursor": "cursor-1",
-		"item": map[string]any{"itemId": "concurrent-m1", "kind": "agentMessage", "revision": 1, "status": "completed", "text": full, "turnId": turnID},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	h.handleNotification(context.Background(), notification{Method: "item/completed", Params: completed})
-	turnDone, err := json.Marshal(map[string]any{"sessionId": sid, "viewCursor": "cursor-end", "turnId": turnID, "terminal": "completed"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if done := h.handleNotification(context.Background(), notification{Method: "turn/completed", Params: turnDone}); !done {
-		t.Fatalf("turn/completed did not report terminal")
+	for i := 0; i < tools; i++ {
+		toolID := "concurrent-tool-" + strings.Repeat("x", i+1)
+		sParams, err := json.Marshal(map[string]any{
+			"sessionId": sid, "viewCursor": "cursor-0",
+			"item": map[string]any{"itemId": toolID, "kind": "toolCall", "revision": 1, "status": "inProgress", "tool": "edit", "args": `{"path":"a.txt"}`, "turnId": turnID},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		h.handleNotification(ctx, notification{Method: "item/started", Params: sParams})
+		cParams, err := json.Marshal(map[string]any{
+			"sessionId": sid, "viewCursor": "cursor-0",
+			"item": map[string]any{"itemId": toolID, "kind": "toolCall", "revision": 2, "status": "completed", "tool": "edit", "visibleOutput": "ok", "turnId": turnID},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		h.handleNotification(ctx, notification{Method: "item/completed", Params: cParams})
 	}
 	h.closeEvents()
 	select {
@@ -684,28 +329,47 @@ func TestConcurrentDrainPreservesToolOrder(t *testing.T) {
 			}
 		}
 	}
-	// The terminal ejects the oldest tool pair when the queue is full of
-	// ordinary traffic, so at least tools-1 pairs survive in order; every
-	// surviving result still follows its use. The 600-event overflow
-	// eviction itself is pinned by TestPureToolBurstPreservesTerminal;
-	// this test pins FIFO order under a concurrent drain.
-	if len(useIdx) < tools-1 {
-		t.Fatalf("tool uses=%d, want at least %d (kinds=%v)", len(useIdx), tools-1, kindsOf(got))
+	if len(useIdx) != tools {
+		t.Fatalf("tool uses=%d, want %d (kinds=%v)", len(useIdx), tools, kindsOf(got))
 	}
-	var assistant, result int
-	for _, ev := range got {
-		switch e := ev.(type) {
-		case agent.AssistantTextEvent:
-			if e.Text == full {
-				assistant++
-			}
-		case agent.ResultEvent:
-			if e.Success {
-				result++
-			}
+}
+
+// TestSpawn_FailedSpawnLeavesNoGoroutine fails the handshake and
+// asserts no per-handle goroutine survives the failed spawn.
+func TestSpawn_FailedSpawnLeavesNoGoroutine(t *testing.T) {
+	p, fh := newTestProvider(t, "single-turn")
+	fh.mu.Lock()
+	fh.schemaVersion = 2
+	fh.mu.Unlock()
+
+	before := runtime.NumGoroutine()
+	_, err := p.Spawn(context.Background(), agent.Spec{Prompt: "x", Cwd: t.TempDir(), Autonomous: true})
+	if err == nil {
+		t.Fatal("expected handshake failure, got nil")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if runtime.NumGoroutine() <= before {
+			return
 		}
+		if time.Now().After(deadline) {
+			t.Fatalf("goroutines before=%d after=%d: failed spawn leaked a goroutine", before, runtime.NumGoroutine())
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
-	if assistant == 0 || result == 0 {
-		t.Fatalf("concurrent drain lost terminal: assistant=%d result=%d events=%d", assistant, result, len(got))
+}
+
+func drainAvailable(ch <-chan agent.Event) []agent.Event {
+	var out []agent.Event
+	for {
+		select {
+		case ev, ok := <-ch:
+			if !ok {
+				return out
+			}
+			out = append(out, ev)
+		default:
+			return out
+		}
 	}
 }

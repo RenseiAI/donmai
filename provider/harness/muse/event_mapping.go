@@ -39,8 +39,13 @@ type mapperState struct {
 	// updates at a stale revision are dropped; completion always
 	// applies (the host guarantees item/completed is authoritative,
 	// including for itemIds never opened on this connection).
-	items     map[string]int
-	textItems map[string]textItem
+	items map[string]int
+	// progressSent records the itemIds that already emitted their
+	// single best-effort progress event. Started/updated emit at most
+	// one StreamProgress per item; deltas emit nothing; completion
+	// emits the final text. This bounds intermediate output to one
+	// event per item instead of one per streaming fragment.
+	progressSent map[string]struct{}
 
 	// pendingToolUse records ToolUseEvents emitted for open toolCall /
 	// userShell items so completion can pair the result.
@@ -55,12 +60,6 @@ type mapperState struct {
 	seenTurns map[string]struct{}
 }
 
-type textItem struct {
-	kind  ItemKind
-	text  string
-	field string
-}
-
 type pendingTool struct {
 	name string
 	id   string
@@ -69,9 +68,9 @@ type pendingTool struct {
 func newMapperState(model string) *mapperState {
 	return &mapperState{
 		model:          model,
-		textItems:      make(map[string]textItem),
 		turnStarted:    make(map[string]int64),
 		items:          make(map[string]int),
+		progressSent:   make(map[string]struct{}),
 		pendingToolUse: make(map[string]pendingTool),
 		seenTurns:      make(map[string]struct{}),
 	}
@@ -451,55 +450,47 @@ func mapItemEvent(method string, params json.RawMessage, state *mapperState, raw
 	case ItemKindAgentMessage:
 		// Assistant text rides one complete message per item: the
 		// completion snapshot is authoritative and the ONLY
-		// AssistantTextEvent for the item. Started/updated snapshots
-		// and deltas are content-free liveness (StreamProgress), never
-		// text fragments: the runner scans each AssistantTextEvent for
-		// line-anchored verdict markers and stamps its summary from the
-		// latest one, so a marker split across fragments loses its
-		// verdict and the summary retains only the trailing fragment
-		// (the ResultEvent carries no Message to repair it). Buffer
-		// the running text only to bound retention; completion emits
-		// the full snapshot regardless of what streamed before it.
-		text := itemText(&item)
-		previous := state.textItems[item.ItemID]
-		switch {
-		case isCompleted:
-			delete(state.textItems, item.ItemID)
-			if text == "" {
-				return nil
+		// AssistantTextEvent for the item. Started/updated emit at
+		// most one content-free liveness event (StreamProgress) per
+		// item, never text fragments: the runner scans each
+		// AssistantTextEvent for line-anchored verdict markers, so a
+		// marker split across fragments would lose its verdict and
+		// the summary would retain only the trailing fragment (the
+		// ResultEvent carries no Message to repair it). Deltas emit
+		// nothing; completion emits the full snapshot.
+		if isCompleted {
+			delete(state.progressSent, item.ItemID)
+			if text := itemText(&item); text != "" {
+				return []agent.Event{agent.AssistantTextEvent{Text: text, Raw: raw}}
 			}
-			return []agent.Event{agent.AssistantTextEvent{Text: text, Raw: raw}}
-		case len(text) <= 1<<20 && (previous.kind != "" || len(state.textItems) < 1024):
-			state.textItems[item.ItemID] = textItem{kind: item.Kind, text: text, field: "text"}
-			if text == "" {
-				return nil
-			}
-			return []agent.Event{agent.StreamProgressEvent()}
-		default:
-			delete(state.textItems, item.ItemID)
-			return []agent.Event{agent.StreamProgressEvent()}
+			return nil
 		}
+		if _, ok := state.progressSent[item.ItemID]; ok {
+			return nil
+		}
+		if state.progressSent == nil {
+			state.progressSent = make(map[string]struct{})
+		}
+		state.progressSent[item.ItemID] = struct{}{}
+		return []agent.Event{agent.StreamProgressEvent()}
 	case ItemKindReasoning:
-		// Reasoning streams as SystemEvents (never scanned for verdicts),
-		// so fragments are safe: forward only the unseen suffix when
-		// snapshots extend the streaming text, in full on replacement.
-		text := reasoningText(&item)
-		previous := state.textItems[item.ItemID]
-		unseen := strings.TrimPrefix(text, previous.text)
-		switch {
-		case isCompleted:
-			delete(state.textItems, item.ItemID)
-		case len(text) <= 1<<20 && (previous.kind != "" || len(state.textItems) < 1024):
-			field := "text"
-			var parts []string
-			if json.Unmarshal(item.Summary, &parts) == nil && len(parts) > 0 {
-				field = fmt.Sprintf("summary.%d", len(parts)-1)
+		// Reasoning completes as a single SystemEvent; started/updated
+		// emit at most one liveness event per item, deltas nothing.
+		if isCompleted {
+			delete(state.progressSent, item.ItemID)
+			if msg := reasoningText(&item); msg != "" {
+				return []agent.Event{agent.SystemEvent{Subtype: "reasoning", Message: msg, Raw: raw}}
 			}
-			state.textItems[item.ItemID] = textItem{kind: item.Kind, text: text, field: field}
-		default:
-			delete(state.textItems, item.ItemID)
+			return nil
 		}
-		return textEvents(item.Kind, unseen, raw)
+		if _, ok := state.progressSent[item.ItemID]; ok {
+			return nil
+		}
+		if state.progressSent == nil {
+			state.progressSent = make(map[string]struct{})
+		}
+		state.progressSent[item.ItemID] = struct{}{}
+		return []agent.Event{agent.StreamProgressEvent()}
 	case ItemKindToolCall:
 		return mapToolCall(item, method, isCompleted, state, raw)
 	case ItemKindUserShell:
@@ -536,54 +527,23 @@ func mapItemEvent(method string, params json.RawMessage, state *mapperState, raw
 	}
 }
 
-// mapItemDelta forwards reasoning text appends as SystemEvents and maps
-// assistant-text appends to content-free liveness. Assistant deltas never
-// emit AssistantTextEvent fragments: the runner scans each such event for
-// line-anchored verdict markers, so a split marker would lose its verdict
-// and the summary would retain only the trailing fragment. The full text
-// still arrives on the matching item/completed snapshot. Unknown
-// items/fields stay silent. Completion supplies the authoritative snapshot
-// if the stream was saturated.
+// mapItemDelta never emits agent events directly: the full text arrives
+// on item/completed, so deltas are tracked only to prove the item is
+// live. Deltas during a gap are dropped.
 func mapItemDelta(params json.RawMessage, state *mapperState, raw any) []agent.Event {
+	_ = raw
 	var p ItemDeltaParams
-	if json.Unmarshal(params, &p) != nil || p.ItemID == "" || state.gap != nil {
+	_ = json.Unmarshal(params, &p)
+	if p.ItemID == "" {
 		return nil
 	}
-	item, ok := state.textItems[p.ItemID]
-	if !ok {
+	if state.gap != nil {
 		return nil
 	}
-	field := strVal(p.Field)
-	if field != "" && field != "text" && !(item.kind == ItemKindReasoning && strings.HasPrefix(field, "summary.")) {
-		return nil
+	if _, ok := state.items[p.ItemID]; !ok {
+		state.items[p.ItemID] = 0
 	}
-	delta := p.Delta
-	if item.kind == ItemKindReasoning && strings.HasPrefix(field, "summary.") && item.field != field && item.text != "" {
-		delta = "\n" + delta
-	}
-	// Bound retained text while preserving liveness for oversized streams.
-	if len(item.text)+len(delta) > 1<<20 {
-		return []agent.Event{agent.StreamProgressEvent()}
-	}
-	item.field = field
-	item.text += delta
-	state.textItems[p.ItemID] = item
-	if item.kind != ItemKindReasoning {
-		// Assistant-text streaming is liveness only; the complete
-		// message arrives on item/completed.
-		return []agent.Event{agent.StreamProgressEvent()}
-	}
-	return textEvents(item.kind, delta, raw)
-}
-
-func textEvents(kind ItemKind, text string, raw any) []agent.Event {
-	if text == "" {
-		return nil
-	}
-	if kind == ItemKindReasoning {
-		return []agent.Event{agent.SystemEvent{Subtype: "reasoning", Message: text, Raw: raw}}
-	}
-	return []agent.Event{agent.AssistantTextEvent{Text: text, Raw: raw}}
+	return nil
 }
 
 func itemText(item *Item) string {
