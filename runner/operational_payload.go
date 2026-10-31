@@ -31,6 +31,7 @@ type OperationalPayload struct {
 	CacheSeedID           string                            `json:"cacheSeedId,omitempty"`
 	PullRequest           *workarea.PullRequestV1           `json:"pullRequest,omitempty"`
 	ContinuePullRequest   *prompt.ContinuePullRequest       `json:"continuePullRequest,omitempty"`
+	ContextPack           json.RawMessage                   `json:"contextPack,omitempty"`
 	Env                   map[string]string                 `json:"env,omitempty"`
 	ResolvedProfile       ResolvedProfile                   `json:"resolvedProfile,omitempty"`
 	Branch                string                            `json:"branch,omitempty"`
@@ -53,6 +54,7 @@ func ProjectOperationalPayload(qw QueuedWork) OperationalPayload {
 		CacheSeedID:           qw.CacheSeedID,
 		PullRequest:           qw.PullRequest,
 		ContinuePullRequest:   qw.ContinuePullRequest,
+		ContextPack:           qw.ContextPack,
 		Env:                   maps.Clone(qw.Env),
 		ResolvedProfile:       qw.ResolvedProfile,
 		Branch:                qw.Branch,

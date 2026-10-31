@@ -603,6 +603,13 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 			res.PostSessionWarnings = append(res.PostSessionWarnings, warning)
 		}
 	}
+	// Negotiated documents land before the first executor turn: the versioned
+	// carrier is validated, decoded and published under the session-owned
+	// context directory. Any refusal fails before spawn so rejected documents
+	// are never claimed as included.
+	if err := r.materializeContextPack(qw, res.WorkareaRoot, res, provider, r.logger); err != nil {
+		return res, err
+	}
 	runnerStatePath := wpath
 	selectedRepositoryReadOnly := repositoryDeclaration != nil && repositoryDeclaration.Selected.Authority == workarea.RepositoryReadOnly
 	if selectedRepositoryReadOnly {
