@@ -1155,7 +1155,7 @@ func TestUpdaterRunUpdateExpiredContextDoesNotSwap(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 	current := filepath.Join(t.TempDir(), "donmai-daemon")
-	if err := os.WriteFile(current, []byte("old-binary-content"), 0o755); err != nil {
+	if err := os.WriteFile(current, []byte("old-binary-content"), 0o755); err != nil { //nolint:gosec // test scratch binary needs the exec bit, mirroring production chmod 0755
 		t.Fatalf("write current binary: %v", err)
 	}
 	// A verifier that waits past the consent deadline, then reports valid:
@@ -1164,8 +1164,6 @@ func TestUpdaterRunUpdateExpiredContextDoesNotSwap(t *testing.T) {
 	// the fast local download but before verification returns, isolating
 	// the post-verification window (an already-expired context would fail
 	// earlier at download and never reach the rename).
-	type sleepVerifier struct{ sleep time.Duration }
-	_ = sleepVerifier{}
 	deadline := time.Now().Add(300 * time.Millisecond)
 	ctx, cancel := context.WithDeadline(context.Background(), deadline)
 	defer cancel()
@@ -1263,13 +1261,15 @@ func TestHostUpgradeDirectoryNotSyncableRefusesWithoutSwap(t *testing.T) {
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "daemon.yaml")
 	stateDir := filepath.Dir(hostUpgradeStatePath(cfgPath))
-	if err := os.MkdirAll(stateDir, 0o755); err != nil {
+	if err := os.MkdirAll(stateDir, 0o750); err != nil {
 		t.Fatalf("mkdir state dir: %v", err)
 	}
-	if err := os.Chmod(stateDir, 0o300); err != nil {
+	if err := os.Chmod(stateDir, 0o300); err != nil { //nolint:gosec // intentional write-only probe: missing read perm fails dir-sync while rename still succeeds
 		t.Fatalf("chmod state dir: %v", err)
 	}
-	t.Cleanup(func() { _ = os.Chmod(stateDir, 0o755) })
+	t.Cleanup(func() {
+		_ = os.Chmod(stateDir, 0o750) //nolint:gosec // G302: restore the 0750 test-dir mode so TempDir cleanup can traverse it
+	})
 	d := newRestartTestDaemon(t, nil)
 	d.opts.ConfigPath = cfgPath
 	d.config = &Config{
