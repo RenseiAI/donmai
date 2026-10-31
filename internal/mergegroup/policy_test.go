@@ -239,6 +239,130 @@ func TestValidateWorkflowRejectsSetPlusAnywhere(t *testing.T) {
 	}
 }
 
+func TestValidateWorkflowRejectsDisabledJobOrStep(t *testing.T) {
+	base := repoWorkflow(t)
+	cases := map[string]string{
+		// Job-level gate: the whole test job never runs.
+		"job-level-false": strings.Replace(base, "  test:\n",
+			"  test:\n    if: ${{ false }}\n", 1),
+		"job-level-literal": strings.Replace(base, "  test:\n",
+			"  test:\n    if: false\n", 1),
+		// Step-level gate: the coverage step never runs.
+		"step-level-false": strings.Replace(base, "      - name: Test\n",
+			"      - name: Test\n        if: ${{ false }}\n", 1),
+	}
+	for name, txt := range cases {
+		if txt == base {
+			t.Fatalf("case %s: insertion anchor not found", name)
+		}
+		if err := ValidateWorkflow(txt); err == nil {
+			t.Errorf("ValidateWorkflow(%s) = nil, want error", name)
+		}
+	}
+}
+
+func TestValidateWorkflowRejectsCoverageRunFilter(t *testing.T) {
+	base := repoWorkflow(t)
+	cases := map[string]string{
+		"run-no-match": strings.Replace(base,
+			"go test -race -coverprofile=coverage.out -json ./...",
+			"go test -race -coverprofile=coverage.out -run '^DoesNotExist$' -json ./...", 1),
+		"run-equals": strings.Replace(base,
+			"go test -race -coverprofile=coverage.out -json ./...",
+			"go test -race -coverprofile=coverage.out -run='^DoesNotExist$' -json ./...", 1),
+		"skip-all": strings.Replace(base,
+			"go test -race -coverprofile=coverage.out -json ./...",
+			"go test -race -coverprofile=coverage.out -skip '.*' -json ./...", 1),
+	}
+	for name, txt := range cases {
+		if txt == base {
+			t.Fatalf("case %s: insertion anchor not found", name)
+		}
+		if err := ValidateWorkflow(txt); err == nil {
+			t.Errorf("ValidateWorkflow(%s) = nil, want error", name)
+		}
+	}
+}
+
+func TestValidateWorkflowRejectsMultilineLoopRetry(t *testing.T) {
+	base := repoWorkflow(t)
+	multilineLoop := "for i in 1 2\ndo\n  if go test -race -coverprofile=coverage.out -json ./...; then break; fi\ndone"
+	cases := map[string]string{
+		"multiline-for-do": strings.Replace(base,
+			"go test -race -coverprofile=coverage.out -json ./...",
+			multilineLoop, 1),
+		"cond-make-rerun": strings.Replace(base, "timeout-minutes: 30",
+			"timeout-minutes: 30\n      - name: Follow-up checks\n        run: if ! make test; then make test; fi", 1),
+	}
+	for name, txt := range cases {
+		if txt == base {
+			t.Fatalf("case %s: insertion anchor not found", name)
+		}
+		if err := ValidateWorkflow(txt); err == nil {
+			t.Errorf("ValidateWorkflow(%s) = nil, want error", name)
+		}
+	}
+}
+
+func TestValidateWorkflowRejectsFakePipefail(t *testing.T) {
+	base := repoWorkflow(t)
+	withEcho := strings.Replace(base,
+		"set -o pipefail\n          go test -race -coverprofile=coverage.out -json ./...",
+		"echo pipefail\n          go test -race -coverprofile=coverage.out -json ./...", 1)
+	if withEcho == base {
+		t.Fatal("insertion anchor not found")
+	}
+	if err := ValidateWorkflow(withEcho); err == nil {
+		t.Fatal("ValidateWorkflow with echo pipefail = nil, want error")
+	}
+}
+
+func TestValidateWorkflowRejectsPipeOrFallback(t *testing.T) {
+	base := repoWorkflow(t)
+	cases := map[string]string{
+		"or-true": strings.Replace(base,
+			"go test -race -coverprofile=coverage.out -json ./...",
+			"go test -race -coverprofile=coverage.out -json ./... || true", 1),
+		"or-rerun": strings.Replace(base,
+			"go test -race -coverprofile=coverage.out -json ./...",
+			"go test -race -coverprofile=coverage.out -json ./... || go test -race -coverprofile=coverage.out -json ./...", 1),
+	}
+	for name, txt := range cases {
+		if txt == base {
+			t.Fatalf("case %s: insertion anchor not found", name)
+		}
+		if err := ValidateWorkflow(txt); err == nil {
+			t.Errorf("ValidateWorkflow(%s) = nil, want error", name)
+		}
+	}
+}
+
+func TestValidateWorkflowRejectsRepeatedSuite(t *testing.T) {
+	base := repoWorkflow(t)
+	twice := strings.Replace(base,
+		"go test -race -coverprofile=coverage.out -json ./...",
+		"go test -race -coverprofile=coverage.out -json ./...\n          go test -race ./...", 1)
+	if twice == base {
+		t.Fatal("insertion anchor not found")
+	}
+	if err := ValidateWorkflow(twice); err == nil {
+		t.Fatal("ValidateWorkflow with repeated suite = nil, want error")
+	}
+}
+
+func TestValidateWorkflowRejectsEchoOnlyCoverage(t *testing.T) {
+	base := repoWorkflow(t)
+	echoOnly := strings.Replace(base,
+		"go test -race -coverprofile=coverage.out -json ./...",
+		"echo go test -race -coverprofile=coverage.out -json ./...", 1)
+	if echoOnly == base {
+		t.Fatal("insertion anchor not found")
+	}
+	if err := ValidateWorkflow(echoOnly); err == nil {
+		t.Fatal("ValidateWorkflow with echo-only coverage = nil, want error")
+	}
+}
+
 func TestValidateWorkflowRejectsMissingDecision(t *testing.T) {
 	base := repoWorkflow(t)
 	stripped := strings.ReplaceAll(base, Marker, "")

@@ -65,10 +65,29 @@ var (
 	// runs on failure()/always() is a rerun gate however it is spelled,
 	// and any `set +` disarms errexit wherever it sits. Both are judged
 	// on the raw lines, not on whether a test command shares the chunk.
-	rerunCondRe     = regexp.MustCompile(`(?i)^\s*if\s*:.*(failure\(\)|always\(\))`)
-	setPlusRe       = regexp.MustCompile(`set\s+\+`)
-	jobHeaderRe     = regexp.MustCompile(`^  [A-Za-z0-9_.-]+:`)
-	shellLoopRe     = regexp.MustCompile(`(?i)\bfor\s+\S+\s+in\b[^\n]*\bdo\b|\bwhile\b[^\n]*\bdo\b|\buntil\b[^\n]*\bdo\b`)
+	rerunCondRe = regexp.MustCompile(`(?i)^\s*if\s*:.*(failure\(\)|always\(\))`)
+	// A statically-false gate disables the job or step without deleting
+	// it: the coverage is gone while the snippet stays on disk. Any YAML
+	// `if:` (job- or step-level) whose expression contains a standalone
+	// `false` is a disable, never a retry, and is rejected outright.
+	disabledCondRe = regexp.MustCompile(`(?i)^\s*if\s*:.*\bfalse\b`)
+	setPlusRe      = regexp.MustCompile(`set\s+\+`)
+	jobHeaderRe    = regexp.MustCompile(`^  [A-Za-z0-9_.-]+:`)
+	// Shell loops may put `do` on the next line, so the loop shape is
+	// matched across newlines within a step chunk.
+	shellLoopRe = regexp.MustCompile(`(?i)\bfor\s+\S+\s+\bin\b[\s\S]*?\bdo\b|\bwhile\b[\s\S]*?\bdo\b|\buntil\b[\s\S]*?\bdo\b`)
+	// A `make test` invocation that is not a longer target name: excludes
+	// `make test-tagged`, `make test-shim-overlap`, and similar.
+	makeTestRe = regexp.MustCompile(`\bmake test([^\w-]|$)`)
+	// `-run`/`-skip` narrow the suite (a no-match filter runs zero tests
+	// and exits 0), so the coverage command must not carry one.
+	testFilterRe = regexp.MustCompile(`(?:^|\s)-run(?:=|\s)|(?:^|\s)-skip(?:=|\s)`)
+	// pipefail is enabled only by a real `set` command carrying `-o
+	// pipefail` (`set -o pipefail`, `set -euo pipefail`, `...; set -o
+	// pipefail`, `... && set -o pipefail`). A bare mention such as
+	// `echo pipefail`, or piping into `set` (`| set -o pipefail`, which
+	// runs in a subshell), does not protect the step's pipe.
+	pipefailSetRe   = regexp.MustCompile(`(?i)(?:^|;|&&)\s*set\s+[^\n;]*-[A-Za-z]*o\s+pipefail\b`)
 	semicolonTrueRe = regexp.MustCompile(`(?i);\s*(/bin/true|/usr/bin/true|true)\b`)
 	semicolonNoopRe = regexp.MustCompile(`;\s*:(?:\s|;|$)`)
 	andTrueRe       = regexp.MustCompile(`(?i)&&\s*(/bin/true|/usr/bin/true|true)\b`)
@@ -229,12 +248,26 @@ func stripQuoted(s string) string {
 	return b.String()
 }
 
+// pipefail counts only as a real `set` command enabling it (`set -o
+// pipefail`, `set -euo pipefail`, ...). A mere mention such as
+// `echo pipefail` leaves the default shell masking a failed producer
+// behind a successful summary consumer, so it must not satisfy the check.
+func pipefailEnabled(s string) bool {
+	for _, line := range strings.Split(s, "\n") {
+		trim := strings.TrimSpace(stripQuoted(line))
+		if pipefailSetRe.FindString(trim) != "" {
+			return true
+		}
+	}
+	return false
+}
+
 // chunkHasUnprotectedPipe reports a shell pipe in a test chunk without
 // pipefail. The YAML `run: |` block marker is not a shell pipe, so the
 // run header carrying only that marker is skipped; quoted -run filters
 // are stripped before scanning.
 func chunkHasUnprotectedPipe(s string) bool {
-	if strings.Contains(strings.ToLower(s), "pipefail") {
+	if pipefailEnabled(s) {
 		return false
 	}
 	for _, line := range strings.Split(s, "\n") {
@@ -253,6 +286,21 @@ func chunkHasUnprotectedPipe(s string) bool {
 		}
 		tmp := strings.ReplaceAll(stripped, "||", "")
 		if strings.Contains(tmp, "|") {
+			return true
+		}
+	}
+	return false
+}
+
+// hasCoverageFilter reports a -run/-skip narrowing flag in a step chunk
+// that carries the required coverage snippet: the command is present but
+// the suite would run zero tests and exit 0.
+func hasCoverageFilter(block, snippet string) bool {
+	for _, s := range stepChunks(block) {
+		if !strings.Contains(s, "run:") || !strings.Contains(s, snippet) {
+			continue
+		}
+		if testFilterRe.FindString(stripQuoted(s)) != "" {
 			return true
 		}
 	}
@@ -303,7 +351,11 @@ func hasShellRetry(code string) bool {
 		if shellLoopRe.MatchString(s) {
 			return true
 		}
-		if hasGoTest && strings.Count(s, "go test") > 1 {
+		// A second suite invocation in the same step is a retry however
+		// it is spelled (`go test` again, or the `make test` wrapper).
+		// `make test-...` targets (test-tagged, test-shim-overlap) are
+		// not suite invocations and are excluded by makeTestRe.
+		if strings.Count(s, "go test")+len(makeTestRe.FindAllString(s, -1)) > 1 {
 			return true
 		}
 		if strings.Contains(s, "||") {
@@ -359,6 +411,9 @@ func ValidateWorkflow(text string) error {
 		if !snippetActive(block, e.Snippet) {
 			return fmt.Errorf("inventory job %q lost its active coverage %q", e.Job, e.Snippet)
 		}
+		if hasCoverageFilter(block, e.Snippet) {
+			return fmt.Errorf("inventory job %q narrows its suite with a test filter", e.Job)
+		}
 		if (e.Job == "macos-confinement" || e.Job == "linux-confinement") && !hasConfinementRun(block) {
 			return fmt.Errorf("inventory job %q lost its live test execution", e.Job)
 		}
@@ -375,6 +430,9 @@ func ValidateWorkflow(text string) error {
 	for _, l := range strings.Split(code, "\n") {
 		if rerunCondRe.MatchString(l) {
 			return fmt.Errorf("retry forbidden: workflow adds a rerun condition")
+		}
+		if disabledCondRe.MatchString(l) {
+			return fmt.Errorf("coverage disabled: workflow adds a disabling condition")
 		}
 	}
 	if setPlusRe.FindString(code) != "" {
