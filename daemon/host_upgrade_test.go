@@ -1472,3 +1472,149 @@ func TestPruneHostUpgradeLedgerKeepsActionableReceipts(t *testing.T) {
 		t.Fatal("expired receipt should be evictable to enforce the bound")
 	}
 }
+
+func TestHostUpgradeOptInFloodStaysBounded(t *testing.T) {
+	t.Parallel()
+	d := hostUpgradeTestDaemon(t, nil)
+	d.config.AutoUpdate.Signers = nil
+	var calls atomic.Int32
+	d.runPreparedUpdate = func(context.Context, AutoUpdateConfig, string) (*UpdateResult, error) {
+		calls.Add(1)
+		return &UpdateResult{Updated: true, Version: "x", Reason: "update-applied"}, nil
+	}
+	timestampLess := func(id string) PendingMutation {
+		raw, _ := json.Marshal(map[string]any{"consented": true})
+		return PendingMutation{ID: id, Op: hostUpgradeOp, Params: raw, RequestedBy: "tester"}
+	}
+	const total = hostUpgradeMaxRetainedOutcomes + 32
+	for i := 0; i < total; i++ {
+		m := timestampLess(fmt.Sprintf("up-optin-flood-%04d", i))
+		applied, failures := d.applyPendingMutations(context.Background(), []PendingMutation{m})
+		if len(applied) != 0 || len(failures) != 1 {
+			t.Fatalf("flood %d applied/failures = %v/%v, want refusal", i, applied, failures)
+		}
+		if !strings.Contains(failures[0].Error, "consent") {
+			t.Fatalf("flood %d failure %q does not name machine-owner consent", i, failures[0].Error)
+		}
+	}
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("update calls = %d, want 0 (opt-in refusals must never execute)", got)
+	}
+	d.hostUpgradeMu.Lock()
+	retained := len(d.hostUpgradeDone)
+	_, evicted := d.hostUpgradeDone["up-optin-flood-0000"]
+	d.hostUpgradeMu.Unlock()
+	if retained > hostUpgradeMaxRetainedOutcomes {
+		t.Fatalf("retained outcomes = %d, want at most %d", retained, hostUpgradeMaxRetainedOutcomes)
+	}
+	if evicted {
+		t.Fatal("oldest opt-in refusal should have been evicted to enforce the bound")
+	}
+	reloaded, err := loadHostUpgradeOutcomes(hostUpgradeStatePath(d.opts.ConfigPath))
+	if err != nil {
+		t.Fatalf("reload durable: %v", err)
+	}
+	if len(reloaded) > hostUpgradeMaxRetainedOutcomes {
+		t.Fatalf("durable outcomes = %d, want at most %d", len(reloaded), hostUpgradeMaxRetainedOutcomes)
+	}
+	for id, outcome := range reloaded {
+		if !outcome.Evictable {
+			t.Fatalf("retained opt-in refusal %q is not evictable", id)
+		}
+	}
+	applied, failures := d.applyPendingMutations(context.Background(), []PendingMutation{timestampLess("up-optin-flood-0000")})
+	if len(applied) != 0 || len(failures) != 1 || !strings.Contains(failures[0].Error, "consent") {
+		t.Fatalf("evicted redelivery applied/failures = %v/%v, want consent refusal", applied, failures)
+	}
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("update calls after evicted redelivery = %d, want 0", got)
+	}
+}
+
+func TestHostUpgradeNoSourceFloodStaysBounded(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "daemon.yaml")
+	d := newRestartTestDaemon(t, nil)
+	d.opts.ConfigPath = cfgPath
+	d.config = &Config{
+		AutoUpdate: AutoUpdateConfig{
+			Channel: ChannelStable, Schedule: ScheduleManual,
+			Signers: []UpdateSigner{{SAN: "test@example.com", Issuer: "https://example.test"}},
+		},
+	}
+	d.runPreparedUpdate = nil
+	timestampLess := func(id string) PendingMutation {
+		raw, _ := json.Marshal(map[string]any{"consented": true})
+		return PendingMutation{ID: id, Op: hostUpgradeOp, Params: raw, RequestedBy: "tester"}
+	}
+	const total = hostUpgradeMaxRetainedOutcomes + 32
+	for i := 0; i < total; i++ {
+		m := timestampLess(fmt.Sprintf("up-nosrc-flood-%04d", i))
+		applied, failures := d.applyPendingMutations(context.Background(), []PendingMutation{m})
+		if len(applied) != 0 || len(failures) != 1 {
+			t.Fatalf("flood %d applied/failures = %v/%v, want refusal", i, applied, failures)
+		}
+		if !strings.Contains(failures[0].Error, "source") {
+			t.Fatalf("flood %d failure %q does not name the missing update source", i, failures[0].Error)
+		}
+	}
+	d.hostUpgradeMu.Lock()
+	retained := len(d.hostUpgradeDone)
+	_, evicted := d.hostUpgradeDone["up-nosrc-flood-0000"]
+	d.hostUpgradeMu.Unlock()
+	if retained > hostUpgradeMaxRetainedOutcomes {
+		t.Fatalf("retained outcomes = %d, want at most %d", retained, hostUpgradeMaxRetainedOutcomes)
+	}
+	if evicted {
+		t.Fatal("oldest no-source refusal should have been evicted to enforce the bound")
+	}
+	reloaded, err := loadHostUpgradeOutcomes(hostUpgradeStatePath(cfgPath))
+	if err != nil {
+		t.Fatalf("reload durable: %v", err)
+	}
+	if len(reloaded) > hostUpgradeMaxRetainedOutcomes {
+		t.Fatalf("durable outcomes = %d, want at most %d", len(reloaded), hostUpgradeMaxRetainedOutcomes)
+	}
+	applied, failures := d.applyPendingMutations(context.Background(), []PendingMutation{timestampLess("up-nosrc-flood-0000")})
+	if len(applied) != 0 || len(failures) != 1 || !strings.Contains(failures[0].Error, "source") {
+		t.Fatalf("evicted redelivery applied/failures = %v/%v, want source refusal", applied, failures)
+	}
+}
+
+func TestHostUpgradeDurableBrokenRefusesNewID(t *testing.T) {
+	t.Parallel()
+	d := hostUpgradeTestDaemon(t, nil)
+	var calls atomic.Int32
+	d.runPreparedUpdate = func(context.Context, AutoUpdateConfig, string) (*UpdateResult, error) {
+		calls.Add(1)
+		return &UpdateResult{Updated: true, Version: "x", Reason: "update-applied"}, nil
+	}
+	stateDir := filepath.Dir(d.opts.ConfigPath)
+	first := hostUpgradeMutation("up-broken-first", map[string]any{"consented": true})
+	if applied, failures := d.applyPendingMutations(context.Background(), []PendingMutation{first}); len(applied) != 0 || len(failures) != 0 {
+		t.Fatalf("first applied/failures = %v/%v, want pending", applied, failures)
+	}
+	_ = os.RemoveAll(stateDir)
+	waitForHostUpgradeDone(t, d, "up-broken-first")
+	d.hostUpgradeMu.Lock()
+	broken := d.hostUpgradeDurableBroken
+	d.hostUpgradeMu.Unlock()
+	if !broken {
+		t.Fatal("durability should be marked broken after persist failure")
+	}
+	if err := os.MkdirAll(stateDir, 0o750); err != nil { //nolint:gosec // G301: test-dir mode matches repo helper dirs
+		t.Fatalf("restore state dir: %v", err)
+	}
+	second := hostUpgradeMutation("up-broken-new", map[string]any{"consented": true})
+	applied, failures := d.applyPendingMutations(context.Background(), []PendingMutation{second})
+	if len(applied) != 0 || len(failures) != 1 {
+		t.Fatalf("sticky-broken applied/failures = %v/%v, want refusal for new id", applied, failures)
+	}
+	if !strings.Contains(strings.ToLower(failures[0].Error), "durable") {
+		t.Fatalf("sticky-broken failure %q does not name durable state", failures[0].Error)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("update calls = %d, want 1 (new id must not execute after breakage)", got)
+	}
+}

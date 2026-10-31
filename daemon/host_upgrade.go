@@ -605,13 +605,16 @@ func (d *Daemon) handleHostUpgradeMutation(m PendingMutation) (appliedID string,
 		return "", &HeartbeatMutationFailure{ID: m.ID, Error: errText}
 	}
 	// Machine-owner opt-in and the configured update source are checked
-	// before request-shape validation so an unauthenticated flood against a
-	// host with no signed source cannot grow the retained ledger: the
-	// refusal names the missing opt-in instead of persisting a per-ID
-	// shape refusal.
+	// before request-shape validation. These environment refusals never
+	// executed anything, so they are recorded as evictable: a flood of
+	// unique IDs against a host with no signed source stays within the
+	// retention bound, and a redelivery of an evicted receipt re-runs the
+	// same environment gate first (re-refusing identically under an
+	// unchanged environment, or reaching a legitimate first decision once
+	// an operator configures a source) instead of a second swap.
 	if !hostUpgradeOptedIn(d.configSnapshotForUpgrade()) {
 		err := "host.upgrade refused: machine-owner update consent is not configured (no signed source)"
-		outcome := hostUpgradeOutcome{Applied: false, Error: err, CompletedAt: now.UTC().Format(time.RFC3339), ConsentUntil: hostUpgradeConsentUntilString(m)}
+		outcome := hostUpgradeOutcome{Applied: false, Error: err, CompletedAt: now.UTC().Format(time.RFC3339), Evictable: true, ConsentUntil: hostUpgradeConsentUntilString(m)}
 		d.hostUpgradeDone[m.ID] = outcome
 		pruneHostUpgradeLedger(d.hostUpgradeDone)
 		if persistErr := persistHostUpgradeOutcome(statePath, m.ID, outcome); persistErr != nil {
@@ -627,7 +630,7 @@ func (d *Daemon) handleHostUpgradeMutation(m PendingMutation) (appliedID string,
 	// without a swap, never ACK applied.
 	if !d.hostUpgradeSourceConfigured() {
 		err := "host.upgrade refused: update source is not configured"
-		outcome := hostUpgradeOutcome{Applied: false, Error: err, CompletedAt: now.UTC().Format(time.RFC3339), ConsentUntil: hostUpgradeConsentUntilString(m)}
+		outcome := hostUpgradeOutcome{Applied: false, Error: err, CompletedAt: now.UTC().Format(time.RFC3339), Evictable: true, ConsentUntil: hostUpgradeConsentUntilString(m)}
 		d.hostUpgradeDone[m.ID] = outcome
 		pruneHostUpgradeLedger(d.hostUpgradeDone)
 		if persistErr := persistHostUpgradeOutcome(statePath, m.ID, outcome); persistErr != nil {
