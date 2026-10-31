@@ -821,14 +821,19 @@ func (h *Handle) closeEvents() {
 	h.releaseConfinement()
 }
 
-// emit publishes an event on the events channel without blocking. If
-// the channel is full, the event is dropped silently, except that
-// best-effort streaming output never takes a reserved slot:
-// once the buffer holds cap-reserved events it is dropped early so the
+// emit publishes an event on the events channel without blocking.
+// Best-effort streaming output never takes a reserved slot: once the
+// buffer holds cap-reserved events it is dropped early so the
 // authoritative assistant completion and terminal result still fit.
+// When a non-best-effort event arrives at a full buffer, emit evicts
+// queued best-effort output to make room; a fixed reservation alone only
+// moves the failure threshold once ordinary traffic (tool calls) fills
+// the reserved tail. When no best-effort output remains, a high-priority
+// terminal-adjacent event (assistant completion, usage, result/error)
+// evicts the oldest queued event rather than dropping the verdict.
 func (h *Handle) emit(ev agent.Event) {
-	h.eventsMu.RLock()
-	defer h.eventsMu.RUnlock()
+	h.eventsMu.Lock()
+	defer h.eventsMu.Unlock()
 	if h.eventsClosed.Load() {
 		return
 	}
@@ -836,11 +841,101 @@ func (h *Handle) emit(ev agent.Event) {
 		if n := cap(h.events); n > streamProgressReservedSlots && len(h.events) >= n-streamProgressReservedSlots {
 			return
 		}
+		select {
+		case h.events <- ev:
+		case <-h.closed:
+		default:
+		}
+		return
 	}
 	select {
 	case h.events <- ev:
+		return
 	case <-h.closed:
+		return
 	default:
+	}
+	if h.evictForTerminal(ev) {
+		select {
+		case h.events <- ev:
+		case <-h.closed:
+		default:
+		}
+	}
+}
+
+// evictForTerminal makes room for ev on a full events channel by
+// dropping queued best-effort output first. It must be called with
+// eventsMu held and only when the non-blocking send above failed.
+// Reports whether room was made. Drained normal events are re-queued in
+// order; only best-effort output — or, for high-priority terminal-
+// adjacent events with no best-effort left, the single oldest event —
+// is lost.
+func (h *Handle) evictForTerminal(ev agent.Event) bool {
+	n := len(h.events)
+	if n == 0 {
+		return true
+	}
+	kept := make([]agent.Event, 0, n)
+	evicted := 0
+	for {
+		select {
+		case e := <-h.events:
+			if isBestEffortStreamEvent(e) {
+				evicted++
+				continue
+			}
+			kept = append(kept, e)
+		default:
+			goto drained
+		}
+	}
+drained:
+	if evicted == 0 {
+		if !isTerminalAdjacentEvent(ev) {
+			for _, e := range kept {
+				select {
+				case h.events <- e:
+				case <-h.closed:
+					return false
+				default:
+					return false
+				}
+			}
+			return false
+		}
+		if len(kept) == 0 {
+			return true
+		}
+		kept = kept[1:]
+	}
+	for _, e := range kept {
+		select {
+		case h.events <- e:
+		case <-h.closed:
+			return false
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// isTerminalAdjacentEvent reports whether ev is terminal-adjacent and
+// must not be dropped in favor of older queued output: the final
+// assistant message the runner verdict-scans, the aggregate per-turn
+// usage, and the terminal result/error itself.
+func isTerminalAdjacentEvent(ev agent.Event) bool {
+	switch ev.(type) {
+	case agent.AssistantTextEvent,
+		agent.LlmCallEvent,
+		agent.UsageEvent,
+		agent.ContextUsageEvent,
+		agent.ResultEvent,
+		agent.ErrorEvent:
+		return true
+	default:
+		return false
 	}
 }
 

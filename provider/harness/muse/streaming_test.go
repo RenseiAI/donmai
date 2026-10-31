@@ -430,3 +430,97 @@ func TestStreaming_SnapshotRetentionBounds(t *testing.T) {
 		}
 	})
 }
+
+// TestMixedBurstPreservesTerminal pins the mixed-traffic overflow
+// contract: streaming liveness fills the best-effort budget, ordinary
+// tool traffic then fills the reserved tail, and the final assistant
+// message, aggregate usage, and terminal result must still be delivered.
+// A fixed reservation alone only moves the threshold — four tool calls
+// consume eight reserved slots — so terminal-adjacent events evict queued
+// best-effort output. Drives the production Handle.handleNotification +
+// emitter path with no concurrent drain.
+func TestMixedBurstPreservesTerminal(t *testing.T) {
+	h := newHandle(nil, agent.Spec{Prompt: "x"}, NewSpawnPlan(agent.Spec{Prompt: "x"}, t.TempDir()), HandleOptions{})
+	sid := "77777777-7777-7777-8777-777777777777"
+	turnID := "88888888-8888-7888-8888-888888888888"
+	h.setSessionID(sid)
+	h.setCurrentTurnID(turnID)
+	answerID := "m1"
+	started, err := json.Marshal(map[string]any{
+		"sessionId": sid, "viewCursor": "cursor-0",
+		"item": map[string]any{"itemId": answerID, "kind": "agentMessage", "revision": 1, "status": "inProgress", "text": "", "turnId": turnID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.handleNotification(context.Background(), notification{Method: "item/started", Params: started})
+	// Fill the best-effort budget with assistant streaming liveness.
+	for i := 0; i < 248; i++ {
+		delta, err := json.Marshal(map[string]any{"sessionId": sid, "viewCursor": "cursor-0", "itemId": answerID, "field": "text", "delta": "a"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		h.handleNotification(context.Background(), notification{Method: "item/delta", Params: delta})
+	}
+	// Four ordinary tool calls consume the reserved tail.
+	for i := 0; i < 4; i++ {
+		id := fmt.Sprintf("tool-%d", i)
+		sParams, err := json.Marshal(map[string]any{
+			"sessionId": sid, "viewCursor": "cursor-0",
+			"item": map[string]any{"itemId": id, "kind": "toolCall", "revision": 1, "status": "inProgress", "tool": "edit", "args": `{"path":"a.txt"}`, "turnId": turnID},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		h.handleNotification(context.Background(), notification{Method: "item/started", Params: sParams})
+		cParams, err := json.Marshal(map[string]any{
+			"sessionId": sid, "viewCursor": "cursor-0",
+			"item": map[string]any{"itemId": id, "kind": "toolCall", "revision": 2, "status": "completed", "tool": "edit", "visibleOutput": "ok", "turnId": turnID},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		h.handleNotification(context.Background(), notification{Method: "item/completed", Params: cParams})
+	}
+	full := "final answer"
+	completed, err := json.Marshal(map[string]any{
+		"sessionId": sid, "viewCursor": "cursor-1",
+		"item": map[string]any{"itemId": answerID, "kind": "agentMessage", "revision": 2, "status": "completed", "text": full, "turnId": turnID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.handleNotification(context.Background(), notification{Method: "item/completed", Params: completed})
+	turnDone, err := json.Marshal(map[string]any{"sessionId": sid, "viewCursor": "cursor-end", "turnId": turnID, "terminal": "completed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := h.handleNotification(context.Background(), notification{Method: "turn/completed", Params: turnDone})
+	if !done {
+		t.Fatalf("turn/completed did not report terminal")
+	}
+	var assistant, usage, result int
+	for {
+		select {
+		case ev := <-h.Events():
+			switch e := ev.(type) {
+			case agent.AssistantTextEvent:
+				if e.Text == full {
+					assistant++
+				}
+			case agent.LlmCallEvent:
+				usage++
+			case agent.ResultEvent:
+				if e.Success {
+					result++
+				}
+			}
+		default:
+			goto drainedMixed
+		}
+	}
+drainedMixed:
+	if assistant == 0 || usage == 0 || result == 0 {
+		t.Fatalf("mixed burst lost final events: assistant=%d usage=%d result=%d handlerDone=%v", assistant, usage, result, done)
+	}
+}
