@@ -589,6 +589,14 @@ type Daemon struct {
 	// tests inject a recorder so the restart handoff is observable
 	// without exiting the test process.
 	autoUpdateRestartHook func()
+	// updateSwapApplied latches when any Update swaps a newer binary to
+	// disk (Updated=true). It is set while the update lifecycle lease is
+	// still held, before finish releases it, so a concurrent Resume that
+	// acquires the lease afterwards observes it and refuses: new work
+	// must not be admitted after the snapshot that authorized the
+	// impending restart. The process exits (or the test hook records)
+	// with the daemon draining; the flag never clears in-process.
+	updateSwapApplied atomic.Bool
 
 	// credentials is the single refresher every lane draws its worker identity
 	// from, constructed in Start once registration has produced one. A durable-
@@ -2544,11 +2552,20 @@ func (d *Daemon) onYamlChanged(cfg *Config) {
 		// lock across it would nest the two. A revoked opt-in stops the
 		// loop promptly; a fresh opt-in starts it without a restart.
 		// Both helpers are idempotent (start is a no-op when a loop
-		// already runs, stop when none does).
-		if autoUpdateSchedulerWanted(cfg) {
-			d.startAutoUpdateScheduler()
-		} else {
-			d.stopAutoUpdateScheduler()
+		// already runs, stop when none does). A queued watcher callback
+		// that waited behind yamlReloadMu while Stop completed must not
+		// recreate the loop after terminal publication: start itself
+		// refuses once a stop generation exists, and this reconcile is
+		// skipped outright once stopping began.
+		d.lifecycleMu.Lock()
+		stopping := d.stopGen != nil
+		d.lifecycleMu.Unlock()
+		if !stopping {
+			if autoUpdateSchedulerWanted(cfg) {
+				d.startAutoUpdateScheduler()
+			} else {
+				d.stopAutoUpdateScheduler()
+			}
 		}
 	}
 
@@ -2752,8 +2769,9 @@ func (d *Daemon) Stop(ctx context.Context) error {
 
 	// Stop the scheduled-update loop first so no new Update can begin
 	// racing the drain below; an in-flight attempt ends with its bounded
-	// attempt context, so this join terminates within the attempt bound.
-	d.stopAutoUpdateScheduler()
+	// attempt context. The join itself is bounded by the caller's Stop
+	// deadline, so a never-settling pre-check cannot hold shutdown past it.
+	d.stopAutoUpdateSchedulerContext(ctx)
 
 	// Start every shutdown barrier before waiting for any of them. In particular,
 	// an unjoinable poll or landing callback must not suppress worker admission
@@ -3228,6 +3246,10 @@ func (d *Daemon) ResumeContext(ctx context.Context) error {
 		state := d.State()
 		d.lifecycleMu.Unlock()
 		return fmt.Errorf("cannot resume while daemon is %s", state)
+	}
+	if d.updateSwapApplied.Load() {
+		d.lifecycleMu.Unlock()
+		return errors.New("cannot resume after an applied update swap \u2014 restart required")
 	}
 	spawner := d.spawner
 	d.lifecycleMu.Unlock()
@@ -4074,7 +4096,14 @@ func (a *updateAttempt) run(ctx context.Context) (*UpdateResult, error) {
 		return nil, errors.New("no config loaded")
 	}
 	if d.runPreparedUpdate != nil {
-		return d.runPreparedUpdate(ctx, cfg.AutoUpdate, d.EffectiveVersion())
+		res, err := d.runPreparedUpdate(ctx, cfg.AutoUpdate, d.EffectiveVersion())
+		if err == nil && res != nil && res.Updated {
+			// Latched while the update lease is still held (deferred
+			// finish releases it), so a Resume that acquires the lease
+			// afterwards observes the fence with no window.
+			d.updateSwapApplied.Store(true)
+		}
+		return res, err
 	}
 	updater := NewUpdater(UpdaterOptions{
 		CurrentVersion: d.EffectiveVersion(),
@@ -4085,7 +4114,11 @@ func (a *updateAttempt) run(ctx context.Context) (*UpdateResult, error) {
 		CDNBase:  strings.TrimSpace(cfg.AutoUpdate.Source),
 		SkipExit: true, // HTTP-driven update: caller decides to exit.
 	})
-	return updater.RunUpdate(ctx)
+	res, err := updater.RunUpdate(ctx)
+	if err == nil && res != nil && res.Updated {
+		d.updateSwapApplied.Store(true)
+	}
+	return res, err
 }
 
 // recordOSSRoutingDecision feeds the routing trace store with the

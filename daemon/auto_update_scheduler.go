@@ -161,7 +161,12 @@ func (d *Daemon) startAutoUpdateScheduler() {
 	}
 	s.cancel = cancel
 	d.lifecycleMu.Lock()
-	if d.autoUpdateScheduler != nil {
+	// A queued watcher callback that waited behind yamlReloadMu while
+	// Stop completed must not install a loop after terminal publication.
+	// The check and install share this critical section so a concurrent
+	// Stop cannot interleave between them. The context is discarded via
+	// cancel when stopping began.
+	if d.stopGen != nil || d.autoUpdateScheduler != nil {
 		d.lifecycleMu.Unlock()
 		cancel()
 		return
@@ -173,9 +178,19 @@ func (d *Daemon) startAutoUpdateScheduler() {
 
 // stopAutoUpdateScheduler cancels the scheduled-update loop and joins it.
 // A never-settling fetch ends with the attempt context (bounded by
-// drainTimeout + the run bound), so Stop terminates within the attempt
+// drainTimeout + the run bound), so the join terminates within the attempt
 // bound. Nil-safe: a daemon that never started the loop stops nothing.
 func (d *Daemon) stopAutoUpdateScheduler() {
+	d.stopAutoUpdateSchedulerContext(context.Background())
+}
+
+// stopAutoUpdateSchedulerContext cancels the loop and joins it, but the
+// join itself is bounded by ctx: shutdown never waits past the caller's
+// deadline even when the in-flight pre-check ignores cancellation (for
+// example a trust-root read blocked on a FIFO before any HTTP request
+// starts). Cancel still bounds the attempt: the check below observes the
+// scheduler context and returns, letting run exit and close done.
+func (d *Daemon) stopAutoUpdateSchedulerContext(ctx context.Context) {
 	d.lifecycleMu.Lock()
 	s := d.autoUpdateScheduler
 	d.autoUpdateScheduler = nil
@@ -185,7 +200,14 @@ func (d *Daemon) stopAutoUpdateScheduler() {
 	}
 	close(s.quit)
 	s.cancel()
-	<-s.done
+	if ctx == nil {
+		<-s.done
+		return
+	}
+	select {
+	case <-s.done:
+	case <-ctx.Done():
+	}
 }
 
 // autoUpdateClockOrDefault returns the injected test clock, or the system
@@ -237,6 +259,16 @@ func (s *autoUpdateScheduler) attemptOnce() {
 	if s == nil || s.daemon == nil {
 		return
 	}
+	// A scheduler that survived Stop (a watcher AfterFunc that entered
+	// before the watcher closed and waited behind yamlReloadMu) stays
+	// inert: no network after stopping began, even if installation raced
+	// terminal publication.
+	s.daemon.lifecycleMu.Lock()
+	stopping := s.daemon.stopGen != nil
+	s.daemon.lifecycleMu.Unlock()
+	if stopping {
+		return
+	}
 	if s.applied.Load() {
 		// Restart already requested for this release; never re-apply the
 		// same swap against the old running version.
@@ -286,13 +318,32 @@ func (s *autoUpdateScheduler) attemptOnce() {
 // checkAutoUpdateRelease fetches the version manifest through the
 // production updater construction (60-second per-request client) and
 // reports whether a strictly newer release exists. A nil manifest with a
-// nil error means up-to-date.
+// nil error means up-to-date. Construction itself (trust-root file read
+// plus executable resolution) runs under the attempt context: a blocked
+// read — for example an operator-configured FIFO with no writer — does
+// not hold the attempt past its bound, and Stop's cancel releases the
+// waiter even though the construction goroutine stays blocked until the
+// path unblocks.
 func (d *Daemon) checkAutoUpdateRelease(ctx context.Context, cfg *Config) (*VersionManifest, error) {
-	u := NewUpdater(UpdaterOptions{
-		CurrentVersion: d.EffectiveVersion(),
-		Config:         cfg.AutoUpdate,
-		CDNBase:        strings.TrimSpace(cfg.AutoUpdate.Source),
-		SkipExit:       true,
-	})
-	return u.CheckForUpdate(ctx)
+	type checkResult struct {
+		manifest *VersionManifest
+		err      error
+	}
+	ch := make(chan checkResult, 1)
+	go func() {
+		u := NewUpdater(UpdaterOptions{
+			CurrentVersion: d.EffectiveVersion(),
+			Config:         cfg.AutoUpdate,
+			CDNBase:        strings.TrimSpace(cfg.AutoUpdate.Source),
+			SkipExit:       true,
+		})
+		m, err := u.CheckForUpdate(ctx)
+		ch <- checkResult{manifest: m, err: err}
+	}()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case r := <-ch:
+		return r.manifest, r.err
+	}
 }
