@@ -1912,7 +1912,7 @@ func TestPosterPost_StatusDependencyPreparationOmitsRawErrors(t *testing.T) {
 // the exact bounded report and replay preserves it.
 func TestPosterPreparedBodyPreservesDependencyPreparation(t *testing.T) {
 	t.Parallel()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	t.Cleanup(srv.Close)

@@ -815,6 +815,61 @@ func TestRun_DependencyInstallTimeoutStillSpawns(t *testing.T) {
 	}
 }
 
+// pnpmFailGoBlockExecer fails the pnpm install fast and blocks the go
+// install until the shared context expires. It drives the combined
+// failed-plus-timed-out state so the timed_out-over-failed priority is
+// pinned: swapping the switch cases reports failed instead and fails the
+// test below.
+type pnpmFailGoBlockExecer struct {
+	mu    sync.Mutex
+	calls []depsCall
+}
+
+func (f *pnpmFailGoBlockExecer) Exec(ctx context.Context, dir, command string, _ map[string]string) (int, error) {
+	f.mu.Lock()
+	f.calls = append(f.calls, depsCall{dir: dir, command: command})
+	f.mu.Unlock()
+	if strings.HasPrefix(command, "pnpm install ") {
+		return 1, nil
+	}
+	<-ctx.Done()
+	return -1, ctx.Err()
+}
+
+func (f *pnpmFailGoBlockExecer) recorded() []depsCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]depsCall(nil), f.calls...)
+}
+
+// TestInstallSessionDependencies_FailedPnpmAndTimedOutGoReportsTimedOut
+// pins the timed_out-over-failed priority: a failed pnpm plus a go
+// install that expires with the shared context reports timed_out, not
+// failed. Swapping the switch cases in installSessionDependencies
+// reports failed and fails this test.
+func TestInstallSessionDependencies_FailedPnpmAndTimedOutGoReportsTimedOut(t *testing.T) {
+	t.Parallel()
+	execer := &pnpmFailGoBlockExecer{}
+	r := depsTestRunner(t, execer)
+	r.depsInstallTimeout = 200 * time.Millisecond
+
+	wpath := t.TempDir()
+	writeFile(t, wpath, "pnpm-lock.yaml", "lockfileVersion: 9.0\n")
+	writeFile(t, wpath, "go.mod", "module example.test/seed\n\ngo 1.24\n")
+
+	prep := r.installSessionDependencies(context.Background(), QueuedWork{QueuedWork: queuedWorkBase("DEPS-BOTH")}, wpath, false)
+
+	if calls := execer.recorded(); len(calls) != 2 {
+		t.Fatalf("install calls = %d; want 2 (failed pnpm then bounded go)", len(calls))
+	}
+	if prep == nil || prep.Status != agent.DependencyPreparationTimedOut {
+		t.Fatalf("preparation = %+v; want timed_out when failed and timed_out combine", prep)
+	}
+	if len(prep.Ecosystems) != 2 || prep.Ecosystems[0] != "pnpm" || prep.Ecosystems[1] != "go" {
+		t.Errorf("ecosystems = %v; want [pnpm go]", prep.Ecosystems)
+	}
+}
+
 func TestDepsInstallExecer_RejectsShellCommands(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()

@@ -2928,6 +2928,57 @@ func TestRun_ShellGetsEvidenceOnly(t *testing.T) {
 // TestRun_NoManifestOmitsPreparation pins the byte-compatible path: a
 // worktree with no manifests omits the report and leaves the protocol
 // unchanged.
+// TestRun_DependencyPreparationReadOnlySkipsAddsNoBypass drives Run with
+// a selected read-only repository: no installer runs, the bounded report
+// is skipped_read_only, and no recovery instruction reaches the delivered
+// prompt plan. Passing false for the read-only flag through the Run wiring
+// would install into the read-only checkout and fail it (AC-3 RED).
+func TestRun_DependencyPreparationReadOnlySkipsAddsNoBypass(t *testing.T) {
+	h := newRunnerHarness(t)
+	h.runner.logger = depsDiscardLogger()
+	provider := &workareaGateProvider{supportsReadOnlySelected: true}
+	reg := NewRegistry()
+	if err := reg.Register(provider); err != nil {
+		t.Fatal(err)
+	}
+	h.runner.registry = reg
+	execer := &recordingDepsExecer{}
+	h.runner.depsExecer = execer
+	contextRepo := makeBareRepo(t)
+	seedManifestsInBareRepo(t, contextRepo)
+
+	qw := h.queuedWork("DEPS-READONLY-RUN")
+	qw.WorkType = "acceptance"
+	qw.ExecutionSecurity = executionSecuritySection(nil)
+	qw.RepositoryDeclaration = &workarea.RepositoryDeclarationV1{
+		Protocol: workarea.ProtocolSessionRootV1,
+		Repositories: []workarea.DeclaredRepositoryV1{
+			{Source: workarea.RepositorySource{Repository: qw.Repository}, Name: "primary", Role: workarea.RepositoryRolePrimary, Authority: workarea.RepositoryMutable},
+			{Source: workarea.RepositorySource{Repository: contextRepo}, Name: "context", Role: workarea.RepositoryRoleContext, Authority: workarea.RepositoryReadOnly},
+		},
+		Select: &workarea.RepositoryFilter{Kind: workarea.RepositoryFilterNamed, Name: "context"},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := h.runner.Run(ctx, qw)
+	if err != nil || res.Status != "completed" {
+		t.Fatalf("Run status=%q err=%v (%s); want completed", res.Status, err, res.Error)
+	}
+	if calls := execer.recorded(); len(calls) != 0 {
+		t.Fatalf("install calls = %v; want none on a selected read-only checkout", calls)
+	}
+	if res.DependencyPreparation == nil || res.DependencyPreparation.Status != agent.DependencyPreparationSkippedReadOnly {
+		t.Fatalf("DependencyPreparation = %+v; want skipped_read_only", res.DependencyPreparation)
+	}
+	provider.mu.Lock()
+	observed := provider.observed
+	provider.mu.Unlock()
+	if observed.PromptPlan != nil && observed.PromptPlan.HarnessProtocol != nil &&
+		strings.Contains(observed.PromptPlan.HarnessProtocol.Text, "Dependency preparation did not complete") {
+		t.Fatalf("read-only preparation must not hand recovery: %q", observed.PromptPlan.HarnessProtocol.Text)
+	}
+}
+
 func TestRun_NoManifestOmitsPreparation(t *testing.T) {
 	h := newRunnerHarness(t)
 	h.runner.logger = depsDiscardLogger()
