@@ -344,6 +344,16 @@ func TestHostUpgradeSimultaneousSecondRefuses(t *testing.T) {
 	if got := calls.Load(); got != 1 {
 		t.Fatalf("update calls = %d, want 1 (no second swap)", got)
 	}
+	// A terminal busy refusal is durable: if its failure ACK is lost, a
+	// redelivery after contention clears must replay the same refusal
+	// instead of executing a request already reported refused.
+	applied, failures = d.applyPendingMutations(context.Background(), []PendingMutation{second})
+	if len(applied) != 0 || len(failures) != 1 || failures[0].ID != "up-second" {
+		t.Fatalf("post-contention redelivery applied/failures = %v/%v, want replayed failure", applied, failures)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("post-contention update calls = %d, want 1 (no second swap)", got)
+	}
 }
 
 func TestHostUpgradeManualLifecycleContention(t *testing.T) {
@@ -353,7 +363,6 @@ func TestHostUpgradeManualLifecycleContention(t *testing.T) {
 	if !ok {
 		t.Fatal("could not claim lifecycle for manual holder")
 	}
-	defer d.releaseLifecycle(lease)
 	var calls atomic.Int32
 	d.runPreparedUpdate = func(context.Context, AutoUpdateConfig, string) (*UpdateResult, error) {
 		calls.Add(1)
@@ -366,6 +375,16 @@ func TestHostUpgradeManualLifecycleContention(t *testing.T) {
 	}
 	if got := calls.Load(); got != 0 {
 		t.Fatalf("update calls = %d, want 0", got)
+	}
+	// Release the manual holder: a redelivery after contention clears must
+	// still replay the recorded refusal, never execute the refused request.
+	d.releaseLifecycle(lease)
+	applied, failures = d.applyPendingMutations(context.Background(), []PendingMutation{m})
+	if len(applied) != 0 || len(failures) != 1 {
+		t.Fatalf("post-contention redelivery applied/failures = %v/%v, want replayed failure", applied, failures)
+	}
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("post-contention update calls = %d, want 0", got)
 	}
 }
 
@@ -447,7 +466,9 @@ func TestHostUpgradeHeartbeatProgressDuringDelayedUpdate(t *testing.T) {
 	d := hostUpgradeTestDaemon(t, nil)
 	entered := make(chan struct{})
 	release := make(chan struct{})
+	var calls atomic.Int32
 	d.runPreparedUpdate = func(ctx context.Context, _ AutoUpdateConfig, _ string) (*UpdateResult, error) {
+		calls.Add(1)
 		close(entered)
 		select {
 		case <-release:
@@ -465,19 +486,27 @@ func TestHostUpgradeHeartbeatProgressDuringDelayedUpdate(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("slow upgrade did not start")
 	}
-	// The next beat must still progress while the update is delayed: a config
-	// mutation applies without waiting on the upgrade lease.
-	done := make(chan struct{})
+	// The next beat must still progress while the update is delayed. A
+	// same-ID redelivery observes the in-flight attempt and defers its ACK
+	// (pending): it must not start a second swap and must not ACK early.
+	// This drives the production same-ID in-flight branch, not a helper.
+	type beatResult struct {
+		applied  []string
+		failures []HeartbeatMutationFailure
+	}
+	done := make(chan beatResult, 1)
 	go func() {
-		defer close(done)
-		_, _ = d.applyPendingMutations(context.Background(), []PendingMutation{
-			{ID: "up-slow-dup", Op: hostUpgradeOp, Params: hostUpgradeMutation("up-slow", map[string]any{"consented": true}).Params},
-		})
+		applied, failures := d.applyPendingMutations(context.Background(), []PendingMutation{m})
+		done <- beatResult{applied: applied, failures: failures}
 	}()
+	var redelivery beatResult
 	select {
-	case <-done:
+	case redelivery = <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("heartbeat blocked behind delayed update")
+	}
+	if len(redelivery.applied) != 0 || len(redelivery.failures) != 0 {
+		t.Fatalf("in-flight duplicate applied/failures = %v/%v, want pending (no ACK yet)", redelivery.applied, redelivery.failures)
 	}
 	// The in-flight duplicate must not have started a second attempt and must
 	// not have ACKed before the durable outcome.
@@ -488,8 +517,14 @@ func TestHostUpgradeHeartbeatProgressDuringDelayedUpdate(t *testing.T) {
 	if !inFlight || completed {
 		t.Fatalf("inFlight=%v completed=%v, want in-flight without early completion", inFlight, completed)
 	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("update calls during in-flight duplicate = %d, want 1 (no second swap)", got)
+	}
 	close(release)
 	waitForHostUpgradeDone(t, d, "up-slow")
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("update calls after completion = %d, want 1", got)
+	}
 }
 
 func TestHostUpgradeShutdownCancelsAttempt(t *testing.T) {
@@ -510,7 +545,14 @@ func TestHostUpgradeShutdownCancelsAttempt(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("upgrade did not start")
 	}
-	d.cancelHostUpgrades()
+	// Drive the production shutdown path: Stop must cancel the in-flight
+	// attempt before waiting on the lifecycle lease. Invoking the cancel
+	// helper directly would bypass this integration.
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer stopCancel()
+	if err := d.Stop(stopCtx); err != nil {
+		t.Fatalf("Stop during in-flight upgrade: %v", err)
+	}
 	outcome := waitForHostUpgradeDone(t, d, "up-shutdown")
 	if outcome.Applied {
 		t.Fatalf("cancelled outcome = %+v, want failure", outcome)
@@ -745,5 +787,205 @@ func TestHostUpgradeCorruptDurableRefusesWithoutSwap(t *testing.T) {
 	}
 	if got := calls.Load(); got != 0 {
 		t.Fatalf("post-corrupt calls = %d, want 0", got)
+	}
+}
+
+func TestHostUpgradeRefusesWithoutUpdateSource(t *testing.T) {
+	t.Parallel()
+	// Production path with no test seam and no configured CDN base: the real
+	// updater would short-circuit to already-up-to-date without checking any
+	// release. Admission must refuse without a swap instead of ACKing applied.
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "daemon.yaml")
+	d := newRestartTestDaemon(t, nil)
+	d.opts.ConfigPath = cfgPath
+	d.config = &Config{
+		AutoUpdate: AutoUpdateConfig{
+			Channel: ChannelStable, Schedule: ScheduleManual,
+			Signers: []UpdateSigner{{SAN: "test@example.com", Issuer: "https://example.test"}},
+		},
+	}
+	d.runPreparedUpdate = nil
+	m := hostUpgradeMutation("up-no-source", map[string]any{"consented": true})
+	applied, failures := d.applyPendingMutations(context.Background(), []PendingMutation{m})
+	if len(applied) != 0 || len(failures) != 1 {
+		t.Fatalf("no-source applied/failures = %v/%v, want refusal", applied, failures)
+	}
+	if !strings.Contains(failures[0].Error, "source") {
+		t.Fatalf("failure %q should name the missing update source", failures[0].Error)
+	}
+	if got := d.State(); got != StateRunning {
+		t.Fatalf("state = %q, want running (no draining for refused request)", got)
+	}
+	applied, failures = d.applyPendingMutations(context.Background(), []PendingMutation{m})
+	if len(applied) != 0 || len(failures) != 1 {
+		t.Fatalf("redelivery applied/failures = %v/%v, want replayed failure", applied, failures)
+	}
+}
+
+func TestHostUpgradePersistFailureDoesNotAckApplied(t *testing.T) {
+	t.Parallel()
+	d := hostUpgradeTestDaemon(t, nil)
+	stateDir := filepath.Dir(d.opts.ConfigPath)
+	var calls atomic.Int32
+	d.runPreparedUpdate = func(context.Context, AutoUpdateConfig, string) (*UpdateResult, error) {
+		calls.Add(1)
+		// Remove the durable directory so the final outcome write fails.
+		// The admission intent was already persisted before this runs.
+		_ = os.RemoveAll(stateDir)
+		return &UpdateResult{Updated: true, Version: "9.9.9", Reason: "update-applied"}, nil
+	}
+	m := hostUpgradeMutation("lost-outcome", map[string]any{"consented": true})
+	if applied, failures := d.applyPendingMutations(context.Background(), []PendingMutation{m}); len(applied) != 0 || len(failures) != 0 {
+		t.Fatalf("first applied/failures = %v/%v, want pending", applied, failures)
+	}
+	outcome := waitForHostUpgradeDone(t, d, "lost-outcome")
+	if outcome.Applied {
+		t.Fatalf("persist-failure outcome = %+v, want failure (no durable receipt)", outcome)
+	}
+	d.hostUpgradeMu.Lock()
+	broken := d.hostUpgradeDurableBroken
+	d.hostUpgradeMu.Unlock()
+	if !broken {
+		t.Fatal("durability should be marked broken after final persist failure")
+	}
+	applied, failures := d.applyPendingMutations(context.Background(), []PendingMutation{m})
+	if len(applied) != 0 || len(failures) != 1 {
+		t.Fatalf("redelivery applied/failures = %v/%v, want failure (never applied without receipt)", applied, failures)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("update calls = %d, want 1", got)
+	}
+}
+
+func TestHostUpgradeCrashPendingDoesNotReswap(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "daemon.yaml")
+	first := newRestartTestDaemon(t, nil)
+	first.opts.ConfigPath = cfgPath
+	first.config = &Config{
+		AutoUpdate: AutoUpdateConfig{
+			Channel: ChannelStable, Schedule: ScheduleManual,
+			Signers: []UpdateSigner{{SAN: "test@example.com", Issuer: "https://example.test"}},
+		},
+	}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var firstCalls atomic.Int32
+	first.runPreparedUpdate = func(ctx context.Context, _ AutoUpdateConfig, _ string) (*UpdateResult, error) {
+		firstCalls.Add(1)
+		close(entered)
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		return &UpdateResult{Updated: true, Version: "7.0.0", Reason: "update-applied"}, nil
+	}
+	m := hostUpgradeMutation("up-crash", map[string]any{"consented": true})
+	if applied, failures := first.applyPendingMutations(context.Background(), []PendingMutation{m}); len(applied) != 0 || len(failures) != 0 {
+		t.Fatalf("first applied/failures = %v/%v, want pending", applied, failures)
+	}
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first upgrade did not start")
+	}
+	// Durable intent must exist before the swap completes: a crash here
+	// leaves request identity on disk.
+	statePath := hostUpgradeStatePath(cfgPath)
+	raw, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatalf("read durable intent: %v", err)
+	}
+	var stored map[string]hostUpgradeOutcome
+	if err := json.Unmarshal(raw, &stored); err != nil {
+		t.Fatalf("decode durable intent: %v", err)
+	}
+	if intent, ok := stored["up-crash"]; !ok || !intent.Pending {
+		t.Fatalf("durable intent = %+v, want pending record for up-crash", stored)
+	}
+	// Simulate a process exit between intent and final outcome: a fresh
+	// daemon with the same state dir must not run a second swap on
+	// redelivery. It answers the interrupted failure instead.
+	second := newRestartTestDaemon(t, nil)
+	second.opts.ConfigPath = cfgPath
+	second.config = &Config{
+		AutoUpdate: AutoUpdateConfig{
+			Channel: ChannelStable, Schedule: ScheduleManual,
+			Signers: []UpdateSigner{{SAN: "test@example.com", Issuer: "https://example.test"}},
+		},
+	}
+	var secondCalls atomic.Int32
+	second.runPreparedUpdate = func(context.Context, AutoUpdateConfig, string) (*UpdateResult, error) {
+		secondCalls.Add(1)
+		return &UpdateResult{Updated: true, Version: "7.0.1", Reason: "update-applied"}, nil
+	}
+	applied, failures := second.applyPendingMutations(context.Background(), []PendingMutation{m})
+	if len(applied) != 0 || len(failures) != 1 {
+		t.Fatalf("post-crash redelivery applied/failures = %v/%v, want interrupted failure", applied, failures)
+	}
+	if !strings.Contains(failures[0].Error, "interrupted") {
+		t.Fatalf("failure %q should name the interruption", failures[0].Error)
+	}
+	if got := secondCalls.Load(); got != 0 {
+		t.Fatalf("post-crash update calls = %d, want 0 (no second swap)", got)
+	}
+	close(release)
+	outcome := waitForHostUpgradeDone(t, first, "up-crash")
+	if !outcome.Applied {
+		t.Fatalf("first outcome = %+v, want applied", outcome)
+	}
+	if got := firstCalls.Load(); got != 1 {
+		t.Fatalf("first calls = %d, want 1", got)
+	}
+}
+
+func TestHostUpgradeExpiryAfterPreflightRefusesWithoutSwap(t *testing.T) {
+	t.Parallel()
+	d := hostUpgradeTestDaemon(t, nil)
+	// Hold a spawn reservation so restart preflight waits past consent
+	// expiry. This drives the real preflight wait, not a helper.
+	d.spawner.mu.Lock()
+	d.spawner.spawnReservations["block-expiry"] = struct{}{}
+	d.spawner.mu.Unlock()
+	t.Cleanup(func() {
+		d.spawner.mu.Lock()
+		delete(d.spawner.spawnReservations, "block-expiry")
+		d.spawner.mu.Unlock()
+	})
+	var calls atomic.Int32
+	d.runPreparedUpdate = func(context.Context, AutoUpdateConfig, string) (*UpdateResult, error) {
+		calls.Add(1)
+		return &UpdateResult{Updated: true, Version: "8.0.0", Reason: "update-applied"}, nil
+	}
+	// RFC3339 truncates to seconds, so allow a full second of margin on
+	// both sides: admission must see a future deadline despite truncation,
+	// and the preflight wait must land safely past it.
+	expiresAt := time.Now().Add(2 * time.Second).UTC().Format(time.RFC3339)
+	m := hostUpgradeMutation("up-expiry-preflight", map[string]any{"consented": true, "expiresAt": expiresAt})
+	if applied, failures := d.applyPendingMutations(context.Background(), []PendingMutation{m}); len(applied) != 0 || len(failures) != 0 {
+		t.Fatalf("first applied/failures = %v/%v, want pending (valid at admission)", applied, failures)
+	}
+	// Wait past expiry while preflight is still blocked, then let preflight
+	// proceed. Execution must revalidate and refuse without a swap.
+	time.Sleep(3 * time.Second)
+	d.spawner.mu.Lock()
+	delete(d.spawner.spawnReservations, "block-expiry")
+	d.spawner.mu.Unlock()
+	outcome := waitForHostUpgradeDone(t, d, "up-expiry-preflight")
+	if outcome.Applied {
+		t.Fatalf("expired-after-preflight outcome = %+v, want refusal", outcome)
+	}
+	if !strings.Contains(strings.ToLower(outcome.Error), "expired") {
+		t.Fatalf("failure %q should name expiry", outcome.Error)
+	}
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("update calls = %d, want 0 (no swap after expiry)", got)
+	}
+	applied, failures := d.applyPendingMutations(context.Background(), []PendingMutation{m})
+	if len(applied) != 0 || len(failures) != 1 {
+		t.Fatalf("redelivery applied/failures = %v/%v, want failure", applied, failures)
 	}
 }

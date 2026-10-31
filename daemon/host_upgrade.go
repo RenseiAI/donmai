@@ -38,6 +38,9 @@ const hostUpgradeMaxRequestedAge = 24 * time.Hour
 // when the attempt reached its defined durable point (binary swapped or host
 // already current); every refusal or failed attempt records Applied false
 // with a human-readable Error. CompletedAt is when the attempt finished.
+// Pending marks a durable intent written before execution starts: a crash
+// between intent and final outcome must never run a second swap on
+// redelivery, so a pending record reloads as an interrupted failure.
 type hostUpgradeOutcome struct {
 	Applied     bool   `json:"applied"`
 	Error       string `json:"error,omitempty"`
@@ -45,6 +48,7 @@ type hostUpgradeOutcome struct {
 	Version     string `json:"version,omitempty"`
 	Reason      string `json:"reason,omitempty"`
 	CompletedAt string `json:"completedAt,omitempty"`
+	Pending     bool   `json:"pending,omitempty"`
 }
 
 // hostUpgradeForbiddenParams are request keys the daemon never honors. Any
@@ -121,6 +125,22 @@ func hostUpgradeOptedIn(cfg *Config) bool {
 	return cfg != nil && len(cfg.AutoUpdate.Signers) > 0
 }
 
+// hostUpgradeSourceConfigured reports whether the production updater has an
+// update source to check. The OSS binary ships with no default CDN base
+// (UpdateCDNBase is empty): without a source the real updater skips its
+// manifest check and reports already-up-to-date without contacting any
+// release. Treating that disabled response as applied would falsely ACK
+// success for a host that never checked a release, so admission refuses
+// without a swap when no source is configured. A test seam
+// (runPreparedUpdate) counts as a source because the test provides the
+// release implementation.
+func (d *Daemon) hostUpgradeSourceConfigured() bool {
+	if d.runPreparedUpdate != nil {
+		return true
+	}
+	return strings.TrimSpace(UpdateCDNBase) != ""
+}
+
 // hostUpgradeStatePath is the durable outcome file. It lives beside
 // daemon.yaml so a process exit between swap and ACK cannot manufacture
 // completion: the next boot reloads it and answers a redelivery from the
@@ -190,6 +210,14 @@ func persistHostUpgradeOutcome(path, id string, outcome hostUpgradeOutcome) erro
 		_ = os.Remove(tmpName)
 		return fmt.Errorf("host.upgrade refused: durable state write failed: %w", err)
 	}
+	// Sync file content before rename so a crash cannot leave a torn write
+	// that later reloads as a second swap. Atomic rename alone does not
+	// establish crash durability without this flush.
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return fmt.Errorf("host.upgrade refused: durable state write failed: %w", err)
+	}
 	if err := tmp.Close(); err != nil {
 		_ = os.Remove(tmpName)
 		return fmt.Errorf("host.upgrade refused: durable state write failed: %w", err)
@@ -197,6 +225,13 @@ func persistHostUpgradeOutcome(path, id string, outcome hostUpgradeOutcome) erro
 	if err := os.Rename(tmpName, path); err != nil {
 		_ = os.Remove(tmpName)
 		return fmt.Errorf("host.upgrade refused: durable state write failed: %w", err)
+	}
+	// Sync the directory entry so the rename itself is durable: without
+	// this a crash between rename and directory flush can lose the outcome
+	// and a redelivery would run a second swap.
+	if dirFile, err := os.Open(dir); err == nil { //nolint:gosec
+		_ = dirFile.Sync()
+		_ = dirFile.Close()
 	}
 	return nil
 }
@@ -244,6 +279,23 @@ func (d *Daemon) initHostUpgradeStateLocked() {
 			d.hostUpgradeDurableError = err.Error()
 		} else {
 			for id, outcome := range outcomes {
+				// A pending intent without a final outcome means the previous
+				// process exited between intent and completion. It may have
+				// swapped before exiting, or never started: either way the
+				// safe answer is an interrupted failure, never a second swap
+				// and never manufactured completion.
+				if outcome.Pending {
+					completedAt := strings.TrimSpace(outcome.CompletedAt)
+					if completedAt == "" {
+						completedAt = time.Now().UTC().Format(time.RFC3339)
+					}
+					outcome = hostUpgradeOutcome{
+						Applied:     false,
+						Error:       "host.upgrade interrupted: previous attempt did not complete",
+						Reason:      "interrupted",
+						CompletedAt: completedAt,
+					}
+				}
 				d.hostUpgradeDone[id] = outcome
 			}
 		}
@@ -273,6 +325,10 @@ func (d *Daemon) handleHostUpgradeMutation(m PendingMutation) (appliedID string,
 	d.hostUpgradeMu.Lock()
 	d.initHostUpgradeStateLocked()
 	if outcome, ok := d.hostUpgradeDone[m.ID]; ok {
+		if outcome.Pending {
+			d.hostUpgradeMu.Unlock()
+			return "", nil
+		}
 		d.hostUpgradeMu.Unlock()
 		if outcome.Applied {
 			return m.ID, nil
@@ -293,16 +349,34 @@ func (d *Daemon) handleHostUpgradeMutation(m PendingMutation) (appliedID string,
 		d.hostUpgradeMu.Unlock()
 		return "", nil
 	}
+	// A terminal busy refusal is a defined durable outcome, not a transient
+	// skip: if this failure ACK is lost, a redelivery after contention
+	// clears must replay the same refusal instead of executing a request
+	// already reported refused.
 	if len(d.hostUpgradeInFlight) > 0 {
+		errText := "host.upgrade already in progress"
+		outcome := hostUpgradeOutcome{Applied: false, Error: errText, CompletedAt: now.UTC().Format(time.RFC3339)}
+		d.hostUpgradeDone[m.ID] = outcome
+		if persistErr := persistHostUpgradeOutcome(statePath, m.ID, outcome); persistErr != nil {
+			d.hostUpgradeDurableBroken = true
+			d.hostUpgradeDurableError = persistErr.Error()
+		}
 		d.hostUpgradeMu.Unlock()
-		return "", &HeartbeatMutationFailure{ID: m.ID, Error: "host.upgrade already in progress"}
+		return "", &HeartbeatMutationFailure{ID: m.ID, Error: errText}
 	}
 	d.lifecycleMu.Lock()
 	lifecycleBusy := d.lifecycleOwner != nil
 	d.lifecycleMu.Unlock()
 	if lifecycleBusy {
+		errText := "host.upgrade refused: lifecycle busy"
+		outcome := hostUpgradeOutcome{Applied: false, Error: errText, CompletedAt: now.UTC().Format(time.RFC3339)}
+		d.hostUpgradeDone[m.ID] = outcome
+		if persistErr := persistHostUpgradeOutcome(statePath, m.ID, outcome); persistErr != nil {
+			d.hostUpgradeDurableBroken = true
+			d.hostUpgradeDurableError = persistErr.Error()
+		}
 		d.hostUpgradeMu.Unlock()
-		return "", &HeartbeatMutationFailure{ID: m.ID, Error: "host.upgrade refused: lifecycle busy"}
+		return "", &HeartbeatMutationFailure{ID: m.ID, Error: errText}
 	}
 	if err := parseHostUpgradeParams(m, now); err != nil {
 		outcome := hostUpgradeOutcome{Applied: false, Error: err.Error(), CompletedAt: now.UTC().Format(time.RFC3339)}
@@ -325,12 +399,41 @@ func (d *Daemon) handleHostUpgradeMutation(m PendingMutation) (appliedID string,
 		d.hostUpgradeMu.Unlock()
 		return "", &HeartbeatMutationFailure{ID: m.ID, Error: err}
 	}
+	// Without a configured update source the production updater never checks
+	// a release: it short-circuits to already-up-to-date with the previously
+	// running binary still draining. That disabled response must refuse
+	// without a swap, never ACK applied.
+	if !d.hostUpgradeSourceConfigured() {
+		err := "host.upgrade refused: update source is not configured"
+		outcome := hostUpgradeOutcome{Applied: false, Error: err, CompletedAt: now.UTC().Format(time.RFC3339)}
+		d.hostUpgradeDone[m.ID] = outcome
+		if persistErr := persistHostUpgradeOutcome(statePath, m.ID, outcome); persistErr != nil {
+			d.hostUpgradeDurableBroken = true
+			d.hostUpgradeDurableError = persistErr.Error()
+		}
+		d.hostUpgradeMu.Unlock()
+		return "", &HeartbeatMutationFailure{ID: m.ID, Error: err}
+	}
 	if err := probeHostUpgradeDurability(statePath); err != nil {
 		outcome := hostUpgradeOutcome{Applied: false, Error: err.Error(), CompletedAt: now.UTC().Format(time.RFC3339)}
 		d.hostUpgradeDone[m.ID] = outcome
 		_ = persistHostUpgradeOutcome(statePath, m.ID, outcome)
 		d.hostUpgradeMu.Unlock()
 		return "", &HeartbeatMutationFailure{ID: m.ID, Error: err.Error()}
+	}
+	// Durable intent before execution: a process exit between admission and
+	// the final outcome must not lose request identity into a second swap.
+	// The intent reloads as an interrupted failure, never as completion and
+	// never as a fresh validation to a second swap.
+	pending := hostUpgradeOutcome{Pending: true, CompletedAt: now.UTC().Format(time.RFC3339)}
+	if persistErr := persistHostUpgradeOutcome(statePath, m.ID, pending); persistErr != nil {
+		errText := persistErr.Error()
+		outcome := hostUpgradeOutcome{Applied: false, Error: errText, CompletedAt: now.UTC().Format(time.RFC3339)}
+		d.hostUpgradeDone[m.ID] = outcome
+		d.hostUpgradeDurableBroken = true
+		d.hostUpgradeDurableError = persistErr.Error()
+		d.hostUpgradeMu.Unlock()
+		return "", &HeartbeatMutationFailure{ID: m.ID, Error: errText}
 	}
 	d.hostUpgradeInFlight[m.ID] = struct{}{}
 	d.hostUpgradeMu.Unlock()
@@ -378,6 +481,17 @@ func (d *Daemon) runHostUpgrade(m PendingMutation) {
 		d.hostUpgradeMu.Unlock()
 	}()
 
+	// Consent is a deadline, not a one-time admission check: restart
+	// preflight can wait past expiresAt while the background context still
+	// permits execution. Revalidate before touching the lifecycle and again
+	// after preflight so an expired request refuses without a swap.
+	if err := parseHostUpgradeParams(m, time.Now()); err != nil {
+		d.finishHostUpgrade(m.ID, hostUpgradeOutcome{
+			Applied: false, Error: err.Error(),
+			CompletedAt: time.Now().UTC().Format(time.RFC3339),
+		})
+		return
+	}
 	lease, ok := d.tryClaimLifecycle(lifecycleUpdate)
 	if !ok {
 		d.finishHostUpgrade(m.ID, hostUpgradeOutcome{
@@ -392,6 +506,14 @@ func (d *Daemon) runHostUpgrade(m PendingMutation) {
 		d.releaseLifecycle(lease)
 		d.finishHostUpgrade(m.ID, hostUpgradeOutcome{
 			Applied: false, Error: "host.upgrade preflight refused: " + err.Error(),
+			CompletedAt: time.Now().UTC().Format(time.RFC3339),
+		})
+		return
+	}
+	if err := parseHostUpgradeParams(m, time.Now()); err != nil {
+		d.releaseLifecycle(lease)
+		d.finishHostUpgrade(m.ID, hostUpgradeOutcome{
+			Applied: false, Error: err.Error(),
 			CompletedAt: time.Now().UTC().Format(time.RFC3339),
 		})
 		return
@@ -434,9 +556,21 @@ func (d *Daemon) runHostUpgrade(m PendingMutation) {
 		})
 		return
 	}
-	if result.Updated || result.Reason == "already-up-to-date" {
+	// already-up-to-date is a durable no-swap-needed outcome only when a
+	// source was actually checked. A disabled updater (no CDN base) reports
+	// the same reason without contacting any release; that path refuses
+	// instead of ACKing applied.
+	if result.Updated || (result.Reason == "already-up-to-date" && d.hostUpgradeSourceConfigured()) {
 		d.finishHostUpgrade(m.ID, hostUpgradeOutcome{
 			Applied: true, Updated: result.Updated, Version: result.Version, Reason: result.Reason,
+			CompletedAt: time.Now().UTC().Format(time.RFC3339),
+		})
+		return
+	}
+	if result.Reason == "already-up-to-date" {
+		d.finishHostUpgrade(m.ID, hostUpgradeOutcome{
+			Applied: false, Error: "host.upgrade refused: update source is not configured",
+			Updated: result.Updated, Version: result.Version, Reason: result.Reason,
 			CompletedAt: time.Now().UTC().Format(time.RFC3339),
 		})
 		return
@@ -465,6 +599,12 @@ func (d *Daemon) executeHostUpgrade(ctx context.Context) (*UpdateResult, error) 
 	if d.runPreparedUpdate != nil {
 		return d.runPreparedUpdate(ctx, cfg.AutoUpdate, d.EffectiveVersion())
 	}
+	// Fail closed when the production updater has no source to check: with
+	// an empty CDN base the updater would report already-up-to-date without
+	// contacting any release, which must never become an applied ACK.
+	if strings.TrimSpace(UpdateCDNBase) == "" {
+		return &UpdateResult{Updated: false, Version: d.EffectiveVersion(), Reason: "update-source-not-configured"}, fmt.Errorf("host.upgrade refused: update source is not configured")
+	}
 	updater := NewUpdater(UpdaterOptions{
 		CurrentVersion: d.EffectiveVersion(),
 		Config:         cfg.AutoUpdate,
@@ -477,7 +617,10 @@ func (d *Daemon) executeHostUpgrade(ctx context.Context) (*UpdateResult, error) 
 // A lost response or process exit therefore cannot manufacture completion:
 // the next redelivery answers from the recorded outcome. A persist failure
 // marks durability broken so later requests refuse instead of risking a
-// second swap from a lost record.
+// second swap from a lost record. A persist failure never leaves an
+// applied outcome in memory: the attempt is recorded as a failure so a
+// redelivery replays failure instead of ACKing success without a durable
+// receipt.
 func (d *Daemon) finishHostUpgrade(id string, outcome hostUpgradeOutcome) {
 	if strings.TrimSpace(outcome.CompletedAt) == "" {
 		outcome.CompletedAt = time.Now().UTC().Format(time.RFC3339)
@@ -485,12 +628,25 @@ func (d *Daemon) finishHostUpgrade(id string, outcome hostUpgradeOutcome) {
 	if outcome.Error == "" && !outcome.Applied {
 		outcome.Error = "host.upgrade failed without a swap"
 	}
+	outcome.Pending = false
 	persistErr := persistHostUpgradeOutcome(hostUpgradeStatePath(d.opts.ConfigPath), id, outcome)
 	d.hostUpgradeMu.Lock()
 	d.initHostUpgradeStateLocked()
 	if persistErr != nil {
 		d.hostUpgradeDurableBroken = true
 		d.hostUpgradeDurableError = persistErr.Error()
+		// Fail closed: an outcome that cannot be made durable must not be
+		// remembered as applied. Redelivery checks Done before the broken
+		// guard, so storing success here would emit applied without the
+		// claimed durable receipt.
+		outcome = hostUpgradeOutcome{
+			Applied:     false,
+			Error:       persistErr.Error(),
+			Updated:     false,
+			Version:     outcome.Version,
+			Reason:      outcome.Reason,
+			CompletedAt: outcome.CompletedAt,
+		}
 	}
 	delete(d.hostUpgradeInFlight, id)
 	d.hostUpgradeDone[id] = outcome
