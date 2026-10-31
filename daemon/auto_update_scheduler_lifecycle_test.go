@@ -2,6 +2,9 @@ package daemon
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -110,5 +113,78 @@ func TestAutoUpdateSchedulerAppliedSwapFencesResume(t *testing.T) {
 	}
 	if got := d.State(); got != StateDraining {
 		t.Fatalf("state = %q, want draining", got)
+	}
+}
+
+// The production updater path latches the same post-swap fence as the
+// prepared-update stub: a real signed-binary swap through NewUpdater +
+// RunUpdate (no runPreparedUpdate) must set updateSwapApplied while the
+// update lease is held, so Resume refuses and the restart handoff owns
+// completion. Removing the shared latch leaves this test green only when
+// the stub path is used; this test drives the production branch with a
+// hermetic pass-through verifier and a temp binary so the swap never
+// touches the test binary. It pins AC-2/AC-4 through the production
+// entry point (scheduler tick → updateWithConfig → RunUpdate).
+func TestAutoUpdateSchedulerProductionSwapFencesResume(t *testing.T) {
+	probe := newUpdateProbeServer(t, "9.9.9", []byte("new-binary"), "test-bundle")
+	d := newRestartTestDaemon(t, nil)
+	d.opts.Version = "0.1.0"
+	d.config = &Config{AutoUpdate: AutoUpdateConfig{
+		Channel: ChannelStable, Schedule: ScheduleNightly, DrainTimeoutSeconds: 1,
+		Source: probe.srv.URL,
+		Signers: []UpdateSigner{
+			{SAN: "releases@example.com", Issuer: "https://issuer.example"},
+		},
+	}}
+	// Hermetic production swap: pass-through verification plus a temp
+	// binary path, so RunUpdate applies the probe binary without a real
+	// sigstore bundle and without touching the test executable.
+	current := filepath.Join(t.TempDir(), "donmai-daemon")
+	if err := os.WriteFile(current, []byte("old-binary"), 0o755); err != nil {
+		t.Fatalf("write current binary: %v", err)
+	}
+	d.autoUpdateVerifier = passVerifier{}
+	d.autoUpdateBinaryPath = current
+	d.autoUpdateRunBound = 5 * time.Second
+	var restarts atomic.Int32
+	d.autoUpdateRestartHook = func() { restarts.Add(1) }
+	if d.runPreparedUpdate != nil {
+		t.Fatal("runPreparedUpdate must stay nil to exercise the production updater branch")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	s := &autoUpdateScheduler{daemon: d, clock: systemUpdateClock{}}
+	s.ctx = ctx
+	s.attemptOnce()
+	if got := restarts.Load(); got != 1 {
+		t.Fatalf("production restart requests = %d, want 1", got)
+	}
+	if !d.updateSwapApplied.Load() {
+		t.Fatal("production swap did not latch updateSwapApplied")
+	}
+	swapped, err := os.ReadFile(current) //nolint:gosec
+	if err != nil {
+		t.Fatalf("read swapped binary: %v", err)
+	}
+	if string(swapped) != "new-binary" {
+		t.Fatalf("swapped binary = %q, want probe binary (production swap never applied)", swapped)
+	}
+	if got := probe.manifestHits.Load(); got < 2 {
+		t.Fatalf("manifest checks = %d, want pre-check plus Update re-check", got)
+	}
+	if err := d.ResumeContext(context.Background()); err == nil {
+		t.Fatalf("resume accepted after production swap: state=%q accepting=%v", d.State(), d.spawner.IsAccepting())
+	}
+	if got := d.State(); got != StateDraining {
+		t.Fatalf("state = %q, want draining", got)
+	}
+	// A second tick must not re-enter Update for the same release.
+	baseManifest := probe.manifestHits.Load()
+	s.attemptOnce()
+	if got := restarts.Load(); got != 1 {
+		t.Fatalf("production restart requests after second tick = %d, want still 1", got)
+	}
+	if got := probe.manifestHits.Load(); got != baseManifest {
+		t.Fatalf("manifest checks after second tick = %d, want %d (applied flag stops re-apply)", got, baseManifest)
 	}
 }

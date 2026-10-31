@@ -589,6 +589,17 @@ type Daemon struct {
 	// tests inject a recorder so the restart handoff is observable
 	// without exiting the test process.
 	autoUpdateRestartHook func()
+	// autoUpdateVerifier, when non-nil, overrides the default sigstore
+	// verifier the production updater builds from the snapshot config.
+	// Production leaves it nil; hermetic tests inject a pass-through so
+	// the production swap path (including the post-swap fence) is
+	// exercisable without a real signed bundle.
+	autoUpdateVerifier BinaryVerifier
+	// autoUpdateBinaryPath, when non-empty, overrides the updater's
+	// current-binary resolution. Production leaves it empty so the
+	// running executable is swapped; tests point it at a temp file so a
+	// successful production swap never touches the test binary.
+	autoUpdateBinaryPath string
 	// updateSwapApplied latches when any Update swaps a newer binary to
 	// disk (Updated=true). It is set while the update lifecycle lease is
 	// still held, before finish releases it, so a concurrent Resume that
@@ -2725,6 +2736,18 @@ func (d *Daemon) Stop(ctx context.Context) error {
 	}
 	d.lifecycleMu.Unlock()
 
+	// Cancel the scheduled-update loop before waiting for the lifecycle
+	// lease: an in-flight scheduled Update holds the update lease while
+	// its attempt context (a child of the scheduler context) bounds
+	// updater construction and downloads. Canceling first lets a
+	// construction blocked on a trust-root FIFO observe cancellation,
+	// release the lease, and let the claim below succeed within the
+	// caller's deadline. The join itself is bounded by ctx. A second
+	// idempotent stop after the stop generation is published catches a
+	// loop a concurrent watcher reload started in the window between
+	// this cancel and that publication.
+	d.stopAutoUpdateSchedulerContext(ctx)
+
 	lease, err := d.claimLifecycle(ctx, lifecycleStop)
 	if err != nil {
 		// Prefer a terminal result that raced the caller's wait over its now-stale
@@ -4029,11 +4052,29 @@ func (d *Daemon) Update(ctx context.Context) (*UpdateResult, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	cfg := d.Config()
+	if cfg == nil {
+		return nil, errors.New("no config loaded")
+	}
+	return d.updateWithConfig(ctx, cfg)
+}
+
+// updateWithConfig runs one update attempt against a snapshot config. The
+// scheduled tick passes the snapshot it pre-checked so a live reload
+// cannot change the trust root between the pre-check construction and the
+// Update construction; the manual door passes the live config.
+func (d *Daemon) updateWithConfig(ctx context.Context, cfg *Config) (*UpdateResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if cfg == nil {
+		return nil, errors.New("no config loaded")
+	}
 	attempt, err := d.beginUpdate(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return attempt.run(ctx)
+	return attempt.runWithConfig(ctx, cfg)
 }
 
 // updateAttempt transfers the one lifecycle lease from synchronous restart
@@ -4084,6 +4125,26 @@ func (a *updateAttempt) run(ctx context.Context) (*UpdateResult, error) {
 		return nil, errors.New("update attempt is not initialized")
 	}
 	d := a.daemon
+	cfg := d.Config()
+	if cfg == nil {
+		return nil, errors.New("no config loaded")
+	}
+	return a.runWithConfig(ctx, cfg)
+}
+
+// runWithConfig executes the leased update against a snapshot config with a
+// single post-swap fence. Both the test-injected prepared-update path and
+// the production updater path share this one latch, so the fence cannot
+// disappear from one path without the other's tests detecting it. The
+// production updater construction (trust-root file read plus executable
+// resolution) runs under the attempt context via newUpdaterWithContext:
+// a FIFO trust root with no writer releases the waiter at the attempt
+// deadline instead of holding the lifecycle lease indefinitely.
+func (a *updateAttempt) runWithConfig(ctx context.Context, cfg *Config) (*UpdateResult, error) {
+	if a == nil || a.daemon == nil {
+		return nil, errors.New("update attempt is not initialized")
+	}
+	d := a.daemon
 	defer a.finish()
 	if ctx == nil {
 		ctx = context.Background()
@@ -4091,34 +4152,72 @@ func (a *updateAttempt) run(ctx context.Context) (*UpdateResult, error) {
 	// A failed, unavailable, or completed self-update does not silently abandon
 	// the prepared stop authorization. finish leaves the daemon draining;
 	// external holds remain in force until explicit resume.
-	cfg := d.Config()
 	if cfg == nil {
 		return nil, errors.New("no config loaded")
 	}
+	var res *UpdateResult
+	var err error
 	if d.runPreparedUpdate != nil {
-		res, err := d.runPreparedUpdate(ctx, cfg.AutoUpdate, d.EffectiveVersion())
-		if err == nil && res != nil && res.Updated {
-			// Latched while the update lease is still held (deferred
-			// finish releases it), so a Resume that acquires the lease
-			// afterwards observes the fence with no window.
-			d.updateSwapApplied.Store(true)
+		res, err = d.runPreparedUpdate(ctx, cfg.AutoUpdate, d.EffectiveVersion())
+	} else {
+		var updater *Updater
+		updater, err = d.newUpdaterWithContext(ctx, cfg)
+		if err != nil {
+			return nil, err
 		}
-		return res, err
+		res, err = updater.RunUpdate(ctx)
 	}
-	updater := NewUpdater(UpdaterOptions{
-		CurrentVersion: d.EffectiveVersion(),
-		Config:         cfg.AutoUpdate,
-		// The explicitly configured update origin reaches the production
-		// updater here; empty keeps the updater inert (up-to-date
-		// without a request) on both the manual and scheduled paths.
-		CDNBase:  strings.TrimSpace(cfg.AutoUpdate.Source),
-		SkipExit: true, // HTTP-driven update: caller decides to exit.
-	})
-	res, err := updater.RunUpdate(ctx)
 	if err == nil && res != nil && res.Updated {
+		// Latched while the update lease is still held (deferred
+		// finish releases it), so a Resume that acquires the lease
+		// afterwards observes the fence with no window.
 		d.updateSwapApplied.Store(true)
 	}
 	return res, err
+}
+
+// newUpdaterWithContext builds the production updater without holding the
+// attempt past its bound. The trust-root file read blocks without
+// cancellation (an operator-configured FIFO with no writer), so
+// construction runs in a waiter goroutine and the attempt deadline — or
+// Stop's scheduler cancel — releases the waiter while the lifecycle lease
+// is still held. The worker goroutine stays blocked until the path
+// unblocks, mirroring checkAutoUpdateRelease.
+func (d *Daemon) newUpdaterWithContext(ctx context.Context, cfg *Config) (*Updater, error) {
+	type updaterResult struct {
+		u *Updater
+	}
+	ch := make(chan updaterResult, 1)
+	currentVersion := d.EffectiveVersion()
+	autoCfg := cfg.AutoUpdate
+	source := strings.TrimSpace(cfg.AutoUpdate.Source)
+	verifier := d.autoUpdateVerifier
+	binaryPath := d.autoUpdateBinaryPath
+	go func() {
+		opts := UpdaterOptions{
+			CurrentVersion: currentVersion,
+			Config:         autoCfg,
+			// The explicitly configured update origin reaches the production
+			// updater here; empty keeps the updater inert (up-to-date
+			// without a request) on both the manual and scheduled paths.
+			CDNBase:  source,
+			SkipExit: true, // HTTP-driven update: caller decides to exit.
+		}
+		if verifier != nil {
+			opts.Verifier = verifier
+		}
+		if binaryPath != "" {
+			opts.CurrentBinaryPath = binaryPath
+		}
+		u := NewUpdater(opts)
+		ch <- updaterResult{u: u}
+	}()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case r := <-ch:
+		return r.u, nil
+	}
 }
 
 // recordOSSRoutingDecision feeds the routing trace store with the

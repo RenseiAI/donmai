@@ -296,7 +296,11 @@ func (s *autoUpdateScheduler) attemptOnce() {
 		// Up-to-date: no lifecycle transition, the machine never drains.
 		return
 	}
-	result, err := d.Update(ctx)
+	// Reuse the pre-checked snapshot so a live reload cannot change the
+	// trust root between the pre-check construction and the Update
+	// construction; the attempt deadline bounds both constructions and
+	// Stop's scheduler cancel releases either waiter.
+	result, err := d.updateWithConfig(ctx, cfg)
 	if err != nil {
 		// Update leaves the daemon draining on every exit path; never
 		// resume here — a failed attempt must not silently abandon a
