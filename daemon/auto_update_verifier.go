@@ -108,7 +108,12 @@ func buildUpdateIdentityPolicies(signers []UpdateSigner) ([]verify.PolicyOption,
 
 // loadUpdateTrustRoot loads the sigstore trusted root: the
 // operator-supplied JSON at path when set, the embedded public Sigstore
-// production root (shared with kit verification) otherwise.
+// production root (shared with kit verification) otherwise. A non-regular
+// file (FIFO, socket, device, directory) is refused without opening it:
+// opening a FIFO for reading blocks until a writer appears, which would
+// hold an update attempt past its bound and leak the constructing
+// goroutine even after the attempt deadline fires. Fail-closed refusal
+// keeps every construction non-blocking and bounded.
 func loadUpdateTrustRoot(path string) (root.TrustedMaterial, string, error) {
 	if path == "" {
 		tr, err := root.NewTrustedRootFromJSON(embeddedTrustRoot)
@@ -116,6 +121,13 @@ func loadUpdateTrustRoot(path string) (root.TrustedMaterial, string, error) {
 			return nil, "", fmt.Errorf("load embedded trust root: %w", err)
 		}
 		return tr, "embedded", nil
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		return nil, "", fmt.Errorf("read trust root %q: %w", path, err)
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, "", fmt.Errorf("read trust root %q: not a regular file (mode %s); refusing swap", path, fi.Mode())
 	}
 	data, err := os.ReadFile(path) //nolint:gosec // operator-configured trust root path
 	if err != nil {

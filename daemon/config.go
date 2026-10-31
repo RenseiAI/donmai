@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -509,6 +510,17 @@ type AutoUpdateConfig struct {
 	Channel             UpdateChannel  `yaml:"channel"             json:"channel"`
 	Schedule            UpdateSchedule `yaml:"schedule"            json:"schedule"`
 	DrainTimeoutSeconds int            `yaml:"drainTimeoutSeconds" json:"drainTimeoutSeconds"`
+
+	// Source is the operator-configured update origin: the base URL of
+	// the CDN that hosts release manifests and binaries (see
+	// auto_update.go for the per-channel layout). Empty is the default
+	// and disables every update check — the binary ships with no
+	// default origin, so an unconfigured daemon never dials any
+	// vendor infrastructure, and a default nightly schedule alone is
+	// never consent. The scheduled checker and the manual update path
+	// both forward this value to the updater; without it the updater
+	// reports up-to-date without a request.
+	Source string `yaml:"source,omitempty" json:"source,omitempty"`
 
 	// Signers is the allowlist of identities trusted to sign release
 	// binaries. Auto-update is fail-closed: when this list is empty the
@@ -1203,6 +1215,12 @@ func validateConfig(c *Config) error {
 	case "", ScheduleNightly, ScheduleOnRelease, ScheduleManual:
 	default:
 		return fmt.Errorf("autoUpdate.schedule invalid: %q", c.AutoUpdate.Schedule)
+	}
+	if src := strings.TrimSpace(c.AutoUpdate.Source); src != "" {
+		u, err := url.Parse(src)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return fmt.Errorf("autoUpdate.source must be an http(s) URL with a host: %q", c.AutoUpdate.Source)
+		}
 	}
 	for i, s := range c.AutoUpdate.Signers {
 		if strings.TrimSpace(s.SAN) == "" && strings.TrimSpace(s.SANRegex) == "" {

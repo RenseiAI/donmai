@@ -329,10 +329,59 @@ autoUpdate:
   channel: stable
   schedule: nightly
   drainTimeoutSeconds: 600
+  source: https://updates.example.com
   signers:
     - sanRegex: ^https://github\.com/<org>/<repo>/\.github/workflows/release\.yml@refs/tags/v.+$
       issuer: https://token.actions.githubusercontent.com
 ```
+
+`autoUpdate.source` names the update origin (the `<cdnBase>` above).
+Empty is the default and disables every check: the scheduled loop never
+starts, the manual endpoint's updater reports up-to-date without a
+request, and nothing is ever dialed by default. A non-empty value must
+be an `http(s)` URL with a host. Opt-in needs all three: a `nightly`
+or `on-release` schedule, a configured `source`, and at least one
+`signers` entry (the operator's local consent to swap, independent of
+any platform request). A defaulted `nightly` schedule alone never opts
+in.
+
+## Scheduled checks
+
+When the config opts in, `Start` owns one cancellable, non-overlapping
+scheduled-update loop; `Stop` cancels it and joins the in-flight attempt,
+so every exit releases scheduler ownership and a never-settling fetch
+terminates within the attempt bound (drain timeout plus a 5-minute run
+budget; each request still carries its own 60-second client bound).
+Cadence: `nightly` checks at 03:00 local time; `on-release` polls the
+manifest hourly (the fleet contract's release notification needs
+SaaS/webhook delivery, which an OSS host has no channel for — the hourly
+poll is the local approximation with the same observable contract).
+`manual` never schedules; the manual `POST /api/daemon/update` endpoint
+is unchanged. Editing `daemon.yaml` takes effect without a restart: the
+watcher adopts `autoUpdate` live, so clearing `source`, selecting
+`manual`, or removing `signers` stops the loop and the next tick is
+inert.
+
+Each tick checks the manifest BEFORE entering `Update`: an unchanged
+release performs no lifecycle transition and the machine never drains.
+Only a strictly newer release enters the reused `Update` path (restart
+preflight, fail-closed verification, swap). The scheduler adds no new
+lifecycle state; every outcome below reuses the existing
+running/draining/updating states:
+
+| Trigger | Result | End state |
+|---|---|---|
+| up-to-date manifest | no lifecycle step | running (never drained) |
+| pre-check (manifest) failure | check failed before entering Update | running (never drained) |
+| newer release, preflight refused | update refused before any binary download | draining (explicit resume required) |
+| Update-phase timeout or failure after entering Update | update error | draining (explicit resume required) |
+| invalid signature | swap refused fail-closed | draining (explicit resume required) |
+| failed restart preflight | swap refused | draining (explicit resume required) |
+| newer signed release | swap applied, restart requested (exit 3); scheduler takes no further ticks | draining until the supervisor restarts into the new binary |
+
+A failed, timed-out, or refused attempt never resumes: the daemon stays
+draining until explicit resume, so a failure cannot silently undo a
+deliberately drained host.
 
 ## Anonymous usage count (opt-in)
 
