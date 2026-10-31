@@ -97,6 +97,30 @@ func TestDecodeContextPackRefusesBadPackIdentity(t *testing.T) {
 	}
 }
 
+func TestMaterializeContextPackRefusesBadPackIdentity(t *testing.T) {
+	for _, packID := range []string{"../evil", "", ".hidden"} {
+		t.Run("packId="+strconv.Quote(packID), func(t *testing.T) {
+			pack := ContextPackV1{Version: ContextPackProtocol, PackID: packID, Documents: []ContextDocumentV1{testPackDoc(t, "doc.md", "x")}}
+			root := RootPath(t.TempDir())
+			err := func() error {
+				_, err := MaterializeContextPack(root, pack)
+				return err
+			}()
+			if err == nil {
+				t.Fatalf("packId %q accepted by Materialize", packID)
+			}
+			var packErr *ContextPackError
+			if !errors.As(err, &packErr) {
+				t.Fatalf("refusal is not a pack error: %v", err)
+			}
+			// No session-owned context directory may appear for a refused identity.
+			if entries, _ := os.ReadDir(filepath.Join(string(root), DeclarationDirName, ContextPackDirName)); len(entries) != 0 {
+				t.Fatalf("refused pack identity left %d entries", len(entries))
+			}
+		})
+	}
+}
+
 func TestMaterializeContextPackPublishesBytes(t *testing.T) {
 	root := RootPath(t.TempDir())
 	pack := ContextPackV1{Version: ContextPackProtocol, PackID: "pack1", Documents: []ContextDocumentV1{
