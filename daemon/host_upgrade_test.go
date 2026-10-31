@@ -1586,8 +1586,16 @@ func TestHostUpgradeDurableBrokenRefusesNewID(t *testing.T) {
 	t.Parallel()
 	d := hostUpgradeTestDaemon(t, nil)
 	var calls atomic.Int32
-	d.runPreparedUpdate = func(context.Context, AutoUpdateConfig, string) (*UpdateResult, error) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	d.runPreparedUpdate = func(ctx context.Context, _ AutoUpdateConfig, _ string) (*UpdateResult, error) {
 		calls.Add(1)
+		close(entered)
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 		return &UpdateResult{Updated: true, Version: "x", Reason: "update-applied"}, nil
 	}
 	stateDir := filepath.Dir(d.opts.ConfigPath)
@@ -1595,7 +1603,13 @@ func TestHostUpgradeDurableBrokenRefusesNewID(t *testing.T) {
 	if applied, failures := d.applyPendingMutations(context.Background(), []PendingMutation{first}); len(applied) != 0 || len(failures) != 0 {
 		t.Fatalf("first applied/failures = %v/%v, want pending", applied, failures)
 	}
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("upgrade did not start")
+	}
 	_ = os.RemoveAll(stateDir)
+	close(release)
 	waitForHostUpgradeDone(t, d, "up-broken-first")
 	d.hostUpgradeMu.Lock()
 	broken := d.hostUpgradeDurableBroken
