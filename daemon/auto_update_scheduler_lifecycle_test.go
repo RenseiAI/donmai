@@ -140,7 +140,7 @@ func TestAutoUpdateSchedulerProductionSwapFencesResume(t *testing.T) {
 	// binary path, so RunUpdate applies the probe binary without a real
 	// sigstore bundle and without touching the test executable.
 	current := filepath.Join(t.TempDir(), "donmai-daemon")
-	if err := os.WriteFile(current, []byte("old-binary"), 0o755); err != nil {
+	if err := os.WriteFile(current, []byte("old-binary"), 0o600); err != nil {
 		t.Fatalf("write current binary: %v", err)
 	}
 	d.autoUpdateVerifier = passVerifier{}

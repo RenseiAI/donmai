@@ -59,10 +59,28 @@ func TestAutoUpdateSchedulerBlockedTrustRootRespectsStopDeadline(t *testing.T) {
 	start := time.Now()
 	stopCtx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
+	sched := d.autoUpdateScheduler
 	_ = d.Stop(stopCtx)
 	if elapsed := time.Since(start); elapsed > 3500*time.Millisecond {
 		t.Fatalf("Stop took %v with a 50ms deadline, want within the attempt bound", elapsed)
 	}
+	// Pin the pre-check construction bound, not just the Stop join: the
+	// waiter must observe the scheduler cancel and release inFlight,
+	// letting run exit and close done even though the construction
+	// goroutine stays blocked on the FIFO until unblocked below. Without
+	// the select on ctx.Done() the attempt wedges with inFlight true
+	// forever and every later tick is skipped.
+	waitForUpdateCondition(t, 5*time.Second, "pre-check released inFlight after Stop cancel", func() bool {
+		return !sched.inFlight.Load()
+	})
+	waitForUpdateCondition(t, 5*time.Second, "scheduler done closed after Stop cancel", func() bool {
+		select {
+		case <-sched.done:
+			return true
+		default:
+			return false
+		}
+	})
 	// Unblock the construction read so the leaked goroutine can finish.
 	go func() {
 		fd, err := syscall.Open(fifo, syscall.O_WRONLY|syscall.O_NONBLOCK, 0)
