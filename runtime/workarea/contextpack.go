@@ -122,6 +122,10 @@ type ContextPackReport struct {
 }
 
 // DecodeContextPack validates the raw carrier and returns the pack.
+// It enforces the closed carrier gate (size, unknown fields, trailing data)
+// plus the header and path shapes via ValidateContextPack. Per-document
+// content integrity (base64 shape, digest shape and match, byte bounds) is
+// enforced later at MaterializeContextPack, which owns the filesystem write.
 func DecodeContextPack(data []byte) (ContextPackV1, error) {
 	if len(data) == 0 || len(data) > maxContextPackCarrierBytes {
 		return ContextPackV1{}, &ContextPackError{Reason: ReasonContextPackLimit, Detail: "carrier size out of bounds"}
@@ -171,8 +175,11 @@ func cleanContextPackPath(p string) (string, error) {
 	if p == "" || len(p) > MaxContextPackPathBytes {
 		return "", &ContextPackError{Reason: ReasonContextPackLimit, Path: p, Detail: "path length out of bounds"}
 	}
-	if path.IsAbs(p) || strings.Contains(p, "\\") {
+	if path.IsAbs(p) {
 		return "", &ContextPackError{Reason: ReasonContextPackUnsafe, Path: p, Detail: "absolute path"}
+	}
+	if strings.Contains(p, "\\") {
+		return "", &ContextPackError{Reason: ReasonContextPackUnsafe, Path: p, Detail: "backslash in path"}
 	}
 	clean := path.Clean(p)
 	if clean == "." || strings.HasPrefix(clean, "../") || strings.Contains(clean, "/../") {
