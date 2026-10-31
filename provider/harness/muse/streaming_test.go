@@ -518,24 +518,27 @@ func TestMixedBurstPreservesTerminal(t *testing.T) {
 
 // TestPureToolBurstPreservesTerminal pins the oldest-eviction fallback:
 // a turn flooded with only ordinary tool events (no best-effort
-// liveness/reasoning left to evict) fills the 256-event channel, so the
-// final assistant completion, aggregate usage and ResultEvent depend on
-// the kept[1:] oldest-eviction fallback. Drives the production
-// Handle.handleNotification + emitter path with 128 toolCall
-// started+completed pairs (256 ToolUse/ToolResult, no drain), then
-// assistant completion + turn/completed, asserting the verdict survives.
-// Kills the INVERT mutant `if !isTerminalAdjacentEvent(ev)` -> `if true`
-// in evictForTerminal (never evict oldest for terminal), which drops the
-// completion and terminal while handleNotification still reports success.
+// liveness/reasoning left to evict) overflows the combined queue(256) +
+// channel(256) = 512-event budget, so the final assistant completion and
+// ResultEvent depend on the kept[1:] oldest-eviction fallback. Drives
+// the production Handle.handleNotification + emitter path with 300
+// toolCall started+completed pairs (600 ToolUse/ToolResult, no drain),
+// then assistant completion + turn/completed, asserting the verdict
+// survives. Kills the INVERT mutant
+// `if !isTerminalAdjacentEvent(ev)` -> `if true` in evictForTerminal
+// (never evict oldest for terminal), which drops the completion and
+// terminal while handleNotification still reports success.
 func TestPureToolBurstPreservesTerminal(t *testing.T) {
 	h := newHandle(nil, agent.Spec{Prompt: "x"}, NewSpawnPlan(agent.Spec{Prompt: "x"}, t.TempDir()), HandleOptions{})
 	sid := "99999999-9999-7999-8999-999999999999"
 	turnID := "aaaaaaaa-aaaa-7aaa-8aaa-aaaaaaaaaaaa"
 	h.setSessionID(sid)
 	h.setCurrentTurnID(turnID)
-	// 128 ordinary tool calls fill the 256-event channel with no
-	// best-effort output left to evict (evicted==0 path).
-	for i := 0; i < 128; i++ {
+	// 300 ordinary tool calls overflow the combined 512-event queue +
+	// channel budget with no best-effort output left to evict
+	// (evicted==0 path), so the terminal below must use the
+	// oldest-eviction fallback.
+	for i := 0; i < 300; i++ {
 		id := fmt.Sprintf("pure-tool-%d", i)
 		sParams, err := json.Marshal(map[string]any{
 			"sessionId": sid, "viewCursor": "cursor-0",
@@ -590,15 +593,6 @@ func TestPureToolBurstPreservesTerminal(t *testing.T) {
 		t.Fatalf("pure-tool flood lost terminal: assistant=%d result=%d handlerDone=%v", assistant, result, done)
 	}
 }
-
-// TestConcurrentDrainPreservesToolOrder pins the B1 ordering contract:
-// a slow concurrent Events() reader draining while the forwarder floods
-// best-effort liveness plus tool traffic must still observe every tool
-// use before its result. The pump owns the only send path to Events()
-// in FIFO order and eviction applies to the queue, so a concurrent
-// receive can never interleave with a drain and flip use/result (which
-// keeps a finished tool marked running in the runner). Drives the
-// production Handle.handleNotification path with a concurrent drain.
 
 // TestConcurrentDrainPreservesToolOrder pins the B1 ordering contract:
 // filling the buffer without a drain, then emitting the terminal while a
@@ -692,8 +686,9 @@ func TestConcurrentDrainPreservesToolOrder(t *testing.T) {
 	}
 	// The terminal ejects the oldest tool pair when the queue is full of
 	// ordinary traffic, so at least tools-1 pairs survive in order; every
-	// surviving result still follows its use. Two hundred pairs exceed the
-	// combined queue and channel budget, so eviction is exercised.
+	// surviving result still follows its use. The 600-event overflow
+	// eviction itself is pinned by TestPureToolBurstPreservesTerminal;
+	// this test pins FIFO order under a concurrent drain.
 	if len(useIdx) < tools-1 {
 		t.Fatalf("tool uses=%d, want at least %d (kinds=%v)", len(useIdx), tools-1, kindsOf(got))
 	}
