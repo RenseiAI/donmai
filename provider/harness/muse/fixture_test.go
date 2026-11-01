@@ -48,6 +48,18 @@ type fakeHost struct {
 	// acknowledgement that fails validation (empty turn id). The handle
 	// emits no applied-effort evidence.
 	turnStartMalformed bool
+	// turnStartOmitStatus, when true, answers turn/start with the
+	// request's command/turn id and started disposition but omits the
+	// acceptance status. The handle must reject it and emit nothing.
+	turnStartOmitStatus bool
+	// turnStartRejected, when true, answers turn/start with a
+	// non-empty turn id but status rejected. The handle must reject
+	// it and emit nothing.
+	turnStartRejected bool
+	// turnStartTurnIDOnly, when true, answers turn/start with only
+	// {"turnId":"turn-1"}. The handle must reject it and emit
+	// nothing.
+	turnStartTurnIDOnly bool
 	// turnStartHang, when true, never answers turn/start, so the bounded
 	// request times out. The handle emits no applied-effort evidence.
 	turnStartHang bool
@@ -167,6 +179,9 @@ func (fh *fakeHost) run(t *testing.T) {
 			turnStartErr := fh.turnStartErr
 			turnStartMalformed := fh.turnStartMalformed
 			turnStartHang := fh.turnStartHang
+			turnStartOmitStatus := fh.turnStartOmitStatus
+			turnStartRejected := fh.turnStartRejected
+			turnStartTurnIDOnly := fh.turnStartTurnIDOnly
 			fh.mu.Unlock()
 			if turnStartHang {
 				// Never answer: the bounded request times out.
@@ -192,6 +207,36 @@ func (fh *fakeHost) run(t *testing.T) {
 					"result": map[string]any{
 						"commandId": cmdID, "disposition": "started",
 						"startedNewTurn": true, "status": "accepted", "turnId": "",
+					},
+				})
+				continue
+			}
+			if turnStartTurnIDOnly {
+				// Minimal malformed acknowledgement: turn id only.
+				fh.write(t, map[string]any{
+					"jsonrpc": "2.0", "id": idRaw,
+					"result": map[string]any{"turnId": "turn-1"},
+				})
+				continue
+			}
+			if turnStartOmitStatus {
+				// Missing acceptance status with a valid turn id.
+				fh.write(t, map[string]any{
+					"jsonrpc": "2.0", "id": idRaw,
+					"result": map[string]any{
+						"commandId": cmdID, "disposition": "started",
+						"startedNewTurn": true, "turnId": cmdID,
+					},
+				})
+				continue
+			}
+			if turnStartRejected {
+				// Rejected acceptance status with a valid turn id.
+				fh.write(t, map[string]any{
+					"jsonrpc": "2.0", "id": idRaw,
+					"result": map[string]any{
+						"commandId": cmdID, "disposition": "started",
+						"startedNewTurn": true, "status": "rejected", "turnId": cmdID,
 					},
 				})
 				continue

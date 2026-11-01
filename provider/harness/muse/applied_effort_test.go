@@ -386,6 +386,62 @@ func TestAppliedEffort_MalformedAckEmitsNothing(t *testing.T) {
 	}
 }
 
+// TestAppliedEffort_MalformedStatusEmitsNothing pins that an acknowledgement
+// missing the acceptance status, carrying only a turn id, or carrying a
+// rejected status is not an admission: both the direct startTurn path and
+// the public Spawn door fail and emit no applied-effort evidence.
+func TestAppliedEffort_MalformedStatusEmitsNothing(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		set  func(*fakeHost)
+	}{
+		{"missing status", func(fh *fakeHost) { fh.turnStartOmitStatus = true }},
+		{"turn id only", func(fh *fakeHost) { fh.turnStartTurnIDOnly = true }},
+		{"rejected status", func(fh *fakeHost) { fh.turnStartRejected = true }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fh, stdinW, stdoutR := newFakeHost()
+			tc.set(fh)
+			fh.script = "single-turn"
+			go fh.run(t)
+			t.Cleanup(fh.close)
+
+			spec := agent.Spec{Prompt: "do work", Cwd: t.TempDir(), Autonomous: true, Effort: agent.EffortHigh}
+			plan := NewSpawnPlan(spec, t.TempDir())
+			h := newHandle(nil, spec, plan, HandleOptions{RPCTimeout: 2 * time.Second})
+			h.client = NewClient(stdinW, stdoutR)
+			h.setSessionID("11111111-1111-7111-8111-111111111111")
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := h.startTurn(ctx, plan.PromptInput); err == nil {
+				t.Fatal("startTurn succeeded on a malformed status ack, want error")
+			}
+			select {
+			case ev := <-h.Events():
+				if sys, ok := ev.(agent.SystemEvent); ok && sys.Subtype == agent.SystemSubtypeAppliedReasoningEffort {
+					t.Errorf("malformed status ack emitted applied event %q, want nothing", sys.Message)
+				} else {
+					t.Errorf("malformed status ack emitted unexpected event %#v, want nothing", ev)
+				}
+			default:
+			}
+
+			// The public Spawn door surfaces the same malformed ack as a
+			// failure within its bound.
+			p, fh2 := newTestProviderWithRPCTimeout(t, "single-turn", 2*time.Second)
+			fh2.mu.Lock()
+			tc.set(fh2)
+			fh2.mu.Unlock()
+			sctx, scancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer scancel()
+			if _, err := p.Spawn(sctx, agent.Spec{Prompt: "do work", Cwd: t.TempDir(), Autonomous: true, Effort: agent.EffortHigh}); err == nil {
+				t.Error("Spawn succeeded on a malformed status ack, want error")
+			}
+		})
+	}
+}
+
 // TestAppliedEffort_NeverSettlingHostTimesOut pins AC-3's hang half: a host
 // that never settles the bounded request yields no report and returns
 // within the timeout.

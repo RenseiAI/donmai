@@ -459,6 +459,9 @@ func (h *Handle) startTurn(ctx context.Context, input []TurnInputPart) error {
 	if err := json.Unmarshal(raw, &res); err != nil {
 		return fmt.Errorf("turn/start: decode response: %w", err)
 	}
+	if res.Status != CommandStatusAccepted {
+		return fmt.Errorf("turn/start: unexpected status %q in response", string(res.Status))
+	}
 	if res.TurnID == "" {
 		return errors.New("turn/start: empty turn id in response")
 	}
