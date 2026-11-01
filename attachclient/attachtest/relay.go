@@ -77,6 +77,18 @@ type StubRelay struct {
 	// correlation context on the initial attach and every reconnect dial.
 	dialMu      sync.Mutex
 	dialHeaders []http.Header
+
+	// sseHeaders records a clone of every degraded-lane SSE-down request's
+	// headers in arrival order, pinning the same correlation context on
+	// the fallback carrier used when the WSS upgrade is unavailable.
+	sseMu      sync.Mutex
+	sseHeaders []http.Header
+
+	// batchHeaders records a clone of every degraded-lane POST-up request's
+	// headers in arrival order, pinning the same correlation context on
+	// the host batch carrier.
+	batchMu      sync.Mutex
+	batchHeaders []http.Header
 }
 
 // New builds a StubRelay. Call Start to bind and serve.
@@ -341,6 +353,24 @@ func (s *StubRelay) DialHeaders() []http.Header {
 	s.dialMu.Lock()
 	defer s.dialMu.Unlock()
 	return append([]http.Header(nil), s.dialHeaders...)
+}
+
+// SSEHeaders returns a copy of every degraded-lane SSE-down request's headers
+// in arrival order. Tests use it to pin correlation context on the fallback
+// carrier, the same way DialHeaders pins the WSS handshake.
+func (s *StubRelay) SSEHeaders() []http.Header {
+	s.sseMu.Lock()
+	defer s.sseMu.Unlock()
+	return append([]http.Header(nil), s.sseHeaders...)
+}
+
+// BatchHeaders returns a copy of every degraded-lane POST-up request's headers
+// in arrival order. Tests use it to pin correlation context on the host batch
+// carrier.
+func (s *StubRelay) BatchHeaders() []http.Header {
+	s.batchMu.Lock()
+	defer s.batchMu.Unlock()
+	return append([]http.Header(nil), s.batchHeaders...)
 }
 
 // restartAnnouncement renders both halves of the announcement from one floor,
@@ -675,6 +705,9 @@ func (s *StubRelay) membersList() []attachwire.PresenceMember {
 // ---- degraded host lane -----------------------------------------------------
 
 func (s *StubRelay) handleHostSSE(w http.ResponseWriter, r *http.Request) {
+	s.sseMu.Lock()
+	s.sseHeaders = append(s.sseHeaders, r.Header.Clone())
+	s.sseMu.Unlock()
 	if s.refuseWhileDraining(w) {
 		return
 	}
@@ -736,6 +769,9 @@ func (s *StubRelay) handleHostSSE(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *StubRelay) handleHostOutput(w http.ResponseWriter, r *http.Request) {
+	s.batchMu.Lock()
+	s.batchHeaders = append(s.batchHeaders, r.Header.Clone())
+	s.batchMu.Unlock()
 	claims, err := parseClaims(bearer(r))
 	if err != nil || claims.Aud != "relay" {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)

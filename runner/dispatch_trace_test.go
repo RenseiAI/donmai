@@ -562,4 +562,102 @@ func TestDispatchTracePropagationDoors(t *testing.T) {
 			t.Fatal("RunHost did not return after cancel")
 		}
 	})
+
+	t.Run("attach degraded lane", func(t *testing.T) {
+		relay := attachtest.New(attachtest.Config{RoomID: "room-trace-degraded", RefuseWSS: true})
+		if err := relay.Start(); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = relay.Close() })
+		token := traceFakeJWT(t, "sess-trace-degraded", 1)
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+		done := make(chan error, 1)
+		go func() {
+			done <- attachclient.RunHost(ctx, attachclient.HostConfig{
+				AttachURL:   relay.BaseWSURL(),
+				TokenSource: func(context.Context) (string, error) { return token, nil },
+				Session:     &traceFakeSession{done: make(chan struct{})},
+				Traceparent: traceparent,
+				Tracestate:  traceState,
+				BackoffMin:  5 * time.Millisecond,
+				BackoffMax:  50 * time.Millisecond,
+				DialTimeout: 5 * time.Second,
+				// Fast probe so at least one upgrade attempt dials while
+				// the relay still refuses WSS: its handshake headers pin
+				// the probe path independently of the initial WSS dial.
+				UpgradeProbeInterval: 20 * time.Millisecond,
+				FallbackAfterN:       1,
+			})
+		}()
+		waitFor := func(cond func() bool, what string) {
+			t.Helper()
+			deadline := time.Now().Add(10 * time.Second)
+			for !cond() && time.Now().Before(deadline) {
+				time.Sleep(5 * time.Millisecond)
+			}
+			if !cond() {
+				t.Fatalf("timed out waiting for %s", what)
+			}
+		}
+		// The refused WSS upgrade falls back to the degraded lane: the
+		// SSE-down GET binds the leg and the first POST-up carries the
+		// subscribe control even with no session frames.
+		waitFor(relay.HostBound, "degraded host bind")
+		waitFor(func() bool { return len(relay.SSEHeaders()) >= 1 }, "degraded SSE request")
+		waitFor(func() bool { return len(relay.BatchHeaders()) >= 1 }, "degraded batch request")
+		// At least one upgrade-probe dial must have run while refused so
+		// the probe header path is observed, not just the initial WSS dial.
+		waitFor(func() bool { return len(relay.DialHeaders()) >= 2 }, "probe dial while refused")
+		for i, hdr := range relay.SSEHeaders() {
+			if got := hdr.Get("traceparent"); got != traceparent {
+				t.Errorf("degraded SSE %d traceparent = %q; want %q", i, got, traceparent)
+			}
+			if got := hdr.Get("tracestate"); got != traceState {
+				t.Errorf("degraded SSE %d tracestate = %q; want %q", i, got, traceState)
+			}
+		}
+		for i, hdr := range relay.BatchHeaders() {
+			if got := hdr.Get("traceparent"); got != traceparent {
+				t.Errorf("degraded batch %d traceparent = %q; want %q", i, got, traceparent)
+			}
+			if got := hdr.Get("tracestate"); got != traceState {
+				t.Errorf("degraded batch %d tracestate = %q; want %q", i, got, traceState)
+			}
+		}
+		// Every WSS handshake observed so far is either the initial dial
+		// or an upgrade-probe dial: both must carry the same context, so
+		// deleting either header site turns this assertion red.
+		for i, hdr := range relay.DialHeaders() {
+			if got := hdr.Get("traceparent"); got != traceparent {
+				t.Errorf("degraded-phase handshake %d traceparent = %q; want %q", i, got, traceparent)
+			}
+			if got := hdr.Get("tracestate"); got != traceState {
+				t.Errorf("degraded-phase handshake %d tracestate = %q; want %q", i, got, traceState)
+			}
+		}
+		// Re-admit WSS: the probe upgrades the live degraded leg and the
+		// fresh WSS handshake must keep the same context.
+		relay.SetRefuseWSS(false)
+		binds := relay.HostBinds()
+		waitFor(func() bool { return relay.HostBinds() > binds }, "upgrade rebind")
+		waitFor(func() bool { return len(relay.DialHeaders()) >= 3 }, "post-upgrade handshake")
+		for i, hdr := range relay.DialHeaders() {
+			if got := hdr.Get("traceparent"); got != traceparent {
+				t.Errorf("handshake %d traceparent = %q; want %q", i, got, traceparent)
+			}
+			if got := hdr.Get("tracestate"); got != traceState {
+				t.Errorf("handshake %d tracestate = %q; want %q", i, got, traceState)
+			}
+		}
+		cancel()
+		select {
+		case err := <-done:
+			if err != context.Canceled {
+				t.Fatalf("RunHost = %v; want context.Canceled", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("RunHost did not return after cancel")
+		}
+	})
 }
