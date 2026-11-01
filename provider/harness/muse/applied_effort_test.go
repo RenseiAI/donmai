@@ -291,7 +291,11 @@ func TestAppliedEffortFromTurnParams_Translation(t *testing.T) {
 		params map[string]any
 		want   agent.EffortLevel
 	}{
+		{map[string]any{"reasoningEffort": "low"}, agent.EffortLow},
+		{map[string]any{"reasoningEffort": "medium"}, agent.EffortMedium},
 		{map[string]any{"reasoningEffort": "high"}, agent.EffortHigh},
+		{map[string]any{"reasoningEffort": "xhigh"}, agent.EffortXHigh},
+		{map[string]any{"reasoningEffort": "max"}, agent.EffortMax},
 		{map[string]any{"reasoningEffort": "minimal"}, agent.EffortLevel("minimal")},
 		{map[string]any{}, ""},
 		{map[string]any{"reasoningEffort": ""}, ""},
@@ -303,6 +307,97 @@ func TestAppliedEffortFromTurnParams_Translation(t *testing.T) {
 		if got := appliedEffortFromTurnParams(tc.params); got != tc.want {
 			t.Errorf("params %v = %q, want %q", tc.params, got, tc.want)
 		}
+	}
+}
+
+// TestAppliedEffort_AllTiersSpawnCapturesApplied pins every applied-ladder
+// tier through the production Spawn door into the real poster: deleting any
+// single allowlist branch (low, medium, xhigh or max) turns that tier's wire
+// value into not-configured here (RED), instead of leaving the suite green.
+func TestAppliedEffort_AllTiersSpawnCapturesApplied(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		effort agent.EffortLevel
+		wire   string
+	}{
+		{"minimal", agent.EffortLevel("minimal"), "minimal"},
+		{"low", agent.EffortLow, "low"},
+		{"medium", agent.EffortMedium, "medium"},
+		{"high", agent.EffortHigh, "high"},
+		{"xhigh", agent.EffortXHigh, "xhigh"},
+		{"max", agent.EffortMax, "max"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, fh := newTestProvider(t, "single-turn")
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			h, err := p.Spawn(ctx, agent.Spec{Prompt: "do work", Cwd: t.TempDir(), Autonomous: true, Effort: tc.effort})
+			if err != nil {
+				t.Fatalf("Spawn: %v", err)
+			}
+			if got, present := turnStartEffortParam(t, fh); !present || got != tc.wire {
+				t.Fatalf("turn/start reasoningEffort = %q present=%v, want %q", got, present, tc.wire)
+			}
+			events := drainEvents(t, h.Events(), 10*time.Second)
+			applied, ok := appliedEventOf(events)
+			if !ok {
+				t.Fatalf("no applied_reasoning_effort event for %q; kinds=%v", tc.wire, kindsOf(events))
+			}
+			if applied.Message != string(tc.effort) {
+				t.Errorf("applied Message = %q, want %q (wire %q must round-trip, not not-configured)", applied.Message, string(tc.effort), tc.wire)
+			}
+			gotCtx, gotContent := postAppliedThroughRealPoster(t, applied)
+			if wantCtx := "appliedReasoningEffort=" + tc.wire; gotCtx != wantCtx {
+				t.Errorf("poster context = %q, want %q (unrecognized here means the poster ladder dropped %q)", gotCtx, wantCtx, tc.wire)
+			}
+			if wantContent := "applied reasoning effort: " + tc.wire + " (as applied)"; gotContent != wantContent {
+				t.Errorf("poster content = %q, want %q", gotContent, wantContent)
+			}
+		})
+	}
+}
+
+// TestAppliedEffort_AllTiersResumeCapturesApplied pins the same full ladder
+// through the resumed-turn door: the resume path shares startTurn, so each
+// tier must round-trip there too.
+func TestAppliedEffort_AllTiersResumeCapturesApplied(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		effort agent.EffortLevel
+		wire   string
+	}{
+		{"minimal", agent.EffortLevel("minimal"), "minimal"},
+		{"low", agent.EffortLow, "low"},
+		{"medium", agent.EffortMedium, "medium"},
+		{"high", agent.EffortHigh, "high"},
+		{"xhigh", agent.EffortXHigh, "xhigh"},
+		{"max", agent.EffortMax, "max"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, fh := newTestProvider(t, "single-turn")
+			fh.sessionID = "22222222-2222-7222-8222-222222222222"
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			h, err := p.Resume(ctx, "22222222-2222-7222-8222-222222222222", agent.Spec{Prompt: "continue", Cwd: t.TempDir(), Autonomous: true, Effort: tc.effort})
+			if err != nil {
+				t.Fatalf("Resume: %v", err)
+			}
+			if got, present := turnStartEffortParam(t, fh); !present || got != tc.wire {
+				t.Fatalf("resumed turn/start reasoningEffort = %q present=%v, want %q", got, present, tc.wire)
+			}
+			events := drainEvents(t, h.Events(), 10*time.Second)
+			applied, ok := appliedEventOf(events)
+			if !ok {
+				t.Fatalf("no applied_reasoning_effort on resume for %q; kinds=%v", tc.wire, kindsOf(events))
+			}
+			if applied.Message != string(tc.effort) {
+				t.Errorf("resumed applied Message = %q, want %q", applied.Message, string(tc.effort))
+			}
+			gotCtx, _ := postAppliedThroughRealPoster(t, applied)
+			if wantCtx := "appliedReasoningEffort=" + tc.wire; gotCtx != wantCtx {
+				t.Errorf("resume poster context = %q, want %q", gotCtx, wantCtx)
+			}
+		})
 	}
 }
 
