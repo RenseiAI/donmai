@@ -860,3 +860,123 @@ func TestHandle_FirstTurnSyncFailuresEmitDiagnostic(t *testing.T) {
 		}
 	})
 }
+
+// TestHandle_MalformedModelNeverEntersDiagnostic pins the
+// model-character filter through the production Spawn entry point: a
+// Spec.Model carrying spaces, newlines, slashes or other non-token
+// characters must never enter the shape summary. Disabling the
+// validatedModelID rejection branch makes the stored ModelID carry
+// the raw value and the capture assertions fail.
+func TestHandle_MalformedModelNeverEntersDiagnostic(t *testing.T) {
+	captureAtDebug := func(t *testing.T) (*bytes.Buffer, func()) {
+		t.Helper()
+		var logs bytes.Buffer
+		prev := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+		return &logs, func() { slog.SetDefault(prev) }
+	}
+
+	malformed := []string{
+		"bad model",
+		"bad\nmodel",
+		"bad\tmodel",
+		"bad/model",
+		"bad;model",
+		"-",
+	}
+	for _, model := range malformed {
+		t.Run("model "+strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(model, "\n", "<nl>"), "\t", "<tab>"), " ", "<sp>"), func(t *testing.T) {
+			logs, restore := captureAtDebug(t)
+			defer restore()
+			p, _ := newTestProvider(t, "single-turn")
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			h, err := p.Spawn(ctx, agent.Spec{Prompt: "work", Model: model, Cwd: t.TempDir(), Autonomous: true})
+			if err != nil {
+				t.Fatalf("Spawn with malformed model %q: %v", model, err)
+			}
+			events := drainEvents(t, h.Events(), 10*time.Second)
+			if res, ok := terminalResult(events); !ok || !res.Success {
+				t.Fatalf("terminal result missing or failed: %+v", res)
+			}
+			out := logs.String()
+			if !strings.Contains(out, "first-turn request shape") {
+				t.Fatalf("malformed model run emitted no diagnostic; logs=%q", out)
+			}
+			hh := h.(*Handle)
+			shape, _ := hh.storedFirstTurnShape()
+			if shape.ModelID != "" {
+				t.Errorf("malformed model %q copied into diagnostic ModelID=%q, want empty", model, shape.ModelID)
+			}
+			// The space variant is JSON-stable, so the log must
+			// not carry it verbatim either; newline/tab forms
+			// are pinned via the stored shape above because
+			// JSON escapes them.
+			if model == "bad model" && strings.Contains(out, model) {
+				t.Errorf("diagnostic copied malformed model %q; logs=%q", model, out)
+			}
+		})
+	}
+
+	t.Run("valid control still recorded", func(t *testing.T) {
+		logs, restore := captureAtDebug(t)
+		defer restore()
+		p, _ := newTestProvider(t, "single-turn")
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		h, err := p.Spawn(ctx, agent.Spec{Prompt: "work", Model: DefaultModel, Cwd: t.TempDir(), Autonomous: true})
+		if err != nil {
+			t.Fatalf("Spawn: %v", err)
+		}
+		events := drainEvents(t, h.Events(), 10*time.Second)
+		if res, ok := terminalResult(events); !ok || !res.Success {
+			t.Fatalf("terminal result missing or failed: %+v", res)
+		}
+		hh := h.(*Handle)
+		shape, _ := hh.storedFirstTurnShape()
+		if shape.ModelID != DefaultModel {
+			t.Errorf("ModelID=%q, want validated default %q", shape.ModelID, DefaultModel)
+		}
+		if out := logs.String(); !strings.Contains(out, "first-turn request shape") {
+			t.Errorf("valid control emitted no diagnostic; logs=%q", out)
+		}
+	})
+}
+
+// TestHandle_ResumeSyncFailureEmitsDiagnostic pins the synchronous
+// session/resume door through the production Resume entry point: a
+// host refusing session/resume must still emit one bounded warn
+// diagnostic without leaking the host error text, and Resume must
+// keep failing with the typed session-gone error. Deleting the
+// emitFirstTurnSyncFailure call on the resume path leaves the suite
+// green without this test; with it the capture assertion fails.
+func TestHandle_ResumeSyncFailureEmitsDiagnostic(t *testing.T) {
+	var logs bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	defer slog.SetDefault(prev)
+
+	p, fh := newTestProvider(t, "single-turn")
+	fh.mu.Lock()
+	fh.resumeErr = &rpcError{Code: -32000, Message: "SENTINEL-RESUME-SYNC-9f8a7b6c5d4e"}
+	fh.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, err := p.Resume(ctx, "22222222-2222-7222-8222-222222222222", agent.Spec{Prompt: "continue", Cwd: t.TempDir(), Autonomous: true})
+	if err == nil {
+		t.Fatal("expected resume failure, got nil")
+	}
+	if !isSessionGoneErr(err) {
+		t.Errorf("expected ErrSessionNotFound, got %v", err)
+	}
+	out := logs.String()
+	if !strings.Contains(out, "first-turn request shape") {
+		t.Fatalf("sync resume failure emitted no diagnostic; logs=%q", out)
+	}
+	if !strings.Contains(out, "session/resume") {
+		t.Errorf("sync resume diagnostic has no resume method; logs=%q", out)
+	}
+	if strings.Contains(out, "SENTINEL-RESUME-SYNC-9f8a7b6c5d4e") {
+		t.Errorf("sync resume diagnostic copied host error text; logs=%q", out)
+	}
+}

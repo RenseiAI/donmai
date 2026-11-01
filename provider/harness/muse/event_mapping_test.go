@@ -497,6 +497,9 @@ func TestFirstTurnAsyncError_SanitizesFreeText(t *testing.T) {
 }
 
 // TestEncodeFirstTurnDiagnostic_CapsAtTwoKiB pins the 2 KiB ceiling.
+// The oversize half proves the truncation fires: it builds a payload
+// whose uncapped JSON exceeds the cap, so deleting the truncation
+// makes the length assertion fail.
 func TestEncodeFirstTurnDiagnostic_CapsAtTwoKiB(t *testing.T) {
 	shape := firstTurnRequestShape{
 		SessionMethod: "session/start",
@@ -506,5 +509,41 @@ func TestEncodeFirstTurnDiagnostic_CapsAtTwoKiB(t *testing.T) {
 	payload := encodeFirstTurnDiagnostic(shape, &firstTurnDiagnosticData{ErrorKind: "overloaded", ErrorMethod: "turn/start"})
 	if len(payload) > firstTurnDiagnosticMaxBytes {
 		t.Errorf("payload length=%d, want <= %d", len(payload), firstTurnDiagnosticMaxBytes)
+	}
+
+	// Oversize input proves the cap truncates: without the
+	// buf[:max] slice the payload stays over the ceiling.
+	largeKeys := make([]string, 400)
+	for i := range largeKeys {
+		largeKeys[i] = "overflow-key-" + strings.Repeat("x", 32) + itoa(i%10) + strings.Repeat("y", 8)
+	}
+	largeTypes := make([]string, 400)
+	for i := range largeTypes {
+		largeTypes[i] = strings.Repeat("z", 32) + itoa(i%10)
+	}
+	oversize := firstTurnRequestShape{
+		SessionMethod:   "session/start",
+		SessionKeys:     largeKeys,
+		TurnKeys:        largeKeys,
+		InputPartTypes:  largeTypes,
+		InputPartCount:  400,
+		MCPServerCount:  9999,
+		ModelID:         DefaultModel,
+		ApprovalMode:    string(ApprovalModePromptUnmatched),
+		ReasoningEffort: string(ReasoningEffortLow),
+	}
+	raw, err := json.Marshal(firstTurnDiagnosticData{Shape: oversize, ErrorKind: "overloaded", ErrorMethod: "turn/start"})
+	if err != nil {
+		t.Fatalf("marshal oversize: %v", err)
+	}
+	if len(raw) <= firstTurnDiagnosticMaxBytes {
+		t.Fatalf("oversize fixture is not oversize: raw=%d, want > %d", len(raw), firstTurnDiagnosticMaxBytes)
+	}
+	capped := encodeFirstTurnDiagnostic(oversize, &firstTurnDiagnosticData{ErrorKind: "overloaded", ErrorMethod: "turn/start"})
+	if len(capped) > firstTurnDiagnosticMaxBytes {
+		t.Errorf("oversize payload length=%d, want <= %d", len(capped), firstTurnDiagnosticMaxBytes)
+	}
+	if len(capped) != firstTurnDiagnosticMaxBytes {
+		t.Errorf("oversize payload length=%d, want exactly %d (truncated)", len(capped), firstTurnDiagnosticMaxBytes)
 	}
 }
