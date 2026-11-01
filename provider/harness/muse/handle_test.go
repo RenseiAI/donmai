@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"strings"
 	"testing"
@@ -1231,5 +1232,246 @@ func TestHandle_ResumeSyncFailureEmitsDiagnostic(t *testing.T) {
 	}
 	if !strings.Contains(line, "sessionMethod=session/resume") {
 		t.Errorf("sync resume line has no session/resume sessionMethod; line=%q", line)
+	}
+}
+
+// TestHandle_FirstTurnDiagnosticCorrelatesTurnID pins the B1 fix: a
+// completion for an older turn must not emit the queued first-turn
+// shape nor consume its once flag. The older terminal ResultEvent
+// still flows (existing contract); only the diagnostic is gated.
+func TestHandle_FirstTurnDiagnosticCorrelatesTurnID(t *testing.T) {
+	var logs bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	defer slog.SetDefault(prev)
+	h := newHandle(nil, agent.Spec{Prompt: "x"}, NewSpawnPlan(agent.Spec{Prompt: "x"}, t.TempDir()), HandleOptions{})
+	sid := "33333333-3333-7333-8333-333333333333"
+	h.setSessionID(sid)
+	queuedID := "44444444-4444-7444-8444-444444444444"
+	oldID := "11111111-1111-7111-8111-111111111111"
+	h.recordSessionShape("session/resume", sessionResumeParams(sid, "c", nil))
+	h.recordTurnShape(turnStartParams(sid, "c", agent.Spec{Prompt: "x"}, []TurnInputPart{{Type: "text"}}, []string{t.TempDir()}), queuedID)
+	oldParams, _ := json.Marshal(map[string]any{"sessionId": sid, "turnId": oldID, "terminal": "completed", "viewCursor": "c"})
+	h.handleNotification(context.Background(), notification{Method: "turn/completed", Params: oldParams})
+	if got := strings.Count(logs.String(), "first-turn request shape"); got != 0 {
+		t.Fatalf("stale turn completion emitted queued shape; logs=%q", logs.String())
+	}
+	queuedParams, _ := json.Marshal(map[string]any{"sessionId": sid, "turnId": queuedID, "terminal": "completed", "viewCursor": "c2"})
+	h.handleNotification(context.Background(), notification{Method: "turn/completed", Params: queuedParams})
+	if got := strings.Count(logs.String(), "first-turn request shape"); got != 1 {
+		t.Fatalf("queued turn completion emissions=%d, want 1 (stale must not consume flag); logs=%q", got, logs.String())
+	}
+	h.closeEvents()
+}
+
+// TestHandle_FirstTurnDiagnosticRejectsUnknownTokens pins the token
+// allowlist through the Handle record doors: unknown approval,
+// provider, effort, busy and input-type tokens never enter the stored
+// shape. Deleting the validatedToken gate copies the sentinel.
+func TestHandle_FirstTurnDiagnosticRejectsUnknownTokens(t *testing.T) {
+	const sentinel = "SENTINEL-UNKNOWN-TOKEN-9f8a7b6c5d4e"
+	h := newHandle(nil, agent.Spec{Prompt: "x"}, NewSpawnPlan(agent.Spec{Prompt: "x"}, t.TempDir()), HandleOptions{})
+	sessionParams := map[string]any{
+		"sessionId": "s", "commandId": "c", "workspaceRoot": t.TempDir(),
+		"modelId":      DefaultModel,
+		"providerId":   sentinel,
+		"approvalMode": sentinel,
+		"config":       map[string]any{},
+	}
+	h.recordSessionShape("session/start", sessionParams)
+	turnParams := map[string]any{
+		"sessionId": "s", "commandId": "c",
+		"input":           []map[string]any{{"type": sentinel, "text": "x"}, {"type": "text", "text": "y"}},
+		"ifBusy":          sentinel,
+		"reasoningEffort": sentinel,
+		"displayText":     "hi",
+		"workspaceRoots":  []string{t.TempDir()},
+	}
+	h.recordTurnShape(turnParams, "turn-9")
+	shape, _ := h.storedFirstTurnShape()
+	if shape.ProviderID == sentinel || shape.ApprovalMode == sentinel || shape.ReasoningEffort == sentinel || shape.IfBusy == sentinel {
+		t.Fatalf("unknown token copied into shape: %+v", shape)
+	}
+	if shape.ProviderID != "" || shape.ApprovalMode != "" || shape.ReasoningEffort != "" || shape.IfBusy != "" {
+		t.Fatalf("unknown tokens must leave validated fields empty: %+v", shape)
+	}
+	for _, typ := range shape.InputPartTypes {
+		if typ == sentinel {
+			t.Fatalf("unknown input type copied into shape: %+v", shape.InputPartTypes)
+		}
+	}
+	if len(shape.InputPartTypes) != 2 || shape.InputPartTypes[0] != "unknown" || shape.InputPartTypes[1] != "text" {
+		t.Fatalf("InputPartTypes=%v, want [unknown text]", shape.InputPartTypes)
+	}
+	payload := encodeFirstTurnDiagnostic(shape, nil)
+	if strings.Contains(payload, sentinel) {
+		t.Fatalf("diagnostic payload leaked sentinel; payload=%q", payload)
+	}
+	h.closeEvents()
+}
+
+// TestHandle_FirstTurnDiagnosticBoundsCounts pins both ceilings
+// through production doors: the 16-type cap via the Handle turn door
+// and the 9999 cap via Spawn with many servers. Deleting either cap
+// copies the overflow.
+func TestHandle_FirstTurnDiagnosticBoundsCounts(t *testing.T) {
+	t.Run("input types capped at 16 via handle", func(t *testing.T) {
+		h := newHandle(nil, agent.Spec{Prompt: "x"}, NewSpawnPlan(agent.Spec{Prompt: "x"}, t.TempDir()), HandleOptions{})
+		parts := make([]map[string]any, 0, 20)
+		for i := 0; i < 20; i++ {
+			parts = append(parts, map[string]any{"type": "text", "text": "x"})
+		}
+		h.recordTurnShape(map[string]any{"sessionId": "s", "commandId": "c", "input": parts}, "turn-cap")
+		shape, _ := h.storedFirstTurnShape()
+		if shape.InputPartCount != 20 {
+			t.Fatalf("InputPartCount=%d, want 20", shape.InputPartCount)
+		}
+		if len(shape.InputPartTypes) != 16 {
+			t.Fatalf("InputPartTypes len=%d, want 16 (capped); got %v", len(shape.InputPartTypes), shape.InputPartTypes)
+		}
+		h.closeEvents()
+	})
+	t.Run("mcp count capped at 9999 via spawn", func(t *testing.T) {
+		var logs bytes.Buffer
+		prev := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+		defer slog.SetDefault(prev)
+		servers := make([]agent.MCPServerConfig, 0, 10001)
+		for i := 0; i < 10001; i++ {
+			servers = append(servers, agent.MCPServerConfig{Name: "srv", Type: "stdio", Command: "true"})
+		}
+		// Names must be unique or the translator collapses them.
+		for i := range servers {
+			servers[i].Name = fmt.Sprintf("srv-%05d", i)
+		}
+		p, _ := newTestProvider(t, "single-turn")
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		h, err := p.Spawn(ctx, agent.Spec{Prompt: "work", Cwd: t.TempDir(), Autonomous: true, MCPServers: servers})
+		if err != nil {
+			t.Fatalf("Spawn: %v", err)
+		}
+		events := drainEvents(t, h.Events(), 15*time.Second)
+		if res, ok := terminalResult(events); !ok || !res.Success {
+			t.Fatalf("terminal result missing or failed: %+v", res)
+		}
+		hh := h.(*Handle)
+		shape, _ := hh.storedFirstTurnShape()
+		if shape.MCPServerCount != 9999 {
+			t.Fatalf("MCPServerCount=%d, want 9999 (capped)", shape.MCPServerCount)
+		}
+		if out := logs.String(); !strings.Contains(out, "first-turn request shape") {
+			t.Fatalf("no diagnostic emitted; logs=%q", out)
+		}
+	})
+}
+
+// TestHandle_FirstTurnDiagnosticCancelledAndQuota pins the async
+// error side through production doors: cancelled via Spawn with the
+// interrupt script, quota and request-denied via the Handle
+// notification door. Deleting any branch collapses the assertion.
+func TestHandle_FirstTurnDiagnosticCancelledAndQuota(t *testing.T) {
+	t.Run("cancelled via spawn", func(t *testing.T) {
+		var logs bytes.Buffer
+		prev := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+		defer slog.SetDefault(prev)
+		p, _ := newTestProvider(t, "interrupt")
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		h, err := p.Spawn(ctx, agent.Spec{Prompt: "work", Cwd: t.TempDir(), Autonomous: true})
+		if err != nil {
+			t.Fatalf("Spawn: %v", err)
+		}
+		events := drainEvents(t, h.Events(), 10*time.Second)
+		if res, ok := terminalResult(events); !ok || res.Success {
+			t.Fatalf("interrupt terminal missing or successful: %+v", res)
+		}
+		lines := firstTurnDiagnosticLines(t, logs.String())
+		if len(lines) != 1 {
+			t.Fatalf("cancelled emissions=%d, want 1; logs=%q", len(lines), logs.String())
+		}
+		if !strings.Contains(lines[0], "errorKind=cancelled") {
+			t.Errorf("cancelled line has no errorKind=cancelled; line=%q", lines[0])
+		}
+		if strings.Contains(lines[0], "interrupted by user") {
+			t.Errorf("cancelled line copied reason text; line=%q", lines[0])
+		}
+	})
+	t.Run("quota and request-denied via handle", func(t *testing.T) {
+		var logs bytes.Buffer
+		prev := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+		defer slog.SetDefault(prev)
+		h := newHandle(nil, agent.Spec{Prompt: "x"}, NewSpawnPlan(agent.Spec{Prompt: "x"}, t.TempDir()), HandleOptions{})
+		sid := "55555555-5555-7555-8555-555555555555"
+		turnID := "66666666-6666-7666-8666-666666666666"
+		h.setSessionID(sid)
+		h.recordSessionShape("session/start", sessionStartParams(agent.Spec{Prompt: "x"}, "s", "c", t.TempDir(), nil))
+		h.recordTurnShape(turnStartParams(sid, "c", agent.Spec{Prompt: "x"}, []TurnInputPart{{Type: "text"}}, []string{t.TempDir()}), turnID)
+		quota := json.RawMessage(`{"usd":1}`)
+		denied := true
+		turnErr := &TurnError{Kind: "overloaded", Message: "HOST-SENTINEL-QUOTA-9f8a7b6c5d4e", Retryable: true, Quota: quota, RequestDenied: &denied}
+		params, _ := json.Marshal(map[string]any{
+			"sessionId": sid, "turnId": turnID, "terminal": "failed", "viewCursor": "c",
+			"error": map[string]any{"kind": "overloaded", "message": "HOST-SENTINEL-QUOTA-9f8a7b6c5d4e", "retryable": true, "quota": map[string]any{"usd": 1}, "requestDenied": true},
+		})
+		h.handleNotification(context.Background(), notification{Method: "turn/completed", Params: params})
+		_ = turnErr
+		lines := firstTurnDiagnosticLines(t, logs.String())
+		if len(lines) != 1 {
+			t.Fatalf("quota emissions=%d, want 1; logs=%q", len(lines), logs.String())
+		}
+		if !strings.Contains(lines[0], "errorKind=overloaded") {
+			t.Errorf("quota line has no errorKind=overloaded; line=%q", lines[0])
+		}
+		if strings.Contains(logs.String(), "HOST-SENTINEL-QUOTA-9f8a7b6c5d4e") {
+			t.Errorf("quota line copied host text; logs=%q", logs.String())
+		}
+		// The stored classification must carry the flags without the raw body.
+		classified := firstTurnAsyncError(TurnTerminalFailed, &TurnError{Kind: "overloaded", Retryable: true, Quota: quota, RequestDenied: &denied}, nil)
+		if !classified.ErrorHasQuota || !classified.ErrorHasRequestDenied || classified.ErrorRetryable == nil || !*classified.ErrorRetryable {
+			t.Fatalf("quota classification lost flags: %+v", classified)
+		}
+		payload := encodeFirstTurnDiagnostic(firstTurnRequestShape{SessionMethod: "session/start"}, classified)
+		if strings.Contains(payload, "HOST-SENTINEL-QUOTA-9f8a7b6c5d4e") {
+			t.Errorf("quota payload copied host text; payload=%q", payload)
+		}
+		h.closeEvents()
+	})
+}
+
+// TestHandle_FirstTurnDiagnosticEmitsOnce pins the once flag through
+// a Spawned handle: the async success consumes the flag, so a second
+// emit with the same turn stays silent. Deleting the flag emits twice.
+func TestHandle_FirstTurnDiagnosticEmitsOnce(t *testing.T) {
+	var logs bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	defer slog.SetDefault(prev)
+	p, _ := newTestProvider(t, "single-turn")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	h, err := p.Spawn(ctx, agent.Spec{Prompt: "work", Cwd: t.TempDir(), Autonomous: true})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	events := drainEvents(t, h.Events(), 10*time.Second)
+	if res, ok := terminalResult(events); !ok || !res.Success {
+		t.Fatalf("terminal result missing or failed: %+v", res)
+	}
+	if got := strings.Count(logs.String(), "first-turn request shape"); got != 1 {
+		t.Fatalf("spawn emissions=%d, want 1; logs=%q", got, logs.String())
+	}
+	hh := h.(*Handle)
+	hh.firstTurn.mu.Lock()
+	firstID := hh.firstTurn.firstTurnID
+	hh.firstTurn.mu.Unlock()
+	if firstID == "" {
+		t.Fatalf("spawn recorded no first-turn id")
+	}
+	hh.emitFirstTurnAsyncCompletion(firstID, TurnTerminalCompleted, nil, nil)
+	if got := strings.Count(logs.String(), "first-turn request shape"); got != 1 {
+		t.Fatalf("second emit with same turn produced %d diagnostics, want 1 (once flag); logs=%q", got, logs.String())
 	}
 }

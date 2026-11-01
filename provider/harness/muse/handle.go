@@ -555,7 +555,7 @@ func (h *Handle) handleNotification(ctx context.Context, n notification) bool {
 			if n.Method == "turn/completed" {
 				var completed TurnCompletedParams
 				_ = json.Unmarshal(n.Params, &completed)
-				h.emitFirstTurnAsyncCompletion(completed.Terminal, completed.Error, completed.Reason)
+				h.emitFirstTurnAsyncCompletion(completed.TurnID, completed.Terminal, completed.Error, completed.Reason)
 			}
 			h.clearCurrentTurnID()
 			h.emit(e)

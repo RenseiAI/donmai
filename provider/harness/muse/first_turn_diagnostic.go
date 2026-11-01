@@ -614,13 +614,23 @@ func (h *Handle) emitFirstTurnSyncFailure(rpcMethod string, err error) {
 // emitFirstTurnAsyncCompletion logs one bounded diagnostic for the
 // first asynchronous turn completion: warn on failure, debug on
 // success. Duplicate completions stay silent via the emitted flag.
-func (h *Handle) emitFirstTurnAsyncCompletion(terminal TurnTerminal, turnErr *TurnError, reason *string) {
+// The turnID gates the emission to the acknowledged first turn: a
+// completion for any other turn (for example an older turn finishing
+// after a queued first turn was recorded) emits no diagnostic and
+// consumes no flag, so the first turn's own completion still reports.
+func (h *Handle) emitFirstTurnAsyncCompletion(turnID string, terminal TurnTerminal, turnErr *TurnError, reason *string) {
 	if h == nil {
 		return
 	}
 	switch terminal {
 	case TurnTerminalCompleted, TurnTerminalFailed, TurnTerminalCancelled:
 	default:
+		return
+	}
+	h.firstTurn.mu.Lock()
+	firstID := h.firstTurn.firstTurnID
+	h.firstTurn.mu.Unlock()
+	if firstID != "" && turnID != "" && firstID != turnID {
 		return
 	}
 	if !h.markFirstTurnEmitted() {
