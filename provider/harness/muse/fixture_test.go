@@ -41,6 +41,16 @@ type fakeHost struct {
 	resumeErr *rpcError
 	// schemaVersion overrides the handshake schema version (0 = 1).
 	schemaVersion int
+	// turnStartErr, when non-nil, is the JSON-RPC error turn/start answers
+	// (host rejection). The handle emits no applied-effort evidence.
+	turnStartErr *rpcError
+	// turnStartMalformed, when true, answers turn/start with an
+	// acknowledgement that fails validation (empty turn id). The handle
+	// emits no applied-effort evidence.
+	turnStartMalformed bool
+	// turnStartHang, when true, never answers turn/start, so the bounded
+	// request times out. The handle emits no applied-effort evidence.
+	turnStartHang bool
 }
 
 func newFakeHost() (*fakeHost, *io.PipeWriter, *io.PipeReader) {
@@ -153,9 +163,39 @@ func (fh *fakeHost) run(t *testing.T) {
 				},
 			})
 		case method == "turn/start" && hasID:
+			fh.mu.Lock()
+			turnStartErr := fh.turnStartErr
+			turnStartMalformed := fh.turnStartMalformed
+			turnStartHang := fh.turnStartHang
+			fh.mu.Unlock()
+			if turnStartHang {
+				// Never answer: the bounded request times out.
+				continue
+			}
+			if turnStartErr != nil {
+				fh.write(t, map[string]any{
+					"jsonrpc": "2.0", "id": idRaw,
+					"error": map[string]any{
+						"code": turnStartErr.Code, "message": turnStartErr.Message,
+						"data": map[string]any{"kind": "internal"},
+					},
+				})
+				continue
+			}
 			params, _ := msg["params"].(map[string]any)
 			sid, _ := params["sessionId"].(string)
 			cmdID, _ := params["commandId"].(string)
+			if turnStartMalformed {
+				// Acknowledgement that fails validation: empty turn id.
+				fh.write(t, map[string]any{
+					"jsonrpc": "2.0", "id": idRaw,
+					"result": map[string]any{
+						"commandId": cmdID, "disposition": "started",
+						"startedNewTurn": true, "status": "accepted", "turnId": "",
+					},
+				})
+				continue
+			}
 			// The returned turnId equals the commandId.
 			fh.write(t, map[string]any{
 				"jsonrpc": "2.0", "id": idRaw,
@@ -427,10 +467,19 @@ func (fh *fakeHost) emitScript(t *testing.T, script, sid, turnID string, denyApp
 
 func newTestProvider(t *testing.T, script string) (*Provider, *fakeHost) {
 	t.Helper()
+	return newTestProviderWithRPCTimeout(t, script, 0)
+}
+
+func newTestProviderWithRPCTimeout(t *testing.T, script string, rpcTimeout time.Duration) (*Provider, *fakeHost) {
+	t.Helper()
 	fh, stdinW, stdoutR := newFakeHost()
 	fh.script = script
 	go fh.run(t)
-	p, err := New(Options{skipProcess: true, stdinOverride: stdinW, stdoutOverride: stdoutR})
+	opts := Options{skipProcess: true, stdinOverride: stdinW, stdoutOverride: stdoutR}
+	if rpcTimeout > 0 {
+		opts.RPCTimeout = rpcTimeout
+	}
+	p, err := New(opts)
 	if err != nil {
 		fh.close()
 		t.Fatalf("New: %v", err)
