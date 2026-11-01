@@ -574,7 +574,13 @@ abort 'FAIL: govulncheck must keep the 10-minute timeout' unless govuln['timeout
 abort 'FAIL: govulncheck must run the compiler guard' unless govuln.fetch('steps').any? { |step| step['run'].to_s.include?('verify-go-compiler.sh') }
 run_script = govuln.fetch('steps').select { |step| step['name'] == 'govulncheck' }.map { |step| step['run'].to_s }.join("\n")
 abort 'FAIL: govulncheck must fail closed' if run_script.match?(/::warning::govulncheck/)
-abort 'FAIL: govulncheck must fail closed' if run_script.match?(/\|\|\s*(echo|true)/)
+abort 'FAIL: govulncheck must run with pipefail' unless run_script.include?('pipefail')
+abort 'FAIL: govulncheck must run with errexit' unless run_script.include?('set -euo pipefail')
+abort 'FAIL: govulncheck must not swallow failures' if run_script.match?(/\|\|/)
+abort 'FAIL: govulncheck must not negate the scanner' if run_script.match?(/!\s*govulncheck/)
+abort 'FAIL: govulncheck must not disable errexit' if run_script.match?(/set \+e/)
+abort 'FAIL: govulncheck must not mask failures' if run_script.match?(/;\s*exit\s+0/)
+abort 'FAIL: govulncheck must scan all packages' unless run_script.include?('govulncheck ./...')
 abort 'FAIL: govulncheck must not continue-on-error' if govuln['continue-on-error'] == true || govuln.fetch('steps').any? { |step| step['continue-on-error'] == true }
 abort 'FAIL: govulncheck must retain the scanned SHA' unless govuln.to_s.match?(/github\.sha|GITHUB_SHA/)
 upload = govuln.fetch('steps').find { |step| step['uses'].to_s.start_with?('actions/upload-artifact@') }
@@ -593,15 +599,23 @@ goreleaser_index = release_steps.index { |step| step['uses'].to_s.start_with?('g
 abort 'FAIL: release job lost its compiler guard' unless guard_index
 abort 'FAIL: release compiler guard must run before the build' unless guard_index < goreleaser_index
 abort 'FAIL: release compiler guard must use the staged script (manual retries)' unless release_steps[guard_index]['run'].to_s.include?('RUNNER_TEMP')
+# The build must not publish: inspection gates the upload.
+build_args = release_steps[goreleaser_index].dig('with', 'args').to_s
+abort 'FAIL: release build must skip publish so inspection gates upload' unless build_args.include?('--skip=publish')
 integration = YAML.safe_load(File.read(File.join(root_dir, '.github/workflows/release-signing-integration.yml')), permitted_classes: [], permitted_symbols: [], aliases: false)
 integration_steps = integration.fetch('jobs').fetch('signing-integration').fetch('steps')
 abort 'FAIL: signing integration lost its compiler guard' unless integration_steps.any? { |step| step['run'].to_s.include?('verify-go-compiler.sh') }
 # AC-3: every binary is inspected with go version -m before upload.
 verify_index = release_steps.index { |step| step['name'] == 'Verify release binaries' }
 attest_index = release_steps.index { |step| step['name'] == 'Attest build provenance' }
+publish_index = release_steps.index { |step| (step['run'].to_s.include?('goreleaser release') && !step['run'].to_s.include?('--skip=publish')) }
 abort 'FAIL: release job lost its binary inspection' unless verify_index
+abort 'FAIL: release job lost its publish step' unless publish_index
 abort 'FAIL: binary inspection must run before provenance upload' unless verify_index < attest_index
 abort 'FAIL: binary inspection must run after the build' unless goreleaser_index < verify_index
+abort 'FAIL: binary inspection must gate publication' unless verify_index < publish_index
+abort 'FAIL: publication must run before provenance upload' unless publish_index < attest_index
+abort 'FAIL: publish must use the staged config (manual retries)' unless release_steps[publish_index]['run'].to_s.include?('RUNNER_TEMP') && release_steps[publish_index]['run'].to_s.include?('goreleaser.yaml')
 verify_run = release_steps[verify_index]['run'].to_s
 abort 'FAIL: binary inspection must use the staged config' unless verify_run.include?('RUNNER_TEMP') && verify_run.include?('goreleaser.yaml')
 abort 'FAIL: binary inspection must target the release tag on every path' unless verify_run.include?('RELEASE_TAG')
@@ -617,6 +631,9 @@ combos = builds.flat_map { |build| Array(build['goos']).product(Array(build['goa
 abort 'FAIL: GoReleaser config declares no platform matrix' if combos.empty?
 inspector = File.read(File.join(root_dir, 'scripts/verify-release-binaries.sh'))
 abort 'FAIL: binary inspector does not derive from the GoReleaser config' unless inspector.include?("goreleaser.yaml") && inspector.include?("builds")
+abort 'FAIL: binary inspector must discover via build id' unless inspector.include?("build['id']") || inspector.include?('build["id"]')
+abort 'FAIL: binary inspector must normalize the v tag' unless inspector.include?("#v") || inspector.include?("TrimPrefix") || inspector.include?("${tag#v}")
+abort 'FAIL: binary inspector must fail closed on producer errors' if inspector.match?(/done\s+<\s+<\(expected_binaries\)/)
 staged = release_steps.find { |step| step['name'] == 'Stage release automation' }['run'].to_s
 %w[verify-go-compiler.sh verify-release-binaries.sh].each do |script|
   abort "FAIL: manual retries can fall back to an older #{script}" unless staged.include?(script)

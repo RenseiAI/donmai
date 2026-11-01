@@ -2,8 +2,8 @@
 # Inspect every release binary with `go version -m` before upload.
 #
 # The expected artifact set is derived from the GoReleaser config (builds:
-# binary name x goos x goarch), never hardcoded, so a new platform is covered
-# automatically. Each binary must exist, must be a Go binary with module
+# build id x binary name x goos x goarch), never hardcoded, so a new platform
+# is covered automatically. Each binary must exist, must be a Go binary with module
 # metadata, and must report a stable compiler >= the go.mod floor. The script
 # retains the SHA256 digest, Go version, and main.version for every binary.
 #
@@ -59,8 +59,11 @@ version_at_least() {
   (( a_patch >= f_patch ))
 }
 
-# List expected binaries as "<binary> <os> <arch>" lines, derived from the
-# GoReleaser config. Fails closed when the config cannot be parsed.
+# List expected binaries as "<binary> <id> <os> <arch>" lines, derived from
+# the GoReleaser config. Fails closed when the config cannot be parsed.
+# GoReleaser names each build directory after the build id
+# (dist/<id>_<goos>_<goarch>*/<binary>), not after the binary name, so both
+# are emitted for directory discovery.
 expected_binaries() {
   ruby -ryaml - "$config" <<'RUBY'
 config_file = ARGV.fetch(0)
@@ -73,12 +76,14 @@ builds = config['builds']
 abort "verify-release-binaries: RED: #{config_file} declares no builds" unless builds.is_a?(Array) && !builds.empty?
 builds.each do |build|
   binary = build['binary']
+  id = build['id'] || binary
   goos = build['goos'] || ['linux']
   goarch = build['goarch'] || ['amd64']
   abort "verify-release-binaries: RED: build entry without binary name" unless binary.is_a?(String) && !binary.empty?
+  abort "verify-release-binaries: RED: build entry without id" unless id.is_a?(String) && !id.empty?
   goos.each do |os|
     goarch.each do |arch|
-      puts "#{binary} #{os} #{arch}"
+      puts "#{binary} #{id} #{os} #{arch}"
     end
   end
 end
@@ -86,10 +91,10 @@ RUBY
 }
 
 locate_binary() {
-  local name=$1 os=$2 arch=$3
+  local name=$1 id=$2 os=$3 arch=$4
   local candidate
-  # GoReleaser build layout: dist/<name>_<os>_<arch>*/<name>.
-  for candidate in "${dist}/${name}_${os}_${arch}"*/"${name}" "${dist}/${name}_${os}_${arch}/${name}"; do
+  # GoReleaser build layout: dist/<id>_<os>_<arch>*/<binary>.
+  for candidate in "${dist}/${id}_${os}_${arch}"*/"${name}" "${dist}/${id}_${os}_${arch}/${name}"; do
     if [[ -f "${candidate}" ]]; then
       printf '%s' "${candidate}"
       return 0
@@ -99,9 +104,9 @@ locate_binary() {
 }
 
 verify_one() {
-  local name=$1 os=$2 arch=$3 floor=$4
+  local name=$1 id=$2 os=$3 arch=$4 floor=$5
   local path go_line go_version main_version sha
-  if ! path=$(locate_binary "${name}" "${os}" "${arch}"); then
+  if ! path=$(locate_binary "${name}" "${id}" "${os}" "${arch}"); then
     printf 'verify-release-binaries: RED: missing binary for %s %s/%s under %s\n' "${name}" "${os}" "${arch}" "${dist}" >&2
     return 1
   fi
@@ -129,20 +134,31 @@ verify_one() {
   fi
   printf 'binary=%s os=%s arch=%s path=%s go=%s sha256=%s version=%s\n' \
     "${name}" "${os}" "${arch}" "${path}" "${go_version}" "${sha}" "${main_version:-unknown}"
-  if [[ -n "${tag}" && -n "${main_version}" && "${main_version}" != "${tag}" ]]; then
-    printf 'verify-release-binaries: RED: %s stamps version %q, want tag %q\n' "${path}" "${main_version}" "${tag}" >&2
-    return 1
+  # GoReleaser strips the tag's leading `v` for `.Version`, which is what the
+  # ldflags stamp. Normalize both sides so tag `v1.2.3` matches stamp `1.2.3`.
+  if [[ -n "${tag}" && -n "${main_version}" ]]; then
+    local want=${tag#v} have=${main_version#v}
+    if [[ "${have}" != "${want}" ]]; then
+      printf 'verify-release-binaries: RED: %s stamps version %q, want tag %q\n' "${path}" "${main_version}" "${tag}" >&2
+      return 1
+    fi
   fi
 }
 
 verify_dist() {
   local floor=$1
   local failures=0 count=0
-  local name os arch line
-  while read -r name os arch; do
+  local name id os arch line
+  # Capture the producer first: a config parse failure after emitting rows
+  # must fail closed instead of verifying only the emitted prefix.
+  local expected
+  if ! expected=$(expected_binaries); then
+    return 1
+  fi
+  while read -r name id os arch; do
     [[ -n "${name}" ]] || continue
     count=$((count + 1))
-    if line=$(verify_one "${name}" "${os}" "${arch}" "${floor}"); then
+    if line=$(verify_one "${name}" "${id}" "${os}" "${arch}" "${floor}"); then
       printf '%s\n' "${line}"
       if [[ -n "${output_file}" ]]; then
         printf '%s\n' "${line}" >>"${output_file}"
@@ -150,7 +166,7 @@ verify_dist() {
     else
       failures=$((failures + 1))
     fi
-  done < <(expected_binaries)
+  done <<<"${expected}"
   if (( count == 0 )); then
     printf 'verify-release-binaries: RED: config derived zero binaries\n' >&2
     return 1
@@ -193,7 +209,7 @@ run_self_test() {
   local work
   work=$(mktemp -d)
   trap 'rm -rf "${work}"' RETURN
-  mkdir -p "${work}/src" "${work}/dist/donmai_linux_amd64_v8.0" "${work}/dist/donmai_darwin_arm64_v8.0"
+  mkdir -p "${work}/src" "${work}/dist/selftest-linux_linux_amd64_v1" "${work}/dist/selftest-darwin_darwin_arm64_v8.0"
   cat >"${work}/src/main.go" <<'GO'
 package main
 var version = "dev"
@@ -204,8 +220,9 @@ module example.com/selftest
 
 go 1.26.10
 GO
-  (cd "${work}/src" && GOWORK=off GOTOOLCHAIN=local go build -ldflags="-X main.version=v1.2.3" -o "${work}/dist/donmai_linux_amd64_v8.0/donmai" . )
-  (cd "${work}/src" && GOWORK=off GOTOOLCHAIN=local go build -ldflags="-X main.version=v1.2.3" -o "${work}/dist/donmai_darwin_arm64_v8.0/donmai" . )
+  # Stamp without the leading `v`, exactly like GoReleaser `{{.Version}}` (it strips the tag `v`).
+  (cd "${work}/src" && GOWORK=off GOTOOLCHAIN=local go build -ldflags="-X main.version=1.2.3" -o "${work}/dist/selftest-linux_linux_amd64_v1/donmai" . )
+  (cd "${work}/src" && GOWORK=off GOTOOLCHAIN=local go build -ldflags="-X main.version=1.2.3" -o "${work}/dist/selftest-darwin_darwin_arm64_v8.0/donmai" . )
   printf 'payload' >"${work}/dist/donmai_1.2.3_linux_amd64.tar.gz"
   printf 'payload' >"${work}/dist/donmai_1.2.3_darwin_arm64.tar.gz"
   cat >"${work}/goreleaser.yaml" <<'YAML'
@@ -237,14 +254,34 @@ YAML
   floor=$(floor_from_go_mod)
   if (cd "${work}" && bash "${self_path}" --config goreleaser-trim.yaml --dist dist --tag v1.2.3 --floor "${floor}" >/dev/null); then pass 'real binaries pass'; else fail 'real binaries pass'; fi
   if (cd "${work}" && bash "${self_path}" --config goreleaser-trim.yaml --dist dist --tag v1.2.3 --floor 99.0.0 >/dev/null 2>&1); then fail 'old metadata refuses'; else pass 'old metadata refuses'; fi
-  mv "${work}/dist/donmai_linux_amd64_v8.0/donmai" "${work}/dist/donmai_linux_amd64_v8.0/donmai.bak"
+  # Patch boundary: the security-relevant patch must refuse, not only major.
+  if version_at_least "1.27.3" "1.27.4" >/dev/null 2>&1; then fail 'patch floor refuses'; else pass 'patch floor refuses'; fi
+  if version_at_least "1.27.3" "1.27.3" >/dev/null; then pass 'patch floor passes'; else fail 'patch floor passes'; fi
+  if (cd "${work}" && bash "${self_path}" --config goreleaser-trim.yaml --dist dist --tag v9.9.9 --floor "${floor}" >/dev/null 2>&1); then fail 'version mismatch refuses'; else pass 'version mismatch refuses'; fi
+  # A config whose later entry omits `binary` must fail closed instead of
+  # verifying only the emitted prefix.
+  cat >"${work}/goreleaser-bad.yaml" <<'YAML'
+version: 2
+builds:
+  - id: selftest-linux
+    main: ./src
+    binary: donmai
+    goos: [linux]
+    goarch: [amd64]
+  - id: selftest-bad
+    main: ./src
+    goos: [linux]
+    goarch: [amd64]
+YAML
+  if (cd "${work}" && bash "${self_path}" --config goreleaser-bad.yaml --dist dist --tag v1.2.3 --floor "${floor}" >/dev/null 2>&1); then fail 'missing binary name refuses'; else pass 'missing binary name refuses'; fi
+  mv "${work}/dist/selftest-linux_linux_amd64_v1/donmai" "${work}/dist/selftest-linux_linux_amd64_v1/donmai.bak"
   if (cd "${work}" && bash "${self_path}" --config goreleaser-trim.yaml --dist dist --tag v1.2.3 --floor "${floor}" >/dev/null 2>&1); then fail 'missing binary refuses'; else pass 'missing binary refuses'; fi
-  mv "${work}/dist/donmai_linux_amd64_v8.0/donmai.bak" "${work}/dist/donmai_linux_amd64_v8.0/donmai"
-  printf '#!/bin/sh\nexit 0\n' >"${work}/dist/donmai_linux_amd64_v8.0/donmai-sh"
-  mv "${work}/dist/donmai_linux_amd64_v8.0/donmai" "${work}/dist/donmai_linux_amd64_v8.0/donmai.real"
-  cp "${work}/dist/donmai_linux_amd64_v8.0/donmai-sh" "${work}/dist/donmai_linux_amd64_v8.0/donmai"
+  mv "${work}/dist/selftest-linux_linux_amd64_v1/donmai.bak" "${work}/dist/selftest-linux_linux_amd64_v1/donmai"
+  printf '#!/bin/sh\nexit 0\n' >"${work}/dist/selftest-linux_linux_amd64_v1/donmai-sh"
+  mv "${work}/dist/selftest-linux_linux_amd64_v1/donmai" "${work}/dist/selftest-linux_linux_amd64_v1/donmai.real"
+  cp "${work}/dist/selftest-linux_linux_amd64_v1/donmai-sh" "${work}/dist/selftest-linux_linux_amd64_v1/donmai"
   if (cd "${work}" && bash "${self_path}" --config goreleaser-trim.yaml --dist dist --tag v1.2.3 --floor "${floor}" >/dev/null 2>&1); then fail 'non-Go binary refuses'; else pass 'non-Go binary refuses'; fi
-  mv "${work}/dist/donmai_linux_amd64_v8.0/donmai.real" "${work}/dist/donmai_linux_amd64_v8.0/donmai"
+  mv "${work}/dist/selftest-linux_linux_amd64_v1/donmai.real" "${work}/dist/selftest-linux_linux_amd64_v1/donmai"
 
   if (( failures > 0 )); then
     printf 'verify-release-binaries self-test: %d failure(s)\n' "${failures}" >&2

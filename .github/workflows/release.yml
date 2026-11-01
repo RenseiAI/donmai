@@ -384,12 +384,14 @@ jobs:
       - name: Install cosign
         uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
 
+      # Build without publishing so binary inspection gates the upload.
+      # The following publish step runs only after verification succeeds.
       - uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7
         with:
           # Keep the verified pipeline order fixed: binary_signs -> archives ->
           # checksums -> signs. Upgrade only with a source/docs re-verification.
           version: "v2.17.1"
-          args: release --clean --config ${{ runner.temp }}/goreleaser.yaml
+          args: release --clean --skip=publish --config ${{ runner.temp }}/goreleaser.yaml
 
       - name: Verify release binaries
         env:
@@ -411,6 +413,13 @@ jobs:
             cat "${RUNNER_TEMP}/release-binaries.log"
             echo '```'
           } >> "${GITHUB_STEP_SUMMARY}"
+
+      # Publish only after verification. A failed inspection stops the job
+      # here, so a bad compiler artifact can never upload or update the cask.
+      - name: Publish release
+        run: |
+          set -euo pipefail
+          goreleaser release --clean --config "${RUNNER_TEMP}/goreleaser.yaml"
 
       # Build provenance for every published archive. This is a different claim
       # from the cosign signature: the signature says "this workflow signed this
