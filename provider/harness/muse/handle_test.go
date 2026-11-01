@@ -529,6 +529,22 @@ func isSessionGoneErr(err error) bool {
 	return false
 }
 
+// firstTurnDiagnosticLines returns only the log lines carrying the
+// first-turn diagnostic marker. Level and method pins must inspect
+// the marker line itself: the surrounding output carries unrelated
+// WARN/DEBUG lines (serve exit, handshake) that would mask a level
+// or method regression behind a whole-output substring check.
+func firstTurnDiagnosticLines(t *testing.T, out string) []string {
+	t.Helper()
+	var lines []string
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, "first-turn request shape") {
+			lines = append(lines, line)
+		}
+	}
+	return lines
+}
+
 func TestHandle_StepUsage(t *testing.T) {
 	p, _ := newTestProvider(t, "step-usage")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -621,6 +637,39 @@ func TestHandle_FirstTurnFailureEmitsShapeAndSuccessControlEmitsDebug(t *testing
 		if strings.Contains(out, "host overloaded") {
 			t.Errorf("failed diagnostic copied free-form host text; logs=%q", out)
 		}
+		lines := firstTurnDiagnosticLines(t, out)
+		if len(lines) != 1 {
+			t.Fatalf("failed diagnostic emissions=%d, want exactly 1; logs=%q", len(lines), out)
+		}
+		line := lines[0]
+		if !strings.Contains(line, "level=WARN") {
+			t.Errorf("failed diagnostic line is not WARN; line=%q", line)
+		}
+		if strings.Contains(line, "level=DEBUG") {
+			t.Errorf("failed diagnostic line must not be DEBUG; line=%q", line)
+		}
+		if !strings.Contains(line, "errorKind=overloaded") {
+			t.Errorf("failed diagnostic line has no classified errorKind; line=%q", line)
+		}
+		if strings.Contains(line, "errorKind=unknown") {
+			t.Errorf("failed diagnostic line collapsed kind to unknown; line=%q", line)
+		}
+		if !strings.Contains(line, "errorMethod=turn/start") {
+			t.Errorf("failed diagnostic line has no turn/start errorMethod; line=%q", line)
+		}
+		if strings.Contains(line, "errorMethod=unknown") {
+			t.Errorf("failed diagnostic line collapsed method to unknown; line=%q", line)
+		}
+		if !strings.Contains(line, "sessionMethod=session/start") {
+			t.Errorf("failed diagnostic line has no session/start sessionMethod; line=%q", line)
+		}
+		if hh, ok := h.(*Handle); !ok {
+			t.Fatalf("Spawn handle is %T, want *Handle", h)
+		} else if shape, _ := hh.storedFirstTurnShape(); shape.SessionMethod != "session/start" {
+			t.Errorf("stored SessionMethod=%q, want session/start", shape.SessionMethod)
+		} else if shape.InputPartCount == 0 {
+			t.Errorf("stored InputPartCount=0, want populated shape not an empty marker")
+		}
 	})
 
 	t.Run("success", func(t *testing.T) {
@@ -644,6 +693,31 @@ func TestHandle_FirstTurnFailureEmitsShapeAndSuccessControlEmitsDebug(t *testing
 		}
 		if !strings.Contains(out, "session/start") {
 			t.Errorf("success diagnostic has no comparable session method; logs=%q", out)
+		}
+		lines := firstTurnDiagnosticLines(t, out)
+		if len(lines) != 1 {
+			t.Fatalf("success diagnostic emissions=%d, want exactly 1; logs=%q", len(lines), out)
+		}
+		line := lines[0]
+		if !strings.Contains(line, "level=DEBUG") {
+			t.Errorf("success diagnostic line is not DEBUG; line=%q", line)
+		}
+		if strings.Contains(line, "level=WARN") {
+			t.Errorf("success diagnostic line must not be WARN failure; line=%q", line)
+		}
+		if strings.Contains(line, "errorKind=") {
+			t.Errorf("success diagnostic line must carry no errorKind; line=%q", line)
+		}
+		if strings.Contains(line, "errorMethod=") {
+			t.Errorf("success diagnostic line must carry no errorMethod; line=%q", line)
+		}
+		if !strings.Contains(line, "sessionMethod=session/start") {
+			t.Errorf("success diagnostic line has no session/start sessionMethod; line=%q", line)
+		}
+		if hh, ok := h.(*Handle); !ok {
+			t.Fatalf("Spawn handle is %T, want *Handle", h)
+		} else if shape, _ := hh.storedFirstTurnShape(); shape.SessionMethod != "session/start" {
+			t.Errorf("stored SessionMethod=%q, want session/start", shape.SessionMethod)
 		}
 	})
 }
@@ -806,6 +880,37 @@ func TestHandle_ResumeFirstTurnDiagnostic(t *testing.T) {
 	if !strings.Contains(out, "session/resume") {
 		t.Errorf("resume diagnostic has no resume method; logs=%q", out)
 	}
+	lines := firstTurnDiagnosticLines(t, out)
+	if len(lines) != 1 {
+		t.Fatalf("resume diagnostic emissions=%d, want exactly 1; logs=%q", len(lines), out)
+	}
+	line := lines[0]
+	if !strings.Contains(line, "level=WARN") {
+		t.Errorf("resume diagnostic line is not WARN; line=%q", line)
+	}
+	if strings.Contains(line, "level=DEBUG") {
+		t.Errorf("resume failure line must not be DEBUG; line=%q", line)
+	}
+	if !strings.Contains(line, "errorKind=overloaded") {
+		t.Errorf("resume diagnostic line has no classified errorKind; line=%q", line)
+	}
+	if strings.Contains(line, "errorKind=unknown") {
+		t.Errorf("resume diagnostic line collapsed kind to unknown; line=%q", line)
+	}
+	if !strings.Contains(line, "errorMethod=turn/start") {
+		t.Errorf("resume diagnostic line has no turn/start errorMethod; line=%q", line)
+	}
+	if strings.Contains(line, "errorMethod=unknown") {
+		t.Errorf("resume diagnostic line collapsed method to unknown; line=%q", line)
+	}
+	if !strings.Contains(line, "sessionMethod=session/resume") {
+		t.Errorf("resume diagnostic line has no session/resume sessionMethod; line=%q", line)
+	}
+	if hh, ok := h.(*Handle); !ok {
+		t.Fatalf("Resume handle is %T, want *Handle", h)
+	} else if shape, _ := hh.storedFirstTurnShape(); shape.SessionMethod != "session/resume" {
+		t.Errorf("stored SessionMethod=%q, want session/resume", shape.SessionMethod)
+	}
 }
 
 // TestHandle_FirstTurnSyncFailuresEmitDiagnostic pins the synchronous
@@ -838,6 +943,32 @@ func TestHandle_FirstTurnSyncFailuresEmitDiagnostic(t *testing.T) {
 		if strings.Contains(out, "SENTINEL-SYNC-SESSION-9f8a7b6c5d4e") {
 			t.Errorf("diagnostic copied sync error text; logs=%q", out)
 		}
+		lines := firstTurnDiagnosticLines(t, out)
+		if len(lines) != 1 {
+			t.Fatalf("sync session emissions=%d, want exactly 1; logs=%q", len(lines), out)
+		}
+		line := lines[0]
+		if !strings.Contains(line, "level=WARN") {
+			t.Errorf("sync session line is not WARN; line=%q", line)
+		}
+		if strings.Contains(line, "level=DEBUG") {
+			t.Errorf("sync session failure line must not be DEBUG; line=%q", line)
+		}
+		if !strings.Contains(line, "errorMethod=session/start") {
+			t.Errorf("sync session line has no session/start errorMethod; line=%q", line)
+		}
+		if strings.Contains(line, "errorMethod=unknown") {
+			t.Errorf("sync session line collapsed method to unknown; line=%q", line)
+		}
+		if !strings.Contains(line, "errorKind=internal") {
+			t.Errorf("sync session line has no classified errorKind=internal; line=%q", line)
+		}
+		if strings.Contains(line, "errorKind=unknown") {
+			t.Errorf("sync session line collapsed kind to unknown; line=%q", line)
+		}
+		if !strings.Contains(line, "sessionMethod=session/start") {
+			t.Errorf("sync session line has no session/start sessionMethod; line=%q", line)
+		}
 	})
 
 	t.Run("turn start", func(t *testing.T) {
@@ -857,6 +988,32 @@ func TestHandle_FirstTurnSyncFailuresEmitDiagnostic(t *testing.T) {
 		}
 		if strings.Contains(out, "SENTINEL-SYNC-TURN-9f8a7b6c5d4e") {
 			t.Errorf("diagnostic copied sync error text; logs=%q", out)
+		}
+		lines := firstTurnDiagnosticLines(t, out)
+		if len(lines) != 1 {
+			t.Fatalf("sync turn emissions=%d, want exactly 1; logs=%q", len(lines), out)
+		}
+		line := lines[0]
+		if !strings.Contains(line, "level=WARN") {
+			t.Errorf("sync turn line is not WARN; line=%q", line)
+		}
+		if strings.Contains(line, "level=DEBUG") {
+			t.Errorf("sync turn failure line must not be DEBUG; line=%q", line)
+		}
+		if !strings.Contains(line, "errorMethod=turn/start") {
+			t.Errorf("sync turn line has no turn/start errorMethod; line=%q", line)
+		}
+		if strings.Contains(line, "errorMethod=unknown") {
+			t.Errorf("sync turn line collapsed method to unknown; line=%q", line)
+		}
+		if !strings.Contains(line, "errorKind=overloaded") {
+			t.Errorf("sync turn line has no classified errorKind=overloaded; line=%q", line)
+		}
+		if strings.Contains(line, "errorKind=unknown") {
+			t.Errorf("sync turn line collapsed kind to unknown; line=%q", line)
+		}
+		if !strings.Contains(line, "sessionMethod=session/start") {
+			t.Errorf("sync turn line has no session/start sessionMethod; line=%q", line)
 		}
 	})
 }
@@ -941,6 +1098,76 @@ func TestHandle_MalformedModelNeverEntersDiagnostic(t *testing.T) {
 			t.Errorf("valid control emitted no diagnostic; logs=%q", out)
 		}
 	})
+
+	t.Run("overlong model never enters diagnostic", func(t *testing.T) {
+		for _, tc := range []struct {
+			name  string
+			model string
+		}{
+			{"129 chars", strings.Repeat("a", 129)},
+			{"500 chars", strings.Repeat("b", 500)},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				logs, restore := captureAtDebug(t)
+				defer restore()
+				p, _ := newTestProvider(t, "single-turn")
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				h, err := p.Spawn(ctx, agent.Spec{Prompt: "work", Model: tc.model, Cwd: t.TempDir(), Autonomous: true})
+				if err != nil {
+					t.Fatalf("Spawn with overlong model: %v", err)
+				}
+				events := drainEvents(t, h.Events(), 10*time.Second)
+				if res, ok := terminalResult(events); !ok || !res.Success {
+					t.Fatalf("terminal result missing or failed: %+v", res)
+				}
+				out := logs.String()
+				if !strings.Contains(out, "first-turn request shape") {
+					t.Fatalf("overlong model run emitted no diagnostic; logs=%q", out)
+				}
+				hh := h.(*Handle)
+				shape, _ := hh.storedFirstTurnShape()
+				if shape.ModelID != "" {
+					t.Errorf("overlong model (%d chars) copied into diagnostic ModelID=%q, want empty", len(tc.model), shape.ModelID)
+				}
+				if strings.Contains(out, tc.model) {
+					t.Errorf("diagnostic copied overlong model (%d chars); logs=%q", len(tc.model), out)
+				}
+				lines := firstTurnDiagnosticLines(t, out)
+				if len(lines) != 1 {
+					t.Fatalf("overlong diagnostic emissions=%d, want exactly 1; logs=%q", len(lines), out)
+				}
+				if strings.Contains(lines[0], "level=WARN") {
+					t.Errorf("overlong success line must not be WARN failure; line=%q", lines[0])
+				}
+			})
+		}
+	})
+
+	t.Run("128-char boundary still recorded", func(t *testing.T) {
+		logs, restore := captureAtDebug(t)
+		defer restore()
+		boundary := strings.Repeat("c", 128)
+		p, _ := newTestProvider(t, "single-turn")
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		h, err := p.Spawn(ctx, agent.Spec{Prompt: "work", Model: boundary, Cwd: t.TempDir(), Autonomous: true})
+		if err != nil {
+			t.Fatalf("Spawn: %v", err)
+		}
+		events := drainEvents(t, h.Events(), 10*time.Second)
+		if res, ok := terminalResult(events); !ok || !res.Success {
+			t.Fatalf("terminal result missing or failed: %+v", res)
+		}
+		hh := h.(*Handle)
+		shape, _ := hh.storedFirstTurnShape()
+		if shape.ModelID != boundary {
+			t.Errorf("ModelID length=%d, want 128-char boundary recorded", len(shape.ModelID))
+		}
+		if out := logs.String(); !strings.Contains(out, "first-turn request shape") {
+			t.Errorf("boundary control emitted no diagnostic; logs=%q", out)
+		}
+	})
 }
 
 // TestHandle_ResumeSyncFailureEmitsDiagnostic pins the synchronous
@@ -978,5 +1205,31 @@ func TestHandle_ResumeSyncFailureEmitsDiagnostic(t *testing.T) {
 	}
 	if strings.Contains(out, "SENTINEL-RESUME-SYNC-9f8a7b6c5d4e") {
 		t.Errorf("sync resume diagnostic copied host error text; logs=%q", out)
+	}
+	lines := firstTurnDiagnosticLines(t, out)
+	if len(lines) != 1 {
+		t.Fatalf("sync resume emissions=%d, want exactly 1; logs=%q", len(lines), out)
+	}
+	line := lines[0]
+	if !strings.Contains(line, "level=WARN") {
+		t.Errorf("sync resume line is not WARN; line=%q", line)
+	}
+	if strings.Contains(line, "level=DEBUG") {
+		t.Errorf("sync resume failure line must not be DEBUG; line=%q", line)
+	}
+	if !strings.Contains(line, "errorMethod=session/resume") {
+		t.Errorf("sync resume line has no session/resume errorMethod; line=%q", line)
+	}
+	if strings.Contains(line, "errorMethod=unknown") {
+		t.Errorf("sync resume line collapsed method to unknown; line=%q", line)
+	}
+	if !strings.Contains(line, "errorKind=sessionNotFound") {
+		t.Errorf("sync resume line has no classified errorKind=sessionNotFound; line=%q", line)
+	}
+	if strings.Contains(line, "errorKind=unknown") {
+		t.Errorf("sync resume line collapsed kind to unknown; line=%q", line)
+	}
+	if !strings.Contains(line, "sessionMethod=session/resume") {
+		t.Errorf("sync resume line has no session/resume sessionMethod; line=%q", line)
 	}
 }
