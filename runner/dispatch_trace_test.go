@@ -342,6 +342,7 @@ func (s *traceFakeSession) Resize(_, _, _, _ uint32) error   { return nil }
 func (s *traceFakeSession) Snapshot() (attachwire.Screen, attachwire.HostSeq, error) {
 	return attachwire.Screen{Epoch: 1}, 0, nil
 }
+
 func (s *traceFakeSession) EmitSnapshot() (attachwire.Frame, bool, error) {
 	return attachwire.Frame{}, false, nil
 }
