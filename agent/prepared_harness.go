@@ -235,6 +235,16 @@ func ApplyPreparedHarness(spec Spec, manifest HarnessManifest) (Spec, error) {
 	adapted = WithToolLifecycleProfile(adapted, toolProfile.ID)
 	adapted.PromptReceipt = copyPromptReceipt(&plan.PromptReceipt)
 	adapted.ToolLifecycleReceipt = copyToolReceipt(&plan.ToolLifecycleReceipt)
+	// Runtime dependency-preparation recovery. The install runs after
+	// admission compiles the host authority, so the runner cannot fold the
+	// outcome into the digested prompt fields above without tripping this
+	// function's own equality check. Instead the outcome rides
+	// Spec.DependencyPreparation — deliberately outside
+	// harnessAuthorityProjection — and is projected here, AFTER the digest
+	// and receipt checks pass, from the same bounded helper the legacy
+	// lane's composition injection uses. Ready, skipped, and nil outcomes
+	// are no-ops; the bare-shell harness keeps evidence only.
+	adapted = withDependencyPreparationRecovery(adapted, manifest, spec.DependencyPreparation)
 	return adapted, nil
 }
 

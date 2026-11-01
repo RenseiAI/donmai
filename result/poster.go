@@ -334,11 +334,14 @@ type statusRequest struct {
 	// result recorded none — old platforms ignore it.
 	PreparationSeconds int64 `json:"preparationSeconds,omitempty"`
 
-	// DependencyPreparation is the bounded dependency-install outcome
-	// retained from the runner's preparation phase (ready, failed,
-	// timed_out, or the skipped pair for detected ecosystems). Additive;
-	// omitted when the result recorded none (no detected ecosystem or a
-	// result that predates the report) — old platforms ignore it.
+	// DependencyPreparation is the bounded per-ecosystem dependency-install
+	// outcome retained from the runner's preparation phase. It is a closed
+	// per-ecosystem object ({"pnpm": <outcome>, "go": <outcome>}, keys
+	// only for detected ecosystems) with the closed outcome vocabulary
+	// ready, failed, timed_out, skipped_read_only, skipped_security.
+	// Additive; omitted when the result recorded none (no detected
+	// ecosystem or a result that predates the report) — old platforms
+	// ignore it.
 	DependencyPreparation *agent.DependencyPreparation `json:"dependencyPreparation,omitempty"`
 
 	// BudgetBreach names the session budget cap the runner stopped the

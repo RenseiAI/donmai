@@ -653,6 +653,20 @@ type Spec struct {
 	// credential delivery or process spawn. Returning an error fails closed.
 	OnToolLifecycleAdapted func(ToolLifecycleReceipt) error `json:"-"`
 
+	// DependencyPreparation is the bounded post-acquire dependency-install
+	// outcome the runner carries into spawn. It is a runtime-only channel
+	// on the prepared-harness lane: deliberately ABSENT from
+	// harnessAuthorityProjection (agent/prepared_harness.go), because the
+	// install runs after admission compiles the host authority and no
+	// post-admission prompt mutation may disturb the authority digest
+	// ApplyPreparedHarness verifies. ApplyPreparedHarness projects the
+	// failed/timed_out recovery handoff from this field AFTER the
+	// equality check passes; ready, skipped, and nil outcomes are
+	// no-ops. The legacy (non-receipted) lane never sets it — it injects
+	// the same handoff at composition time, where no digest exists to
+	// disturb. Never serialized: process-only, like the receipts.
+	DependencyPreparation *DependencyPreparation `json:"-"`
+
 	// AdditionalExtensions is an ORDERED list of additional extensions
 	// delivered to a harness whose spawn surface loads host-side extensions
 	// (currently pi; provider/harness/pi). Per
@@ -705,29 +719,29 @@ type CostData struct {
 }
 
 // DependencyPreparation is the bounded outcome of post-acquire
-// dependency preparation. Status is one of the closed vocabulary
-// below; Ecosystems names the detected ecosystems the status applies
-// to (subset of "pnpm", "go", in detection order). It carries no
-// command output and no error text by construction.
+// dependency preparation. It is a closed per-ecosystem object: each key
+// names a detected ecosystem ("pnpm", "go", in install order) and each
+// value is one of the closed outcome vocabulary below. Only detected
+// ecosystems appear as keys; undetected ecosystems are omitted, never
+// empty or null. It carries no command output and no error text by
+// construction.
 type DependencyPreparation struct {
-	Status string `json:"status"`
-	// Ecosystems names the detected ecosystems the status applies to.
-	// Omitted when empty; never carries paths, output, or error text.
-	Ecosystems []string `json:"ecosystems,omitempty"`
+	Pnpm string `json:"pnpm,omitempty"`
+	Go   string `json:"go,omitempty"`
 }
 
-// Closed dependency-preparation outcome vocabulary. ready means every
-// detected install exited zero; failed means a non-zero exit or start
+// Closed dependency-preparation outcome vocabulary. ready means the
+// ecosystem's install exited zero; failed means a non-zero exit or start
 // error; timed_out means the install context expired (including parent
 // cancellation mid-install); the skipped pair means no install was
 // attempted for a detected ecosystem. A nil *DependencyPreparation
 // (omitted on the wire) means no ecosystem was detected.
 const (
-	DependencyPreparationReady             = "ready"
-	DependencyPreparationFailed            = "failed"
-	DependencyPreparationTimedOut          = "timed_out"
-	DependencyPreparationSkippedReadOnly   = "skipped_read_only"
-	DependencyPreparationSkippedRestricted = "skipped_restricted"
+	DependencyPreparationReady           = "ready"
+	DependencyPreparationFailed          = "failed"
+	DependencyPreparationTimedOut        = "timed_out"
+	DependencyPreparationSkippedReadOnly = "skipped_read_only"
+	DependencyPreparationSkippedSecurity = "skipped_security"
 )
 
 // Result is the runner's final session-result shape, distinct from the
@@ -937,14 +951,14 @@ type Result struct {
 
 	// DependencyPreparation is the bounded outcome of post-acquire
 	// dependency preparation (runner dependency install step). It names
-	// whether the detected ecosystems installed cleanly: ready when every
-	// install exited zero, failed on a non-zero exit or start error,
-	// timed_out when the install context expired, skipped_read_only when
-	// the selected repository forbids writes, skipped_restricted when the
-	// execution-security gate forbids host installs. Nil when no
-	// ecosystem was detected (nothing to prepare) so old results stay
-	// byte-identical. Bounded by construction: status plus the detected
-	// ecosystem names only, never raw tool output or error text.
+	// the per-ecosystem install outcome for every detected ecosystem:
+	// ready when the install exited zero, failed on a non-zero exit or
+	// start error, timed_out when the install context expired,
+	// skipped_read_only when the selected repository forbids writes,
+	// skipped_security when the execution-security gate forbids host
+	// installs. Nil when no ecosystem was detected (nothing to prepare)
+	// so old results stay byte-identical. Bounded by construction:
+	// per-ecosystem outcomes only, never raw tool output or error text.
 	// Additive — old platforms ignore it.
 	DependencyPreparation *DependencyPreparation `json:"dependencyPreparation,omitempty"`
 

@@ -2734,8 +2734,8 @@ func TestRun_DependencyPreparationReadyAddsNoRecovery(t *testing.T) {
 	if calls := execer.recorded(); len(calls) != 2 {
 		t.Fatalf("install calls = %d; want pnpm then go despite .bin", len(calls))
 	}
-	if res.DependencyPreparation == nil || res.DependencyPreparation.Status != agent.DependencyPreparationReady {
-		t.Fatalf("DependencyPreparation = %+v; want ready", res.DependencyPreparation)
+	if res.DependencyPreparation == nil || res.DependencyPreparation.Pnpm != agent.DependencyPreparationReady || res.DependencyPreparation.Go != agent.DependencyPreparationReady {
+		t.Fatalf("DependencyPreparation = %+v; want {pnpm:ready go:ready}", res.DependencyPreparation)
 	}
 	if provider.spec.PromptPlan == nil || provider.spec.PromptPlan.HarnessProtocol == nil {
 		t.Fatalf("prompt plan missing harness protocol: %+v", provider.spec.PromptPlan)
@@ -2778,8 +2778,8 @@ func TestRun_DependencyPreparationFailureHandsRecovery(t *testing.T) {
 			if err != nil || res.Status != "completed" {
 				t.Fatalf("Run status=%q err=%v (%s); want completed despite install failure", res.Status, err, res.Error)
 			}
-			if res.DependencyPreparation == nil || res.DependencyPreparation.Status != tc.wantStat {
-				t.Fatalf("DependencyPreparation = %+v; want %q", res.DependencyPreparation, tc.wantStat)
+			if res.DependencyPreparation == nil || res.DependencyPreparation.Pnpm != tc.wantStat || res.DependencyPreparation.Go != tc.wantStat {
+				t.Fatalf("DependencyPreparation = %+v; want {pnpm:%s go:%s}", res.DependencyPreparation, tc.wantStat, tc.wantStat)
 			}
 			if provider.spec.PromptPlan == nil || provider.spec.PromptPlan.HarnessProtocol == nil {
 				t.Fatalf("prompt plan missing harness protocol: %+v", provider.spec.PromptPlan)
@@ -2828,8 +2828,8 @@ func TestRun_DependencyPreparationTimeoutHandsRecovery(t *testing.T) {
 	if err != nil || res.Status != "completed" {
 		t.Fatalf("Run status=%q err=%v (%s); want completed despite timeout", res.Status, err, res.Error)
 	}
-	if res.DependencyPreparation == nil || res.DependencyPreparation.Status != agent.DependencyPreparationTimedOut {
-		t.Fatalf("DependencyPreparation = %+v; want timed_out", res.DependencyPreparation)
+	if res.DependencyPreparation == nil || res.DependencyPreparation.Pnpm != agent.DependencyPreparationTimedOut || res.DependencyPreparation.Go != agent.DependencyPreparationTimedOut {
+		t.Fatalf("DependencyPreparation = %+v; want {pnpm:timed_out go:timed_out}", res.DependencyPreparation)
 	}
 	if provider.spec.PromptPlan == nil || provider.spec.PromptPlan.HarnessProtocol == nil {
 		t.Fatalf("prompt plan missing harness protocol: %+v", provider.spec.PromptPlan)
@@ -2880,8 +2880,8 @@ func TestRun_DependencyPreparationSkipsAddNoBypass(t *testing.T) {
 	if calls := execer.recorded(); len(calls) != 0 {
 		t.Fatalf("install calls = %v; want none under restricted execution", calls)
 	}
-	if res.DependencyPreparation == nil || res.DependencyPreparation.Status != agent.DependencyPreparationSkippedRestricted {
-		t.Fatalf("DependencyPreparation = %+v; want skipped_restricted", res.DependencyPreparation)
+	if res.DependencyPreparation == nil || res.DependencyPreparation.Pnpm != agent.DependencyPreparationSkippedSecurity || res.DependencyPreparation.Go != agent.DependencyPreparationSkippedSecurity {
+		t.Fatalf("DependencyPreparation = %+v; want {pnpm:skipped_security go:skipped_security}", res.DependencyPreparation)
 	}
 	if provider.spec.PromptPlan != nil && provider.spec.PromptPlan.HarnessProtocol != nil &&
 		strings.Contains(provider.spec.PromptPlan.HarnessProtocol.Text, "Dependency preparation did not complete") {
@@ -2918,8 +2918,8 @@ func TestRun_ShellGetsEvidenceOnly(t *testing.T) {
 	if err != nil || res.Status != "completed" {
 		t.Fatalf("Run status=%q err=%v (%s); want completed", res.Status, err, res.Error)
 	}
-	if res.DependencyPreparation == nil || res.DependencyPreparation.Status != agent.DependencyPreparationFailed {
-		t.Fatalf("DependencyPreparation = %+v; want failed evidence on shell run", res.DependencyPreparation)
+	if res.DependencyPreparation == nil || res.DependencyPreparation.Pnpm != agent.DependencyPreparationFailed || res.DependencyPreparation.Go != agent.DependencyPreparationFailed {
+		t.Fatalf("DependencyPreparation = %+v; want {pnpm:failed go:failed} evidence on shell run", res.DependencyPreparation)
 	}
 	if shell.spec.PromptPlan != nil && shell.spec.PromptPlan.HarnessProtocol != nil {
 		t.Fatalf("shell prompt plan must carry no harness protocol: %+v", shell.spec.PromptPlan.HarnessProtocol)
@@ -2968,8 +2968,8 @@ func TestRun_DependencyPreparationReadOnlySkipsAddsNoBypass(t *testing.T) {
 	if calls := execer.recorded(); len(calls) != 0 {
 		t.Fatalf("install calls = %v; want none on a selected read-only checkout", calls)
 	}
-	if res.DependencyPreparation == nil || res.DependencyPreparation.Status != agent.DependencyPreparationSkippedReadOnly {
-		t.Fatalf("DependencyPreparation = %+v; want skipped_read_only", res.DependencyPreparation)
+	if res.DependencyPreparation == nil || res.DependencyPreparation.Pnpm != agent.DependencyPreparationSkippedReadOnly || res.DependencyPreparation.Go != agent.DependencyPreparationSkippedReadOnly {
+		t.Fatalf("DependencyPreparation = %+v; want {pnpm:skipped_read_only go:skipped_read_only}", res.DependencyPreparation)
 	}
 	provider.mu.Lock()
 	observed := provider.observed
@@ -2980,13 +2980,17 @@ func TestRun_DependencyPreparationReadOnlySkipsAddsNoBypass(t *testing.T) {
 	}
 }
 
-// preparedDepsProvider presents the codex harness manifest and capabilities
-// while delegating spawn to the stub inner, so a receipt-bearing Run can
-// exercise the prepared-harness lane end to end and capture the delivered
-// spec. The stub inner performs no prepared-harness digest check, matching
-// the legacy deps capturing provider: the assertion is that the runner
-// re-projects the recovery handoff after applyPreparedSourceAuthority.
-type preparedDepsProvider struct {
+// preparedRecoveryProvider presents the codex harness manifest and
+// capabilities while running every spawn through the real
+// agent.PrepareHarness equality check, then delegates to the stub inner
+// for handle behavior. A receipt-bearing Run therefore exercises the
+// production admission path end to end: the runner's digest-exempt
+// recovery channel must survive the provider-side authority check, and
+// the captured spec is the adapted spec the provider would actually
+// deliver — not the pre-check input. A post-authority prompt mutation
+// (the reverted shape) fails here with an AuthorityDriftError instead
+// of a silent pass.
+type preparedRecoveryProvider struct {
 	inner    agent.HarnessProvider
 	manifest agent.HarnessManifest
 	caps     agent.Capabilities
@@ -2994,27 +2998,39 @@ type preparedDepsProvider struct {
 	spawns   int
 }
 
-func (p *preparedDepsProvider) Name() agent.ProviderName { return agent.ProviderCodex }
+func (p *preparedRecoveryProvider) Name() agent.ProviderName { return agent.ProviderCodex }
 
-func (p *preparedDepsProvider) Capabilities() agent.Capabilities { return p.caps }
+func (p *preparedRecoveryProvider) Capabilities() agent.Capabilities { return p.caps }
 
-func (p *preparedDepsProvider) Manifest() agent.HarnessManifest { return p.manifest }
+func (p *preparedRecoveryProvider) Manifest() agent.HarnessManifest { return p.manifest }
 
-func (p *preparedDepsProvider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, error) {
-	p.spec = spec
+func (p *preparedRecoveryProvider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, error) {
+	adapted, err := agent.PrepareHarness(spec, p.manifest)
+	if err != nil {
+		return nil, err
+	}
+	p.spec = adapted
 	p.spawns++
-	return p.inner.Spawn(ctx, spec)
+	return p.inner.Spawn(ctx, adapted)
 }
 
-func (p *preparedDepsProvider) Resume(ctx context.Context, sessionID string, spec agent.Spec) (agent.Handle, error) {
+func (p *preparedRecoveryProvider) Resume(ctx context.Context, sessionID string, spec agent.Spec) (agent.Handle, error) {
 	return p.inner.Resume(ctx, sessionID, spec)
 }
 
-func (p *preparedDepsProvider) Shutdown(ctx context.Context) error { return p.inner.Shutdown(ctx) }
+func (p *preparedRecoveryProvider) Shutdown(ctx context.Context) error { return p.inner.Shutdown(ctx) }
 
-func preparedDepsWork(t *testing.T, h *runnerHarness, provider *preparedDepsProvider, identifier string) QueuedWork {
+func preparedDepsWork(t *testing.T, h *runnerHarness, provider *preparedRecoveryProvider, identifier string) QueuedWork {
 	t.Helper()
 	qw := h.queuedWork(identifier)
+	// Mint a session bearer like production dispatch does: the spawn lane
+	// mounts the per-session MCP gateway from the real bearer while the
+	// prepared source models it with a placeholder, and the authority
+	// normalization equalizes the two. A bearerless (degraded-mint)
+	// session omits the gateway at spawn and would drift on mcpServers
+	// for reasons unrelated to dependency preparation. The bearer is
+	// digest-exempt (json:"-"), so admission is unaffected.
+	qw.McpAuthToken = "sess_test_bearer"
 	base := exactReceiptQueuedWork(qw.SessionID)
 	qw.ResolvedProfile = base.ResolvedProfile
 	qw.ExecutionSecurity = executionSecuritySection(nil)
@@ -3044,10 +3060,12 @@ func preparedDepsWork(t *testing.T, h *runnerHarness, provider *preparedDepsProv
 // TestRun_PreparedDependencyRecoveryHandsRecovery drives the production Run
 // through the receipt-bearing prepared-harness lane: the host preflight
 // compiles the authority before installation, the installer fails or times
-// out, and the delivered spawn must still carry the bounded recovery handoff
-// with the original task intact. Removing the post-authority re-projection
-// leaves spawnCalls at 1 with status failed/timed_out but no recovery text
-// and fails it (B1/B2 RED).
+// out, and the provider-side real agent.PrepareHarness check must still
+// pass (a post-authority prompt mutation fails here with an
+// AuthorityDriftError and the run never spawns) while the delivered
+// adapted spec carries the bounded recovery handoff with the original
+// task intact. Removing the digest-exempt runtime projection leaves a
+// successful spawn with no recovery text and fails it.
 func TestRun_PreparedDependencyRecoveryHandsRecovery(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
@@ -3067,7 +3085,7 @@ func TestRun_PreparedDependencyRecoveryHandsRecovery(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			provider := &preparedDepsProvider{inner: inner.(agent.HarnessProvider), manifest: codexManifestForTest(), caps: codexCapabilitiesForTest()}
+			provider := &preparedRecoveryProvider{inner: inner.(agent.HarnessProvider), manifest: codexManifestForTest(), caps: codexCapabilitiesForTest()}
 			reg := NewRegistry()
 			if err := reg.Register(provider); err != nil {
 				t.Fatal(err)
@@ -3088,8 +3106,11 @@ func TestRun_PreparedDependencyRecoveryHandsRecovery(t *testing.T) {
 			if provider.spawns != 1 {
 				t.Fatalf("spawnCalls = %d; want 1 (best-effort spawn preserved)", provider.spawns)
 			}
-			if res.DependencyPreparation == nil || res.DependencyPreparation.Status != tc.wantStat {
-				t.Fatalf("DependencyPreparation = %+v; want %q", res.DependencyPreparation, tc.wantStat)
+			if res.DependencyPreparation == nil || res.DependencyPreparation.NeedsRecovery() != tc.wantRecov {
+				t.Fatalf("DependencyPreparation = %+v; want recovery=%v", res.DependencyPreparation, tc.wantRecov)
+			}
+			if tc.wantRecov && (res.DependencyPreparation.Pnpm != tc.wantStat && res.DependencyPreparation.Go != tc.wantStat) {
+				t.Fatalf("DependencyPreparation = %+v; want %q in a detected ecosystem", res.DependencyPreparation, tc.wantStat)
 			}
 			if provider.spec.PromptPlan == nil || provider.spec.PromptPlan.HarnessProtocol == nil {
 				if tc.wantRecov {
@@ -3106,8 +3127,8 @@ func TestRun_PreparedDependencyRecoveryHandsRecovery(t *testing.T) {
 				t.Fatalf("ready preparation must add no recovery in prepared lane: %q", text)
 			}
 			if tc.wantRecov {
-				if !strings.Contains(text, tc.wantStat) {
-					t.Errorf("prepared recovery missing bounded status %q: %q", tc.wantStat, text)
+				if !strings.Contains(text, res.DependencyPreparation.OutcomeSummary()) {
+					t.Errorf("prepared recovery missing bounded summary %q: %q", res.DependencyPreparation.OutcomeSummary(), text)
 				}
 				if !strings.Contains(provider.spec.PromptPlan.UserPrompt.Text, "This is a test issue body.") {
 					t.Errorf("original user task lost in prepared prompt plan: %+v", provider.spec.PromptPlan.UserPrompt)

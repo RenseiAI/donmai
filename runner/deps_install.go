@@ -52,16 +52,17 @@ const goDepsInstallCommand = "go mod download"
 // execution with a minimal environment and process-group cancellation).
 //
 // Recovery handoff (explicit, not automatic repair): the returned
-// *agent.DependencyPreparation is the bounded outcome the runner retains
-// on the terminal result and, for failed/timed_out outcomes, renders as
-// a short runner-authored recovery instruction in the delivered harness
-// protocol (see injectDependencyPreparationPartial). There is no second
-// install attempt with weaker policy and no additional outbound fetch:
-// the handoff asks the model-driving harness to inspect and repair with
-// its own permitted tools, and to report blocked when repair cannot
-// finish. It reports attempted preparation, never a guarantee of agent
-// recovery. Cancellation never authorizes more work: once the install
-// context expires the step stops and reports timed_out.
+// *agent.DependencyPreparation is the bounded per-ecosystem outcome the
+// runner retains on the terminal result and, for failed/timed_out
+// outcomes, renders as a short runner-authored recovery instruction in
+// the delivered harness protocol (see injectDependencyPreparationPartial).
+// There is no second install attempt with weaker policy and no additional
+// outbound fetch: the handoff asks the model-driving harness to inspect
+// and repair with its own permitted tools, and to report blocked when
+// repair cannot finish. It reports attempted preparation, never a
+// guarantee of agent recovery. Cancellation never authorizes more work:
+// once the install context expires the step stops and reports timed_out
+// for every ecosystem that did not install cleanly.
 func (r *Runner) installSessionDependencies(ctx context.Context, qw QueuedWork, wpath string, readOnlyCheckout bool) *agent.DependencyPreparation {
 	ecosystems := detectedDependencyEcosystems(wpath)
 	if len(ecosystems) == 0 {
@@ -70,11 +71,11 @@ func (r *Runner) installSessionDependencies(ctx context.Context, qw QueuedWork, 
 	if readOnlyCheckout {
 		r.logger.Debug("dependency install skipped: selected repository is read-only",
 			"sessionId", qw.SessionID)
-		return &agent.DependencyPreparation{Status: agent.DependencyPreparationSkippedReadOnly, Ecosystems: ecosystems}
+		return skippedDependencyPreparation(ecosystems, agent.DependencyPreparationSkippedReadOnly)
 	}
 	if !depsInstallPermitted(qw) {
 		r.logger.Debug("dependency install skipped: execution security requires confinement", "sessionId", qw.SessionID)
-		return &agent.DependencyPreparation{Status: agent.DependencyPreparationSkippedRestricted, Ecosystems: ecosystems}
+		return skippedDependencyPreparation(ecosystems, agent.DependencyPreparationSkippedSecurity)
 	}
 	if wpath == "" {
 		return nil
@@ -94,51 +95,85 @@ func (r *Runner) installSessionDependencies(ctx context.Context, qw QueuedWork, 
 		execer = depsInstallExecer{}
 	}
 	// Cancellation never authorizes more work: an already-expired
-	// install context reports timed_out without running anything.
+	// install context reports timed_out for every detected ecosystem
+	// without running anything.
 	if installCtx.Err() != nil {
 		r.logger.Warn("repository dependency install timed out; continuing without installed dependencies",
 			"sessionId", qw.SessionID, "err", installCtx.Err())
-		return &agent.DependencyPreparation{Status: agent.DependencyPreparationTimedOut, Ecosystems: ecosystems}
+		return skippedDependencyPreparation(ecosystems, agent.DependencyPreparationTimedOut)
 	}
-	timedOut := false
-	failed := false
+	outcomes := make(map[string]string, len(ecosystems))
 	if hasDependencyEcosystem(ecosystems, "pnpm") {
 		pnpmTimedOut, pnpmFailed := r.runDepsInstallCommand(installCtx, qw, execer, wpath, pnpmDepsInstallCommand)
-		timedOut = timedOut || pnpmTimedOut
-		failed = failed || pnpmFailed
+		outcomes["pnpm"] = installOutcome(pnpmTimedOut, pnpmFailed)
 		// Re-evaluate after the first ecosystem so a cancellation
 		// mid-install never authorizes the second install: an expired
-		// shared context reports timed_out below without starting go.
-		if installCtx.Err() != nil {
-			timedOut = true
-		}
+		// shared context reports timed_out for the unattempted
+		// ecosystem below instead of starting go.
 	}
 	// Run go unless the shared context expired or the first command
 	// already consumed the shared deadline. A failed (non-timeout)
 	// pnpm install still attempts go — failure is per-ecosystem,
 	// best-effort — but a timed-out first command starts no more work.
-	goTimedOut, goFailed := false, false
-	if hasDependencyEcosystem(ecosystems, "go") && !timedOut && installCtx.Err() == nil {
-		goTimedOut, goFailed = r.runDepsInstallCommand(installCtx, qw, execer, wpath, goDepsInstallCommand)
+	if hasDependencyEcosystem(ecosystems, "go") && !outcomeTimedOut(outcomes["pnpm"]) && installCtx.Err() == nil {
+		goTimedOut, goFailed := r.runDepsInstallCommand(installCtx, qw, execer, wpath, goDepsInstallCommand)
+		outcomes["go"] = installOutcome(goTimedOut, goFailed)
 	}
 	// A context that expired between ecosystems authorizes no more
-	// work and reports timed_out even when nothing else failed.
+	// work: every ecosystem without a clean install reports timed_out.
 	if installCtx.Err() != nil {
-		timedOut = timedOut || true
+		for _, name := range ecosystems {
+			if outcomes[name] == "" || outcomes[name] == agent.DependencyPreparationReady {
+				outcomes[name] = agent.DependencyPreparationTimedOut
+			}
+		}
 	}
-	timedOut = timedOut || goTimedOut
-	failed = failed || goFailed
-	switch {
-	case timedOut:
-		return &agent.DependencyPreparation{Status: agent.DependencyPreparationTimedOut, Ecosystems: ecosystems}
-	case failed:
-		return &agent.DependencyPreparation{Status: agent.DependencyPreparationFailed, Ecosystems: ecosystems}
-	default:
+	// An ecosystem never attempted because an earlier one consumed the
+	// shared deadline reports timed_out: the install context expired
+	// before it could run.
+	for _, name := range ecosystems {
+		if outcomes[name] == "" {
+			outcomes[name] = agent.DependencyPreparationTimedOut
+		}
+	}
+	prep := &agent.DependencyPreparation{}
+	for _, name := range ecosystems {
+		prep.SetEcosystemOutcome(name, outcomes[name])
+	}
+	if !prep.NeedsRecovery() {
 		r.logger.Info("repository dependency preparation ready",
 			"sessionId", qw.SessionID, "dir", wpath)
-		return &agent.DependencyPreparation{Status: agent.DependencyPreparationReady, Ecosystems: ecosystems}
+	}
+	return prep
+}
+
+// skippedDependencyPreparation reports one skipped outcome for every
+// detected ecosystem: no install was attempted, so every key shares the
+// same closed outcome.
+func skippedDependencyPreparation(ecosystems []string, outcome string) *agent.DependencyPreparation {
+	prep := &agent.DependencyPreparation{}
+	for _, name := range ecosystems {
+		prep.SetEcosystemOutcome(name, outcome)
+	}
+	return prep
+}
+
+// installOutcome folds one command's (timedOut, failed) pair into the
+// closed per-ecosystem vocabulary. An expired install context
+// (deadline or parent cancellation) is timed_out even when the execer
+// also reports an error, so cancellation never reads as a plain failure.
+func installOutcome(timedOut, failed bool) string {
+	switch {
+	case timedOut:
+		return agent.DependencyPreparationTimedOut
+	case failed:
+		return agent.DependencyPreparationFailed
+	default:
+		return agent.DependencyPreparationReady
 	}
 }
+
+func outcomeTimedOut(outcome string) bool { return outcome == agent.DependencyPreparationTimedOut }
 
 // detectedDependencyEcosystems names the installable ecosystems present
 // in wpath, in install order (pnpm before go). Bounded to the two
@@ -171,12 +206,11 @@ func hasDependencyEcosystem(ecosystems []string, name string) bool {
 // outcome must carry the runner-authored recovery handoff into the
 // delivered harness protocol: only failed and timed_out outcomes do.
 // Ready and both skipped outcomes add no instruction; nil (no detected
-// ecosystem) adds none either.
+// ecosystem) adds none either. Canonical logic lives in
+// agent.DependencyPreparation.NeedsRecovery; this stays as the runner's
+// call-site name.
 func dependencyPreparationNeedsRecovery(prep *agent.DependencyPreparation) bool {
-	if prep == nil {
-		return false
-	}
-	return prep.Status == agent.DependencyPreparationFailed || prep.Status == agent.DependencyPreparationTimedOut
+	return prep.NeedsRecovery()
 }
 
 // injectDependencyPreparationPartial appends the recovery handoff to the
@@ -184,16 +218,10 @@ func dependencyPreparationNeedsRecovery(prep *agent.DependencyPreparation) bool 
 // text and the caller's original task. Ready, skipped, and nil outcomes
 // return the protocol unchanged so they add no instruction and no
 // bypass. Shell delivery never reaches this helper through the loop's
-// provider gate; autonomous shell remediation is out of scope.
+// provider gate; autonomous shell remediation is out of scope. The prose
+// is canonical in agent.AppendDependencyPreparationRecovery.
 func injectDependencyPreparationPartial(existing string, prep *agent.DependencyPreparation) string {
-	if !dependencyPreparationNeedsRecovery(prep) {
-		return existing
-	}
-	partial := "# Dependency preparation\nDependency preparation did not complete (status: " + prep.Status + "). Dependencies are not ready. Inspect and repair the checkout with your permitted tools before relying on dependency-based checks; do not assume dependencies are installed. If repair cannot finish, report blocked with the reason."
-	if existing == "" {
-		return partial
-	}
-	return existing + "\n\n" + partial
+	return agent.AppendDependencyPreparationRecovery(existing, prep)
 }
 
 // runDepsInstallCommand runs one dependency install command and logs

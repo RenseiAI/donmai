@@ -1831,11 +1831,12 @@ func TestPosterPost_StatusDependencyPreparationSerialized(t *testing.T) {
 		want string
 	}{
 		{name: "omitted when no report", in: nil, want: ""},
-		{name: "ready", in: &agent.DependencyPreparation{Status: agent.DependencyPreparationReady, Ecosystems: []string{"pnpm", "go"}}, want: `{"status":"ready","ecosystems":["pnpm","go"]}`},
-		{name: "failed", in: &agent.DependencyPreparation{Status: agent.DependencyPreparationFailed, Ecosystems: []string{"pnpm"}}, want: `{"status":"failed","ecosystems":["pnpm"]}`},
-		{name: "timed out", in: &agent.DependencyPreparation{Status: agent.DependencyPreparationTimedOut, Ecosystems: []string{"go"}}, want: `{"status":"timed_out","ecosystems":["go"]}`},
-		{name: "skipped read-only", in: &agent.DependencyPreparation{Status: agent.DependencyPreparationSkippedReadOnly, Ecosystems: []string{"pnpm"}}, want: `{"status":"skipped_read_only","ecosystems":["pnpm"]}`},
-		{name: "skipped restricted", in: &agent.DependencyPreparation{Status: agent.DependencyPreparationSkippedRestricted, Ecosystems: []string{"go"}}, want: `{"status":"skipped_restricted","ecosystems":["go"]}`},
+		{name: "ready", in: &agent.DependencyPreparation{Pnpm: agent.DependencyPreparationReady, Go: agent.DependencyPreparationReady}, want: `{"pnpm":"ready","go":"ready"}`},
+		{name: "failed pnpm only", in: &agent.DependencyPreparation{Pnpm: agent.DependencyPreparationFailed}, want: `{"pnpm":"failed"}`},
+		{name: "timed out go only", in: &agent.DependencyPreparation{Go: agent.DependencyPreparationTimedOut}, want: `{"go":"timed_out"}`},
+		{name: "skipped read-only", in: &agent.DependencyPreparation{Pnpm: agent.DependencyPreparationSkippedReadOnly}, want: `{"pnpm":"skipped_read_only"}`},
+		{name: "skipped security", in: &agent.DependencyPreparation{Go: agent.DependencyPreparationSkippedSecurity}, want: `{"go":"skipped_security"}`},
+		{name: "mixed", in: &agent.DependencyPreparation{Pnpm: agent.DependencyPreparationFailed, Go: agent.DependencyPreparationReady}, want: `{"pnpm":"failed","go":"ready"}`},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1888,7 +1889,7 @@ func TestPosterPost_StatusDependencyPreparationOmitsRawErrors(t *testing.T) {
 	p := newPoster(t, srv.URL, 0)
 	r := goodResult()
 	r.Error = "install failed: SENTINEL-install-stdout with output SENTINEL-raw-bytes"
-	r.DependencyPreparation = &agent.DependencyPreparation{Status: agent.DependencyPreparationFailed, Ecosystems: []string{"pnpm"}}
+	r.DependencyPreparation = &agent.DependencyPreparation{Pnpm: agent.DependencyPreparationFailed}
 	if err := p.Post(context.Background(), "sess-depprep-sentinel", r); err != nil {
 		t.Fatalf("Post: %v", err)
 	}
@@ -1918,7 +1919,7 @@ func TestPosterPreparedBodyPreservesDependencyPreparation(t *testing.T) {
 	t.Cleanup(srv.Close)
 	p := newPoster(t, srv.URL, 0)
 	r := goodResult()
-	r.DependencyPreparation = &agent.DependencyPreparation{Status: agent.DependencyPreparationTimedOut, Ecosystems: []string{"pnpm", "go"}}
+	r.DependencyPreparation = &agent.DependencyPreparation{Pnpm: agent.DependencyPreparationTimedOut, Go: agent.DependencyPreparationTimedOut}
 	prepared, err := p.PrepareTerminalStatusBody(context.Background(), "sess-depprep-prepared", r, nil)
 	if err != nil {
 		t.Fatalf("PrepareTerminalStatusBody: %v", err)
@@ -1931,7 +1932,7 @@ func TestPosterPreparedBodyPreservesDependencyPreparation(t *testing.T) {
 	if !present {
 		t.Fatalf("prepared body omits dependencyPreparation: %s", prepared)
 	}
-	want := `{"status":"timed_out","ecosystems":["pnpm","go"]}`
+	want := `{"pnpm":"timed_out","go":"timed_out"}`
 	if string(got) != want {
 		t.Fatalf("prepared dependencyPreparation = %s; want %s", got, want)
 	}

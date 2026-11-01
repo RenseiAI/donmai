@@ -1060,7 +1060,14 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// a bare shell never receives executable recovery prose (its user
 	// surface executes commands, so no non-user authority is projected
 	// there) — it keeps the terminal report as evidence only.
-	if provider.Name() != agent.ProviderShell {
+	// Receipt-bearing (prepared) spawns skip this composition-time
+	// injection: the prepared authority compiled at admission cannot
+	// contain a post-admission outcome, and any post-authority prompt
+	// mutation would trip the ApplyPreparedHarness digest check and turn
+	// a recoverable install failure into a session failure. The outcome
+	// rides the digest-exempt Spec.DependencyPreparation runtime channel
+	// instead, projected after the equality check passes (below).
+	if provider.Name() != agent.ProviderShell && len(selection.receipt.Bytes()) == 0 {
 		composition.HarnessProtocol = injectDependencyPreparationPartial(composition.HarnessProtocol, depsPrep)
 	}
 	if signalGuard.degraded {
@@ -1170,18 +1177,18 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 			}
 		}
 		spec = applyPreparedSourceAuthority(spec, preparedSource, preparedPlan)
-		// preparedSource was compiled during admission, before dependency
-		// installation ran, so it cannot carry the recovery handoff: the
-		// authority replacement above would otherwise drop the failed or
-		// timed-out instruction the legacy lane delivers. Re-project the
-		// bounded handoff onto the authoritative prepared surfaces. Ready,
-		// skipped, and no-manifest outcomes are no-ops; the bare-shell lane
+		// The install ran after admission compiled the prepared authority,
+		// so the replacement above carries no preparation outcome — and
+		// must not be amended here: PromptPlan and SystemPromptAppend are
+		// digest-covered, and any post-authority mutation trips the
+		// provider's ApplyPreparedHarness check. The outcome rides the
+		// digest-exempt Spec.DependencyPreparation runtime channel
+		// instead; ApplyPreparedHarness projects the bounded handoff
+		// after the equality check passes. Ready, skipped, and
+		// no-manifest outcomes are no-ops there; the bare-shell lane
 		// stays excluded, matching the composition gate above.
 		if provider.Name() != agent.ProviderShell && dependencyPreparationNeedsRecovery(depsPrep) {
-			if spec.PromptPlan != nil && spec.PromptPlan.HarnessProtocol != nil {
-				spec.PromptPlan.HarnessProtocol.Text = injectDependencyPreparationPartial(spec.PromptPlan.HarnessProtocol.Text, depsPrep)
-			}
-			spec.SystemPromptAppend = injectDependencyPreparationPartial(spec.SystemPromptAppend, depsPrep)
+			spec.DependencyPreparation = depsPrep
 		}
 	} else {
 		spec.OnPromptAdapted = func(receipt agent.PromptDeliveryReceipt) error {

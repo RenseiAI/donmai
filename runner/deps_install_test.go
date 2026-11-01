@@ -83,11 +83,8 @@ func TestInstallSessionDependencies_PnpmBeforeGo(t *testing.T) {
 			t.Errorf("call %d dir = %q; want worktree %q", i, call.dir, wpath)
 		}
 	}
-	if prep == nil || prep.Status != agent.DependencyPreparationReady {
-		t.Fatalf("preparation = %+v; want ready", prep)
-	}
-	if len(prep.Ecosystems) != 2 || prep.Ecosystems[0] != "pnpm" || prep.Ecosystems[1] != "go" {
-		t.Errorf("ecosystems = %v; want [pnpm go]", prep.Ecosystems)
+	if prep == nil || prep.Pnpm != agent.DependencyPreparationReady || prep.Go != agent.DependencyPreparationReady {
+		t.Fatalf("preparation = %+v; want {pnpm:ready go:ready}", prep)
 	}
 }
 
@@ -112,8 +109,8 @@ func TestInstallSessionDependencies_RunsPnpmDespiteNodeModulesPresent(t *testing
 	if calls[0].command != pnpmDepsInstallCommand || calls[0].dir != wpath {
 		t.Errorf("call = %+v; want pnpm install in %q", calls[0], wpath)
 	}
-	if prep == nil || prep.Status != agent.DependencyPreparationReady {
-		t.Fatalf("preparation = %+v; want ready", prep)
+	if prep == nil || prep.Pnpm != agent.DependencyPreparationReady || prep.Go != "" {
+		t.Fatalf("preparation = %+v; want {pnpm:ready} (go undetected)", prep)
 	}
 }
 
@@ -139,8 +136,8 @@ func TestInstallSessionDependencies_RunsBothEcosystemsDespiteNodeModulesPresent(
 	if calls[1].command != goDepsInstallCommand || calls[1].dir != wpath {
 		t.Errorf("second call = %+v; want go install in %q", calls[1], wpath)
 	}
-	if prep == nil || prep.Status != agent.DependencyPreparationReady {
-		t.Fatalf("preparation = %+v; want ready", prep)
+	if prep == nil || prep.Pnpm != agent.DependencyPreparationReady || prep.Go != agent.DependencyPreparationReady {
+		t.Fatalf("preparation = %+v; want {pnpm:ready go:ready}", prep)
 	}
 }
 
@@ -176,8 +173,8 @@ func TestInstallSessionDependencies_ReadOnlyCheckoutSkips(t *testing.T) {
 	if calls := execer.recorded(); len(calls) != 0 {
 		t.Fatalf("install calls = %v; want none on a read-only checkout", calls)
 	}
-	if prep == nil || prep.Status != agent.DependencyPreparationSkippedReadOnly {
-		t.Fatalf("preparation = %+v; want skipped_read_only", prep)
+	if prep == nil || prep.Pnpm != agent.DependencyPreparationSkippedReadOnly || prep.Go != agent.DependencyPreparationSkippedReadOnly {
+		t.Fatalf("preparation = %+v; want {pnpm:skipped_read_only go:skipped_read_only}", prep)
 	}
 }
 
@@ -198,8 +195,8 @@ func TestInstallSessionDependencies_FailureContinuesToNextEcosystem(t *testing.T
 	if len(calls) != 2 {
 		t.Fatalf("install calls = %d; want 2 (failure must not skip go)", len(calls))
 	}
-	if prep == nil || prep.Status != agent.DependencyPreparationFailed {
-		t.Fatalf("preparation = %+v; want failed", prep)
+	if prep == nil || prep.Pnpm != agent.DependencyPreparationFailed || prep.Go != agent.DependencyPreparationFailed {
+		t.Fatalf("preparation = %+v; want {pnpm:failed go:failed}", prep)
 	}
 }
 
@@ -216,8 +213,8 @@ func TestInstallSessionDependencies_ExecErrorContinues(t *testing.T) {
 	if calls := execer.recorded(); len(calls) != 1 {
 		t.Fatalf("install calls = %d; want 1", len(calls))
 	}
-	if prep == nil || prep.Status != agent.DependencyPreparationFailed {
-		t.Fatalf("preparation = %+v; want failed", prep)
+	if prep == nil || prep.Go != agent.DependencyPreparationFailed || prep.Pnpm != "" {
+		t.Fatalf("preparation = %+v; want {go:failed} (pnpm undetected)", prep)
 	}
 }
 
@@ -253,14 +250,14 @@ func TestInstallSessionDependencies_ExpiredContextReportsTimedOut(t *testing.T) 
 
 	prep := r.installSessionDependencies(context.Background(), QueuedWork{QueuedWork: queuedWorkBase("DEPS-TIMEOUT")}, wpath, false)
 
-	if prep == nil || prep.Status != agent.DependencyPreparationTimedOut {
-		t.Fatalf("preparation = %+v; want timed_out", prep)
+	if prep == nil || prep.Go != agent.DependencyPreparationTimedOut || prep.Pnpm != "" {
+		t.Fatalf("preparation = %+v; want {go:timed_out} (pnpm undetected)", prep)
 	}
 	if n := execer.recorded(); n != 1 {
 		t.Fatalf("install calls = %d; want 1 bounded attempt", n)
 	}
-	if len(prep.Ecosystems) != 1 || prep.Ecosystems[0] != "go" {
-		t.Errorf("ecosystems = %v; want [go]", prep.Ecosystems)
+	if got := prep.DetectedEcosystems(); len(got) != 1 || got[0] != "go" {
+		t.Errorf("ecosystems = %v; want [go]", got)
 	}
 }
 
@@ -280,12 +277,12 @@ func TestInstallSessionDependencies_CancelledContextAuthorizesNoWork(t *testing.
 	if calls := execer.recorded(); len(calls) != 0 {
 		t.Fatalf("install calls = %v; want none: cancellation must not authorize work", calls)
 	}
-	if prep == nil || prep.Status != agent.DependencyPreparationTimedOut {
-		t.Fatalf("preparation = %+v; want timed_out", prep)
+	if prep == nil || prep.Pnpm != agent.DependencyPreparationTimedOut || prep.Go != agent.DependencyPreparationTimedOut {
+		t.Fatalf("preparation = %+v; want {pnpm:timed_out go:timed_out}", prep)
 	}
 }
 
-func TestInstallSessionDependencies_RestrictedContextReportsSkippedRestricted(t *testing.T) {
+func TestInstallSessionDependencies_RestrictedContextReportsSkippedSecurity(t *testing.T) {
 	t.Parallel()
 	execer := &recordingDepsExecer{}
 	r := depsTestRunner(t, execer)
@@ -303,11 +300,11 @@ func TestInstallSessionDependencies_RestrictedContextReportsSkippedRestricted(t 
 	if calls := execer.recorded(); len(calls) != 0 {
 		t.Fatalf("install calls = %v; want none under restricted execution", calls)
 	}
-	if prep == nil || prep.Status != agent.DependencyPreparationSkippedRestricted {
-		t.Fatalf("preparation = %+v; want skipped_restricted", prep)
+	if prep == nil || prep.Pnpm != agent.DependencyPreparationSkippedSecurity || prep.Go != agent.DependencyPreparationSkippedSecurity {
+		t.Fatalf("preparation = %+v; want {pnpm:skipped_security go:skipped_security}", prep)
 	}
-	if len(prep.Ecosystems) != 2 {
-		t.Errorf("ecosystems = %v; want both detected ecosystems on the skipped report", prep.Ecosystems)
+	if got := prep.DetectedEcosystems(); len(got) != 2 {
+		t.Errorf("ecosystems = %v; want both detected ecosystems on the skipped report", got)
 	}
 }
 
@@ -320,11 +317,12 @@ func TestInjectDependencyPreparationPartial(t *testing.T) {
 		wantChange bool
 	}{
 		{name: "nil omits", prep: nil},
-		{name: "ready adds nothing", prep: &agent.DependencyPreparation{Status: agent.DependencyPreparationReady, Ecosystems: []string{"pnpm"}}},
-		{name: "read-only skip adds no bypass", prep: &agent.DependencyPreparation{Status: agent.DependencyPreparationSkippedReadOnly, Ecosystems: []string{"pnpm"}}},
-		{name: "restricted skip adds no bypass", prep: &agent.DependencyPreparation{Status: agent.DependencyPreparationSkippedRestricted, Ecosystems: []string{"go"}}},
-		{name: "failed hands recovery", prep: &agent.DependencyPreparation{Status: agent.DependencyPreparationFailed, Ecosystems: []string{"pnpm"}}, wantChange: true},
-		{name: "timed out hands recovery", prep: &agent.DependencyPreparation{Status: agent.DependencyPreparationTimedOut, Ecosystems: []string{"go"}}, wantChange: true},
+		{name: "ready adds nothing", prep: &agent.DependencyPreparation{Pnpm: agent.DependencyPreparationReady}},
+		{name: "read-only skip adds no bypass", prep: &agent.DependencyPreparation{Pnpm: agent.DependencyPreparationSkippedReadOnly}},
+		{name: "security skip adds no bypass", prep: &agent.DependencyPreparation{Go: agent.DependencyPreparationSkippedSecurity}},
+		{name: "failed hands recovery", prep: &agent.DependencyPreparation{Pnpm: agent.DependencyPreparationFailed}, wantChange: true},
+		{name: "mixed failed and ready hands recovery", prep: &agent.DependencyPreparation{Pnpm: agent.DependencyPreparationFailed, Go: agent.DependencyPreparationReady}, wantChange: true},
+		{name: "timed out hands recovery", prep: &agent.DependencyPreparation{Pnpm: agent.DependencyPreparationTimedOut, Go: agent.DependencyPreparationTimedOut}, wantChange: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -347,8 +345,8 @@ func TestInjectDependencyPreparationPartial(t *testing.T) {
 			if !strings.Contains(got, "report blocked with the reason") {
 				t.Errorf("recovery handoff missing blocked report: %q", got)
 			}
-			if !strings.Contains(got, tc.prep.Status) {
-				t.Errorf("recovery handoff missing bounded status %q: %q", tc.prep.Status, got)
+			if !strings.Contains(got, tc.prep.OutcomeSummary()) {
+				t.Errorf("recovery handoff missing bounded summary %q: %q", tc.prep.OutcomeSummary(), got)
 			}
 			for _, sentinel := range []string{"binary missing", "install-stdout", "exit 1", "/bin/sh"} {
 				if strings.Contains(got, sentinel) {
@@ -842,12 +840,13 @@ func (f *pnpmFailGoBlockExecer) recorded() []depsCall {
 	return append([]depsCall(nil), f.calls...)
 }
 
-// TestInstallSessionDependencies_FailedPnpmAndTimedOutGoReportsTimedOut
-// pins the timed_out-over-failed priority: a failed pnpm plus a go
-// install that expires with the shared context reports timed_out, not
-// failed. Swapping the switch cases in installSessionDependencies
-// reports failed and fails this test.
-func TestInstallSessionDependencies_FailedPnpmAndTimedOutGoReportsTimedOut(t *testing.T) {
+// TestInstallSessionDependencies_FailedPnpmAndTimedOutGoKeepsPerEcosystemOutcomes
+// pins per-ecosystem fidelity when outcomes combine: a failed pnpm plus
+// a go install that expires with the shared context reports failed for
+// pnpm and timed_out for go, and the combined report still needs
+// recovery. Collapsing the two into one status loses which ecosystem
+// needs repair and fails this test.
+func TestInstallSessionDependencies_FailedPnpmAndTimedOutGoKeepsPerEcosystemOutcomes(t *testing.T) {
 	t.Parallel()
 	execer := &pnpmFailGoBlockExecer{}
 	r := depsTestRunner(t, execer)
@@ -862,11 +861,14 @@ func TestInstallSessionDependencies_FailedPnpmAndTimedOutGoReportsTimedOut(t *te
 	if calls := execer.recorded(); len(calls) != 2 {
 		t.Fatalf("install calls = %d; want 2 (failed pnpm then bounded go)", len(calls))
 	}
-	if prep == nil || prep.Status != agent.DependencyPreparationTimedOut {
-		t.Fatalf("preparation = %+v; want timed_out when failed and timed_out combine", prep)
+	if prep == nil || prep.Pnpm != agent.DependencyPreparationFailed || prep.Go != agent.DependencyPreparationTimedOut {
+		t.Fatalf("preparation = %+v; want {pnpm:failed go:timed_out}", prep)
 	}
-	if len(prep.Ecosystems) != 2 || prep.Ecosystems[0] != "pnpm" || prep.Ecosystems[1] != "go" {
-		t.Errorf("ecosystems = %v; want [pnpm go]", prep.Ecosystems)
+	if !prep.NeedsRecovery() {
+		t.Fatalf("preparation = %+v; want recovery for a failed/timed_out combination", prep)
+	}
+	if got := prep.DetectedEcosystems(); len(got) != 2 || got[0] != "pnpm" || got[1] != "go" {
+		t.Errorf("ecosystems = %v; want [pnpm go]", got)
 	}
 }
 
