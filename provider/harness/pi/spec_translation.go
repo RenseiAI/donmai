@@ -119,14 +119,32 @@ func rpcArgs(layout sessionLayout, extensionPaths []string, mode launchMode, ses
 // lets pi resolve the provider from its own config. Empty Spec.Model emits
 // nothing, leaving pi on its own default. The reasoning-effort suffix mirrors
 // pi's `--model <id>[:<thinking>]` grammar.
+// pinnedThinkingLevel returns the thinking level modelPinArgs actually
+// appends to the --model pin for this spec: the shared translated value
+// both the argv pin and the applied-effort evidence report. Empty (the
+// zero value) when the builder appends no suffix — no model, or no
+// configured effort — so callers can never infer a level from model-ID
+// text (a colon-suffixed ID such as "local-model:high" with omitted
+// effort pins no level and reports none).
+func pinnedThinkingLevel(spec agent.Spec) agent.EffortLevel {
+	if spec.Model == "" {
+		return ""
+	}
+	lvl := thinkingLevelForEffort(spec.Effort)
+	if lvl == "" {
+		return ""
+	}
+	return agent.EffortLevel(lvl)
+}
+
 func modelPinArgs(spec agent.Spec) []string {
 	if spec.Model == "" {
 		return nil
 	}
 	provider, bareModel, useNative := nativeProviderPin(spec.Model, spec.Endpoint)
 	modelArg := bareModel
-	if lvl := thinkingLevelForEffort(spec.Effort); lvl != "" {
-		modelArg += ":" + lvl
+	if lvl := pinnedThinkingLevel(spec); lvl != "" {
+		modelArg += ":" + string(lvl)
 	}
 	switch {
 	case useNative:

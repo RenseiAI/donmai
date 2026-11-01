@@ -570,3 +570,111 @@ func TestAppliedEffort_CallSites(t *testing.T) {
 	// coverage for it. This test fails (RED) if launchNotices is ever wired
 	// into the interactive spawn path.
 }
+
+// colonSuffixedOmittedEffortSpec is the B1 false-provenance shape: a
+// tag-style model ID that itself ends in ":high" with no configured
+// effort. The pin must carry the ID unchanged and the applied report must
+// stay empty (not-configured) — never "high" inferred from the ID text.
+func colonSuffixedOmittedEffortSpec(cwd string) agent.Spec {
+	return agent.Spec{Prompt: "do work", Cwd: cwd, Autonomous: true, Model: "local-model:high"}
+}
+
+// TestAppliedEffort_SpawnColonModelIDWithOmittedEffortReportsEmpty is the B1
+// Spawn regression: a real headless Spawn with a colon-bearing model ID and
+// omitted effort must emit an empty (not-configured) applied value. RED on
+// the old text-parsing helper, which read the ID suffix as "high".
+func TestAppliedEffort_SpawnColonModelIDWithOmittedEffortReportsEmpty(t *testing.T) {
+	dir := t.TempDir()
+	cwd := t.TempDir()
+	bin := appliedFakePi(t, dir)
+	p, err := New(Options{
+		PiBin: bin, HandshakeTimeout: 10 * time.Second, handshakeToken: testHandshakeToken,
+		VersionProbe: func(context.Context, string) (string, error) { return PinnedVersion, nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = p.Shutdown(context.Background()) })
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+	h, err := p.Spawn(ctx, colonSuffixedOmittedEffortSpec(cwd))
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+
+	argv := waitForAppliedArgv(t, filepath.Join(dir, "argv"))
+	if !strings.Contains(argv, "local-model:high") {
+		t.Fatalf("final argv lacks the model ID local-model:high:\n%s", argv)
+	}
+	if strings.Contains(argv, "local-model:high:") {
+		t.Fatalf("final argv appends an invented suffix to the colon-bearing ID:\n%s", argv)
+	}
+
+	events := drainApplied(t, h)
+	applied, ok := appliedEventOf(events)
+	if !ok {
+		t.Fatalf("no applied_reasoning_effort event; kinds=%v", kindsOfApplied(events))
+	}
+	if applied.Message != "" {
+		t.Fatalf("applied Message = %q, want empty (not-configured): ID text must not become provenance", applied.Message)
+	}
+	gotCtx, gotContent := postAppliedThroughRealPoster(t, applied)
+	if gotCtx != "appliedReasoningEffort=not-configured" {
+		t.Errorf("poster context = %q, want appliedReasoningEffort=not-configured", gotCtx)
+	}
+	if !strings.Contains(gotContent, "not configured") {
+		t.Errorf("poster content = %q, want the not-configured sentence", gotContent)
+	}
+	if res, ok := terminalAppliedResult(events); !ok || !res.Success {
+		t.Fatalf("terminal missing or failed: %+v", res)
+	}
+}
+
+// TestAppliedEffort_ResumeColonModelIDWithOmittedEffortReportsEmpty is the B1
+// Resume regression: the same false-provenance shape through the Resume
+// launch path. RED on the old text-parsing helper for the same reason.
+func TestAppliedEffort_ResumeColonModelIDWithOmittedEffortReportsEmpty(t *testing.T) {
+	dir := t.TempDir()
+	cwd := t.TempDir()
+	bin := appliedFakePi(t, dir)
+	p, err := New(Options{
+		PiBin: bin, HandshakeTimeout: 10 * time.Second, handshakeToken: testHandshakeToken,
+		VersionProbe: func(context.Context, string) (string, error) { return PinnedVersion, nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = p.Shutdown(context.Background()) })
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+	h, err := p.Resume(ctx, "resume-cursor-colon-id", colonSuffixedOmittedEffortSpec(cwd))
+	if err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+
+	argv := waitForAppliedArgv(t, filepath.Join(dir, "argv"))
+	if !strings.Contains(argv, "--session") || !strings.Contains(argv, "resume-cursor-colon-id") {
+		t.Fatalf("resumed argv lacks --session cursor:\n%s", argv)
+	}
+	if !strings.Contains(argv, "local-model:high") {
+		t.Fatalf("resumed argv lacks the model ID local-model:high:\n%s", argv)
+	}
+
+	events := drainApplied(t, h)
+	applied, ok := appliedEventOf(events)
+	if !ok {
+		t.Fatalf("no applied_reasoning_effort on resume; kinds=%v", kindsOfApplied(events))
+	}
+	if applied.Message != "" {
+		t.Fatalf("resumed applied Message = %q, want empty (not-configured)", applied.Message)
+	}
+	gotCtx, _ := postAppliedThroughRealPoster(t, applied)
+	if gotCtx != "appliedReasoningEffort=not-configured" {
+		t.Errorf("resume poster context = %q, want appliedReasoningEffort=not-configured", gotCtx)
+	}
+	if res, ok := terminalAppliedResult(events); !ok || !res.Success {
+		t.Fatalf("resumed terminal missing or failed: %+v", res)
+	}
+}
