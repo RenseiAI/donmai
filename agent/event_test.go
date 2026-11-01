@@ -724,3 +724,40 @@ func TestLlmCallEvent_CostOnlyDeltaPassesStrictValidator(t *testing.T) {
 		t.Fatalf("aggregate/partial atom lost cost-only delta: %+v", atomDecoded)
 	}
 }
+
+// TestAppliedReasoningEffortEvent_SubtypeAndMessage proves the constructor
+// emits the applied_reasoning_effort subtype with the applied level as its
+// message, and an empty message when no applied effort was reported — the
+// adapter-sent record, distinct from the requested-effort event.
+func TestAppliedReasoningEffortEvent_SubtypeAndMessage(t *testing.T) {
+	t.Parallel()
+	got := AppliedReasoningEffortEvent(EffortMax)
+	if got.Subtype != SystemSubtypeAppliedReasoningEffort {
+		t.Errorf("Subtype = %q; want %q", got.Subtype, SystemSubtypeAppliedReasoningEffort)
+	}
+	if got.Message != "max" {
+		t.Errorf("Message = %q; want %q", got.Message, "max")
+	}
+	if got.Subtype == SystemSubtypeReasoningEffort {
+		t.Errorf("applied subtype must differ from the requested subtype %q", SystemSubtypeReasoningEffort)
+	}
+	empty := AppliedReasoningEffortEvent("")
+	if empty.Subtype != SystemSubtypeAppliedReasoningEffort {
+		t.Errorf("Subtype = %q; want %q", empty.Subtype, SystemSubtypeAppliedReasoningEffort)
+	}
+	if empty.Message != "" {
+		t.Errorf("Message = %q; want empty (no applied effort reported)", empty.Message)
+	}
+	wire, err := MarshalEvent(got)
+	if err != nil {
+		t.Fatalf("MarshalEvent applied: %v", err)
+	}
+	decoded, err := UnmarshalEvent(wire)
+	if err != nil {
+		t.Fatalf("UnmarshalEvent applied: %v", err)
+	}
+	sys, ok := decoded.(SystemEvent)
+	if !ok || sys.Subtype != SystemSubtypeAppliedReasoningEffort || sys.Message != "max" {
+		t.Errorf("round-trip = %#v, want applied_reasoning_effort carrying max", decoded)
+	}
+}
