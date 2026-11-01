@@ -346,3 +346,48 @@ func TestMarshalSpan_NilSpan(t *testing.T) {
 		t.Fatal("MarshalSpan(nil) returned nil error")
 	}
 }
+
+// TestSpan_JoinKeysOmittedWhenAbsent pins the wire rule for the optional
+// trace-correlation join keys: they ride the donmai extensions only when
+// set, with their exact wire names, and stay absent otherwise — never
+// empty placeholders. The shared golden pins the absent shape
+// byte-for-byte; this test names the rule the golden enforces so a
+// renamed key or an emitted placeholder fails here with the key named.
+func TestSpan_JoinKeysOmittedWhenAbsent(t *testing.T) {
+	t.Parallel()
+	joined := canonicalLlmCallSpan()
+	joined.Donmai.SessionStorageID = "sto_1"
+	joined.Donmai.SessionPublicID = "pub_1"
+	joined.Donmai.TrackerSessionID = "trk_1"
+	data, err := MarshalSpan(joined)
+	if err != nil {
+		t.Fatalf("MarshalSpan: %v", err)
+	}
+	donmai, ok := normalize(t, data)["donmai"].(map[string]any)
+	if !ok {
+		t.Fatal("donmai is not an object")
+	}
+	for k, want := range map[string]string{
+		"sessionStorageId": "sto_1",
+		"sessionPublicId":  "pub_1",
+		"trackerSessionId": "trk_1",
+	} {
+		if donmai[k] != want {
+			t.Errorf("donmai.%s = %v, want %q", k, donmai[k], want)
+		}
+	}
+
+	bare, err := MarshalSpan(canonicalLlmCallSpan())
+	if err != nil {
+		t.Fatalf("MarshalSpan: %v", err)
+	}
+	plain, ok := normalize(t, bare)["donmai"].(map[string]any)
+	if !ok {
+		t.Fatal("donmai is not an object")
+	}
+	for _, k := range []string{"sessionStorageId", "sessionPublicId", "trackerSessionId"} {
+		if v, present := plain[k]; present {
+			t.Errorf("donmai.%s = %v, want absent", k, v)
+		}
+	}
+}

@@ -718,6 +718,37 @@ func validHexID(id string, byteLen int) bool {
 	return err == nil
 }
 
+// maxTracestateBytes bounds an accepted tracestate header value. W3C
+// recommends 512 bytes; longer values are dropped as malformed rather
+// than truncated, so a partial state can never correlate the wrong trace.
+const maxTracestateBytes = 512
+
+// ValidTraceparent reports whether tp is a well-formed W3C traceparent
+// (version 00, 16-byte trace id, 8-byte parent id, valid flags, lowercase
+// non-zero ids). The runner sanitizes dispatch context at the consumer
+// boundary with this check; the processor reuses the same parse when
+// adopting the dispatch trace id, so the two agree by construction.
+func ValidTraceparent(tp string) bool {
+	_, _, ok := parseTraceparent(tp)
+	return ok
+}
+
+// ValidTracestate reports whether ts is safe to emit as a header value:
+// non-empty, within the W3C size recommendation, and printable ASCII
+// (no control bytes that would break request framing). Empty reads
+// false so callers can fold absence and malformed into one branch.
+func ValidTracestate(ts string) bool {
+	if ts == "" || len(ts) > maxTracestateBytes {
+		return false
+	}
+	for i := 0; i < len(ts); i++ {
+		if ts[i] < 0x20 || ts[i] > 0x7e {
+			return false
+		}
+	}
+	return true
+}
+
 func parseTraceparent(tp string) (traceID, parentID string, ok bool) {
 	parts := strings.Split(tp, "-")
 	if len(parts) != 4 {

@@ -35,9 +35,13 @@ func (h *host) runWSS(ctx context.Context, tok string, cl hostClaims, exitDeadli
 	var res attemptResult
 
 	dialCtx, cancel := context.WithTimeout(ctx, h.cfg.DialTimeout)
+	header := http.Header{"Authorization": {"Bearer " + tok}}
+	for name, values := range h.cfg.traceHeaders() {
+		header[name] = values
+	}
 	conn, resp, err := websocket.Dial(dialCtx, h.cfg.AttachURL, &websocket.DialOptions{
 		HTTPClient:   h.cfg.HTTPClient,
-		HTTPHeader:   http.Header{"Authorization": {"Bearer " + tok}},
+		HTTPHeader:   header,
 		Subprotocols: []string{attachwire.SubprotocolVersion},
 	})
 	cancel()

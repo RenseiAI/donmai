@@ -71,6 +71,12 @@ type StubRelay struct {
 
 	mu      sync.Mutex
 	started bool
+
+	// dialHeaders records a clone of every WSS handshake request's headers
+	// in arrival order, so tests can assert the client carried the same
+	// correlation context on the initial attach and every reconnect dial.
+	dialMu      sync.Mutex
+	dialHeaders []http.Header
 }
 
 // New builds a StubRelay. Call Start to bind and serve.
@@ -328,6 +334,15 @@ func (s *StubRelay) refuseWhileDraining(w http.ResponseWriter) bool {
 // this relay was built.
 func (s *StubRelay) RefusedDials() int { return int(s.refusedDials.Load()) }
 
+// DialHeaders returns a copy of every WSS handshake request's headers in
+// arrival order. Tests use it to pin correlation context on the initial
+// attach and on reconnect dials.
+func (s *StubRelay) DialHeaders() []http.Header {
+	s.dialMu.Lock()
+	defer s.dialMu.Unlock()
+	return append([]http.Header(nil), s.dialHeaders...)
+}
+
 // restartAnnouncement renders both halves of the announcement from one floor,
 // so the control message and the close reason can never disagree.
 func restartAnnouncement(after time.Duration) (message, closeReason string) {
@@ -338,6 +353,9 @@ func restartAnnouncement(after time.Duration) (message, closeReason string) {
 // ---- WSS lane ---------------------------------------------------------------
 
 func (s *StubRelay) handleWS(w http.ResponseWriter, r *http.Request) {
+	s.dialMu.Lock()
+	s.dialHeaders = append(s.dialHeaders, r.Header.Clone())
+	s.dialMu.Unlock()
 	if s.refuseWhileDraining(w) {
 		return
 	}
