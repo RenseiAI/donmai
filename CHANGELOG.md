@@ -10,6 +10,16 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 No unreleased changes.
 
+## v0.72.95 — 2026-11-01
+
+### Chores
+
+- Define workarea writer quiescence across disposition and archive
+- Stream Muse intermediate output and refresh wire schema
+- Consume consented host upgrade requests through the existing updater
+- Session proxy-first, env key ignored in session
+- Make merge-group flake handling explicit and testable
+
 ## v0.72.94 — 2026-10-31
 
 ### Fixes
