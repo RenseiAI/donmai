@@ -470,6 +470,33 @@ func (fh *fakeHost) emitScript(t *testing.T, script, sid, turnID string, denyApp
 		// After recovery (session/resume), the turn completes.
 		agentMsg("item-9", "recovered", 1)
 		completed("completed")
+	case "stale-queued-failure":
+		// The acknowledged first turn stays queued while an older
+		// turn's success arrives first. The stale success must not
+		// terminate the session or consume the first-turn diagnostic;
+		// the queued first turn's failure then terminates with one.
+		staleID := "00000000-0000-7000-8000-000000000001"
+		if staleID == turnID {
+			staleID = "00000000-0000-7000-8000-000000000002"
+		}
+		fh.write(t, map[string]any{
+			"jsonrpc": "2.0", "method": "turn/started",
+			"params": map[string]any{"sessionId": sid, "turnId": turnID, "viewCursor": "cursor-1"},
+		})
+		fh.write(t, map[string]any{
+			"jsonrpc": "2.0", "method": "turn/completed",
+			"params": map[string]any{
+				"sessionId": sid, "terminal": "completed", "turnId": staleID, "viewCursor": "cursor-stale",
+				"usage": map[string]any{"cachedTokens": 1, "inputTokens": 10, "outputTokens": 5, "reasoningTokens": 0},
+			},
+		})
+		fh.write(t, map[string]any{
+			"jsonrpc": "2.0", "method": "turn/completed",
+			"params": map[string]any{
+				"sessionId": sid, "terminal": "failed", "turnId": turnID, "viewCursor": "cursor-end",
+				"error": map[string]any{"kind": "overloaded", "message": "host overloaded", "retryable": true},
+			},
+		})
 	}
 }
 

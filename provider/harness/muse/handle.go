@@ -548,13 +548,26 @@ func (h *Handle) handleNotification(ctx context.Context, n notification) bool {
 		h.decideFromNotification(n.Params, rawObj)
 	}
 
+	var completed TurnCompletedParams
+	isTurnCompleted := n.Method == "turn/completed"
+	if isTurnCompleted {
+		_ = json.Unmarshal(n.Params, &completed)
+	}
+
 	events := mapNotification(n.Method, n.Params, h.state, rawObj)
 	for _, ev := range events {
 		switch e := ev.(type) {
 		case agent.ResultEvent:
-			if n.Method == "turn/completed" {
-				var completed TurnCompletedParams
-				_ = json.Unmarshal(n.Params, &completed)
+			if isTurnCompleted {
+				if h.isStaleFirstTurnCompletion(completed.TurnID) {
+					// A completion for a turn other than the
+					// acknowledged first turn is not this handle's
+					// terminal: it must not emit the queued shape,
+					// consume the once flag, clear the foreground
+					// turn, or exit the forwarder. The queued
+					// first turn's own completion still reports.
+					continue
+				}
 				h.emitFirstTurnAsyncCompletion(completed.TurnID, completed.Terminal, completed.Error, completed.Reason)
 			}
 			h.clearCurrentTurnID()
@@ -575,8 +588,12 @@ func (h *Handle) handleNotification(ctx context.Context, n notification) bool {
 		h.emit(ev)
 	}
 	// A turn that completed without a terminal ResultEvent (unknown
-	// terminal vocabulary) still ends foreground tracking.
-	if n.Method == "turn/completed" {
+	// terminal vocabulary) still ends foreground tracking, unless it is
+	// a stale turn other than the acknowledged first turn.
+	if isTurnCompleted {
+		if h.isStaleFirstTurnCompletion(completed.TurnID) {
+			return false
+		}
 		h.clearCurrentTurnID()
 	}
 	return false

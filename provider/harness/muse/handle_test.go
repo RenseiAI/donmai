@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -544,6 +545,53 @@ func firstTurnDiagnosticLines(t *testing.T, out string) []string {
 		}
 	}
 	return lines
+}
+
+// firstTurnPayloadFromTextLine decodes the bounded shape JSON carried in
+// the emitted diagnostic's shape attribute (slog TextHandler quoting).
+// It pins the wire payload itself: deleting an encoder assignment that
+// serializes a flag removes the key from this struct, so the check fails.
+func firstTurnPayloadFromTextLine(t *testing.T, line string) firstTurnDiagnosticData {
+	t.Helper()
+	const key = `shape="`
+	idx := strings.Index(line, key)
+	if idx < 0 {
+		t.Fatalf("diagnostic line has no shape attribute; line=%q", line)
+	}
+	start := idx + len(`shape=`)
+	// The TextHandler quotes the payload with Go syntax: inner quotes
+	// appear escaped (\") while the outer closing quote follows the
+	// payload's final } unescaped. Scan for that unescaped closer.
+	end := -1
+	escaped := false
+	for i := start + 1; i < len(line); i++ {
+		c := line[i]
+		if escaped {
+			escaped = false
+			continue
+		}
+		if c == '\\' {
+			escaped = true
+			continue
+		}
+		if c == '"' {
+			end = i
+			break
+		}
+	}
+	if end < 0 {
+		t.Fatalf("diagnostic line has unterminated shape attribute; line=%q", line)
+	}
+	quoted := line[start : end+1]
+	raw, err := strconv.Unquote(quoted)
+	if err != nil {
+		t.Fatalf("shape attribute is not Go-quoted: %v; line=%q", err, line)
+	}
+	var data firstTurnDiagnosticData
+	if err := json.Unmarshal([]byte(raw), &data); err != nil {
+		t.Fatalf("shape payload is not JSON: %v; payload=%q", err, raw)
+	}
+	return data
 }
 
 func TestHandle_StepUsage(t *testing.T) {
@@ -1251,17 +1299,69 @@ func TestHandle_FirstTurnDiagnosticCorrelatesTurnID(t *testing.T) {
 	oldID := "11111111-1111-7111-8111-111111111111"
 	h.recordSessionShape("session/resume", sessionResumeParams(sid, "c", nil))
 	h.recordTurnShape(turnStartParams(sid, "c", agent.Spec{Prompt: "x"}, []TurnInputPart{{Type: "text"}}, []string{t.TempDir()}), queuedID)
+	h.setCurrentTurnID(queuedID)
 	oldParams, _ := json.Marshal(map[string]any{"sessionId": sid, "turnId": oldID, "terminal": "completed", "viewCursor": "c"})
-	h.handleNotification(context.Background(), notification{Method: "turn/completed", Params: oldParams})
+	if done := h.handleNotification(context.Background(), notification{Method: "turn/completed", Params: oldParams}); done {
+		t.Fatalf("stale turn completion terminated the session; want non-terminal so the queued first turn still reports")
+	}
 	if got := strings.Count(logs.String(), "first-turn request shape"); got != 0 {
 		t.Fatalf("stale turn completion emitted queued shape; logs=%q", logs.String())
 	}
+	h.turnMu.RLock()
+	foreground := h.currentTurnID
+	h.turnMu.RUnlock()
+	if foreground != queuedID {
+		t.Fatalf("stale completion cleared foreground turn %q, want %q (queued first turn still tracked)", foreground, queuedID)
+	}
 	queuedParams, _ := json.Marshal(map[string]any{"sessionId": sid, "turnId": queuedID, "terminal": "completed", "viewCursor": "c2"})
-	h.handleNotification(context.Background(), notification{Method: "turn/completed", Params: queuedParams})
+	if done := h.handleNotification(context.Background(), notification{Method: "turn/completed", Params: queuedParams}); !done {
+		t.Fatalf("queued first-turn completion did not terminate; want terminal so the session ends")
+	}
 	if got := strings.Count(logs.String(), "first-turn request shape"); got != 1 {
 		t.Fatalf("queued turn completion emissions=%d, want 1 (stale must not consume flag); logs=%q", got, logs.String())
 	}
 	h.closeEvents()
+}
+
+// TestHandle_QueuedFirstTurnSurvivesStaleCompletionViaResume pins the
+// production lifecycle: through the Resume entry point with the fake
+// transport, a stale older success must not terminate the session
+// before the acknowledged queued first turn fails. Removing the stale
+// terminal gate makes the stale success terminate with zero diagnostics.
+func TestHandle_QueuedFirstTurnSurvivesStaleCompletionViaResume(t *testing.T) {
+	var logs bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	defer slog.SetDefault(prev)
+	p, fh := newTestProvider(t, "stale-queued-failure")
+	fh.sessionID = "22222222-2222-7222-8222-222222222222"
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	h, err := p.Resume(ctx, "22222222-2222-7222-8222-222222222222", agent.Spec{Prompt: "continue", Cwd: t.TempDir(), Autonomous: true})
+	if err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	events := drainEvents(t, h.Events(), 10*time.Second)
+	res, ok := terminalResult(events)
+	if !ok {
+		t.Fatalf("no terminal ResultEvent; kinds=%v", kindsOf(events))
+	}
+	if res.Success {
+		t.Fatalf("stale success terminated the session as success; want the queued first-turn failure (errors=%v)", res.Errors)
+	}
+	if res.ErrorSubtype != "overloaded" {
+		t.Errorf("ErrorSubtype=%q, want overloaded (queued first-turn failure)", res.ErrorSubtype)
+	}
+	lines := firstTurnDiagnosticLines(t, logs.String())
+	if len(lines) != 1 {
+		t.Fatalf("diagnostic emissions=%d, want 1 after stale success plus queued failure; logs=%q", len(lines), logs.String())
+	}
+	if !strings.Contains(lines[0], "errorKind=overloaded") {
+		t.Errorf("queued failure line has no errorKind=overloaded; line=%q", lines[0])
+	}
+	if !strings.Contains(lines[0], "sessionMethod=session/resume") {
+		t.Errorf("queued failure line has no session/resume sessionMethod; line=%q", lines[0])
+	}
 }
 
 // TestHandle_FirstTurnDiagnosticRejectsUnknownTokens pins the token
@@ -1416,8 +1516,12 @@ func TestHandle_FirstTurnDiagnosticCancelledAndQuota(t *testing.T) {
 			"sessionId": sid, "turnId": turnID, "terminal": "failed", "viewCursor": "c",
 			"error": map[string]any{"kind": "overloaded", "message": "HOST-SENTINEL-QUOTA-9f8a7b6c5d4e", "retryable": true, "quota": map[string]any{"usd": 1}, "requestDenied": true},
 		})
-		h.handleNotification(context.Background(), notification{Method: "turn/completed", Params: params})
 		_ = turnErr
+		_ = quota
+		_ = denied
+		if done := h.handleNotification(context.Background(), notification{Method: "turn/completed", Params: params}); !done {
+			t.Fatalf("quota failure did not terminate; want terminal ResultEvent")
+		}
 		lines := firstTurnDiagnosticLines(t, logs.String())
 		if len(lines) != 1 {
 			t.Fatalf("quota emissions=%d, want 1; logs=%q", len(lines), logs.String())
@@ -1428,14 +1532,21 @@ func TestHandle_FirstTurnDiagnosticCancelledAndQuota(t *testing.T) {
 		if strings.Contains(logs.String(), "HOST-SENTINEL-QUOTA-9f8a7b6c5d4e") {
 			t.Errorf("quota line copied host text; logs=%q", logs.String())
 		}
-		// The stored classification must carry the flags without the raw body.
-		classified := firstTurnAsyncError(TurnTerminalFailed, &TurnError{Kind: "overloaded", Retryable: true, Quota: quota, RequestDenied: &denied}, nil)
-		if !classified.ErrorHasQuota || !classified.ErrorHasRequestDenied || classified.ErrorRetryable == nil || !*classified.ErrorRetryable {
-			t.Fatalf("quota classification lost flags: %+v", classified)
+		// The emitted payload itself must carry the retryable, quota
+		// and request-denied flags without the raw body. Deleting any
+		// of the three encoder assignments drops the key and fails.
+		emitted := firstTurnPayloadFromTextLine(t, lines[0])
+		if emitted.ErrorRetryable == nil || !*emitted.ErrorRetryable {
+			t.Errorf("emitted payload lost errorRetryable; payload=%+v; line=%q", emitted, lines[0])
 		}
-		payload := encodeFirstTurnDiagnostic(firstTurnRequestShape{SessionMethod: "session/start"}, classified)
-		if strings.Contains(payload, "HOST-SENTINEL-QUOTA-9f8a7b6c5d4e") {
-			t.Errorf("quota payload copied host text; payload=%q", payload)
+		if !emitted.ErrorHasQuota {
+			t.Errorf("emitted payload lost errorHasQuota; payload=%+v; line=%q", emitted, lines[0])
+		}
+		if !emitted.ErrorHasRequestDenied {
+			t.Errorf("emitted payload lost errorHasRequestDenied; payload=%+v; line=%q", emitted, lines[0])
+		}
+		if emitted.ErrorKind != "overloaded" {
+			t.Errorf("emitted payload ErrorKind=%q, want overloaded; payload=%+v", emitted.ErrorKind, emitted)
 		}
 		h.closeEvents()
 	})

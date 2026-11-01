@@ -611,6 +611,25 @@ func (h *Handle) emitFirstTurnSyncFailure(rpcMethod string, err error) {
 	)
 }
 
+// isStaleFirstTurnCompletion reports whether a turn/completed delivery
+// belongs to a turn other than the acknowledged first turn. When the
+// handle has recorded its foreground turn id, any completion carrying a
+// different non-empty id is stale: it must neither emit the first-turn
+// diagnostic nor terminate the forwarder, so the queued first turn's own
+// completion still reports. Empty ids or an unrecorded first turn disable
+// the gate and preserve the existing terminal contract.
+func (h *Handle) isStaleFirstTurnCompletion(turnID string) bool {
+	if h == nil || turnID == "" {
+		return false
+	}
+	h.firstTurn.mu.Lock()
+	defer h.firstTurn.mu.Unlock()
+	if h.firstTurn.firstTurnID == "" {
+		return false
+	}
+	return turnID != h.firstTurn.firstTurnID
+}
+
 // emitFirstTurnAsyncCompletion logs one bounded diagnostic for the
 // first asynchronous turn completion: warn on failure, debug on
 // success. Duplicate completions stay silent via the emitted flag.
