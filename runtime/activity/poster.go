@@ -84,6 +84,14 @@ const (
 	reasoningEffortNotConfiguredContent = "reasoning effort: not configured; none was requested, so the harness or model default applies"
 	reasoningEffortUnknownContent       = "reasoning effort: the configured value is not a recognized level (low, medium, high, xhigh, max)"
 
+	// appliedReasoningEffortContentPrefix and the two fixed sentences below
+	// are the only content an agent.SystemSubtypeAppliedReasoningEffort
+	// marker can produce (AppliedReasoningEffortContent). The applied
+	// ladder adds minimal to the requested ladder.
+	appliedReasoningEffortContentPrefix        = "applied reasoning effort: "
+	appliedReasoningEffortNotConfiguredContent = "applied reasoning effort: not configured; no applied effort was reported, so the harness or model default applies"
+	appliedReasoningEffortUnknownContent       = "applied reasoning effort: the reported value is not a recognized level (minimal, low, medium, high, xhigh, max)"
+
 	// signalGuardRefusedContentPrefix prefixes the guard's refusal line
 	// forwarded for a signal-guard refusal marker. The line itself names
 	// the attempted pattern and the spared pids; the prefix states the
@@ -655,7 +663,11 @@ func (p *Poster) maybePostRunning(ctx context.Context) {
 // agent.SystemSubtypeToolCallRefusedOutputLimit, and
 // agent.SystemSubtypeReasoningEffort become context markers with fixed
 // content (never the event's free-form Message; the effort marker names a
-// level only when it is a known agent.EffortLevel). Codex rerouting,
+// level only when it is a known agent.EffortLevel).
+// agent.SystemSubtypeAppliedReasoningEffort becomes a context marker with
+// the same fixed-content posture on its own key, naming a level only when
+// it is in the applied ladder (minimal plus every known agent.EffortLevel).
+// Codex rerouting,
 // moderation and safety buffering become warnings; native diagnostics retain
 // their error/warning level without terminating the turn; file/plan deltas become
 // progress activities.
@@ -790,6 +802,13 @@ func mapEvent(ev agent.Event, ts time.Time, providerName string, durationMs int6
 			out.ContextKey = ReasoningEffortContextKey
 			out.ContextValue = ReasoningEffortContextValue(effort)
 			return out, true
+		case agent.SystemSubtypeAppliedReasoningEffort:
+			effort := agent.EffortLevel(e.Message)
+			out.Type = "context"
+			out.Content = AppliedReasoningEffortContent(effort)
+			out.ContextKey = AppliedReasoningEffortContextKey
+			out.ContextValue = AppliedReasoningEffortContextValue(effort)
+			return out, true
 		case agent.SystemSubtypeToolCallBounds:
 			out.Type = "context"
 			out.Content = ToolCallBoundsContent(e.Message)
@@ -898,6 +917,65 @@ func ReasoningEffortContent(effort agent.EffortLevel) string {
 		return reasoningEffortContentPrefix + string(effort) + " (as configured)"
 	default:
 		return reasoningEffortUnknownContent
+	}
+}
+
+// AppliedReasoningEffortContextKey is the contextKey an applied-effort
+// marker carries, so a control plane can read the effort an adapter actually
+// sent without parsing Content. It is distinct from ReasoningEffortContextKey
+// (requested-only): the two markers never share a key.
+const AppliedReasoningEffortContextKey = "appliedReasoningEffort"
+
+// Applied-effort contextValue sentinels for a session with no reported
+// applied effort, and for a reported value outside the applied ladder. They
+// carry the same wire values as the requested-effort sentinels but are
+// separate constants so the two marker families cannot drift together.
+const (
+	AppliedReasoningEffortNotConfigured = "not-configured"
+	AppliedReasoningEffortUnrecognized  = "unrecognized"
+)
+
+// AppliedReasoningEffortMinimal is the extra applied-ladder tier below low:
+// adapters report it, but it is outside the requested EffortLevels ladder.
+const AppliedReasoningEffortMinimal = "minimal"
+
+// isAppliedReasoningEffortLevel reports whether level is in the applied
+// ladder: minimal plus every known agent.EffortLevel. The empty value (not
+// reported) is not a level.
+func isAppliedReasoningEffortLevel(level agent.EffortLevel) bool {
+	if level == AppliedReasoningEffortMinimal {
+		return true
+	}
+	return level.Known()
+}
+
+// AppliedReasoningEffortContextValue is the contextValue of an applied-effort
+// marker: the level name when it is in the applied ladder (minimal plus every
+// known agent.EffortLevel), else one of the two sentinels. Like the Content,
+// it never carries free-form text.
+func AppliedReasoningEffortContextValue(effort agent.EffortLevel) string {
+	switch {
+	case effort == "":
+		return AppliedReasoningEffortNotConfigured
+	case isAppliedReasoningEffortLevel(effort):
+		return string(effort)
+	default:
+		return AppliedReasoningEffortUnrecognized
+	}
+}
+
+// AppliedReasoningEffortContent is the fixed-vocabulary activity content for
+// an agent.SystemSubtypeAppliedReasoningEffort marker. The level is named
+// only when it is in the applied ladder, so the content never carries
+// free-form text.
+func AppliedReasoningEffortContent(effort agent.EffortLevel) string {
+	switch {
+	case effort == "":
+		return appliedReasoningEffortNotConfiguredContent
+	case isAppliedReasoningEffortLevel(effort):
+		return appliedReasoningEffortContentPrefix + string(effort) + " (as applied)"
+	default:
+		return appliedReasoningEffortUnknownContent
 	}
 }
 
