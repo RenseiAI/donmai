@@ -180,6 +180,8 @@ func newStatusBeaconReporterWith(qw QueuedWork, interval time.Duration, now func
 		BaseURL:            qw.PlatformURL,
 		AuthToken:          qw.AuthToken,
 		CredentialProvider: credProvider,
+		Traceparent:        qw.Traceparent,
+		Tracestate:         qw.Tracestate,
 		HTTPClient:         client,
 		Logger:             logger,
 		Now:                now,
