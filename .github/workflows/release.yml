@@ -305,6 +305,8 @@ jobs:
       - name: Stage release automation
         run: |
           install -m 0755 scripts/verify-release-tag.sh "${RUNNER_TEMP}/verify-release-tag.sh"
+          install -m 0755 scripts/verify-go-compiler.sh "${RUNNER_TEMP}/verify-go-compiler.sh"
+          install -m 0755 scripts/verify-release-binaries.sh "${RUNNER_TEMP}/verify-release-binaries.sh"
           install -m 0644 .goreleaser.yaml "${RUNNER_TEMP}/goreleaser.yaml"
           install -d "${RUNNER_TEMP}/release-bin"
           install -m 0755 scripts/sign-and-notarize.sh \
@@ -338,6 +340,9 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
+
+      - name: Verify Go compiler
+        run: "${RUNNER_TEMP}/verify-go-compiler.sh"
 
       # Import the Apple Developer ID Application certificate into an
       # ephemeral RUNNER_TEMP keychain so `codesign` (invoked by
@@ -385,6 +390,27 @@ jobs:
           # checksums -> signs. Upgrade only with a source/docs re-verification.
           version: "v2.17.1"
           args: release --clean --config ${{ runner.temp }}/goreleaser.yaml
+
+      - name: Verify release binaries
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          "${RUNNER_TEMP}/verify-release-binaries.sh" \
+            --config "${RUNNER_TEMP}/goreleaser.yaml" \
+            --dist dist \
+            --tag "${RELEASE_TAG}" \
+            --output "${RUNNER_TEMP}/release-binaries.log"
+          {
+            echo "### release binaries (go version -m)"
+            echo
+            echo "tag: ${RELEASE_TAG}"
+            echo "commit SHA: ${GITHUB_SHA}"
+            echo
+            echo '```'
+            cat "${RUNNER_TEMP}/release-binaries.log"
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
 
       # Build provenance for every published archive. This is a different claim
       # from the cosign signature: the signature says "this workflow signed this

@@ -427,6 +427,8 @@ required_paths = %w[
   scripts/sign-and-notarize.sh
   scripts/test-sign-and-notarize.sh
   scripts/test-release-workflows.sh
+  scripts/verify-go-compiler.sh
+  scripts/verify-release-binaries.sh
   go.mod
 ]
 %w[pull_request push].each do |event|
@@ -564,7 +566,92 @@ scan = YAML.safe_load(File.read(File.join(root_dir, '.github/workflows/security-
 %w[secret-scan govulncheck semgrep].each do |job|
   abort "FAIL: security scan lost job #{job}" unless scan.fetch('jobs').key?(job)
 end
+# AC-1: the scheduled scanner blocks and retains the scanned SHA.
+scan_raw = File.read(File.join(root_dir, '.github/workflows/security-scan.yml'))
+govuln = scan.fetch('jobs').fetch('govulncheck')
+abort 'FAIL: govulncheck lost its blocking name' if govuln['name'].to_s.match?(/report-only/i)
+abort 'FAIL: govulncheck must keep the 10-minute timeout' unless govuln['timeout-minutes'] == 10
+abort 'FAIL: govulncheck must run the compiler guard' unless govuln.fetch('steps').any? { |step| step['run'].to_s.include?('verify-go-compiler.sh') }
+run_script = govuln.fetch('steps').select { |step| step['name'] == 'govulncheck' }.map { |step| step['run'].to_s }.join("\n")
+abort 'FAIL: govulncheck must fail closed' if run_script.match?(/::warning::govulncheck/)
+abort 'FAIL: govulncheck must fail closed' if run_script.match?(/\|\|\s*(echo|true)/)
+abort 'FAIL: govulncheck must not continue-on-error' if govuln['continue-on-error'] == true || govuln.fetch('steps').any? { |step| step['continue-on-error'] == true }
+abort 'FAIL: govulncheck must retain the scanned SHA' unless govuln.to_s.match?(/github\.sha|GITHUB_SHA/)
+upload = govuln.fetch('steps').find { |step| step['uses'].to_s.start_with?('actions/upload-artifact@') }
+abort 'FAIL: govulncheck must upload its report' unless upload && upload.dig('with', 'if-no-files-found') == 'error'
+abort 'FAIL: govulncheck must retain its report' unless upload.dig('with', 'retention-days').is_a?(Integer)
+# The weekly schedule stays on the head branch.
+triggers = scan['on'] || scan[true]
+abort 'FAIL: security scan lost its weekly schedule' unless triggers.is_a?(Hash) && Array(triggers['schedule']).any? { |entry| entry['cron'].to_s.match?(/\*/) }
+# AC-2: CI and release validate the actual compiler.
+ci = YAML.safe_load(File.read(File.join(root_dir, '.github/workflows/ci.yml')), permitted_classes: [], permitted_symbols: [], aliases: false)
+contracts = ci.fetch('jobs').fetch('release-contracts')
+abort 'FAIL: release-contracts lost its compiler guard' unless contracts.fetch('steps').any? { |step| step['run'].to_s.include?('verify-go-compiler.sh') }
+release_steps = release.fetch('jobs').fetch('release').fetch('steps')
+guard_index = release_steps.index { |step| step['name'] == 'Verify Go compiler' && step['run'].to_s.include?('verify-go-compiler.sh') }
+goreleaser_index = release_steps.index { |step| step['uses'].to_s.start_with?('goreleaser/goreleaser-action@') }
+abort 'FAIL: release job lost its compiler guard' unless guard_index
+abort 'FAIL: release compiler guard must run before the build' unless guard_index < goreleaser_index
+abort 'FAIL: release compiler guard must use the staged script (manual retries)' unless release_steps[guard_index]['run'].to_s.include?('RUNNER_TEMP')
+integration = YAML.safe_load(File.read(File.join(root_dir, '.github/workflows/release-signing-integration.yml')), permitted_classes: [], permitted_symbols: [], aliases: false)
+integration_steps = integration.fetch('jobs').fetch('signing-integration').fetch('steps')
+abort 'FAIL: signing integration lost its compiler guard' unless integration_steps.any? { |step| step['run'].to_s.include?('verify-go-compiler.sh') }
+# AC-3: every binary is inspected with go version -m before upload.
+verify_index = release_steps.index { |step| step['name'] == 'Verify release binaries' }
+attest_index = release_steps.index { |step| step['name'] == 'Attest build provenance' }
+abort 'FAIL: release job lost its binary inspection' unless verify_index
+abort 'FAIL: binary inspection must run before provenance upload' unless verify_index < attest_index
+abort 'FAIL: binary inspection must run after the build' unless goreleaser_index < verify_index
+verify_run = release_steps[verify_index]['run'].to_s
+abort 'FAIL: binary inspection must use the staged config' unless verify_run.include?('RUNNER_TEMP') && verify_run.include?('goreleaser.yaml')
+abort 'FAIL: binary inspection must target the release tag on every path' unless verify_run.include?('RELEASE_TAG')
+abort 'FAIL: binary inspection must retain the scanned SHA' unless verify_run.include?('GITHUB_SHA')
+if release_steps[verify_index].key?('if')
+  abort 'FAIL: binary inspection must run on every path (no event condition)'
+end
+abort 'FAIL: binary inspection does not inspect with go version -m' unless File.read(File.join(root_dir, 'scripts/verify-release-binaries.sh')).include?('go version -m')
+# The expected artifact set comes from the GoReleaser config, never a copy.
+builds = YAML.safe_load(File.read(File.join(root_dir, '.goreleaser.yaml')), permitted_classes: [], permitted_symbols: [], aliases: false).fetch('builds')
+abort 'FAIL: GoReleaser config declares no builds' unless builds.is_a?(Array) && !builds.empty?
+combos = builds.flat_map { |build| Array(build['goos']).product(Array(build['goarch'])) }
+abort 'FAIL: GoReleaser config declares no platform matrix' if combos.empty?
+inspector = File.read(File.join(root_dir, 'scripts/verify-release-binaries.sh'))
+abort 'FAIL: binary inspector does not derive from the GoReleaser config' unless inspector.include?("goreleaser.yaml") && inspector.include?("builds")
+staged = release_steps.find { |step| step['name'] == 'Stage release automation' }['run'].to_s
+%w[verify-go-compiler.sh verify-release-binaries.sh].each do |script|
+  abort "FAIL: manual retries can fall back to an older #{script}" unless staged.include?(script)
+end
 RUBY
+
+# AC-2: the compiler guard pins its contract directly: floor and newer stable
+# pass; old, missing, malformed, and prerelease compilers fail.
+compiler_script="${root_dir}/scripts/verify-go-compiler.sh"
+[[ -x "${compiler_script}" ]] || fail 'Go compiler guard is missing or not executable'
+"${compiler_script}" --self-test
+floor=$(grep -E '^go [0-9]+\.[0-9]+\.[0-9]+$' "${root_dir}/go.mod" | head -1 | cut -d' ' -f2)
+[[ -n "${floor}" ]] || fail 'cannot read Go floor from go.mod'
+"${compiler_script}" --floor "${floor}" --version-output "go version go${floor} darwin/arm64" || fail 'floor compiler was rejected'
+"${compiler_script}" --floor "${floor}" --version-output 'go version go1.27.3 darwin/arm64' || fail 'newer stable compiler was rejected'
+if "${compiler_script}" --floor "${floor}" --version-output 'go version go1.0.0 darwin/arm64' >/dev/null 2>&1; then
+  fail 'old compiler was accepted'
+fi
+if "${compiler_script}" --floor "${floor}" --version-output '' >/dev/null 2>&1; then
+  fail 'missing compiler output was accepted'
+fi
+if "${compiler_script}" --floor "${floor}" --version-output 'go version go1.26 darwin/arm64' >/dev/null 2>&1; then
+  fail 'malformed compiler output was accepted'
+fi
+if "${compiler_script}" --floor "${floor}" --version-output 'go version go1.26.10rc1 darwin/arm64' >/dev/null 2>&1; then
+  fail 'prerelease compiler was accepted'
+fi
+if PATH="${temp_dir}" "${compiler_script}" >/dev/null 2>&1; then
+  fail 'missing go toolchain was accepted'
+fi
+
+# AC-3: real binary inspection refuses missing or stale metadata.
+binaries_script="${root_dir}/scripts/verify-release-binaries.sh"
+[[ -x "${binaries_script}" ]] || fail 'release binary inspector is missing or not executable'
+"${binaries_script}" --self-test
 
 # The E2B build wrapper must pass the versioned target on every build and add
 # the rolling default only when requested by an automatic tag push.

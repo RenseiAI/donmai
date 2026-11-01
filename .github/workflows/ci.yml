@@ -45,6 +45,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Verify Go compiler
+        run: ./scripts/verify-go-compiler.sh
+
       - name: Release workflow contract tests
         run: bash scripts/test-release-workflows.sh
 
