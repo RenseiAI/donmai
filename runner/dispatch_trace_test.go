@@ -259,7 +259,7 @@ func TestRunDispatchTraceEndToEnd(t *testing.T) {
 			if tc.name == "valid" {
 				wantHeaders = map[string]string{"traceparent": validParent, "tracestate": "vendor=value"}
 			}
-			for _, door := range []string{"/activity", "/lock-refresh", "/step-heartbeat", "/progress"} {
+			for _, door := range []string{"/activity", "/lock-refresh", "/step-heartbeat", "/progress", "/traces"} {
 				requireDispatchHeaders(t, rec, door, wantHeaders)
 			}
 
@@ -660,4 +660,107 @@ func TestDispatchTracePropagationDoors(t *testing.T) {
 			t.Fatal("RunHost did not return after cancel")
 		}
 	})
+}
+
+// interactiveTraceSession adapts the trace fake to the runner's PTY surface
+// (agent.InteractiveSession) at epoch 1. Subscribe returns an
+// agent.InteractiveSubscription so sessAdapter can hand it to the attach
+// client; the session stays alive until the test closes done.
+type interactiveTraceSession struct {
+	done chan struct{}
+}
+
+func (s *interactiveTraceSession) WriteInput(p []byte) (int, error) { return len(p), nil }
+func (s *interactiveTraceSession) Resize(_, _, _, _ uint32) error   { return nil }
+func (s *interactiveTraceSession) Snapshot() (attachwire.Screen, attachwire.HostSeq, error) {
+	return attachwire.Screen{Epoch: 1}, 0, nil
+}
+func (s *interactiveTraceSession) EmitSnapshot() (attachwire.Frame, bool, error) {
+	return attachwire.Frame{}, false, nil
+}
+func (s *interactiveTraceSession) EmitMarker(string) error { return nil }
+func (s *interactiveTraceSession) Subscribe(attachwire.HostSeq) (agent.InteractiveSubscription, error) {
+	return &traceFakeSubscription{frames: make(chan attachwire.Frame)}, nil
+}
+func (s *interactiveTraceSession) Done() <-chan struct{} { return s.done }
+func (s *interactiveTraceSession) Exit() (attachwire.ExitPayload, bool) {
+	return attachwire.NewNormalExit(0), true
+}
+
+// TestDispatchInteractiveTraceCarriesToRelay drives the production
+// interactive lane (dispatchInteractive) against a stub relay and asserts
+// the runner-built attach handshake carries the dispatch trace context.
+// Deleting the HostConfig trace wiring in dispatchInteractive leaves the
+// direct-construction Doors subtests green, so this runner-level pin is the
+// only guard for the interactive lane.
+func TestDispatchInteractiveTraceCarriesToRelay(t *testing.T) {
+	const (
+		traceID    = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+		parentID   = "ffffffffffffffff"
+		traceState = "vendor=value"
+	)
+	traceparent := "00-" + traceID + "-" + parentID + "-01"
+
+	relay := attachtest.New(attachtest.Config{RoomID: "room-trace-interactive"})
+	if err := relay.Start(); err != nil {
+		t.Fatalf("relay start: %v", err)
+	}
+	t.Cleanup(func() { _ = relay.Close() })
+	token := traceFakeJWT(t, "sess-trace-interactive", 1)
+	t.Setenv(envAttachURL, relay.BaseWSURL())
+	t.Setenv(envAttachToken, token)
+	t.Setenv(envAttachTokenFile, "")
+
+	session := &interactiveTraceSession{done: make(chan struct{})}
+	handle := &testInteractiveHandle{Handle: &fakeHandle{events: make(chan agent.Event)}, session: session}
+	r := minimalRunner(t)
+	qw := QueuedWork{}
+	qw.SessionID = "sess-trace-interactive"
+	qw.Mode = interactiveRunMode
+	qw.Traceparent = traceparent
+	qw.Tracestate = traceState
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	type outcome struct {
+		res *Result
+		err error
+	}
+	resultCh := make(chan outcome, 1)
+	go func() {
+		res := &Result{SessionID: qw.SessionID}
+		res.ProviderName = agent.ProviderStub
+		out, err := r.dispatchInteractive(ctx, handle, t.TempDir(), qw, res, noopSink{}, nil, nil, agent.NoticeDeliveryPTYNotice)
+		resultCh <- outcome{res: out, err: err}
+	}()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for len(relay.DialHeaders()) == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if len(relay.DialHeaders()) == 0 {
+		close(session.done)
+		t.Fatal("timed out waiting for interactive attach handshake")
+	}
+	for i, hdr := range relay.DialHeaders() {
+		if got := hdr.Get("traceparent"); got != traceparent {
+			t.Errorf("interactive handshake %d traceparent = %q; want %q", i, got, traceparent)
+		}
+		if got := hdr.Get("tracestate"); got != traceState {
+			t.Errorf("interactive handshake %d tracestate = %q; want %q", i, got, traceState)
+		}
+	}
+
+	close(session.done)
+	select {
+	case got := <-resultCh:
+		if got.err != nil {
+			t.Fatalf("dispatchInteractive: %v", got.err)
+		}
+		if got.res.Status != "completed" {
+			t.Fatalf("status = %q; want completed (%s)", got.res.Status, got.res.Error)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("dispatchInteractive did not return after session exit")
+	}
 }
