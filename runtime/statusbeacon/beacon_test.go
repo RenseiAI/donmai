@@ -415,6 +415,45 @@ func TestCredentialProviderSuppliesFreshCredentials(t *testing.T) {
 	}
 }
 
+// TestBeaconDispatchTraceHeaders pins the progress-beacon omission rule:
+// each configured context value rides its own header, and an unset value
+// stays absent. Deleting either per-field guard (always emitting that
+// header) turns this test red.
+func TestBeaconDispatchTraceHeaders(t *testing.T) {
+	t.Parallel()
+	const parent = "00-11111111111111111111111111111111-2222222222222222-01"
+	for _, tc := range []struct {
+		name, parent, state string
+	}{
+		{name: "both", parent: parent, state: "vendor=value"},
+		{name: "parent only", parent: parent},
+		{name: "state only", state: "vendor=value"},
+		{name: "absent"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			srv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+				for name, want := range map[string]string{"traceparent": tc.parent, "tracestate": tc.state} {
+					if got := r.Header.Values(name); (want == "" && len(got) != 0) || (want != "" && (len(got) != 1 || got[0] != want)) {
+						t.Errorf("%s = %q, want %q (absent when empty)", name, got, want)
+					}
+				}
+				w.WriteHeader(http.StatusOK)
+			})
+			b, err := statusbeacon.New(statusbeacon.Config{
+				SessionID: "s1", BaseURL: srv.URL, HTTPClient: srv.Client(),
+				Traceparent: tc.parent, Tracestate: tc.state,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !b.Report(context.Background(), "streaming") {
+				t.Fatal("Report returned false on a 200 OK")
+			}
+		})
+	}
+}
+
 // TestShouldPost mirrors the runner's step-change gate without posting.
 func TestShouldPost(t *testing.T) {
 	t.Parallel()

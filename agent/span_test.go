@@ -347,12 +347,15 @@ func TestMarshalSpan_NilSpan(t *testing.T) {
 	}
 }
 
-// TestSpan_JoinKeysOmittedWhenAbsent pins the wire rule for the optional
-// trace-correlation join keys: they ride the donmai extensions only when
-// set, with their exact wire names, and stay absent otherwise — never
-// empty placeholders. The shared golden pins the absent shape
-// byte-for-byte; this test names the rule the golden enforces so a
-// renamed key or an emitted placeholder fails here with the key named.
+// TestSpan_JoinKeysOmittedWhenAbsent pins the codec wire rule for the
+// optional trace-correlation join keys: they ride the donmai extensions
+// only when set, with their exact wire names, and stay absent otherwise —
+// never empty placeholders. This is the Marshal/Unmarshal layer only: the
+// session processor substitutes the session id for an absent storage id
+// (the legacy storage alias; see TestProcessor_JoinIdentitiesFallbackAndOmission),
+// while absent public/tracker ids stay omitted. The shared golden pins the
+// absent shape byte-for-byte; this test names the rule the golden enforces
+// so a renamed key or an emitted placeholder fails here with the key named.
 func TestSpan_JoinKeysOmittedWhenAbsent(t *testing.T) {
 	t.Parallel()
 	joined := canonicalLlmCallSpan()

@@ -194,25 +194,51 @@ func TestRunDispatchTraceEndToEnd(t *testing.T) {
 		parentID = "bbbbbbbbbbbbbbbb"
 	)
 	validParent := "00-" + traceID + "-" + parentID + "-01"
+	sampledRandomParent := "00-" + traceID + "-" + parentID + "-03"
+	overlongState := strings.Repeat("a", 513)
 	for _, tc := range []struct {
-		name       string
-		trace      map[string]string
-		wantParent string
-		wantTrace  string
+		name        string
+		trace       map[string]string
+		wantParent  string
+		wantTrace   string
+		wantHeaders map[string]string
 	}{
 		{
-			name:       "valid",
-			trace:      map[string]string{"traceparent": validParent, "tracestate": "vendor=value", "sessionStorageId": "sto-e2e", "sessionPublicId": "pub-e2e", "trackerSessionId": "trk-e2e"},
-			wantParent: validParent,
-			wantTrace:  traceID,
+			name:        "valid",
+			trace:       map[string]string{"traceparent": validParent, "tracestate": "vendor=value", "sessionStorageId": "sto-e2e", "sessionPublicId": "pub-e2e", "trackerSessionId": "trk-e2e"},
+			wantParent:  validParent,
+			wantTrace:   traceID,
+			wantHeaders: map[string]string{"traceparent": validParent, "tracestate": "vendor=value"},
 		},
 		{
-			name:       "malformed",
-			trace:      map[string]string{"traceparent": "not-a-traceparent", "tracestate": "bad\nstate"},
-			wantParent: "",
-			wantTrace:  "",
+			name:        "valid sampled random flags",
+			trace:       map[string]string{"traceparent": sampledRandomParent, "tracestate": "vendor=value", "sessionStorageId": "sto-e2e", "sessionPublicId": "pub-e2e", "trackerSessionId": "trk-e2e"},
+			wantParent:  sampledRandomParent,
+			wantTrace:   traceID,
+			wantHeaders: map[string]string{"traceparent": sampledRandomParent, "tracestate": "vendor=value"},
 		},
-		{name: "absent", trace: nil, wantParent: "", wantTrace: ""},
+		{
+			name:        "oversized tracestate omitted",
+			trace:       map[string]string{"traceparent": validParent, "tracestate": overlongState},
+			wantParent:  validParent,
+			wantTrace:   traceID,
+			wantHeaders: map[string]string{"traceparent": validParent, "tracestate": ""},
+		},
+		{
+			name:        "high-byte tracestate omitted",
+			trace:       map[string]string{"traceparent": validParent, "tracestate": "vendor=\u00e9"},
+			wantParent:  validParent,
+			wantTrace:   traceID,
+			wantHeaders: map[string]string{"traceparent": validParent, "tracestate": ""},
+		},
+		{
+			name:        "malformed",
+			trace:       map[string]string{"traceparent": "not-a-traceparent", "tracestate": "bad\nstate"},
+			wantParent:  "",
+			wantTrace:   "",
+			wantHeaders: map[string]string{"traceparent": "", "tracestate": ""},
+		},
+		{name: "absent", trace: nil, wantParent: "", wantTrace: "", wantHeaders: map[string]string{"traceparent": "", "tracestate": ""}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newRunnerHarness(t)
@@ -255,12 +281,8 @@ func TestRunDispatchTraceEndToEnd(t *testing.T) {
 				t.Fatalf("status = %q; want completed (%s)", res.Status, res.Error)
 			}
 
-			wantHeaders := map[string]string{"traceparent": "", "tracestate": ""}
-			if tc.name == "valid" {
-				wantHeaders = map[string]string{"traceparent": validParent, "tracestate": "vendor=value"}
-			}
 			for _, door := range []string{"/activity", "/lock-refresh", "/step-heartbeat", "/progress", "/traces"} {
-				requireDispatchHeaders(t, rec, door, wantHeaders)
+				requireDispatchHeaders(t, rec, door, tc.wantHeaders)
 			}
 
 			batches := rec.spanBatches()
@@ -283,7 +305,7 @@ func TestRunDispatchTraceEndToEnd(t *testing.T) {
 			if root == nil {
 				t.Fatal("no session root span in ingest batches")
 			}
-			if tc.name == "valid" {
+			if tc.wantTrace != "" {
 				if root["traceId"] != traceID {
 					t.Errorf("root traceId = %v; want %s (dispatch trace not adopted)", root["traceId"], traceID)
 				}
@@ -291,9 +313,23 @@ func TestRunDispatchTraceEndToEnd(t *testing.T) {
 					t.Errorf("root parentSpanId = %v; want %s (dispatch parent not adopted)", root["parentSpanId"], parentID)
 				}
 				donmai, _ := root["donmai"].(map[string]any)
-				for k, want := range map[string]string{"sessionStorageId": "sto-e2e", "sessionPublicId": "pub-e2e", "trackerSessionId": "trk-e2e"} {
-					if donmai[k] != want {
-						t.Errorf("donmai.%s = %v; want %q (join identity not preserved)", k, donmai[k], want)
+				if tc.trace["sessionStorageId"] != "" {
+					for k, want := range map[string]string{"sessionStorageId": "sto-e2e", "sessionPublicId": "pub-e2e", "trackerSessionId": "trk-e2e"} {
+						if tc.trace[k] == "" {
+							continue
+						}
+						if donmai[k] != want {
+							t.Errorf("donmai.%s = %v; want %q (join identity not preserved)", k, donmai[k], want)
+						}
+					}
+				} else {
+					if donmai["sessionStorageId"] != qw.SessionID {
+						t.Errorf("donmai.sessionStorageId = %v; want %s (absent storage falls back to the session id)", donmai["sessionStorageId"], qw.SessionID)
+					}
+					for _, k := range []string{"sessionPublicId", "trackerSessionId"} {
+						if v, present := donmai[k]; present && v != "" {
+							t.Errorf("donmai.%s = %v; want omitted when absent", k, v)
+						}
 					}
 				}
 			} else {
@@ -302,6 +338,15 @@ func TestRunDispatchTraceEndToEnd(t *testing.T) {
 				}
 				if trace, _ := root["traceId"].(string); len(trace) != 32 {
 					t.Errorf("root traceId = %q; want fresh 32-hex local root", trace)
+				}
+				donmai, _ := root["donmai"].(map[string]any)
+				if donmai["sessionStorageId"] != qw.SessionID {
+					t.Errorf("donmai.sessionStorageId = %v; want %s (absent storage falls back to the session id)", donmai["sessionStorageId"], qw.SessionID)
+				}
+				for _, k := range []string{"sessionPublicId", "trackerSessionId"} {
+					if v, present := donmai[k]; present && v != "" {
+						t.Errorf("donmai.%s = %v; want omitted when absent", k, v)
+					}
 				}
 			}
 			// The trace context is correlation-only: authoritative org and

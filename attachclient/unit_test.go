@@ -300,6 +300,45 @@ func TestPostHostBatchNetworkErrorFatal(t *testing.T) {
 	}
 }
 
+// TestHostConfigTraceHeaders pins the attach handshake omission rule:
+// each configured context value rides its own header, an unset value
+// stays absent (never an empty placeholder), and an empty config merges
+// nothing. Deleting either per-field guard (always emitting that header)
+// turns this test red.
+func TestHostConfigTraceHeaders(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name, parent, state string
+		wantNil             bool
+	}{
+		{name: "both", parent: "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01", state: "vendor=value"},
+		{name: "parent only", parent: "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01"},
+		{name: "state only", state: "vendor=value"},
+		{name: "absent", wantNil: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			hdr := HostConfig{Traceparent: tc.parent, Tracestate: tc.state}.traceHeaders()
+			if tc.wantNil {
+				if hdr != nil {
+					t.Fatalf("traceHeaders() = %v, want nil", hdr)
+				}
+				return
+			}
+			for name, want := range map[string]string{"traceparent": tc.parent, "tracestate": tc.state} {
+				got := hdr.Values(name)
+				if want == "" {
+					if len(got) != 0 {
+						t.Errorf("%s = %q, want absent", name, got)
+					}
+				} else if len(got) != 1 || got[0] != want {
+					t.Errorf("%s = %q, want [%q]", name, got, want)
+				}
+			}
+		})
+	}
+}
+
 func writeAccepted(w http.ResponseWriter) {
 	writeJSONStatus(w, http.StatusOK, attachwire.HostBatchAccepted{BatchID: "b1", AckSeq: 3})
 }

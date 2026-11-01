@@ -724,10 +724,10 @@ func validHexID(id string, byteLen int) bool {
 const maxTracestateBytes = 512
 
 // ValidTraceparent reports whether tp is a well-formed W3C traceparent
-// (version 00, 16-byte trace id, 8-byte parent id, valid flags, lowercase
-// non-zero ids). The runner sanitizes dispatch context at the consumer
-// boundary with this check; the processor reuses the same parse when
-// adopting the dispatch trace id, so the two agree by construction.
+// (version 00, 16-byte trace id, 8-byte parent id, any 1-byte flags,
+// lowercase non-zero ids). The runner sanitizes dispatch context at the
+// consumer boundary with this check; the processor reuses the same parse
+// when adopting the dispatch trace id, so the two agree by construction.
 func ValidTraceparent(tp string) bool {
 	_, _, ok := parseTraceparent(tp)
 	return ok
@@ -763,7 +763,14 @@ func parseTraceparent(tp string) (traceID, parentID string, ok bool) {
 	if parts[1] == strings.Repeat("0", 32) || parts[2] == strings.Repeat("0", 16) {
 		return "", "", false
 	}
-	if parts[3] != "01" && parts[3] != "00" {
+	// Flags are an opaque 1-byte field: any two hex digits carry
+	// correlation (00 unsampled, 01 sampled, 03 sampled with a random
+	// trace id, and future flag assignments). Reject only malformed
+	// values so a valid sampled context is never dropped.
+	if len(parts[3]) != 2 {
+		return "", "", false
+	}
+	if _, err := hex.DecodeString(parts[3]); err != nil {
 		return "", "", false
 	}
 	// Lowercase canonical.
