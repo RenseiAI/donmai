@@ -675,6 +675,7 @@ func (s *interactiveTraceSession) Resize(_, _, _, _ uint32) error   { return nil
 func (s *interactiveTraceSession) Snapshot() (attachwire.Screen, attachwire.HostSeq, error) {
 	return attachwire.Screen{Epoch: 1}, 0, nil
 }
+
 func (s *interactiveTraceSession) EmitSnapshot() (attachwire.Frame, bool, error) {
 	return attachwire.Frame{}, false, nil
 }
