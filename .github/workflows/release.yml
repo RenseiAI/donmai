@@ -384,14 +384,20 @@ jobs:
       - name: Install cosign
         uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
 
-      # Build without publishing so binary inspection gates the upload.
-      # The following publish step runs only after verification succeeds.
+      # Build into a non-public draft so binary inspection gates publicity.
+      # The draft holds the exact bytes inspection approves: the publish step
+      # below only flips the draft flag and never rebuilds, so the recorded
+      # digests attest to the public artifacts. A second `release --clean`
+      # would wipe dist and recompile (pinned v2.17.1 has no publish-only
+      # command: its dist pipe fails on a non-empty dist without --clean,
+      # and CleanPipe removes dist), discarding the inspected bytes — Apple
+      # signing alone can change bytes between runs — so it must never come back.
       - uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7
         with:
           # Keep the verified pipeline order fixed: binary_signs -> archives ->
           # checksums -> signs. Upgrade only with a source/docs re-verification.
           version: "v2.17.1"
-          args: release --clean --skip=publish --config ${{ runner.temp }}/goreleaser.yaml
+          args: release --clean --draft --config ${{ runner.temp }}/goreleaser.yaml
 
       - name: Verify release binaries
         env:
@@ -415,11 +421,19 @@ jobs:
           } >> "${GITHUB_STEP_SUMMARY}"
 
       # Publish only after verification. A failed inspection stops the job
-      # here, so a bad compiler artifact can never upload or update the cask.
+      # here, so a bad compiler artifact can never leave the draft: the
+      # draft is visible to collaborators only, and undrafting flips a flag
+      # on the already-uploaded assets without touching dist or recompiling.
       - name: Publish release
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
-          goreleaser release --clean --config "${RUNNER_TEMP}/goreleaser.yaml"
+          gh release edit "${RELEASE_TAG}" --draft=false
+          if [[ "$(gh release view "${RELEASE_TAG}" --json isDraft --jq .isDraft)" != "false" ]]; then
+            echo "::error::release ${RELEASE_TAG} is still a draft after publish"
+            exit 1
+          fi
 
       # Build provenance for every published archive. This is a different claim
       # from the cosign signature: the signature says "this workflow signed this
@@ -430,3 +444,21 @@ jobs:
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: dist/*.tar.gz
+
+      # A failed run must not leave an unverified draft behind: the next
+      # manual retry of the same tag would collide with it at release
+      # creation. Delete the draft only — never the signed tag (no
+      # --cleanup-tag), which the retry still needs. Runs only when the
+      # release is still a draft, so a failure after a successful publish
+      # can never delete the public release.
+      - name: Remove unverified draft
+        if: failure()
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ "$(gh release view "${RELEASE_TAG}" --json isDraft --jq .isDraft 2>/dev/null)" == "true" ]]; then
+            gh release delete "${RELEASE_TAG}" --yes
+          else
+            echo "no unverified draft for ${RELEASE_TAG}; nothing to clean"
+          fi

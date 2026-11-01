@@ -599,23 +599,41 @@ goreleaser_index = release_steps.index { |step| step['uses'].to_s.start_with?('g
 abort 'FAIL: release job lost its compiler guard' unless guard_index
 abort 'FAIL: release compiler guard must run before the build' unless guard_index < goreleaser_index
 abort 'FAIL: release compiler guard must use the staged script (manual retries)' unless release_steps[guard_index]['run'].to_s.include?('RUNNER_TEMP')
-# The build must not publish: inspection gates the upload.
+# The build must upload to a non-public draft only: inspection gates
+# publicity. Pinned v2.17.1 has no publish-only command (no `continue`, no
+# build skip: its dist pipe fails on a non-empty dist without --clean, and
+# CleanPipe removes dist), so a second `release --clean` would rebuild and
+# discard the inspected bytes. The gated undraft below flips a flag on the
+# already-uploaded assets and never touches dist.
 build_args = release_steps[goreleaser_index].dig('with', 'args').to_s
-abort 'FAIL: release build must skip publish so inspection gates upload' unless build_args.include?('--skip=publish')
+abort 'FAIL: release build must create a draft so nothing is public before inspection' unless build_args.include?('--draft')
+abort 'FAIL: release build must not skip publish (the draft must carry the inspected assets)' if build_args.include?('--skip=publish')
+release_runs = release_steps.select { |step| step.to_s.include?('release --clean') }
+abort 'FAIL: release must build exactly once (a second release rebuilds and discards inspection)' unless release_runs == [release_steps[goreleaser_index]]
 integration = YAML.safe_load(File.read(File.join(root_dir, '.github/workflows/release-signing-integration.yml')), permitted_classes: [], permitted_symbols: [], aliases: false)
 integration_steps = integration.fetch('jobs').fetch('signing-integration').fetch('steps')
 abort 'FAIL: signing integration lost its compiler guard' unless integration_steps.any? { |step| step['run'].to_s.include?('verify-go-compiler.sh') }
 # AC-3: every binary is inspected with go version -m before upload.
 verify_index = release_steps.index { |step| step['name'] == 'Verify release binaries' }
 attest_index = release_steps.index { |step| step['name'] == 'Attest build provenance' }
-publish_index = release_steps.index { |step| (step['run'].to_s.include?('goreleaser release') && !step['run'].to_s.include?('--skip=publish')) }
+publish_index = release_steps.index { |step| step['name'] == 'Publish release' }
+publish_run = release_steps.fetch(publish_index, {})['run'].to_s
+abort 'FAIL: publish must not rerun GoReleaser (it rebuilds and discards the inspected dist)' if publish_run.include?('goreleaser')
+abort 'FAIL: publish must not clean (it would discard the inspected dist)' if publish_run.include?('--clean')
+abort 'FAIL: publish must release the gated draft without rebuilding' unless publish_run.include?('gh release edit') && publish_run.include?('--draft=false')
+abort 'FAIL: publish must target the release tag on every path' unless publish_run.include?('RELEASE_TAG')
+abort 'FAIL: publish must confirm the release left draft status' unless publish_run.include?('isDraft')
+cleanup = release_steps.find { |step| step['name'].to_s.match?(/unverified draft/i) }
+abort 'FAIL: release job lost its unverified-draft cleanup' unless cleanup
+abort 'FAIL: draft cleanup must run on failure only' unless cleanup['if'].to_s.include?('failure()')
+abort 'FAIL: draft cleanup must never delete the signed tag' if cleanup['run'].to_s.include?('--cleanup-tag')
+abort 'FAIL: draft cleanup must only delete drafts' unless cleanup['run'].to_s.include?('isDraft')
 abort 'FAIL: release job lost its binary inspection' unless verify_index
 abort 'FAIL: release job lost its publish step' unless publish_index
 abort 'FAIL: binary inspection must run before provenance upload' unless verify_index < attest_index
 abort 'FAIL: binary inspection must run after the build' unless goreleaser_index < verify_index
 abort 'FAIL: binary inspection must gate publication' unless verify_index < publish_index
 abort 'FAIL: publication must run before provenance upload' unless publish_index < attest_index
-abort 'FAIL: publish must use the staged config (manual retries)' unless release_steps[publish_index]['run'].to_s.include?('RUNNER_TEMP') && release_steps[publish_index]['run'].to_s.include?('goreleaser.yaml')
 verify_run = release_steps[verify_index]['run'].to_s
 abort 'FAIL: binary inspection must use the staged config' unless verify_run.include?('RUNNER_TEMP') && verify_run.include?('goreleaser.yaml')
 abort 'FAIL: binary inspection must target the release tag on every path' unless verify_run.include?('RELEASE_TAG')
@@ -669,6 +687,34 @@ fi
 binaries_script="${root_dir}/scripts/verify-release-binaries.sh"
 [[ -x "${binaries_script}" ]] || fail 'release binary inspector is missing or not executable'
 "${binaries_script}" --self-test
+
+# A dist of good binaries with no archives is not shippable. Probe the
+# empty-archive refusal directly so deleting the guard fails this contract
+# even if the self-test above is ever trimmed.
+no_archives_dir="${temp_dir}/no-archives"
+mkdir -p "${no_archives_dir}/dist/onlybin_linux_amd64_v1" "${no_archives_dir}/src"
+cat >"${no_archives_dir}/src/main.go" <<'GO'
+package main
+func main() {}
+GO
+cat >"${no_archives_dir}/src/go.mod" <<'GO'
+module example.com/noarchives
+
+go 1.26.10
+GO
+(cd "${no_archives_dir}/src" && GOWORK=off GOTOOLCHAIN=local go build -ldflags="-X main.version=1.2.3" -o "${no_archives_dir}/dist/onlybin_linux_amd64_v1/donmai" .)
+cat >"${no_archives_dir}/goreleaser.yaml" <<'YAML'
+version: 2
+builds:
+  - id: onlybin
+    main: ./src
+    binary: donmai
+    goos: [linux]
+    goarch: [amd64]
+YAML
+if (cd "${no_archives_dir}" && bash "${binaries_script}" --config goreleaser.yaml --dist dist --tag v1.2.3 --floor "${floor}" >/dev/null 2>&1); then
+  fail 'binary inspector accepted a dist with no archives'
+fi
 
 # The E2B build wrapper must pass the versioned target on every build and add
 # the rolling default only when requested by an automatic tag push.

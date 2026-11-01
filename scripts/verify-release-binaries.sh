@@ -274,6 +274,12 @@ builds:
     goarch: [amd64]
 YAML
   if (cd "${work}" && bash "${self_path}" --config goreleaser-bad.yaml --dist dist --tag v1.2.3 --floor "${floor}" >/dev/null 2>&1); then fail 'missing binary name refuses'; else pass 'missing binary name refuses'; fi
+  # A dist of good binaries with no archives is not shippable: the
+  # empty-archive refusal must fail closed when the archives vanish.
+  mkdir -p "${work}/hidden-archives"
+  mv "${work}"/dist/*.tar.gz "${work}/hidden-archives/"
+  if (cd "${work}" && bash "${self_path}" --config goreleaser-trim.yaml --dist dist --tag v1.2.3 --floor "${floor}" >/dev/null 2>&1); then fail 'missing archives refuses'; else pass 'missing archives refuses'; fi
+  mv "${work}"/hidden-archives/*.tar.gz "${work}/dist/"
   mv "${work}/dist/selftest-linux_linux_amd64_v1/donmai" "${work}/dist/selftest-linux_linux_amd64_v1/donmai.bak"
   if (cd "${work}" && bash "${self_path}" --config goreleaser-trim.yaml --dist dist --tag v1.2.3 --floor "${floor}" >/dev/null 2>&1); then fail 'missing binary refuses'; else pass 'missing binary refuses'; fi
   mv "${work}/dist/selftest-linux_linux_amd64_v1/donmai.bak" "${work}/dist/selftest-linux_linux_amd64_v1/donmai"
