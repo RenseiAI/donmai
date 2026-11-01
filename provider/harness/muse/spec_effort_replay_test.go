@@ -11,9 +11,10 @@ import (
 
 // strictReasoningEffortVocabulary is the pinned closed vocabulary the
 // host accepts on turn/start (msp.schema.json ReasoningEffort enum).
-// The strict replay host below enforces exactly this set so a
-// serialization regression that sends an unknown variant fails at the
-// Spawn boundary with invalidParams — mirroring the live host.
+// The replay tests below assert the recorded wire params carry exactly
+// this set verbatim at the Spawn boundary — a serialization regression
+// that omits or remaps a tier fails the assertion, mirroring how the
+// live host would refuse an unknown variant.
 var strictReasoningEffortVocabulary = map[string]struct{}{
 	"none": {}, "minimal": {}, "low": {}, "medium": {},
 	"high": {}, "xhigh": {}, "max": {}, "ultra": {},
@@ -213,6 +214,73 @@ func TestSpawn_UnsupportedEffort_FailsExplicitly(t *testing.T) {
 		}
 		if !errors.Is(err, agent.ErrSpawnFailed) {
 			t.Errorf("Spawn with effort %q err=%v, want ErrSpawnFailed in the chain", effort, err)
+		}
+	}
+}
+
+// TestResume_UnsupportedEffort_FailsExplicitly pins the Resume door of
+// AC-2: an explicit but unsupported tier is refused on Resume with the
+// same typed refusal as Spawn, before any host process starts. Resume
+// shares the spawnHandle admission path; without that shared check a
+// refactor splitting Resume admission could silently re-admit bogus
+// tiers on Resume.
+//
+// RED control: drop the validateEffort call in spawnHandle and this
+// test goes RED (Resume proceeds to bring-up instead of refusing).
+func TestResume_UnsupportedEffort_FailsExplicitly(t *testing.T) {
+	p, _ := newTestProvider(t, "single-turn")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	const resumeID = "22222222-2222-7222-8222-222222222222"
+	for _, effort := range []agent.EffortLevel{"bogus", "default"} {
+		_, err := p.Resume(ctx, resumeID, agent.Spec{Prompt: "continue", Cwd: t.TempDir(), Autonomous: true, Effort: effort})
+		if err == nil {
+			t.Errorf("Resume with effort %q succeeded, want explicit refusal", effort)
+			continue
+		}
+		var specErr *SpecEffortError
+		if !errors.As(err, &specErr) {
+			t.Errorf("Resume with effort %q err=%v, want *SpecEffortError in the chain", effort, err)
+		}
+		if !errors.Is(err, agent.ErrSpawnFailed) {
+			t.Errorf("Resume with effort %q err=%v, want ErrSpawnFailed in the chain", effort, err)
+		}
+	}
+}
+
+// TestSpawn_Interactive_UnsupportedEffort_FailsExplicitly pins the
+// interactive spawn door's admission guard: an explicit but unsupported
+// tier is refused by the production Spawn entry point with an
+// interactive spec, before the login check and before any PTY child
+// starts — with the typed refusal, never a silent run at the host
+// default.
+//
+// RED control: drop the validateEffort call in spawnInteractive and
+// this test goes RED (the spawn proceeds past admission into login /
+// PTY bring-up instead of refusing with *SpecEffortError).
+func TestSpawn_Interactive_UnsupportedEffort_FailsExplicitly(t *testing.T) {
+	p := newFakeInteractiveProvider(t, `echo "tui up"`)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	for _, effort := range []agent.EffortLevel{"bogus", "default"} {
+		_, err := p.Spawn(ctx, agent.Spec{
+			Prompt:      "hello",
+			Cwd:         t.TempDir(),
+			Interactive: &agent.InteractiveSpec{Cols: 80, Rows: 24},
+			Effort:      effort,
+		})
+		if err == nil {
+			t.Errorf("interactive Spawn with effort %q succeeded, want explicit refusal", effort)
+			continue
+		}
+		var specErr *SpecEffortError
+		if !errors.As(err, &specErr) {
+			t.Errorf("interactive Spawn with effort %q err=%v, want *SpecEffortError in the chain", effort, err)
+		}
+		if !errors.Is(err, agent.ErrSpawnFailed) {
+			t.Errorf("interactive Spawn with effort %q err=%v, want ErrSpawnFailed in the chain", effort, err)
 		}
 	}
 }

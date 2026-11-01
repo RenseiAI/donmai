@@ -92,19 +92,19 @@ func resolveEffort(spec agent.Spec) *ReasoningEffort {
 }
 
 // validEffortTiers is the closed reasoning-tier vocabulary the host
-// accepts on turn/start (and turn/steer): the pinned schema's
-// ReasoningEffort enum. Empty means unset (omit the member so the host
-// default applies) and is the only non-explicit value.
+// accepts on turn/start: the pinned schema's ReasoningEffort enum.
+// Empty means unset (omit the member so the host default applies) and
+// is the only non-explicit value.
 var validEffortTiers = map[agent.EffortLevel]struct{}{
-	"":                            {},
+	"":                           {},
 	agent.EffortLevel("minimal"): {},
-	agent.EffortLow:                {},
-	agent.EffortMedium:             {},
-	agent.EffortHigh:               {},
-	agent.EffortXHigh:              {},
-	agent.EffortMax:                {},
-	agent.EffortLevel("none"):     {},
-	agent.EffortLevel("ultra"):    {},
+	agent.EffortLow:              {},
+	agent.EffortMedium:           {},
+	agent.EffortHigh:             {},
+	agent.EffortXHigh:            {},
+	agent.EffortMax:              {},
+	agent.EffortLevel("none"):    {},
+	agent.EffortLevel("ultra"):   {},
 }
 
 // validateEffort refuses an explicit but unsupported reasoning tier
