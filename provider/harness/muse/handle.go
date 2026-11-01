@@ -98,6 +98,11 @@ type Handle struct {
 	confinementOnce sync.Once
 
 	state *mapperState
+
+	// firstTurn carries the bounded safe summary of the actual
+	// outgoing session/first-turn shape plus the once-only emission
+	// flag. Spawn and Resume share one summary per handle.
+	firstTurn firstTurnShapeState
 }
 
 // HandleOptions tweaks handle behavior. Used by tests; production code
@@ -395,6 +400,7 @@ func (h *Handle) startSession(ctx context.Context) error {
 	commandID := newUUIDv7()
 	mcpServers := h.plan.MCPServers
 	params := sessionStartParams(h.spec, sessionID, commandID, h.plan.WorkspaceRoot, mcpServers)
+	h.recordSessionShape("session/start", params)
 	raw, err := h.client.Request(ctx, "session/start", params, h.rpcTimeout)
 	if err != nil {
 		return fmt.Errorf("session/start: %w", err)
@@ -424,6 +430,7 @@ func (h *Handle) resumeSession(ctx context.Context, sessionID string) error {
 	h.setSessionID(sessionID)
 	h.client.Subscribe(sessionID, func(n notification) { h.deliver(n) })
 	params := sessionResumeParams(sessionID, newUUIDv7(), h.plan.MCPServers)
+	h.recordSessionShape("session/resume", params)
 	raw, err := h.client.Request(ctx, "session/resume", params, h.rpcTimeout)
 	if err != nil {
 		h.client.Unsubscribe(sessionID)
@@ -451,6 +458,7 @@ func (h *Handle) startTurn(ctx context.Context, input []TurnInputPart) error {
 		roots = []string{h.plan.WorkspaceRoot}
 	}
 	params := turnStartParams(sessionID, commandID, h.spec, input, roots)
+	h.recordTurnShape(params, "")
 	raw, err := h.client.Request(ctx, "turn/start", params, h.rpcTimeout)
 	if err != nil {
 		return fmt.Errorf("turn/start: %w", err)
@@ -463,6 +471,7 @@ func (h *Handle) startTurn(ctx context.Context, input []TurnInputPart) error {
 		return errors.New("turn/start: empty turn id in response")
 	}
 	h.setCurrentTurnID(res.TurnID)
+	h.recordTurnShape(params, res.TurnID)
 	return nil
 }
 
@@ -543,6 +552,11 @@ func (h *Handle) handleNotification(ctx context.Context, n notification) bool {
 	for _, ev := range events {
 		switch e := ev.(type) {
 		case agent.ResultEvent:
+			if n.Method == "turn/completed" {
+				var completed TurnCompletedParams
+				_ = json.Unmarshal(n.Params, &completed)
+				h.emitFirstTurnAsyncCompletion(completed.Terminal, completed.Error, completed.Reason)
+			}
 			h.clearCurrentTurnID()
 			h.emit(e)
 			return true

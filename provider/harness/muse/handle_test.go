@@ -1,7 +1,11 @@
 package muse
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -569,4 +573,290 @@ func TestHandle_StepUsage(t *testing.T) {
 	if total != *res.Cost || total.TotalCostUsd != 0.75 {
 		t.Fatalf("step sum=%+v terminal=%+v", total, res.Cost)
 	}
+}
+
+// TestHandle_FirstTurnFailureEmitsShapeAndSuccessControlEmitsDebug pins
+// AC-1: a failed first turn through the production Spawn entry point
+// emits a correlated shape summary, and a successful control emits a
+// comparable debug summary. Removing the production emission makes the
+// capture assertions fail.
+func TestHandle_FirstTurnFailureEmitsShapeAndSuccessControlEmitsDebug(t *testing.T) {
+	captureAtDebug := func(t *testing.T) (*bytes.Buffer, func()) {
+		t.Helper()
+		var logs bytes.Buffer
+		prev := slog.Default()
+		handler := slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})
+		slog.SetDefault(slog.New(handler))
+		return &logs, func() { slog.SetDefault(prev) }
+	}
+
+	t.Run("failed", func(t *testing.T) {
+		logs, restore := captureAtDebug(t)
+		defer restore()
+		p, _ := newTestProvider(t, "failed")
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		h, err := p.Spawn(ctx, agent.Spec{Prompt: "work", Cwd: t.TempDir(), Autonomous: true})
+		if err != nil {
+			t.Fatalf("Spawn: %v", err)
+		}
+		events := drainEvents(t, h.Events(), 10*time.Second)
+		res, ok := terminalResult(events)
+		if !ok || res.Success {
+			t.Fatalf("terminal result missing or unexpectedly successful: %+v", res)
+		}
+		if res.ErrorSubtype != "overloaded" {
+			t.Errorf("ErrorSubtype=%q, want overloaded", res.ErrorSubtype)
+		}
+		out := logs.String()
+		if !strings.Contains(out, "first-turn request shape") {
+			t.Fatalf("failed first turn emitted no shape diagnostic; logs=%q", out)
+		}
+		if !strings.Contains(out, "session/start") {
+			t.Errorf("failed diagnostic has no correlated session method; logs=%q", out)
+		}
+		if !strings.Contains(out, "overloaded") {
+			t.Errorf("failed diagnostic reports no host error classification; logs=%q", out)
+		}
+		if strings.Contains(out, "host overloaded") {
+			t.Errorf("failed diagnostic copied free-form host text; logs=%q", out)
+		}
+	})
+
+	t.Run("success", func(t *testing.T) {
+		logs, restore := captureAtDebug(t)
+		defer restore()
+		p, _ := newTestProvider(t, "single-turn")
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		h, err := p.Spawn(ctx, agent.Spec{Prompt: "work", Cwd: t.TempDir(), Autonomous: true})
+		if err != nil {
+			t.Fatalf("Spawn: %v", err)
+		}
+		events := drainEvents(t, h.Events(), 10*time.Second)
+		res, ok := terminalResult(events)
+		if !ok || !res.Success {
+			t.Fatalf("terminal result missing or failed: %+v", res)
+		}
+		out := logs.String()
+		if !strings.Contains(out, "first-turn request shape") {
+			t.Fatalf("successful first turn emitted no debug shape; logs=%q", out)
+		}
+		if !strings.Contains(out, "session/start") {
+			t.Errorf("success diagnostic has no comparable session method; logs=%q", out)
+		}
+	})
+}
+
+// TestHandle_FirstTurnDiagnosticExcludesSecretsAndStaysBounded pins AC-2:
+// distinct sentinels in every excluded surface never reach the log, and
+// oversize plus duplicate deliveries stay bounded. Including one raw
+// value or removing the emission cap makes these assertions fail.
+func TestHandle_FirstTurnDiagnosticExcludesSecretsAndStaysBounded(t *testing.T) {
+	const (
+		promptSentinel  = "PROMPT-SENTINEL-9f8a7b6c5d4eaa01"
+		baseSentinel    = "BASE-SENTINEL-9f8a7b6c5d4eaa02"
+		appendSentinel  = "APPEND-SENTINEL-9f8a7b6c5d4eaa03"
+		ctxSentinel     = "CTX-SENTINEL-9f8a7b6c5d4eaa04"
+		envSentinel     = "ENV-SENTINEL-9f8a7b6c5d4eaa05"
+		urlSentinel     = "https://sentinel-9f8a7b6c5d4eaa06.invalid/mcp"
+		headerSentinel  = "HEADER-SENTINEL-9f8a7b6c5d4eaa07"
+		cmdSentinel     = "sentinel-cmd-9f8a7b6c5d4eaa08"
+		nameSentinel    = "SESSION-NAME-SENTINEL-9f8a7b6c5d4eaa09"
+		hostErrSentinel = "HOST-ERROR-SENTINEL-9f8a7b6c5d4eaa10"
+	)
+	sentinels := []string{promptSentinel, baseSentinel, appendSentinel, ctxSentinel, envSentinel, urlSentinel, headerSentinel, cmdSentinel, nameSentinel, hostErrSentinel}
+
+	specWithSecrets := func(prompt string) agent.Spec {
+		return agent.Spec{
+			Prompt:             prompt,
+			BaseInstructions:   baseSentinel,
+			SystemPromptAppend: appendSentinel,
+			InitialContext:     ctxSentinel,
+			SessionName:        nameSentinel,
+			Cwd:                t.TempDir(),
+			Autonomous:         true,
+			Env:                map[string]string{"SENTINEL_ENV": envSentinel},
+			MCPServers: []agent.MCPServerConfig{
+				{Name: "http-srv", Type: "http", URL: urlSentinel, Headers: map[string]string{"Authorization": headerSentinel}},
+				{Name: "stdio-srv", Type: "stdio", Command: cmdSentinel, Args: []string{"--sentinel"}, Env: map[string]string{"K": envSentinel}},
+			},
+		}
+	}
+
+	captureAtDebug := func(t *testing.T) (*bytes.Buffer, func()) {
+		t.Helper()
+		var logs bytes.Buffer
+		prev := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+		return &logs, func() { slog.SetDefault(prev) }
+	}
+
+	t.Run("failed omits every excluded surface", func(t *testing.T) {
+		logs, restore := captureAtDebug(t)
+		defer restore()
+		p, fh := newTestProvider(t, "failed")
+		fh.mu.Lock()
+		fh.failedMessage = hostErrSentinel
+		fh.mu.Unlock()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		h, err := p.Spawn(ctx, specWithSecrets(promptSentinel))
+		if err != nil {
+			t.Fatalf("Spawn: %v", err)
+		}
+		events := drainEvents(t, h.Events(), 10*time.Second)
+		if res, ok := terminalResult(events); !ok || res.Success {
+			t.Fatalf("terminal result missing or successful: %+v", res)
+		}
+		out := logs.String()
+		if !strings.Contains(out, "first-turn request shape") {
+			t.Fatalf("no diagnostic emitted; logs=%q", out)
+		}
+		for _, s := range sentinels {
+			if strings.Contains(out, s) {
+				t.Errorf("diagnostic leaked excluded sentinel %q; logs=%q", s, out)
+			}
+		}
+		if len(out) > 8192 {
+			t.Errorf("diagnostic log length=%d, want bounded (<8KiB)", len(out))
+		}
+	})
+
+	t.Run("oversize prompt stays bounded", func(t *testing.T) {
+		logs, restore := captureAtDebug(t)
+		defer restore()
+		p, _ := newTestProvider(t, "single-turn")
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		huge := strings.Repeat("x", 20000)
+		h, err := p.Spawn(ctx, agent.Spec{Prompt: huge, Cwd: t.TempDir(), Autonomous: true})
+		if err != nil {
+			t.Fatalf("Spawn: %v", err)
+		}
+		events := drainEvents(t, h.Events(), 10*time.Second)
+		if res, ok := terminalResult(events); !ok || !res.Success {
+			t.Fatalf("terminal result missing or failed: %+v", res)
+		}
+		out := logs.String()
+		if !strings.Contains(out, "first-turn request shape") {
+			t.Fatalf("no diagnostic emitted; logs=%q", out)
+		}
+		if strings.Contains(out, huge[:100]) {
+			t.Error("diagnostic copied oversize prompt text")
+		}
+		if len(out) > 8192 {
+			t.Errorf("oversize diagnostic log length=%d, want bounded", len(out))
+		}
+	})
+
+	t.Run("duplicate completion emits once", func(t *testing.T) {
+		var logs bytes.Buffer
+		prev := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+		defer slog.SetDefault(prev)
+		h := newHandle(nil, agent.Spec{Prompt: "x"}, NewSpawnPlan(agent.Spec{Prompt: "x"}, t.TempDir()), HandleOptions{})
+		sid := "33333333-3333-7333-8333-333333333333"
+		h.setSessionID(sid)
+		h.recordSessionShape("session/start", sessionStartParams(agent.Spec{Prompt: "x"}, "s", "c", t.TempDir(), nil))
+		h.recordTurnShape(turnStartParams("s", "c", agent.Spec{Prompt: "x"}, []TurnInputPart{{Type: "text"}}, []string{t.TempDir()}), "turn-1")
+		params, _ := json.Marshal(map[string]any{"sessionId": sid, "turnId": "turn-1", "terminal": "completed", "viewCursor": "c"})
+		h.handleNotification(context.Background(), notification{Method: "turn/completed", Params: params})
+		h.handleNotification(context.Background(), notification{Method: "turn/completed", Params: params})
+		h.closeEvents()
+		if got := strings.Count(logs.String(), "first-turn request shape"); got != 1 {
+			t.Errorf("diagnostic emissions=%d, want exactly 1 (duplicates stay bounded); logs=%q", got, logs.String())
+		}
+	})
+}
+
+// TestHandle_ResumeFirstTurnDiagnostic pins AC-3: Resume receives the
+// same protection, terminal failure stays failure with existing event
+// ordering. Bypassing the resume diagnostic hook makes the capture
+// assertions fail.
+func TestHandle_ResumeFirstTurnDiagnostic(t *testing.T) {
+	var logs bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	defer slog.SetDefault(prev)
+
+	p, fh := newTestProvider(t, "failed")
+	fh.sessionID = "22222222-2222-7222-8222-222222222222"
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	h, err := p.Resume(ctx, "22222222-2222-7222-8222-222222222222", agent.Spec{Prompt: "continue", Cwd: t.TempDir(), Autonomous: true})
+	if err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	events := drainEvents(t, h.Events(), 10*time.Second)
+	res, ok := terminalResult(events)
+	if !ok || res.Success {
+		t.Fatalf("resume terminal result missing or successful: %+v", res)
+	}
+	if res.ErrorSubtype != "overloaded" {
+		t.Errorf("ErrorSubtype=%q, want overloaded", res.ErrorSubtype)
+	}
+	if _, ok := events[len(events)-1].(agent.ResultEvent); !ok {
+		t.Errorf("last event is %T, want ResultEvent (existing ordering preserved)", events[len(events)-1])
+	}
+	out := logs.String()
+	if !strings.Contains(out, "first-turn request shape") {
+		t.Fatalf("resume failed turn emitted no diagnostic; logs=%q", out)
+	}
+	if !strings.Contains(out, "session/resume") {
+		t.Errorf("resume diagnostic has no resume method; logs=%q", out)
+	}
+}
+
+// TestHandle_FirstTurnSyncFailuresEmitDiagnostic pins the synchronous
+// doors: session/start and turn/start RPC failures emit one bounded
+// diagnostic without changing the Spawn error contract.
+func TestHandle_FirstTurnSyncFailuresEmitDiagnostic(t *testing.T) {
+	captureAtDebug := func(t *testing.T) (*bytes.Buffer, func()) {
+		t.Helper()
+		var logs bytes.Buffer
+		prev := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+		return &logs, func() { slog.SetDefault(prev) }
+	}
+
+	t.Run("session start", func(t *testing.T) {
+		logs, restore := captureAtDebug(t)
+		defer restore()
+		p, fh := newTestProvider(t, "single-turn")
+		fh.mu.Lock()
+		fh.sessionStartErr = &rpcError{Code: -32000, Message: "SENTINEL-SYNC-SESSION-9f8a7b6c5d4e"}
+		fh.mu.Unlock()
+		_, err := p.Spawn(context.Background(), agent.Spec{Prompt: "work", Cwd: t.TempDir(), Autonomous: true})
+		if err == nil {
+			t.Fatal("expected session/start failure, got nil")
+		}
+		out := logs.String()
+		if !strings.Contains(out, "first-turn request shape") {
+			t.Fatalf("sync session failure emitted no diagnostic; logs=%q", out)
+		}
+		if strings.Contains(out, "SENTINEL-SYNC-SESSION-9f8a7b6c5d4e") {
+			t.Errorf("diagnostic copied sync error text; logs=%q", out)
+		}
+	})
+
+	t.Run("turn start", func(t *testing.T) {
+		logs, restore := captureAtDebug(t)
+		defer restore()
+		p, fh := newTestProvider(t, "single-turn")
+		fh.mu.Lock()
+		fh.turnStartErr = &rpcError{Code: -32000, Message: "SENTINEL-SYNC-TURN-9f8a7b6c5d4e"}
+		fh.mu.Unlock()
+		_, err := p.Spawn(context.Background(), agent.Spec{Prompt: "work", Cwd: t.TempDir(), Autonomous: true})
+		if err == nil {
+			t.Fatal("expected turn/start failure, got nil")
+		}
+		out := logs.String()
+		if !strings.Contains(out, "first-turn request shape") {
+			t.Fatalf("sync turn failure emitted no diagnostic; logs=%q", out)
+		}
+		if strings.Contains(out, "SENTINEL-SYNC-TURN-9f8a7b6c5d4e") {
+			t.Errorf("diagnostic copied sync error text; logs=%q", out)
+		}
+	})
 }

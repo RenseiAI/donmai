@@ -2,6 +2,7 @@ package muse
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/RenseiAI/donmai/agent"
@@ -375,5 +376,135 @@ func TestMapTokenUsage_CumulativeFallback(t *testing.T) {
 	}
 	if events := mapNotification("session/tokenUsage", json.RawMessage(`{`), state, nil); len(events) != 0 {
 		t.Fatalf("malformed usage=%v", events)
+	}
+}
+
+// TestFirstTurnShape_AllowlistsOnly pins the safe-shape contract: only
+// allowlisted names, validated tokens, counts and presence flags
+// survive. Raw prompt, paths, URLs, headers, environment and unknown
+// keys never enter the payload.
+func TestFirstTurnShape_AllowlistsOnly(t *testing.T) {
+	const promptSentinel = "PROMPT-SENTINEL-evt-9f8a7b6c5d4e"
+	sessionParams := map[string]any{
+		"sessionId":     "sid",
+		"commandId":     "cmd",
+		"workspaceRoot": "/sentinel/path/9f8a7b6c5d4e",
+		"modelId":       DefaultModel,
+		"providerId":    ProviderID,
+		"approvalMode":  string(ApprovalModePromptUnmatched),
+		"config": map[string]any{"mcpServers": map[string]SessionMCPServerConfig{
+			"sentinel-name": {Transport: "streamableHttp", URL: "https://sentinel.invalid/mcp", Headers: map[string]string{"Authorization": "sentinel-header"}},
+		}},
+		"unknownFutureKey": "sentinel-unknown",
+	}
+	turnParams := map[string]any{
+		"sessionId": "sid",
+		"commandId": "cmd",
+		"input": []map[string]any{
+			{"type": "text", "text": promptSentinel},
+			{"type": "image", "base64Data": "sentinel-b64"},
+			{"type": "teleport", "text": "sentinel-unknown-type"},
+		},
+		"ifBusy":          string(IfBusyQueue),
+		"displayText":     promptSentinel,
+		"workspaceRoots":  []string{"/sentinel/root"},
+		"reasoningEffort": string(ReasoningEffortLow),
+		"mysteryKey":      "sentinel-mystery",
+	}
+	shape := buildFirstTurnShape("session/start", sessionParams, turnParams)
+	payload := encodeFirstTurnDiagnostic(shape, nil)
+	for _, sentinel := range []string{promptSentinel, "sentinel-path", "sentinel.invalid", "sentinel-header", "sentinel-name", "sentinel-unknown", "sentinel-mystery", "sentinel-b64", "/sentinel/root"} {
+		if strings.Contains(payload, sentinel) {
+			t.Errorf("shape payload leaked %q; payload=%q", sentinel, payload)
+		}
+	}
+	if shape.ModelID != DefaultModel {
+		t.Errorf("ModelID=%q, want validated default", shape.ModelID)
+	}
+	if shape.ApprovalMode != string(ApprovalModePromptUnmatched) {
+		t.Errorf("ApprovalMode=%q", shape.ApprovalMode)
+	}
+	if shape.ReasoningEffort != string(ReasoningEffortLow) {
+		t.Errorf("ReasoningEffort=%q", shape.ReasoningEffort)
+	}
+	if shape.InputPartCount != 3 {
+		t.Errorf("InputPartCount=%d, want 3", shape.InputPartCount)
+	}
+	wantTypes := []string{"text", "image", "unknown"}
+	if len(shape.InputPartTypes) != len(wantTypes) {
+		t.Fatalf("InputPartTypes=%v, want %v", shape.InputPartTypes, wantTypes)
+	}
+	for i, w := range wantTypes {
+		if shape.InputPartTypes[i] != w {
+			t.Errorf("InputPartTypes[%d]=%q, want %q", i, shape.InputPartTypes[i], w)
+		}
+	}
+	if shape.MCPServerCount != 1 {
+		t.Errorf("MCPServerCount=%d, want 1 (count, never names)", shape.MCPServerCount)
+	}
+	if shape.WorkspaceRootsCount != 1 {
+		t.Errorf("WorkspaceRootsCount=%d, want 1", shape.WorkspaceRootsCount)
+	}
+	if !shape.HasDisplayText || !shape.HasWorkspaceRoot || !shape.HasConfig {
+		t.Errorf("presence flags lost: %+v", shape)
+	}
+	for _, k := range shape.SessionKeys {
+		if !allowedSessionStartKeys[k] {
+			t.Errorf("session key %q not allowlisted", k)
+		}
+	}
+	for _, k := range shape.TurnKeys {
+		if !allowedTurnStartKeys[k] {
+			t.Errorf("turn key %q not allowlisted", k)
+		}
+	}
+}
+
+// TestFirstTurnAsyncError_SanitizesFreeText pins the error side: known
+// kinds travel, unknown kinds and every message/reason stay out.
+func TestFirstTurnAsyncError_SanitizesFreeText(t *testing.T) {
+	const sentinel = "HOST-SENTINEL-evt-9f8a7b6c5d4e"
+	// Known kind survives with its flags; the sentinel message does not.
+	known := &TurnError{Kind: "overloaded", Message: sentinel, Retryable: true, Quota: json.RawMessage(`{"usd":1}`)}
+	classified := firstTurnAsyncError(TurnTerminalFailed, known, nil)
+	payload := encodeFirstTurnDiagnostic(firstTurnRequestShape{SessionMethod: "session/start"}, classified)
+	if classified.ErrorKind != "overloaded" {
+		t.Errorf("ErrorKind=%q, want overloaded", classified.ErrorKind)
+	}
+	if strings.Contains(payload, sentinel) {
+		t.Errorf("diagnostic copied host message; payload=%q", payload)
+	}
+	// Unknown kind collapses to unknown; the sentinel kind does not travel.
+	unknown := &TurnError{Kind: sentinel, Message: sentinel, Retryable: false}
+	classified = firstTurnAsyncError(TurnTerminalFailed, unknown, nil)
+	payload = encodeFirstTurnDiagnostic(firstTurnRequestShape{SessionMethod: "session/start"}, classified)
+	if classified.ErrorKind != "unknown" {
+		t.Errorf("ErrorKind=%q, want unknown for unlisted kind", classified.ErrorKind)
+	}
+	if strings.Contains(payload, sentinel) {
+		t.Errorf("diagnostic copied unknown kind/message; payload=%q", payload)
+	}
+	// Reason text never travels, only its presence.
+	reason := sentinel
+	classified = firstTurnAsyncError(TurnTerminalCancelled, nil, &reason)
+	payload = encodeFirstTurnDiagnostic(firstTurnRequestShape{SessionMethod: "session/start"}, classified)
+	if !classified.ErrorHasReason {
+		t.Error("ErrorHasReason=false, want presence flag")
+	}
+	if strings.Contains(payload, sentinel) {
+		t.Errorf("diagnostic copied reason text; payload=%q", payload)
+	}
+}
+
+// TestEncodeFirstTurnDiagnostic_CapsAtTwoKiB pins the 2 KiB ceiling.
+func TestEncodeFirstTurnDiagnostic_CapsAtTwoKiB(t *testing.T) {
+	shape := firstTurnRequestShape{
+		SessionMethod: "session/start",
+		SessionKeys:   []string{"approvalMode", "commandId", "config", "modelId", "providerId", "sessionId", "workspaceRoot"},
+		TurnKeys:      []string{"commandId", "displayText", "ifBusy", "input", "sessionId", "workspaceRoots"},
+	}
+	payload := encodeFirstTurnDiagnostic(shape, &firstTurnDiagnosticData{ErrorKind: "overloaded", ErrorMethod: "turn/start"})
+	if len(payload) > firstTurnDiagnosticMaxBytes {
+		t.Errorf("payload length=%d, want <= %d", len(payload), firstTurnDiagnosticMaxBytes)
 	}
 }
