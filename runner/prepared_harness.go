@@ -286,6 +286,7 @@ func applyPreparedSourceAuthority(target, source agent.Spec, plan *agent.Prepare
 	target.ProviderConfig = source.ProviderConfig
 	target.PromptPlan = source.PromptPlan
 	target.ToolLifecyclePlan = source.ToolLifecyclePlan
+	target.CardSkills = append([]agent.CardSkill(nil), source.CardSkills...)
 	target.AdditionalExtensions = boundRuntimeExtensionDeliveries(source)
 	target.CapabilityRuntimeMaterializations = make([]agent.CapabilityRuntimeMaterializationV1, len(source.CapabilityRuntimeMaterializations))
 	for i := range source.CapabilityRuntimeMaterializations {

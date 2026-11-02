@@ -84,7 +84,7 @@ func codeIntelEnforcementNote(spec agent.Spec) *SpecFieldNote {
 // (`pi --mode json`, StructuredVia:"spawn-collect", design §7) is a deferred
 // follow-up — SupportsOneShot is advertised but the SpawnComplete projection
 // is not wired in this cut.
-func rpcArgs(layout sessionLayout, extensionPaths []string, mode launchMode, sessionID string, spec agent.Spec) []string {
+func rpcArgs(layout sessionLayout, extensionPaths []string, skillDirs []string, mode launchMode, sessionID string, spec agent.Spec) []string {
 	args := []string{"--mode", "rpc"}
 	for _, path := range extensionPaths {
 		args = append(args, "-e", path)
@@ -94,6 +94,10 @@ func rpcArgs(layout sessionLayout, extensionPaths []string, mode launchMode, ses
 		"--approve",
 		"--session-dir", layout.root,
 	)
+	// Card skills ride the native --skill surface (skills.go): --no-skills
+	// plus one --skill per materialized directory. Empty keeps skill-less
+	// spawns byte-identical.
+	args = append(args, skillArgs(skillDirs)...)
 	if spec.SessionName != "" && mode == launchPrompt {
 		args = append(args, "--name", spec.SessionName)
 	}

@@ -454,6 +454,16 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 	for i, delivery := range spec.AdditionalExtensions {
 		actualExtensions[i] = agentExtensionIdentity{id: delivery.ID, digest: delivery.Digest, path: extraExtensionPaths[i], delegationTools: append([]string(nil), delivery.DelegationTools...)}
 	}
+	// Materialize agent-card skills into the per-session skills directory
+	// (skills.go). Runs on EVERY launch — Spawn and Resume funnel through
+	// here — so a resumed session re-materializes rather than trusting state
+	// the seat could have rewritten. Any failure denies spawn closed before
+	// credentials reach the child.
+	skillDirs, err := writeCardSkills(layout, spec.CardSkills)
+	if err != nil {
+		removeCardSkillsDir(layout)
+		return nil, err
+	}
 	token := p.opts.handshakeToken
 	if token == "" {
 		token = newHandshakeToken()
@@ -473,14 +483,19 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 	childEnvParts := sessionChildEnv(spec)
 	credentialPath, err := writeSessionCredentialFile(layout, sessionCredentialEntries(spec), childEnvParts.deferred)
 	if err != nil {
+		removeCardSkillsDir(layout)
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}
 	removeCredentials := func() {
 		removeSessionCredentialFile(layout)
 		removeNativeProviderAuthFile(layout)
 	}
-	if _, err := writeNativeProviderAuthFile(layout, spec); err != nil {
+	removeSessionFiles := func() {
 		removeCredentials()
+		_ = removeCardSkillsDir(layout)
+	}
+	if _, err := writeNativeProviderAuthFile(layout, spec); err != nil {
+		removeSessionFiles()
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}
 	// Prepare the confinement plan for a session that requested it. The
@@ -493,7 +508,7 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 	if confiner != nil {
 		plan, err = p.confineSession(spec, layout, confiner)
 		if err != nil {
-			removeCredentials()
+			removeSessionFiles()
 			return nil, err
 		}
 	}
@@ -514,7 +529,7 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 		receipt, err = newReceiptAdmission(p.artifact, layout, actualExtensions, p.trustedExtensions, startup)
 		if err != nil {
 			releasePlan()
-			removeCredentials()
+			removeSessionFiles()
 			return nil, fmt.Errorf("%w: measure pi receipt extension closure: %v", agent.ErrSpawnFailed, err)
 		}
 	}
@@ -543,10 +558,10 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 		stdin = p.opts.stdinOverride
 		stdout = p.opts.stdoutOverride
 	} else {
-		c, in, out, serr := p.spawnChild(spec, layout, extensionPaths, childEnv, mode, sessionID, p.artifact, receipt, plan)
+		c, in, out, serr := p.spawnChild(spec, layout, extensionPaths, skillDirs, childEnv, mode, sessionID, p.artifact, receipt, plan)
 		if serr != nil {
 			releasePlan()
-			removeCredentials()
+			removeSessionFiles()
 			return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, serr)
 		}
 		cmd, stdin, stdout = c, in, out
@@ -557,7 +572,7 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 			if err := revalidateLaunchTrust(p.artifact, receipt, childEnv); err != nil {
 				stopStartedChild(cmd)
 				releasePlan()
-				removeCredentials()
+				removeSessionFiles()
 				return nil, fmt.Errorf("%w: pi artifact changed after spawn: %v", agent.ErrSpawnFailed, err)
 			}
 		}
@@ -574,9 +589,10 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 	h.evidenceClaim = evidenceClaim
 	// The session credential files live in the session state root. Stop
 	// removes them so a finished session leaves no secret on disk; the
-	// worktree lifecycle that removes the state root is the backstop.
+	// worktree lifecycle that removes the state root is the backstop. Card
+	// skills are removed too so a finished session leaves no skill behind.
 	h.onStop = func() {
-		removeCredentials()
+		removeSessionFiles()
 	}
 	// Set before the pump starts (the go statement orders the write before
 	// every read on the pump goroutine); dispatch emits them directly behind
@@ -768,13 +784,15 @@ func newHeadlessChildCommand(argv []string, dir string, env []string) *exec.Cmd 
 // composed env (incl. the per-session handshake token + provider-pin vars), and
 // its own process group. extensionPaths is the boundary extension followed by
 // every materialized+verified spec.AdditionalExtensions entry, in order
-// (ADR-2026-08-12 D1). A non-nil plan wraps the argv in the session's
+// (ADR-2026-08-12 D1); skillDirs are the materialized card-skill directories
+// passed with --skill (+ --no-skills so a repo skill cannot shadow them).
+// A non-nil plan wraps the argv in the session's
 // confinement; the child then inherits exactly three descriptors — the
 // stdin/stdout/stderr pipes created below — and never a descriptor open on
 // an out-of-set file (ExtraFiles is never set: newHeadlessChildCommand).
 // spawnChild never releases the plan: on any error the caller does.
-func (p *Provider) spawnChild(spec agent.Spec, layout sessionLayout, extensionPaths []string, childEnv []string, mode launchMode, sessionID string, artifact *artifactLease, receipt *receiptAdmission, plan *confinement.Plan) (*exec.Cmd, io.WriteCloser, io.ReadCloser, error) {
-	argv, err := confinePiArgv(plan, append([]string{p.binary}, rpcArgs(layout, extensionPaths, mode, sessionID, spec)...))
+func (p *Provider) spawnChild(spec agent.Spec, layout sessionLayout, extensionPaths []string, skillDirs []string, childEnv []string, mode launchMode, sessionID string, artifact *artifactLease, receipt *receiptAdmission, plan *confinement.Plan) (*exec.Cmd, io.WriteCloser, io.ReadCloser, error) {
+	argv, err := confinePiArgv(plan, append([]string{p.binary}, rpcArgs(layout, extensionPaths, skillDirs, mode, sessionID, spec)...))
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("pi confine command: %w", err)
 	}

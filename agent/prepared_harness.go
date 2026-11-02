@@ -299,6 +299,10 @@ type harnessAuthorityProjection struct {
 	PromptPlan         *PromptPlan           `json:"promptPlan"`
 	ToolLifecyclePlan  *ToolLifecyclePlan    `json:"toolLifecyclePlan"`
 	PromptMode         PromptSessionMode     `json:"promptMode"`
+	// CardSkills binds the agent card's native skills into the authority
+	// digest. omitempty keeps every plan compiled for work without card
+	// skills byte-identical to the pre-field projection.
+	CardSkills []CardSkill `json:"cardSkills,omitempty"`
 	// ExecutionSecurity binds the stamped levels into the authority digest.
 	// omitempty keeps every plan compiled for a work item without the
 	// section byte-identical to the pre-field projection.
@@ -332,6 +336,7 @@ func newHarnessAuthorityProjection(spec Spec, plan *PreparedHarness) harnessAuth
 		PromptPlan:         normalized.PromptPlan,
 		ToolLifecyclePlan:  normalized.ToolLifecyclePlan,
 		PromptMode:         normalized.PromptMode,
+		CardSkills:         normalized.CardSkills,
 		ExecutionSecurity:  normalized.ExecutionSecurity,
 	}
 }
@@ -377,6 +382,7 @@ func authorityFieldDigests(p harnessAuthorityProjection) map[string]string {
 		"promptPlan":         digestValue(p.PromptPlan),
 		"toolLifecyclePlan":  digestValue(p.ToolLifecyclePlan),
 		"promptMode":         digestValue(p.PromptMode),
+		"cardSkills":         digestValue(p.CardSkills),
 	}
 	if p.ExecutionSecurity != nil {
 		digests["executionSecurity"] = digestValue(p.ExecutionSecurity)

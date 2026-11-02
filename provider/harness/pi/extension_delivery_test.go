@@ -183,7 +183,7 @@ func TestRPCArgs_BoundaryFirstThenAdditionalExtensionsInOrder(t *testing.T) {
 	layout := sessionLayout{root: "/session", extension: "/session/policy.ts"}
 	extensionPaths := []string{layout.extension, "/session/extensions-injected/a-pack.ts", "/session/extensions-injected/b-pack.ts"}
 
-	args := rpcArgs(layout, extensionPaths, launchPrompt, "", agent.Spec{})
+	args := rpcArgs(layout, extensionPaths, nil, launchPrompt, "", agent.Spec{})
 
 	wantPrefix := []string{
 		"--mode", "rpc",
@@ -209,7 +209,7 @@ func TestInteractiveArgs_BoundaryFirstThenAdditionalExtensionsInOrder(t *testing
 	layout := sessionLayout{root: "/session", extension: "/session/policy.ts"}
 	extensionPaths := []string{layout.extension, "/session/extensions-injected/a-pack.ts"}
 
-	args := interactiveArgs(agent.Spec{}, layout, extensionPaths)
+	args := interactiveArgs(agent.Spec{}, layout, extensionPaths, nil)
 
 	wantPrefix := []string{
 		"-e", "/session/policy.ts",
@@ -230,7 +230,7 @@ func TestInteractiveArgs_BoundaryFirstThenAdditionalExtensionsInOrder(t *testing
 func TestInteractiveArgs_NoAdditionalExtensionKeepsBoundaryOnly(t *testing.T) {
 	t.Parallel()
 	layout := sessionLayout{root: "/session", extension: "/session/policy.ts"}
-	args := interactiveArgs(agent.Spec{}, layout, []string{layout.extension})
+	args := interactiveArgs(agent.Spec{}, layout, []string{layout.extension}, nil)
 
 	var extensionPaths []string
 	for i, arg := range args {

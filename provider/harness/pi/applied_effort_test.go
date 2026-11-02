@@ -532,7 +532,7 @@ func TestAppliedEffort_CancelledLaunchEmitsNothing(t *testing.T) {
 func TestAppliedEffort_CallSites(t *testing.T) {
 	t.Parallel()
 	spec := nativeHighSpec("/tmp/work")
-	headless := rpcArgs(sessionLayout{root: "/tmp/session"}, []string{"/tmp/session/policy.ts"}, launchPrompt, "", spec)
+	headless := rpcArgs(sessionLayout{root: "/tmp/session"}, []string{"/tmp/session/policy.ts"}, nil, launchPrompt, "", spec)
 	var headlessModel string
 	for i, a := range headless {
 		if a == "--model" && i+1 < len(headless) {
@@ -542,7 +542,7 @@ func TestAppliedEffort_CallSites(t *testing.T) {
 	if headlessModel != "claude-opus-4-8:high" {
 		t.Fatalf("headless rpcArgs --model = %q, want the translated pin claude-opus-4-8:high", headlessModel)
 	}
-	interactive := interactiveArgs(spec, sessionLayout{root: "/tmp/session"}, []string{"/tmp/session/policy.ts"})
+	interactive := interactiveArgs(spec, sessionLayout{root: "/tmp/session"}, []string{"/tmp/session/policy.ts"}, nil)
 	var interactiveModel string
 	for i, a := range interactive {
 		if a == "--model" && i+1 < len(interactive) {

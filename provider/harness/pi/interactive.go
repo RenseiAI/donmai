@@ -105,17 +105,33 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 	// is partitioned ONCE so the file and the exec environment are two
 	// halves of the same composition. Any write failure denies spawn closed,
 	// before the child starts; the files are removed by the PTY cleanup below.
+	// Card skills are materialized the same way the headless lane does:
+	// re-materialized on every spawn so a resumed session never trusts state
+	// the seat could have rewritten.
+	skillDirs, err := writeCardSkills(layout, spec.CardSkills)
+	if err != nil {
+		_ = removeCardSkillsDir(layout)
+		return nil, err
+	}
+	removeSkills := func() {
+		_ = removeCardSkillsDir(layout)
+	}
 	childEnvParts := interactiveChildEnvParts(spec)
 	credentialPath, err := writeSessionCredentialFile(layout, sessionCredentialEntries(spec), childEnvParts.deferred)
 	if err != nil {
+		removeSkills()
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}
 	removeCredentials := func() {
 		removeSessionCredentialFile(layout)
 		removeNativeProviderAuthFile(layout)
 	}
-	if _, err := writeNativeProviderAuthFile(layout, spec); err != nil {
+	removeSessionFiles := func() {
 		removeCredentials()
+		removeSkills()
+	}
+	if _, err := writeNativeProviderAuthFile(layout, spec); err != nil {
+		removeSessionFiles()
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}
 
@@ -145,7 +161,7 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 	if confiner != nil {
 		plan, err = p.confineSession(spec, layout, confiner)
 		if err != nil {
-			removeCredentials()
+			removeSessionFiles()
 			return nil, err
 		}
 	}
@@ -164,13 +180,13 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 		p.interactiveBeforeChildStart(layout.root)
 	}
 
-	wrapped, err := confinePiArgv(plan, append([]string{p.binary}, interactiveArgs(spec, layout, extensionPaths)...))
+	wrapped, err := confinePiArgv(plan, append([]string{p.binary}, interactiveArgs(spec, layout, extensionPaths, skillDirs)...))
 	if err != nil {
 		evidenceClaim.release()
 		if plan != nil {
 			_ = plan.Release()
 		}
-		removeCredentials()
+		removeSessionFiles()
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}
 	for _, kv := range confinePiEnv(nil, plan) {
@@ -183,7 +199,7 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 	}
 
 	handle, err := ptycli.SpawnWithOptions(ctx, wrapped[0], wrapped[1:], spec, p.Manifest(), ptycli.SpawnOptions{
-		Cleanup: releaseInteractiveSession(plan, removeCredentials),
+		Cleanup: releaseInteractiveSession(plan, removeSessionFiles),
 		// spec.Env is the child's complete environment: the PTY host must not
 		// layer it over its own parent environment, or every parent name the
 		// allowlist kept out would ride back in around it.
@@ -194,7 +210,7 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 		if plan != nil {
 			_ = plan.Release()
 		}
-		removeCredentials()
+		removeSessionFiles()
 		return nil, err
 	}
 	wrappedHandle := newInteractiveStateLossHandle(handle, layout.root, tailer)
@@ -288,7 +304,7 @@ func piSeedMessage(seed string) string {
 	}
 }
 
-func interactiveArgs(spec agent.Spec, layout sessionLayout, extensionPaths []string) []string {
+func interactiveArgs(spec agent.Spec, layout sessionLayout, extensionPaths []string, skillDirs []string) []string {
 	var args []string
 	for _, path := range extensionPaths {
 		args = append(args, "-e", path)
@@ -298,6 +314,10 @@ func interactiveArgs(spec agent.Spec, layout sessionLayout, extensionPaths []str
 		"--approve",
 		"--session-dir", layout.root,
 	)
+	// Card skills ride the same native --skill surface as the headless lane
+	// (skills.go). Empty keeps skill-less interactive spawns byte-identical.
+	// Placed before the positional prompt so the seed stays last.
+	args = append(args, skillArgs(skillDirs)...)
 	if spec.SessionName != "" {
 		args = append(args, "--name", spec.SessionName)
 	}

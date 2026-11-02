@@ -156,6 +156,7 @@ func translateSpecWithToolPolicy(qw QueuedWork, caps agent.Capabilities, in Spec
 		InitialContext:     in.InitialContext,
 		ProviderConfig:     copyProviderConfig(qw.ResolvedProfile.ProviderConfig),
 		Endpoint:           copyEndpointBinding(qw.ResolvedProfile.Endpoint),
+		CardSkills:         cardSkillsFromQueuedWork(qw),
 	}
 
 	// InitialContext is a legacy compatibility field. The typed PromptPlan
@@ -274,6 +275,24 @@ func defaultDisallowedTools() []string {
 		"AskUserQuestion",
 		"mcp__claude_ai_Linear__*",
 	}
+}
+
+// cardSkillsFromQueuedWork projects the queued work's agent-card inline skills
+// onto the harness-native skill surface. Only entries with a non-blank body
+// are carried: whitespace-only bodies contribute no SKILL.md (mirroring
+// foldInlineSkills, which injects no text for them) while their tool
+// restrictions still ride Spec.DisallowedTools via the caller's
+// additionalDisallowed channel. Nil when no skill carries a body, preserving
+// the pre-field wire shape exactly.
+func cardSkillsFromQueuedWork(qw QueuedWork) []agent.CardSkill {
+	var out []agent.CardSkill
+	for _, sk := range qw.Skills {
+		if strings.TrimSpace(sk.Body) == "" {
+			continue
+		}
+		out = append(out, agent.CardSkill{ID: sk.ID, Body: sk.Body})
+	}
+	return out
 }
 
 // copyProviderConfig returns a defensive copy of the resolved profile's

@@ -12,7 +12,7 @@ import (
 func TestRPCArgs_ProjectsSessionNameAtStartup(t *testing.T) {
 	t.Parallel()
 	layout := sessionLayout{root: "/tmp/session"}
-	got := rpcArgs(layout, nil, launchPrompt, "", agent.Spec{SessionName: "chief-of-staff"})
+	got := rpcArgs(layout, nil, nil, launchPrompt, "", agent.Spec{SessionName: "chief-of-staff"})
 	want := []string{"--mode", "rpc", "--no-extensions", "--approve", "--session-dir", "/tmp/session", "--name", "chief-of-staff"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("rpcArgs = %q; want %q", got, want)
@@ -22,7 +22,7 @@ func TestRPCArgs_ProjectsSessionNameAtStartup(t *testing.T) {
 func TestInteractiveArgs_ProjectsSessionNameAtStartup(t *testing.T) {
 	t.Parallel()
 	layout := sessionLayout{root: "/tmp/session"}
-	got := interactiveArgs(agent.Spec{SessionName: "chief-of-staff", Prompt: "coordinate"}, layout, nil)
+	got := interactiveArgs(agent.Spec{SessionName: "chief-of-staff", Prompt: "coordinate"}, layout, nil, nil)
 	want := []string{"--no-extensions", "--approve", "--session-dir", "/tmp/session", "--name", "chief-of-staff", "coordinate"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("interactiveArgs = %q; want %q", got, want)
@@ -53,7 +53,7 @@ func TestInteractiveArgs_SeedStaysAMessage(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			got := interactiveArgs(agent.Spec{Prompt: tc.seed}, layout, nil)
+			got := interactiveArgs(agent.Spec{Prompt: tc.seed}, layout, nil, nil)
 			if len(got) == 0 {
 				t.Fatalf("interactiveArgs returned an empty argv for seed %q", tc.seed)
 			}
@@ -76,7 +76,7 @@ func TestInteractiveArgs_NoSeedGainsNoTransform(t *testing.T) {
 		{},
 		{SessionName: "chief-of-staff"},
 	} {
-		got := interactiveArgs(spec, layout, nil)
+		got := interactiveArgs(spec, layout, nil, nil)
 		if slices.Contains(got, "--") {
 			t.Fatalf("seedless interactiveArgs(%+v) = %q, want no --", spec, got)
 		}

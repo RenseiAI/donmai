@@ -177,8 +177,8 @@ func TestHeadlessChildArgv_BuildersCarryNoCredentialValue(t *testing.T) {
 	layout := sessionLayout{root: "/tmp/session"}
 
 	for _, argv := range [][]string{
-		rpcArgs(layout, []string{"/tmp/session/extension.js"}, launchPrompt, "", spec),
-		interactiveArgs(spec, layout, []string{"/tmp/session/extension.js"}),
+		rpcArgs(layout, []string{"/tmp/session/extension.js"}, nil, launchPrompt, "", spec),
+		interactiveArgs(spec, layout, []string{"/tmp/session/extension.js"}, nil),
 		modelPinArgs(spec),
 	} {
 		for _, a := range argv {
