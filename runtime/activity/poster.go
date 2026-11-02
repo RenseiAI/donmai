@@ -635,6 +635,12 @@ func (p *Poster) maybePostRunning(ctx context.Context) {
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if p.cfg.Traceparent != "" {
+		req.Header.Set("traceparent", p.cfg.Traceparent)
+	}
+	if p.cfg.Tracestate != "" {
+		req.Header.Set("tracestate", p.cfg.Tracestate)
+	}
 	if creds.AuthToken != "" {
 		req.Header.Set("Authorization", "Bearer "+creds.AuthToken)
 	}

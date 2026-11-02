@@ -98,6 +98,11 @@ type Handle struct {
 	confinementOnce sync.Once
 
 	state *mapperState
+
+	// firstTurn carries the bounded safe summary of the actual
+	// outgoing session/first-turn shape plus the once-only emission
+	// flag. Spawn and Resume share one summary per handle.
+	firstTurn firstTurnShapeState
 }
 
 // HandleOptions tweaks handle behavior. Used by tests; production code
@@ -395,6 +400,7 @@ func (h *Handle) startSession(ctx context.Context) error {
 	commandID := newUUIDv7()
 	mcpServers := h.plan.MCPServers
 	params := sessionStartParams(h.spec, sessionID, commandID, h.plan.WorkspaceRoot, mcpServers)
+	h.recordSessionShape("session/start", params)
 	raw, err := h.client.Request(ctx, "session/start", params, h.rpcTimeout)
 	if err != nil {
 		return fmt.Errorf("session/start: %w", err)
@@ -424,6 +430,7 @@ func (h *Handle) resumeSession(ctx context.Context, sessionID string) error {
 	h.setSessionID(sessionID)
 	h.client.Subscribe(sessionID, func(n notification) { h.deliver(n) })
 	params := sessionResumeParams(sessionID, newUUIDv7(), h.plan.MCPServers)
+	h.recordSessionShape("session/resume", params)
 	raw, err := h.client.Request(ctx, "session/resume", params, h.rpcTimeout)
 	if err != nil {
 		h.client.Unsubscribe(sessionID)
@@ -451,6 +458,7 @@ func (h *Handle) startTurn(ctx context.Context, input []TurnInputPart) error {
 		roots = []string{h.plan.WorkspaceRoot}
 	}
 	params := turnStartParams(sessionID, commandID, h.spec, input, roots)
+	h.recordTurnShape(params, "")
 	raw, err := h.client.Request(ctx, "turn/start", params, h.rpcTimeout)
 	if err != nil {
 		return fmt.Errorf("turn/start: %w", err)
@@ -466,6 +474,7 @@ func (h *Handle) startTurn(ctx context.Context, input []TurnInputPart) error {
 		return errors.New("turn/start: empty turn id in response")
 	}
 	h.setCurrentTurnID(res.TurnID)
+	h.recordTurnShape(params, res.TurnID)
 	// Post-admission applied-effort evidence: the effort actually present
 	// in the admitted request, emitted only after the host accepts the
 	// turn. All callers (new and resumed headless turns) share this path;
@@ -549,10 +558,28 @@ func (h *Handle) handleNotification(ctx context.Context, n notification) bool {
 		h.decideFromNotification(n.Params, rawObj)
 	}
 
+	var completed TurnCompletedParams
+	isTurnCompleted := n.Method == "turn/completed"
+	if isTurnCompleted {
+		_ = json.Unmarshal(n.Params, &completed)
+	}
+
 	events := mapNotification(n.Method, n.Params, h.state, rawObj)
 	for _, ev := range events {
 		switch e := ev.(type) {
 		case agent.ResultEvent:
+			if isTurnCompleted {
+				if h.isStaleFirstTurnCompletion(completed.TurnID) {
+					// A completion for a turn other than the
+					// acknowledged first turn is not this handle's
+					// terminal: it must not emit the queued shape,
+					// consume the once flag, clear the foreground
+					// turn, or exit the forwarder. The queued
+					// first turn's own completion still reports.
+					continue
+				}
+				h.emitFirstTurnAsyncCompletion(completed.TurnID, completed.Terminal, completed.Error, completed.Reason)
+			}
 			h.clearCurrentTurnID()
 			h.emit(e)
 			return true
@@ -571,8 +598,12 @@ func (h *Handle) handleNotification(ctx context.Context, n notification) bool {
 		h.emit(ev)
 	}
 	// A turn that completed without a terminal ResultEvent (unknown
-	// terminal vocabulary) still ends foreground tracking.
-	if n.Method == "turn/completed" {
+	// terminal vocabulary) still ends foreground tracking, unless it is
+	// a stale turn other than the acknowledged first turn.
+	if isTurnCompleted {
+		if h.isStaleFirstTurnCompletion(completed.TurnID) {
+			return false
+		}
 		h.clearCurrentTurnID()
 	}
 	return false

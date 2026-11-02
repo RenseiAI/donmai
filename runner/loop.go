@@ -1474,6 +1474,8 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 			EndpointPath:       r.spanEndpointPath,
 			AuthToken:          qw.AuthToken,
 			CredentialProvider: spanCredentialProvider,
+			Traceparent:        qw.Traceparent,
+			Tracestate:         qw.Tracestate,
 			HTTPClient:         r.httpClient,
 			Logger:             r.logger,
 		})

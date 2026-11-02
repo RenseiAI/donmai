@@ -19,6 +19,7 @@ import (
 	"github.com/RenseiAI/donmai/result"
 	"github.com/RenseiAI/donmai/runtime/env"
 	"github.com/RenseiAI/donmai/runtime/mcp"
+	spanruntime "github.com/RenseiAI/donmai/runtime/span"
 	"github.com/RenseiAI/donmai/runtime/state"
 	"github.com/RenseiAI/donmai/runtime/workarea"
 	"github.com/RenseiAI/donmai/runtime/worktree"
@@ -839,6 +840,11 @@ func (r *Runner) run(ctx context.Context, qw QueuedWork, admission *HarnessAdmis
 		return nil, fmt.Errorf("runner: bind capability realization selection: %w", bindErr)
 	}
 	qw = bound
+	// Validate the dispatch trace context at the consumer boundary,
+	// before validation, posters, spans or attach wiring read it. See
+	// sanitizeDispatchTrace: malformed context is omitted telemetry,
+	// never fatal, and never authorizes a tenant/session transition.
+	qw.Traceparent, qw.Tracestate = sanitizeDispatchTrace(qw.Traceparent, qw.Tracestate)
 	startedAt := r.now().UnixMilli()
 
 	// Apply the runner-side upper-bound timeout if requested.
@@ -1151,6 +1157,27 @@ func markTerminalLeaseFailure(res *Result, err error) {
 	res.FailureMode = FailureTerminalWorkareaLease
 	res.Error = err.Error()
 	res.TerminalWorkareaLease = nil
+}
+
+// sanitizeDispatchTrace validates the dispatch W3C trace context at the
+// consumer boundary, before any poster, span or attach wiring reads it.
+// The trace context is correlation-only telemetry: (organization, session)
+// remains the lifecycle authority, so a trace id never authorizes a
+// tenant or session transition. A malformed traceparent or tracestate is
+// omitted (the run keeps its locally-minted root), never fatal — invalid
+// context must not weaken execution. Each field is judged independently:
+// a valid tracestate still flows when the traceparent is absent, matching
+// the poster emission contract. The optional join identities
+// (storage/public/tracker) pass through verbatim and are never
+// derived from — or gated on — the trace fields.
+func sanitizeDispatchTrace(traceparent, tracestate string) (string, string) {
+	if !spanruntime.ValidTraceparent(traceparent) {
+		traceparent = ""
+	}
+	if !spanruntime.ValidTracestate(tracestate) {
+		tracestate = ""
+	}
+	return traceparent, tracestate
 }
 
 // validateQueuedWork checks the minimum field set required for Run.

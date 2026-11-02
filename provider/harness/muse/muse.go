@@ -346,6 +346,7 @@ func (p *Provider) spawnHandle(ctx context.Context, spec agent.Spec, resumeSessi
 	}
 	if resumeSessionID != "" {
 		if err := h.resumeSession(ctx, resumeSessionID); err != nil {
+			h.emitFirstTurnSyncFailure("session/resume", err)
 			h.signalClosed()
 			h.closeEvents()
 			_ = h.shutdownChild("resume failed")
@@ -356,6 +357,7 @@ func (p *Provider) spawnHandle(ctx context.Context, spec agent.Spec, resumeSessi
 		}
 	} else {
 		if err := h.startSession(ctx); err != nil {
+			h.emitFirstTurnSyncFailure("session/start", err)
 			h.signalClosed()
 			h.closeEvents()
 			_ = h.shutdownChild("session start failed")
@@ -363,6 +365,7 @@ func (p *Provider) spawnHandle(ctx context.Context, spec agent.Spec, resumeSessi
 		}
 	}
 	if err := h.startTurn(ctx, plan.PromptInput); err != nil {
+		h.emitFirstTurnSyncFailure("turn/start", err)
 		h.signalClosed()
 		h.closeEvents()
 		_ = h.shutdownChild("first turn failed")

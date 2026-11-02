@@ -1329,7 +1329,23 @@ func TestPosterDispatchTraceHeaders(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			var attempts atomic.Int64
+			var statuses atomic.Int64
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if strings.HasSuffix(r.URL.Path, "/status") {
+					statuses.Add(1)
+					for name, want := range map[string]string{"traceparent": tc.parent, "tracestate": tc.state} {
+						values, present := r.Header[http.CanonicalHeaderKey(name)]
+						if want == "" {
+							if present {
+								t.Errorf("status %s unexpectedly present: %q", name, values)
+							}
+						} else if len(values) != 1 || values[0] != want {
+							t.Errorf("status %s = %q; want [%q]", name, values, want)
+						}
+					}
+					w.WriteHeader(http.StatusOK)
+					return
+				}
 				if !strings.HasSuffix(r.URL.Path, "/activity") {
 					w.WriteHeader(http.StatusOK)
 					return
@@ -1369,6 +1385,9 @@ func TestPosterDispatchTraceHeaders(t *testing.T) {
 			}
 			if got := attempts.Load(); got != 2 {
 				t.Fatalf("post attempts = %d; want 2", got)
+			}
+			if got := statuses.Load(); got != 1 {
+				t.Fatalf("running-status posts = %d; want 1 (same context as the activity post)", got)
 			}
 		})
 	}
