@@ -103,6 +103,32 @@ locate_binary() {
   return 1
 }
 
+# Hash one file and print its lowercase hex SHA256 digest. Fails closed when
+# the hashing pipeline fails or the digest is not 64 hex characters. Both
+# hash branches (shasum, sha256sum) check the pipeline status explicitly so a
+# failing hasher cannot leave an empty digest, and validate the digest so a
+# malformed hasher cannot pass. Called inside command substitution (which
+# disables implicit errexit), so every failure is an explicit return 1.
+hash_file() {
+  local file=$1 digest
+  if command -v shasum >/dev/null 2>&1; then
+    if ! digest=$(shasum -a 256 "${file}" | awk '{print $1}'); then
+      printf 'verify-release-binaries: RED: digest command failed for %s\n' "${file}" >&2
+      return 1
+    fi
+  else
+    if ! digest=$(sha256sum "${file}" | awk '{print $1}'); then
+      printf 'verify-release-binaries: RED: digest command failed for %s\n' "${file}" >&2
+      return 1
+    fi
+  fi
+  if [[ ! "${digest}" =~ ^[0-9a-f]{64}$ ]]; then
+    printf 'verify-release-binaries: RED: malformed digest %q for %s\n' "${digest}" "${file}" >&2
+    return 1
+  fi
+  printf '%s' "${digest}"
+}
+
 verify_one() {
   local name=$1 id=$2 os=$3 arch=$4 floor=$5
   local path go_line go_version main_version sha
@@ -127,10 +153,8 @@ verify_one() {
   fi
   main_version=$(grep -E 'main\.version=' <<<"${meta}" | grep -Eo 'main\.version=[^ "\\]+' | head -1 || true)
   main_version=${main_version#main.version=}
-  if command -v shasum >/dev/null 2>&1; then
-    sha=$(shasum -a 256 "${path}" | awk '{print $1}')
-  else
-    sha=$(sha256sum "${path}" | awk '{print $1}')
+  if ! sha=$(hash_file "${path}"); then
+    return 1
   fi
   printf 'binary=%s os=%s arch=%s path=%s go=%s sha256=%s version=%s\n' \
     "${name}" "${os}" "${arch}" "${path}" "${go_version}" "${sha}" "${main_version:-unknown}"
@@ -182,10 +206,8 @@ verify_dist() {
   fi
   for archive in "${archives[@]}"; do
     local digest
-    if command -v shasum >/dev/null 2>&1; then
-      digest=$(shasum -a 256 "${archive}" | awk '{print $1}')
-    else
-      digest=$(sha256sum "${archive}" | awk '{print $1}')
+    if ! digest=$(hash_file "${archive}"); then
+      return 1
     fi
     printf 'archive=%s sha256=%s\n' "$(basename "${archive}")" "${digest}"
     if [[ -n "${output_file}" ]]; then
@@ -288,6 +310,18 @@ YAML
   cp "${work}/dist/selftest-linux_linux_amd64_v1/donmai-sh" "${work}/dist/selftest-linux_linux_amd64_v1/donmai"
   if (cd "${work}" && bash "${self_path}" --config goreleaser-trim.yaml --dist dist --tag v1.2.3 --floor "${floor}" >/dev/null 2>&1); then fail 'non-Go binary refuses'; else pass 'non-Go binary refuses'; fi
   mv "${work}/dist/selftest-linux_linux_amd64_v1/donmai.real" "${work}/dist/selftest-linux_linux_amd64_v1/donmai"
+  # A failing hasher must fail closed instead of accepting an empty digest.
+  mkdir -p "${work}/fakebin-fail"
+  printf '#!/bin/sh\nexit 1\n' >"${work}/fakebin-fail/shasum"
+  printf '#!/bin/sh\nexit 1\n' >"${work}/fakebin-fail/sha256sum"
+  chmod +x "${work}/fakebin-fail/shasum" "${work}/fakebin-fail/sha256sum"
+  if (cd "${work}" && PATH="${work}/fakebin-fail:${PATH}" bash "${self_path}" --config goreleaser-trim.yaml --dist dist --tag v1.2.3 --floor "${floor}" >/dev/null 2>&1); then fail 'digest error refuses'; else pass 'digest error refuses'; fi
+  # A malformed hasher output must fail closed instead of passing.
+  mkdir -p "${work}/fakebin-malformed"
+  printf '#!/bin/sh\necho "not-a-digest  %s"\n' "x" >"${work}/fakebin-malformed/shasum"
+  printf '#!/bin/sh\necho "not-a-digest  %s"\n' "x" >"${work}/fakebin-malformed/sha256sum"
+  chmod +x "${work}/fakebin-malformed/shasum" "${work}/fakebin-malformed/sha256sum"
+  if (cd "${work}" && PATH="${work}/fakebin-malformed:${PATH}" bash "${self_path}" --config goreleaser-trim.yaml --dist dist --tag v1.2.3 --floor "${floor}" >/dev/null 2>&1); then fail 'digest malformed refuses'; else pass 'digest malformed refuses'; fi
 
   if (( failures > 0 )); then
     printf 'verify-release-binaries self-test: %d failure(s)\n' "${failures}" >&2
