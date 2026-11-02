@@ -639,6 +639,8 @@ abort 'FAIL: already-public guard must read the live release' unless reject_run.
 abort 'FAIL: already-public guard must refuse a public release' unless reject_run.include?('already exists and is public') && reject_run.include?('exit 1')
 abort 'FAIL: already-public guard must allow a missing release' unless reject_run.include?('not found')
 abort 'FAIL: already-public guard must fail closed on unreadable status' unless reject_run.include?('cannot determine release status')
+abort 'FAIL: already-public guard must allow only an explicit draft' unless reject_run.include?('== "true"')
+abort 'FAIL: already-public guard must fail closed on unexpected values' unless reject_run.include?('unexpected isDraft')
 build_step = release_steps[goreleaser_index]
 abort 'FAIL: draft build must suppress the tap upload' unless build_step['env'].to_s.include?('GORELEASER_PUBLISH_HOMEBREW') && build_step['env'].to_s.include?('false')
 abort 'FAIL: draft build must not skip the cask file generation (the gated tap step needs dist/homebrew)' if build_args.include?('--skip=homebrew')
@@ -651,6 +653,7 @@ abort 'FAIL: cask publish must run only for automatic stable' unless cask_step['
 abort 'FAIL: cask publish must not rerun GoReleaser (it rebuilds)' if cask_step['run'].to_s.include?('goreleaser')
 abort 'FAIL: cask publish must reuse the inspected cask file' unless cask_step['run'].to_s.include?('dist/homebrew/Casks/donmai.rb')
 abort 'FAIL: cask publish must fail closed without inspected artifacts' unless cask_step['run'].to_s.include?('missing') && cask_step['run'].to_s.include?('exit 1')
+abort 'FAIL: cask publish must push the tap update' unless cask_step['run'].to_s.include?('push origin HEAD:main')
 # B2: Latest policy rides with the gated publish.
 abort 'FAIL: publish must carry the verified Latest policy' unless publish_run.include?('--latest=') && publish_run.include?('GORELEASER_MAKE_LATEST')
 # B3: publication scheduling — publish runs only on success, never after failure.
@@ -839,6 +842,46 @@ fi
 if PATH="${temp_dir}/mock-gh-error:${PATH}" RELEASE_TAG=v1.2.3 bash "${workflow_extract_dir}/reject.sh" >/dev/null 2>&1; then
   fail 'already-public guard accepted an unreadable release status'
 fi
+# B1 fail-closed: empty, null, and garbage success responses must refuse,
+# and a public response with a stderr diagnostic must still refuse.
+for malformed in empty null garbage; do
+  mock_malformed_bin="${temp_dir}/mock-gh-${malformed}"
+  mkdir -p "${mock_malformed_bin}"
+  case "${malformed}" in
+    empty) malformed_output="" ;;
+    null) malformed_output="null" ;;
+    garbage) malformed_output="maybe" ;;
+  esac
+  cat >"${mock_malformed_bin}/gh" <<MOCK
+#!/bin/sh
+if [ "\$1" = "release" ] && [ "\$2" = "view" ]; then
+  echo "${malformed_output}"
+  exit 0
+fi
+echo "unexpected gh call: \$*" >&2
+exit 1
+MOCK
+  chmod +x "${mock_malformed_bin}/gh"
+  if PATH="${mock_malformed_bin}:${PATH}" RELEASE_TAG=v1.2.3 bash "${workflow_extract_dir}/reject.sh" >/dev/null 2>&1; then
+    fail "already-public guard accepted a ${malformed} release status"
+  fi
+done
+mock_warning_bin="${temp_dir}/mock-gh-public-warning"
+mkdir -p "${mock_warning_bin}"
+cat >"${mock_warning_bin}/gh" <<'MOCK'
+#!/bin/sh
+if [ "$1" = "release" ] && [ "$2" = "view" ]; then
+  echo "false"
+  echo "warning: rate limited" >&2
+  exit 0
+fi
+echo "unexpected gh call: $*" >&2
+exit 1
+MOCK
+chmod +x "${mock_warning_bin}/gh"
+if PATH="${mock_warning_bin}:${PATH}" RELEASE_TAG=v1.2.3 bash "${workflow_extract_dir}/reject.sh" >/dev/null 2>&1; then
+  fail 'already-public guard accepted a public release with a stderr diagnostic'
+fi
 # B2: the gated publish carries the verified Latest policy on both paths.
 for latest_value in true false; do
   mock_publish_bin="${temp_dir}/mock-publish-${latest_value}"
@@ -914,6 +957,46 @@ chmod +x "${temp_dir}/mock-git-empty/git"
 if (cd "${cask_empty_dir}" && PATH="${temp_dir}/mock-git-empty:${PATH}" RELEASE_TAG=v1.2.3 HOMEBREW_TAP_GITHUB_TOKEN=dummy bash ./cask.sh >/dev/null 2>&1); then
   fail 'cask publish accepted a missing cask file'
 fi
+# B2: the gated cask step publishes the inspected cask file when it changes.
+# Extracted from the production workflow, so deleting the push fails here:
+# the mutated shell still exits 0, but no push is recorded.
+cask_changed_dir="${temp_dir}/cask-changed"
+mkdir -p "${cask_changed_dir}/dist/homebrew/Casks"
+printf 'cask "donmai" do\n  version "1.2.3"\nend\n' >"${cask_changed_dir}/dist/homebrew/Casks/donmai.rb"
+cp "${workflow_extract_dir}/cask.sh" "${cask_changed_dir}/cask.sh"
+mkdir -p "${temp_dir}/mock-git-changed"
+cask_push_log="${temp_dir}/cask-push.log"
+rm -f "${cask_push_log}"
+cat >"${temp_dir}/mock-git-changed/git" <<MOCK
+#!/bin/sh
+log="${cask_push_log}"
+printf '%s\n' "git \$*" >>"\${log}"
+if [ "\$1" = "clone" ]; then
+  dest=""
+  for arg in "\$@"; do dest="\$arg"; done
+  mkdir -p "\${dest}/Casks"
+  printf 'cask "donmai" do\n  version "old"\nend\n' >"\${dest}/Casks/donmai.rb"
+  exit 0
+fi
+if [ "\$1" = "-C" ]; then
+  shift; dir="\$1"; shift
+  sub="\$1"; shift
+  case "\${sub}" in
+    config) exit 0 ;;
+    add) exit 0 ;;
+    diff) exit 1 ;;
+    commit) printf '%s\n' "git commit \$*" >>"\${log}"; exit 0 ;;
+    push) printf '%s\n' "git push \$*" >>"\${log}"; exit 0 ;;
+    *) exit 0 ;;
+  esac
+fi
+exit 0
+MOCK
+chmod +x "${temp_dir}/mock-git-changed/git"
+if ! (cd "${cask_changed_dir}" && PATH="${temp_dir}/mock-git-changed:${PATH}" RELEASE_TAG=v1.2.3 HOMEBREW_TAP_GITHUB_TOKEN=dummy bash ./cask.sh >/dev/null 2>&1); then
+  fail 'cask publish failed on a changed cask file'
+fi
+grep -Fq -- "git push origin HEAD:main" "${cask_push_log}" || fail 'cask publish did not push the tap update'
 
 # The E2B build wrapper must pass the versioned target on every build and add
 # the rolling default only when requested by an automatic tag push.

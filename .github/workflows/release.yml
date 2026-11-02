@@ -396,18 +396,25 @@ jobs:
           RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
-          view_output="$(gh release view "${RELEASE_TAG}" --json isDraft --jq .isDraft 2>&1)" && view_ok=true || view_ok=false
-          if [[ "${view_ok}" == true ]]; then
-            if [[ "${view_output}" == "false" ]]; then
+          view_stderr="$(mktemp)"
+          if view_output="$(gh release view "${RELEASE_TAG}" --json isDraft --jq .isDraft 2>"${view_stderr}")"; then
+            rm -f "${view_stderr}"
+            if [[ "${view_output}" == "true" ]]; then
+              echo "existing release for ${RELEASE_TAG} is a draft; proceeding with draft build"
+            elif [[ "${view_output}" == "false" ]]; then
               echo "::error::release ${RELEASE_TAG} already exists and is public; refusing to build over a public release before inspection" >&2
               exit 1
+            else
+              echo "::error::cannot determine release status for ${RELEASE_TAG}: unexpected isDraft value '${view_output}'" >&2
+              exit 1
             fi
-            echo "existing release for ${RELEASE_TAG} is a draft; proceeding with draft build"
           else
-            if grep -qi "not found" <<<"${view_output}"; then
+            view_error="$(cat "${view_stderr}")"
+            rm -f "${view_stderr}"
+            if grep -qi "not found" <<<"${view_error}"; then
               echo "no existing release for ${RELEASE_TAG}; proceeding with draft build"
             else
-              echo "::error::cannot determine release status for ${RELEASE_TAG}: ${view_output}" >&2
+              echo "::error::cannot determine release status for ${RELEASE_TAG}: ${view_error}" >&2
               exit 1
             fi
           fi
