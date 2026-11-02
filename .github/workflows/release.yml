@@ -305,6 +305,8 @@ jobs:
       - name: Stage release automation
         run: |
           install -m 0755 scripts/verify-release-tag.sh "${RUNNER_TEMP}/verify-release-tag.sh"
+          install -m 0755 scripts/verify-go-compiler.sh "${RUNNER_TEMP}/verify-go-compiler.sh"
+          install -m 0755 scripts/verify-release-binaries.sh "${RUNNER_TEMP}/verify-release-binaries.sh"
           install -m 0644 .goreleaser.yaml "${RUNNER_TEMP}/goreleaser.yaml"
           install -d "${RUNNER_TEMP}/release-bin"
           install -m 0755 scripts/sign-and-notarize.sh \
@@ -338,6 +340,9 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
+
+      - name: Verify Go compiler
+        run: "${RUNNER_TEMP}/verify-go-compiler.sh"
 
       # Import the Apple Developer ID Application certificate into an
       # ephemeral RUNNER_TEMP keychain so `codesign` (invoked by
@@ -379,12 +384,136 @@ jobs:
       - name: Install cosign
         uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
 
+      # Reject a retry over an already-public release before GoReleaser can
+      # touch it. Pinned v2.17.1 preserves the existing draft flag when the
+      # tag already has a release, so building over a public release would
+      # upload missing assets to that public release before inspection
+      # despite `--draft`. A missing release ("release not found") and an
+      # existing draft proceed; a public release or an unreadable status
+      # fails closed.
+      - name: Reject already-public release
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          view_stderr="$(mktemp)"
+          if view_output="$(gh release view "${RELEASE_TAG}" --json isDraft --jq .isDraft 2>"${view_stderr}")"; then
+            rm -f "${view_stderr}"
+            if [[ "${view_output}" == "true" ]]; then
+              echo "existing release for ${RELEASE_TAG} is a draft; proceeding with draft build"
+            elif [[ "${view_output}" == "false" ]]; then
+              echo "::error::release ${RELEASE_TAG} already exists and is public; refusing to build over a public release before inspection" >&2
+              exit 1
+            else
+              echo "::error::cannot determine release status for ${RELEASE_TAG}: unexpected isDraft value '${view_output}'" >&2
+              exit 1
+            fi
+          else
+            view_error="$(cat "${view_stderr}")"
+            rm -f "${view_stderr}"
+            if grep -qi "not found" <<<"${view_error}"; then
+              echo "no existing release for ${RELEASE_TAG}; proceeding with draft build"
+            else
+              echo "::error::cannot determine release status for ${RELEASE_TAG}: ${view_error}" >&2
+              exit 1
+            fi
+          fi
+
+      # Build into a non-public draft so binary inspection gates publicity.
+      # The draft holds the exact bytes inspection approves: the publish step
+      # below only flips the draft flag and never rebuilds, so the recorded
+      # digests attest to the public artifacts. A second `release --clean`
+      # would wipe dist and recompile (pinned v2.17.1 has no publish-only
+      # command: its dist pipe fails on a non-empty dist without --clean,
+      # and CleanPipe removes dist), discarding the inspected bytes — Apple
+      # signing alone can change bytes between runs — so it must never come back.
+      # The tap upload is suppressed here (the verified Homebrew policy is
+      # ignored for this one build): pinned v2.17.1 runs the cask publisher
+      # even with `--draft`, so an automatic stable build would update the
+      # public cask while the referenced release is still private. The cask
+      # file is still generated into dist/homebrew for the gated tap step
+      # after publication; nothing public is written before inspection.
       - uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7
+        env:
+          GORELEASER_PUBLISH_HOMEBREW: "false"
         with:
           # Keep the verified pipeline order fixed: binary_signs -> archives ->
           # checksums -> signs. Upgrade only with a source/docs re-verification.
           version: "v2.17.1"
-          args: release --clean --config ${{ runner.temp }}/goreleaser.yaml
+          args: release --clean --draft --config ${{ runner.temp }}/goreleaser.yaml
+
+      - name: Verify release binaries
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          "${RUNNER_TEMP}/verify-release-binaries.sh" \
+            --config "${RUNNER_TEMP}/goreleaser.yaml" \
+            --dist dist \
+            --tag "${RELEASE_TAG}" \
+            --output "${RUNNER_TEMP}/release-binaries.log"
+          {
+            echo "### release binaries (go version -m)"
+            echo
+            echo "tag: ${RELEASE_TAG}"
+            echo "commit SHA: ${GITHUB_SHA}"
+            echo
+            echo '```'
+            cat "${RUNNER_TEMP}/release-binaries.log"
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      # Publish only after verification. A failed inspection stops the job
+      # here, so a bad compiler artifact can never leave the draft: the
+      # draft is visible to collaborators only, and undrafting flips a flag
+      # on the already-uploaded assets without touching dist or recompiling.
+      # The verified Latest policy is applied here: GoReleaser only sends
+      # make_latest from its publish method, which `--draft` skips, so the
+      # manual `gh edit` must carry `--latest` explicitly. Automatic stable
+      # exports true; every manual retry and prerelease exports false, so an
+      # older stable republished by hand can never replace GitHub Latest.
+      - name: Publish release
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release edit "${RELEASE_TAG}" --draft=false --latest="${GORELEASER_MAKE_LATEST}"
+          if [[ "$(gh release view "${RELEASE_TAG}" --json isDraft --jq .isDraft)" != "false" ]]; then
+            echo "::error::release ${RELEASE_TAG} is still a draft after publish"
+            exit 1
+          fi
+
+      # Update the rolling Homebrew cask only after the inspected draft is
+      # public. The draft build above suppresses the tap upload, so this is
+      # the first and only tap write. It reuses the cask file GoReleaser
+      # generated into dist (from the inspected archives) and never reruns
+      # GoReleaser, so no rebuild can change the inspected bytes. Automatic
+      # stable runs it; manual retries and prereleases skip it.
+      - name: Publish Homebrew cask
+        if: env.GORELEASER_PUBLISH_HOMEBREW == 'true'
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          cask_src="dist/homebrew/Casks/donmai.rb"
+          if [[ ! -f "${cask_src}" ]]; then
+            echo "::error::cask file ${cask_src} missing; refusing to update tap without inspected artifacts" >&2
+            exit 1
+          fi
+          tap_dir="$(mktemp -d)"
+          trap 'rm -rf "${tap_dir}"' EXIT
+          git clone --depth 1 "https://x-access-token:${HOMEBREW_TAP_GITHUB_TOKEN}@github.com/RenseiAI/homebrew-tap.git" "${tap_dir}"
+          mkdir -p "${tap_dir}/Casks"
+          cp "${cask_src}" "${tap_dir}/Casks/donmai.rb"
+          git -C "${tap_dir}" config user.name "donmai-release"
+          git -C "${tap_dir}" config user.email "donmai-release@users.noreply.github.com"
+          git -C "${tap_dir}" add Casks/donmai.rb
+          if git -C "${tap_dir}" diff --cached --quiet; then
+            echo "cask already up to date for ${RELEASE_TAG}; nothing to push"
+            exit 0
+          fi
+          git -C "${tap_dir}" commit -m "Brew cask update for donmai version ${RELEASE_TAG}"
+          git -C "${tap_dir}" push origin HEAD:main
 
       # Build provenance for every published archive. This is a different claim
       # from the cosign signature: the signature says "this workflow signed this
@@ -395,3 +524,21 @@ jobs:
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: dist/*.tar.gz
+
+      # A failed run must not leave an unverified draft behind: the next
+      # manual retry of the same tag would collide with it at release
+      # creation. Delete the draft only — never the signed tag (no
+      # --cleanup-tag), which the retry still needs. Runs only when the
+      # release is still a draft, so a failure after a successful publish
+      # can never delete the public release.
+      - name: Remove unverified draft
+        if: failure()
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ "$(gh release view "${RELEASE_TAG}" --json isDraft --jq .isDraft 2>/dev/null)" == "true" ]]; then
+            gh release delete "${RELEASE_TAG}" --yes
+          else
+            echo "no unverified draft for ${RELEASE_TAG}; nothing to clean"
+          fi
