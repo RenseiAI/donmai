@@ -1297,7 +1297,23 @@ func TestPosterDispatchTraceHeaders(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			var attempts atomic.Int64
+			var statuses atomic.Int64
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if strings.HasSuffix(r.URL.Path, "/status") {
+					statuses.Add(1)
+					for name, want := range map[string]string{"traceparent": tc.parent, "tracestate": tc.state} {
+						values, present := r.Header[http.CanonicalHeaderKey(name)]
+						if want == "" {
+							if present {
+								t.Errorf("status %s unexpectedly present: %q", name, values)
+							}
+						} else if len(values) != 1 || values[0] != want {
+							t.Errorf("status %s = %q; want [%q]", name, values, want)
+						}
+					}
+					w.WriteHeader(http.StatusOK)
+					return
+				}
 				if !strings.HasSuffix(r.URL.Path, "/activity") {
 					w.WriteHeader(http.StatusOK)
 					return
@@ -1338,6 +1354,9 @@ func TestPosterDispatchTraceHeaders(t *testing.T) {
 			if got := attempts.Load(); got != 2 {
 				t.Fatalf("post attempts = %d; want 2", got)
 			}
+			if got := statuses.Load(); got != 1 {
+				t.Fatalf("running-status posts = %d; want 1 (same context as the activity post)", got)
+			}
 		})
 	}
 }
@@ -1367,16 +1386,16 @@ func TestHarnessLifecycleUnrecognizedIsOwnConstant(t *testing.T) {
 func TestAppliedReasoningEffortSentinelsAreOwnConstants(t *testing.T) {
 	t.Parallel()
 	if activity.AppliedReasoningEffortContextKey != "appliedReasoningEffort" {
-		t.Fatalf("activity.AppliedReasoningEffortContextKey = %q, want appliedReasoningEffort", activity.AppliedReasoningEffortContextKey)
+		t.Fatalf("AppliedReasoningEffortContextKey = %q, want appliedReasoningEffort", activity.AppliedReasoningEffortContextKey)
 	}
 	if activity.AppliedReasoningEffortContextKey == activity.ReasoningEffortContextKey {
 		t.Fatalf("applied key must differ from the requested key %q", activity.ReasoningEffortContextKey)
 	}
 	if activity.AppliedReasoningEffortNotConfigured != "not-configured" {
-		t.Fatalf("activity.AppliedReasoningEffortNotConfigured = %q, want not-configured", activity.AppliedReasoningEffortNotConfigured)
+		t.Fatalf("AppliedReasoningEffortNotConfigured = %q, want not-configured", activity.AppliedReasoningEffortNotConfigured)
 	}
 	if activity.AppliedReasoningEffortUnrecognized != "unrecognized" {
-		t.Fatalf("activity.AppliedReasoningEffortUnrecognized = %q, want unrecognized", activity.AppliedReasoningEffortUnrecognized)
+		t.Fatalf("AppliedReasoningEffortUnrecognized = %q, want unrecognized", activity.AppliedReasoningEffortUnrecognized)
 	}
 	if got := activity.AppliedReasoningEffortContextValue(""); got != activity.AppliedReasoningEffortNotConfigured {
 		t.Fatalf("empty applied contextValue = %q, want the applied not-configured sentinel", got)
@@ -1386,7 +1405,7 @@ func TestAppliedReasoningEffortSentinelsAreOwnConstants(t *testing.T) {
 	}
 }
 
-// TestAppliedReasoningEffortStopDrains pins the drain half: an applied
+// TestAppliedReasoningEffortStopDrains pins AC-3's drain half: an applied
 // event enqueued before Stop still reaches the server with its own key after
 // shutdown. Dropping the new subtype in the drain path fails this test (RED).
 func TestAppliedReasoningEffortStopDrains(t *testing.T) {

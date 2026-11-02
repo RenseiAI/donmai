@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -305,5 +307,103 @@ func TestPoster_CancelledRunContextStillDrainsOnStop(t *testing.T) {
 	case <-posted:
 	case <-time.After(2 * time.Second):
 		t.Fatal("Stop did not drain after caller context cancellation")
+	}
+}
+
+func TestPosterDispatchTraceHeaders(t *testing.T) {
+	t.Parallel()
+	const parent = "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01"
+	for _, tc := range []struct {
+		name, parent, state string
+	}{
+		{name: "both", parent: parent, state: "vendor=value"},
+		{name: "parent only", parent: parent},
+		{name: "state only", state: "vendor=value"},
+		{name: "absent"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var attempts atomic.Int64
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				for name, want := range map[string]string{"traceparent": tc.parent, "tracestate": tc.state} {
+					values, present := r.Header[http.CanonicalHeaderKey(name)]
+					if want == "" {
+						if present {
+							t.Errorf("%s unexpectedly present: %q", name, values)
+						}
+					} else if len(values) != 1 || values[0] != want {
+						t.Errorf("%s = %q; want [%q]", name, values, want)
+					}
+				}
+				attempts.Add(1)
+				w.WriteHeader(http.StatusAccepted)
+			}))
+			t.Cleanup(srv.Close)
+			p, err := NewPoster(PosterConfig{
+				BaseURL: srv.URL, HTTPClient: srv.Client(),
+				Traceparent: tc.parent, Tracestate: tc.state,
+				FlushSpans: 2, FlushInterval: time.Hour,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := p.Start(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if !p.Send(sampleLlmSpan(1)) {
+				t.Fatal("Send rejected")
+			}
+			_ = p.Stop()
+			if got := attempts.Load(); got != 1 {
+				t.Fatalf("post attempts = %d; want 1", got)
+			}
+		})
+	}
+}
+
+// TestPosterHangingTransportCancelled pins the cancellation bound on the
+// trace ingest path: a request against an endpoint that never settles must
+// return once the caller cancels, rather than holding the delivery
+// goroutine (and Stop's drain) for the full client timeout.
+func TestPosterHangingTransportCancelled(t *testing.T) {
+	t.Parallel()
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-release:
+			w.WriteHeader(http.StatusAccepted)
+		case <-r.Context().Done():
+		}
+	}))
+	// LIFO cleanups: release first so the hanging handler can return,
+	// then the server close. A never-settling handler does not observe
+	// client cancellation promptly, so closing the server first would
+	// wait on the handler while the handler waited on release.
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(release) })
+	p, err := NewPoster(PosterConfig{BaseURL: srv.URL, HTTPClient: srv.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := agent.MarshalSpan(sampleLlmSpan(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := json.Marshal([]json.RawMessage{encoded})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- p.post(ctx, body) }()
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("hanging post returned %v; want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("hanging post did not return within 5s of cancellation")
 	}
 }

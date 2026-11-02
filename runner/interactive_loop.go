@@ -388,6 +388,15 @@ func (r *Runner) dispatchInteractive(
 		hostCfg := attachclient.HostConfig{
 			AttachURL:             attachURL,
 			InitialAuthorityToken: attachToken,
+			// The dispatch trace context rides the attach handshake as
+			// correlation-only headers (WSS upgrade + degraded lane).
+			// qw carries the consumer-sanitized values, so the relay
+			// sees the same context as every poster; an older relay
+			// ignores the unknown headers. Reconnect re-dials the same
+			// configured transport, so the context survives re-attach.
+			// Trace fields never authorize a tenant/session transition.
+			Traceparent: qw.Traceparent,
+			Tracestate:  qw.Tracestate,
 			// Token re-mint rail: the provisioner may maintain a fresh
 			// short-exp token at ATTACH_TOKEN_FILE (atomically rewritten
 			// before each expiry); the source re-reads it before carrier
