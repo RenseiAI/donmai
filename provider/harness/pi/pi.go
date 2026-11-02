@@ -461,7 +461,7 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 	// credentials reach the child.
 	skillDirs, err := writeCardSkills(layout, spec.CardSkills)
 	if err != nil {
-		removeCardSkillsDir(layout)
+		_ = removeCardSkillsDir(layout)
 		return nil, err
 	}
 	token := p.opts.handshakeToken
@@ -483,7 +483,7 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 	childEnvParts := sessionChildEnv(spec)
 	credentialPath, err := writeSessionCredentialFile(layout, sessionCredentialEntries(spec), childEnvParts.deferred)
 	if err != nil {
-		removeCardSkillsDir(layout)
+		_ = removeCardSkillsDir(layout)
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}
 	removeCredentials := func() {
