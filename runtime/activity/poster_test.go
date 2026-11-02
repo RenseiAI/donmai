@@ -647,6 +647,39 @@ func TestEventMappingTable(t *testing.T) {
 			wantContext:   "reasoningEffort=unrecognized",
 		},
 		{
+			name:        "System applied reasoning effort configured -> context naming the level",
+			event:       agent.AppliedReasoningEffortEvent(agent.EffortMax),
+			wantSent:    true,
+			wantType:    "context",
+			wantContent: "applied reasoning effort: max (as applied)",
+			wantContext: "appliedReasoningEffort=max",
+		},
+		{
+			name:        "System applied reasoning effort minimal -> context naming the level",
+			event:       agent.SystemEvent{Subtype: agent.SystemSubtypeAppliedReasoningEffort, Message: "minimal"},
+			wantSent:    true,
+			wantType:    "context",
+			wantContent: "applied reasoning effort: minimal (as applied)",
+			wantContext: "appliedReasoningEffort=minimal",
+		},
+		{
+			name:        "System applied reasoning effort not configured -> context saying so",
+			event:       agent.AppliedReasoningEffortEvent(""),
+			wantSent:    true,
+			wantType:    "context",
+			wantContent: "applied reasoning effort: not configured; no applied effort was reported, so the harness or model default applies",
+			wantContext: "appliedReasoningEffort=not-configured",
+		},
+		{
+			name:          "System applied reasoning effort unknown value -> fixed context, never the value",
+			event:         agent.SystemEvent{Subtype: agent.SystemSubtypeAppliedReasoningEffort, Message: "free-form message must not cross the wire"},
+			wantSent:      true,
+			wantType:      "context",
+			wantContent:   "applied reasoning effort: the reported value is not a recognized level (minimal, low, medium, high, xhigh, max)",
+			rejectContent: "free-form message",
+			wantContext:   "appliedReasoningEffort=unrecognized",
+		},
+		{
 			name:        "System tool call bounds configured -> context naming the bound",
 			event:       agent.ToolCallBoundsEvent(300),
 			wantSent:    true,
@@ -1342,5 +1375,81 @@ func TestHarnessLifecycleUnrecognizedIsOwnConstant(t *testing.T) {
 	}
 	if got := activity.HarnessLifecycleContent("bogus-moment"); !strings.Contains(got, "unrecognized moment") {
 		t.Fatalf("unknown moment content = %q, want the fixed unrecognized sentence", got)
+	}
+}
+
+// TestAppliedReasoningEffortSentinelsAreOwnConstants pins the applied-effort
+// family's key and sentinels: the applied key differs from the requested key,
+// and the applied sentinels are their own constants (not aliases of the
+// requested family's). Deleting them (reverting to ReasoningEffort*) fails
+// this file to compile (RED).
+func TestAppliedReasoningEffortSentinelsAreOwnConstants(t *testing.T) {
+	t.Parallel()
+	if activity.AppliedReasoningEffortContextKey != "appliedReasoningEffort" {
+		t.Fatalf("AppliedReasoningEffortContextKey = %q, want appliedReasoningEffort", activity.AppliedReasoningEffortContextKey)
+	}
+	if activity.AppliedReasoningEffortContextKey == activity.ReasoningEffortContextKey {
+		t.Fatalf("applied key must differ from the requested key %q", activity.ReasoningEffortContextKey)
+	}
+	if activity.AppliedReasoningEffortNotConfigured != "not-configured" {
+		t.Fatalf("AppliedReasoningEffortNotConfigured = %q, want not-configured", activity.AppliedReasoningEffortNotConfigured)
+	}
+	if activity.AppliedReasoningEffortUnrecognized != "unrecognized" {
+		t.Fatalf("AppliedReasoningEffortUnrecognized = %q, want unrecognized", activity.AppliedReasoningEffortUnrecognized)
+	}
+	if got := activity.AppliedReasoningEffortContextValue(""); got != activity.AppliedReasoningEffortNotConfigured {
+		t.Fatalf("empty applied contextValue = %q, want the applied not-configured sentinel", got)
+	}
+	if got := activity.AppliedReasoningEffortContextValue("bogus-level"); got != activity.AppliedReasoningEffortUnrecognized {
+		t.Fatalf("bogus applied contextValue = %q, want the applied unrecognized sentinel", got)
+	}
+}
+
+// TestAppliedReasoningEffortStopDrains pins AC-3's drain half: an applied
+// event enqueued before Stop still reaches the server with its own key after
+// shutdown. Dropping the new subtype in the drain path fails this test (RED).
+func TestAppliedReasoningEffortStopDrains(t *testing.T) {
+	t.Parallel()
+	var mu sync.Mutex
+	var contexts []string
+	srv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/activity") {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		raw, _ := io.ReadAll(r.Body)
+		var body struct {
+			Activity struct {
+				Type         string `json:"type"`
+				Content      string `json:"content"`
+				ContextKey   string `json:"contextKey"`
+				ContextValue string `json:"contextValue"`
+			} `json:"activity"`
+		}
+		if err := json.Unmarshal(raw, &body); err == nil && body.Activity.ContextKey != "" {
+			mu.Lock()
+			contexts = append(contexts, body.Activity.ContextKey+"="+body.Activity.ContextValue)
+			mu.Unlock()
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+	p, err := activity.New(activity.Config{
+		SessionID: "s1", WorkerID: "w1", BaseURL: srv.URL, HTTPClient: srv.Client(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	p.Send(context.Background(), agent.AppliedReasoningEffortEvent(agent.EffortHigh))
+	if err := p.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	mu.Lock()
+	got := append([]string(nil), contexts...)
+	mu.Unlock()
+	if len(got) != 1 || got[0] != "appliedReasoningEffort=high" {
+		t.Fatalf("drained applied contexts = %q, want exactly [appliedReasoningEffort=high]", got)
 	}
 }
