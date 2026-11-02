@@ -45,6 +45,11 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}
+	pluginDir, err := writeCardSkillsPluginDir(spec.CardSkills)
+	if err != nil {
+		_ = clijsonl.RemoveMCPConfig(mcpPath)
+		return nil, err
+	}
 	// Unattended trust: a bare interactive REPL parks on the workspace
 	// trust modal for any cwd the CLI has not recorded as trusted, and
 	// there is no flag that skips it — pre-seeding the record is the only
@@ -128,7 +133,7 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 		if hook != nil {
 			hook.snapshotTranscriptPath()
 		}
-		errs := []error{clijsonl.RemoveMCPConfig(mcpPath)}
+		errs := []error{clijsonl.RemoveMCPConfig(mcpPath), removeCardSkillsPluginDir(pluginDir)}
 		if hook != nil {
 			errs = append(errs, hook.close())
 		}
@@ -138,7 +143,7 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 		return errors.Join(errs...)
 	}
 
-	argv := append([]string{"--session-id", sessionID}, interactiveArgsWith(spec, mcpPath, settings)...)
+	argv := append([]string{"--session-id", sessionID}, interactiveArgsWith(spec, mcpPath, pluginDir, settings)...)
 	h, err := ptycli.SpawnWithCleanup(ctx, p.binary, argv, spec, p.Manifest(), cleanup)
 	if err != nil {
 		if relay != nil {
@@ -455,11 +460,11 @@ func claudeSeedMessage(seed string) string {
 }
 
 func interactiveArgs(spec agent.Spec) []string {
-	return interactiveArgsWith(spec, "", "")
+	return interactiveArgsWith(spec, "", "", "")
 }
 
 func interactiveArgsWithMCP(spec agent.Spec, mcpConfigPath string) []string {
-	return interactiveArgsWith(spec, mcpConfigPath, "")
+	return interactiveArgsWith(spec, mcpConfigPath, "", "")
 }
 
 // interactiveArgsWith adds the notice-channel settings to the interactive argv.
@@ -475,8 +480,11 @@ func interactiveArgsWithMCP(spec agent.Spec, mcpConfigPath string) []string {
 // is passed: suppressing the base layer would silently strip the operator's own
 // settings from every interactive session, which is a far larger change than
 // the one this flag is here to make.
-func interactiveArgsWith(spec agent.Spec, mcpConfigPath, settingsJSON string) []string {
+func interactiveArgsWith(spec agent.Spec, mcpConfigPath, pluginDir, settingsJSON string) []string {
 	var argv []string
+	if pluginDir != "" {
+		argv = append(argv, pluginDirArgs(pluginDir)...)
+	}
 	if spec.SessionName != "" {
 		argv = append(argv, "--name", spec.SessionName)
 	}

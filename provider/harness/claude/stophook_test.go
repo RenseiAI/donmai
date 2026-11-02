@@ -553,7 +553,7 @@ func TestInteractiveArgs_NoticeSettingsPrecedeThePositionalPrompt(t *testing.T) 
 	const settings = `{"hooks":{"Stop":[]}}`
 	spec := agent.Spec{Prompt: "fix the bug", Autonomous: true}
 
-	got := interactiveArgsWith(spec, "", settings)
+	got := interactiveArgsWith(spec, "", "", settings)
 	want := []string{
 		"--settings", settings,
 		"--permission-mode", "bypassPermissions",

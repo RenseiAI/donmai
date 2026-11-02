@@ -100,7 +100,7 @@ func TestInteractiveArgs_CarryNoCredentialValue(t *testing.T) {
 	}
 	for _, argv := range [][]string{
 		interactiveArgs(spec),
-		interactiveArgsWith(spec, "/tmp/mcp.json", `{"hooks":{}}`),
+		interactiveArgsWith(spec, "/tmp/mcp.json", "", `{"hooks":{}}`),
 	} {
 		for _, a := range argv {
 			if strings.Contains(a, argvSecretSentinel) {
@@ -108,7 +108,7 @@ func TestInteractiveArgs_CarryNoCredentialValue(t *testing.T) {
 			}
 		}
 	}
-	argv, stdinPrompt := buildArgs(spec, "", "", "")
+	argv, stdinPrompt := buildArgs(spec, "", "", "", "")
 	for _, a := range argv {
 		if strings.Contains(a, argvSecretSentinel) {
 			t.Fatalf("headless argv carries the sentinel credential: %q (argv=%q)", a, argv)

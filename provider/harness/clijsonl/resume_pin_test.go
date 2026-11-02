@@ -14,7 +14,7 @@ import (
 func TestResumeArgv_EmptyExtrasKeepByteIdenticalShape(t *testing.T) {
 	t.Parallel()
 
-	argv, stdin := resumeArgv("sess-1", "follow up", nil)
+	argv, stdin := resumeArgv("sess-1", "follow up", nil, nil)
 	want := []string{
 		"-p",
 		"--output-format", "stream-json",
@@ -34,7 +34,7 @@ func TestResumeArgv_PinPairRidesBetweenFlagsAndResume(t *testing.T) {
 	t.Parallel()
 
 	pin := `{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:1/v1"}}`
-	argv, _ := resumeArgv("sess-1", "follow up", []string{"--settings", pin})
+	argv, _ := resumeArgv("sess-1", "follow up", []string{"--settings", pin}, nil)
 	settings, ok := adjacentValue(argv, "--settings")
 	if !ok || settings != pin {
 		t.Fatalf("resume argv = %q, want the --settings pin pair carried verbatim", argv)
@@ -87,7 +87,7 @@ func TestResumeArgv_DropsNonPinFragments(t *testing.T) {
 	for name, extra := range cases {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			argv, _ := resumeArgv("sess-1", "follow up", extra)
+			argv, _ := resumeArgv("sess-1", "follow up", extra, nil)
 			if slices.Contains(argv, "--settings") {
 				t.Fatalf("resume argv admits %q: %q — only the destinations-only pin pair may ride", extra, argv)
 			}

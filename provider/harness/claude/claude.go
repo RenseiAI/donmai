@@ -176,32 +176,48 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 }
 
 // spawn is the internal Provider.Spawn/Resume implementation. It writes
-// the MCP config tmpfile, builds the CLI args, and starts the subprocess
-// via the shared clijsonl driver, returning a fully-wired Handle.
+// the MCP config tmpfile and the per-session card-skills plugin directory,
+// builds the CLI args, and starts the subprocess via the shared clijsonl
+// driver, returning a fully-wired Handle.
 //
 // The endpoint-binding projection (applyEndpoint) already ran in Spawn,
 // before the interactive/headless split — spec arrives here with it applied.
 //
 // On any failure prior to the subprocess being started, the driver
-// cleans up the MCP tmpfile and returns an error wrapping
-// agent.ErrSpawnFailed.
+// cleans up the MCP tmpfile plus the plugin directory and returns an error
+// wrapping agent.ErrSpawnFailed.
 func (p *Provider) spawn(ctx context.Context, spec agent.Spec, resumeSessionID, ownedSessionID string) (agent.Handle, error) {
 	mcpPath, err := clijsonl.WriteMCPConfigWithEnv(spec.MCPServers, spec.Env)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}
+	pluginDir, err := writeCardSkillsPluginDir(spec.CardSkills)
+	if err != nil {
+		_ = clijsonl.RemoveMCPConfig(mcpPath)
+		return nil, err
+	}
 
-	argv, stdinPrompt := buildArgs(spec, mcpPath, resumeSessionID, ownedSessionID)
+	argv, stdinPrompt := buildArgs(spec, mcpPath, pluginDir, resumeSessionID, ownedSessionID)
 	// Between-turn Inject re-enters the session cwd, where a repo-local
 	// settings file could redirect the follow-up turn's bearer: hand the
 	// driver the same routing pin this spawn carries so every --resume
 	// resolves on the pinned layer. Host-login sessions pin nothing and
 	// keep the resume argv byte-identical.
 	//
+	// The card-skills plugin directory rides alongside the pin: the driver
+	// re-passes --plugin-dir on every Inject --resume (the CLI's --resume
+	// does not restore session-only plugin dirs) and removes the directory
+	// on Stop. A skill-less session carries no directory and keeps the
+	// resume argv byte-identical.
+	//
 	// The owned id rides into the handle ahead of the CLI's own init line
 	// (see SpawnBinaryWithOwnedSessionID): SessionID() is the resume token
 	// from the moment Spawn/Resume returns, not from the first event.
-	return clijsonl.SpawnBinaryWithOwnedSessionID(ctx, p.binary, argv, stdinPrompt, mcpPath, resumePinArgs(spec), spec.Cwd, spec.Env, spec.OnProcessSpawned, ownedSessionIDForHandle(resumeSessionID, ownedSessionID))
+	var pluginDirs []string
+	if pluginDir != "" {
+		pluginDirs = []string{pluginDir}
+	}
+	return clijsonl.SpawnBinaryWithOwnedSessionIDAndPluginDirs(ctx, p.binary, argv, stdinPrompt, mcpPath, pluginDirs, resumePinArgs(spec), spec.Cwd, spec.Env, spec.OnProcessSpawned, ownedSessionIDForHandle(resumeSessionID, ownedSessionID))
 }
 
 // ownedSessionIDForHandle resolves the resume token the handle owns from

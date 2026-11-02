@@ -174,7 +174,7 @@ func TestResume_ContinuesOwnedConversation(t *testing.T) {
 func TestBuildArgs_OwnedSessionIDFlag(t *testing.T) {
 	t.Parallel()
 
-	fresh, _ := buildArgs(agent.Spec{Prompt: "p"}, "", "", "owned-1")
+	fresh, _ := buildArgs(agent.Spec{Prompt: "p"}, "", "", "", "owned-1")
 	if idx := slices.Index(fresh, "--session-id"); idx < 0 || idx+1 >= len(fresh) || fresh[idx+1] != "owned-1" {
 		t.Fatalf("fresh argv missing --session-id owned-1: %v", fresh)
 	}
@@ -182,7 +182,7 @@ func TestBuildArgs_OwnedSessionIDFlag(t *testing.T) {
 		t.Fatalf("fresh argv must not carry --resume: %v", fresh)
 	}
 
-	resumed, _ := buildArgs(agent.Spec{Prompt: "p"}, "", "sess-live-1", "owned-1")
+	resumed, _ := buildArgs(agent.Spec{Prompt: "p"}, "", "", "sess-live-1", "owned-1")
 	if slices.Contains(resumed, "--session-id") {
 		t.Fatalf("resume argv must not carry --session-id: %v", resumed)
 	}
@@ -190,7 +190,7 @@ func TestBuildArgs_OwnedSessionIDFlag(t *testing.T) {
 		t.Fatalf("resume argv missing --resume sess-live-1: %v", resumed)
 	}
 
-	plain, _ := buildArgs(agent.Spec{Prompt: "p"}, "", "", "")
+	plain, _ := buildArgs(agent.Spec{Prompt: "p"}, "", "", "", "")
 	if slices.Contains(plain, "--session-id") || slices.Contains(plain, "--resume") {
 		t.Fatalf("unowned spawn must carry neither identity flag: %v", plain)
 	}

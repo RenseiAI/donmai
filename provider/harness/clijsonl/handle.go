@@ -20,6 +20,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -110,6 +111,10 @@ type Handle struct {
 	// above a repo-local settings file that could otherwise redirect the
 	// session bearer on follow-up turns. Empty for harnesses without one.
 	resumeExtraArgs []string
+	// pluginDirs are per-session plugin directories (currently Claude card
+	// skills via --plugin-dir) re-passed on every Inject --resume and
+	// removed when the Handle stops. Empty for harnesses without one.
+	pluginDirs []string
 	cmd             *exec.Cmd
 	events          chan agent.Event
 	logger          *slog.Logger
@@ -243,7 +248,27 @@ func SpawnBinary(
 	env map[string]string,
 	onProcessSpawned func(pid int),
 ) (*Handle, error) {
-	return spawnRaw(ctx, binary, argv, stdinPrompt, mcpConfigPath, resumeExtraArgs, cwd, env, onProcessSpawned, "")
+	return spawnRaw(ctx, binary, argv, stdinPrompt, mcpConfigPath, nil, resumeExtraArgs, cwd, env, onProcessSpawned, "")
+}
+
+// SpawnBinaryWithPluginDirs is SpawnBinary for a harness whose session
+// carries a per-session plugin directory (currently Claude card skills via
+// --plugin-dir). The directories are re-passed on every Inject --resume
+// and removed when the Handle stops. Nil/empty keeps the historical
+// behavior exactly.
+func SpawnBinaryWithPluginDirs(
+	ctx context.Context,
+	binary string,
+	argv []string,
+	stdinPrompt string,
+	mcpConfigPath string,
+	pluginDirs []string,
+	resumeExtraArgs []string,
+	cwd string,
+	env map[string]string,
+	onProcessSpawned func(pid int),
+) (*Handle, error) {
+	return spawnRaw(ctx, binary, argv, stdinPrompt, mcpConfigPath, pluginDirs, resumeExtraArgs, cwd, env, onProcessSpawned, "")
 }
 
 // SpawnBinaryWithOwnedSessionID is SpawnBinary for a harness that owns its
@@ -268,7 +293,28 @@ func SpawnBinaryWithOwnedSessionID(
 	onProcessSpawned func(pid int),
 	ownedSessionID string,
 ) (*Handle, error) {
-	return spawnRaw(ctx, binary, argv, stdinPrompt, mcpConfigPath, resumeExtraArgs, cwd, env, onProcessSpawned, ownedSessionID)
+	return spawnRaw(ctx, binary, argv, stdinPrompt, mcpConfigPath, nil, resumeExtraArgs, cwd, env, onProcessSpawned, ownedSessionID)
+}
+
+// SpawnBinaryWithOwnedSessionIDAndPluginDirs is the owned-session variant of
+// SpawnBinaryWithPluginDirs: the owned resume token is seeded before the
+// reader starts, and the per-session plugin directories ride every Inject
+// --resume and are removed on Stop. Nil/empty pluginDirs keeps the
+// historical behavior exactly.
+func SpawnBinaryWithOwnedSessionIDAndPluginDirs(
+	ctx context.Context,
+	binary string,
+	argv []string,
+	stdinPrompt string,
+	mcpConfigPath string,
+	pluginDirs []string,
+	resumeExtraArgs []string,
+	cwd string,
+	env map[string]string,
+	onProcessSpawned func(pid int),
+	ownedSessionID string,
+) (*Handle, error) {
+	return spawnRaw(ctx, binary, argv, stdinPrompt, mcpConfigPath, pluginDirs, resumeExtraArgs, cwd, env, onProcessSpawned, ownedSessionID)
 }
 
 // spawnRaw is the low-level subprocess spawn shared by the claude
@@ -285,6 +331,7 @@ func spawnRaw(
 	argv []string,
 	stdinPrompt string,
 	mcpConfigPath string,
+	pluginDirs []string,
 	resumeExtraArgs []string,
 	cwd string,
 	env map[string]string,
@@ -318,17 +365,20 @@ func spawnRaw(
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		_ = removeMCPConfig(mcpConfigPath)
+		_ = removePluginDirs(pluginDirs)
 		return nil, fmt.Errorf("%w: stdin pipe: %v", agent.ErrSpawnFailed, err)
 	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		_ = removeMCPConfig(mcpConfigPath)
+		_ = removePluginDirs(pluginDirs)
 		_ = stdin.Close()
 		return nil, fmt.Errorf("%w: stdout pipe: %v", agent.ErrSpawnFailed, err)
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
 		_ = removeMCPConfig(mcpConfigPath)
+		_ = removePluginDirs(pluginDirs)
 		_ = stdin.Close()
 		_ = stdout.Close()
 		return nil, fmt.Errorf("%w: stderr pipe: %v", agent.ErrSpawnFailed, err)
@@ -336,6 +386,7 @@ func spawnRaw(
 
 	if err := cmd.Start(); err != nil {
 		_ = removeMCPConfig(mcpConfigPath)
+		_ = removePluginDirs(pluginDirs)
 		_ = stdin.Close()
 		_ = stdout.Close()
 		_ = stderr.Close()
@@ -359,6 +410,7 @@ func spawnRaw(
 	h := &Handle{
 		binary:          binary,
 		mcpConfigPath:   mcpConfigPath,
+		pluginDirs:      append([]string(nil), pluginDirs...),
 		cwd:             cwd,
 		env:             append([]string(nil), childEnv...),
 		resumeExtraArgs: append([]string(nil), resumeExtraArgs...),
@@ -501,11 +553,13 @@ func (h *Handle) Inject(ctx context.Context, text string) error {
 
 	// Build the resume argv. The CLI's --resume restores
 	// model/tools/cwd/env from the captured session, so the resume
-	// invocation carries only the new prompt (via stdin) and the
-	// resume id. This is the fixed argv form that the claude provider's
-	// buildArgs emits for an inject-spec (Prompt-only, empty MCP path):
-	// the required headless flags + --resume <id>.
-	argv, stdinPrompt := resumeArgv(sid, text, h.resumeExtraArgs)
+	// invocation carries only the new prompt (via stdin), the resume id,
+	// and the harness-owned session fragments that --resume does not
+	// restore (routing pin, per-session plugin directories). This is the
+	// fixed argv form that the claude provider's buildArgs emits for an
+	// inject-spec (Prompt-only, empty MCP path): the required headless
+	// flags + fragments + --resume <id>.
+	argv, stdinPrompt := resumeArgv(sid, text, h.resumeExtraArgs, h.pluginDirs)
 	// The pin rides a --settings string THIS process passes, so it cannot
 	// be widened by callee-controlled input: the extras come from the
 	// harness's own post-projection pin (never text or repo state), and
@@ -672,10 +726,12 @@ func (h *Handle) doStop(ctx context.Context) error {
 	// guarded by stopOnce.
 	close(h.shutdown)
 
-	// Always close the events channel and remove the MCP tmpfile
-	// before returning, even if subprocess teardown errored.
+	// Always close the events channel and remove the MCP tmpfile plus any
+	// per-session plugin directories before returning, even if subprocess
+	// teardown errored.
 	defer h.closeEvents()
 	defer func() { _ = removeMCPConfig(h.mcpConfigPath) }()
+	defer func() { _ = removePluginDirs(h.pluginDirs) }()
 
 	// If the parent subprocess has already exited, the events
 	// channel has nothing more to receive — skip signaling.
@@ -902,7 +958,7 @@ func (b *boundedBuffer) String() string {
 // pair, a non-pin envelope — vetoes the whole thing, so callee input
 // can never smuggle a tool, model, or second settings layer onto the
 // resume turn.
-func resumeArgv(sessionID, prompt string, resumeExtraArgs []string) (argv []string, stdinPrompt string) {
+func resumeArgv(sessionID, prompt string, resumeExtraArgs []string, pluginDirs []string) (argv []string, stdinPrompt string) {
 	argv = []string{
 		"-p",
 		"--output-format", "stream-json",
@@ -910,6 +966,7 @@ func resumeArgv(sessionID, prompt string, resumeExtraArgs []string) (argv []stri
 		"--dangerously-skip-permissions",
 	}
 	argv = append(argv, filterRoutingPinArgs(resumeExtraArgs)...)
+	argv = append(argv, filterPluginDirArgs(pluginDirs)...)
 	argv = append(argv, "--resume", sessionID)
 	return argv, prompt
 }
@@ -934,6 +991,40 @@ func filterRoutingPinArgs(extra []string) []string {
 		return nil
 	}
 	return []string{"--settings", extra[1]}
+}
+
+// filterPluginDirArgs admits only well-formed per-session plugin directory
+// fragments: each entry must be an absolute, clean path (the harness
+// materialized it under its own temp directory, never from callee input).
+// Anything else vetoes that entry rather than passing a path the CLI would
+// resolve outside the session's own directory. Empty input yields nil so a
+// skill-less session's resume argv stays byte-identical.
+func filterPluginDirArgs(dirs []string) []string {
+	var out []string
+	for _, dir := range dirs {
+		if dir == "" {
+			continue
+		}
+		if !filepath.IsAbs(dir) || filepath.Clean(dir) != dir {
+			continue
+		}
+		out = append(out, "--plugin-dir", dir)
+	}
+	return out
+}
+
+// removePluginDirs deletes per-session plugin directories recorded on the
+// handle. Idempotent: missing or empty paths return nil.
+func removePluginDirs(dirs []string) error {
+	for _, dir := range dirs {
+		if dir == "" {
+			continue
+		}
+		if err := os.RemoveAll(dir); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	return nil
 }
 
 // composeEnv builds the child process environment by merging parentEnv

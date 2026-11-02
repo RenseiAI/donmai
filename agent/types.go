@@ -673,6 +673,29 @@ type Spec struct {
 	// D5.5 there is still no cross-harness "supports extensions" boolean;
 	// only the exact profile's ToolPluginDelivery answers the question.
 	AdditionalExtensions []ExtensionDelivery `json:"additionalExtensions,omitempty"`
+
+	// CardSkills carries the agent card's inline skills for harnesses with a
+	// native per-session plugin surface (currently Claude via --plugin-dir).
+	// Each entry's Body is materialized by the harness into a session-scoped
+	// plugin directory outside the worktree; the harness passes that directory
+	// with its native plugin flag. Nil/empty is inert for every producer
+	// (additive, omitempty, wire round-trip unchanged) — a harness without
+	// the surface ignores an absent list, exactly like every other
+	// capability-gated Spec field. Entries are populated from the queued
+	// work's card skills by the runner's spec translation; providers must
+	// validate and refuse unsafe entries closed before spawn.
+	CardSkills []CardSkill `json:"cardSkills,omitempty"`
+}
+
+// CardSkill is one agent-card inline skill carried for native plugin delivery.
+// It mirrors the wire skill's identity and body; tool restrictions ride the
+// existing Spec.DisallowedTools channel (subtractive), not this struct.
+type CardSkill struct {
+	// ID is the skill's canonical id (e.g. "spring-debugging"). Used for
+	// the plugin's skills/<id>/SKILL.md directory name and log correlation.
+	ID string `json:"id,omitempty"`
+	// Body is the inline skill body rendered into SKILL.md verbatim.
+	Body string `json:"body,omitempty"`
 }
 
 // WithToolLifecycleProfile returns a copy selecting one manifest-declared

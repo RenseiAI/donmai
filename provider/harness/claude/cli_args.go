@@ -117,7 +117,12 @@ var linearMCPDisallowList = []string{
 // The mcpConfigPath argument is the path to the per-session
 // `--mcp-config` JSON tmpfile prepared by writeMCPConfig (see mcp.go).
 // When empty (no MCP servers configured) the flag is omitted.
-func buildArgs(spec agent.Spec, mcpConfigPath, resumeSessionID, ownedSessionID string) (argv []string, stdinPrompt string) {
+//
+// The pluginDir argument is the per-session card-skills plugin directory
+// prepared by writeCardSkillsPluginDir (see skills.go). When non-empty it
+// is passed as `--plugin-dir <dir>`; empty keeps skill-less spawns
+// byte-identical.
+func buildArgs(spec agent.Spec, mcpConfigPath, pluginDir, resumeSessionID, ownedSessionID string) (argv []string, stdinPrompt string) {
 	argv = []string{
 		"-p",
 		"--output-format", "stream-json",
@@ -135,6 +140,9 @@ func buildArgs(spec agent.Spec, mcpConfigPath, resumeSessionID, ownedSessionID s
 		// A pin that cannot be marshalled (string maps never fail in
 		// practice) still spawns: the process environment the pin mirrors
 		// remains, and failing the spawn would lie about what happened.
+	}
+	if pluginDir != "" {
+		argv = append(argv, pluginDirArgs(pluginDir)...)
 	}
 	if spec.SessionName != "" && resumeSessionID == "" {
 		argv = append(argv, "--name", spec.SessionName)
