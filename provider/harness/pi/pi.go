@@ -674,6 +674,17 @@ func (p *Provider) launchNotices(spec agent.Spec) []agent.Event {
 	// its local tool gate answers a narrower channel — see the residual note
 	// on the RPC tool_call hook.
 	notices = append(notices, agent.ToolCallBoundsEvent(DefaultToolCallTimeoutSeconds))
+	// Applied effort from the final headless launch configuration: the level
+	// the adapter actually pinned via modelPinArgs (the same `--model
+	// <id>[:<level>]` the child exec'd with, and the same level the
+	// extension pin carries as DONMAI_PI_THINKING_LEVEL), on the new
+	// activity key. Only the headless RPC lane calls launchNotices, so the
+	// interactive PTY lane (interactiveArgs shares modelPinArgs but has no
+	// event seam) emits nothing here. Emitted only after a successful
+	// headless launch: the handle publishes notices behind the InitEvent,
+	// which never resolves when the handshake gate fails closed, and a
+	// prompt/resume command is never sent on that path.
+	notices = append(notices, appliedEffortEvent(spec))
 	return notices
 }
 
