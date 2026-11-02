@@ -120,6 +120,19 @@ func withDependencyPreparationRecovery(adapted Spec, manifest HarnessManifest, p
 		adapted.PromptPlan = &plan
 	}
 	adapted.SystemPromptAppend = AppendDependencyPreparationRecovery(adapted.SystemPromptAppend, prep)
+	// A harness with no system surface received the operating protocol
+	// as a downgraded user-prompt prefix at adaptation time — and sends
+	// only Spec.Prompt — so the handoff must ride the prompt too, or the
+	// prepared lane delivers no recovery to it at all. Gated on the same
+	// caller-authorized protocol-to-user downgrade AdaptPrompt required,
+	// so harnesses with a native system surface never duplicate it.
+	if profile, ok := manifest.PromptProfile(PromptModeForSpec(adapted)); ok &&
+		profile.SystemDelivery == PromptDeliveryUnsupported &&
+		adapted.PromptPlan != nil {
+		if _, found := findDowngrade(adapted.PromptPlan.AuthorizedDowngrades, PromptChannelHarnessProtocol); found {
+			adapted.Prompt = AppendDependencyPreparationRecovery(adapted.Prompt, prep)
+		}
+	}
 	return adapted
 }
 

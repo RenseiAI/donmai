@@ -120,10 +120,12 @@ func (r *Runner) installSessionDependencies(ctx context.Context, qw QueuedWork, 
 		outcomes["go"] = installOutcome(goTimedOut, goFailed)
 	}
 	// A context that expired between ecosystems authorizes no more
-	// work: every ecosystem without a clean install reports timed_out.
+	// work: every unattempted ecosystem reports timed_out. Completed
+	// outcomes keep their recorded value — a clean install stays ready
+	// even when a later ecosystem consumes the shared deadline.
 	if installCtx.Err() != nil {
 		for _, name := range ecosystems {
-			if outcomes[name] == "" || outcomes[name] == agent.DependencyPreparationReady {
+			if outcomes[name] == "" {
 				outcomes[name] = agent.DependencyPreparationTimedOut
 			}
 		}

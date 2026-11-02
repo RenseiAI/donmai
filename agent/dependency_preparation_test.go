@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/provider/harness/opencode"
 	"github.com/RenseiAI/donmai/provider/harness/pi"
 )
 
@@ -201,6 +202,62 @@ func TestApplyPreparedHarnessProjectsRecoveryAfterEqualityCheck(t *testing.T) {
 				}
 			} else if strings.Contains(adapted.SystemPromptAppend, "Dependency preparation did not complete") {
 				t.Errorf("non-recovery outcome must leave SystemPromptAppend unchanged: %q", adapted.SystemPromptAppend)
+			}
+		})
+	}
+}
+
+// TestApplyPreparedHarnessProjectsRecoveryOnNativeSurface is the
+// prepared-lane delivery-surface contract: the recovery handoff must
+// reach the native prompt the exact harness actually sends. A harness
+// whose profile downgrades the operating protocol into the user prompt
+// (OpenCode has no system surface) carries the handoff on Spec.Prompt;
+// a harness with a native system surface (pi) carries it on
+// SystemPromptAppend and leaves the user prompt free of duplication.
+// Projecting only onto the post-adaptation protocol surfaces leaves
+// OpenCode's native prompt without recovery and fails it.
+func TestApplyPreparedHarnessProjectsRecoveryOnNativeSurface(t *testing.T) {
+	t.Parallel()
+	prep := &agent.DependencyPreparation{Pnpm: agent.DependencyPreparationFailed}
+	for _, tc := range []struct {
+		name     string
+		manifest agent.HarnessManifest
+		// wantPromptRecovery selects the native surface: true means the
+		// handoff rides Spec.Prompt, false means SystemPromptAppend.
+		wantPromptRecovery bool
+	}{
+		{name: "opencode downgraded protocol rides prompt", manifest: (&opencode.Provider{}).Manifest(), wantPromptRecovery: true},
+		{name: "pi system protocol rides system surface", manifest: (&pi.Provider{}).Manifest()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			source := recoveryTestSpec()
+			plan := compileRecoveryPlan(t, source, tc.manifest)
+			materialized := source
+			materialized.PreparedHarness = plan
+			materialized.DependencyPreparation = prep
+			adapted, err := agent.PrepareHarness(materialized, tc.manifest)
+			if err != nil {
+				t.Fatalf("PrepareHarness: %v", err)
+			}
+			if !strings.Contains(adapted.Prompt, "do the work") {
+				t.Fatalf("original user task lost in native prompt: %q", adapted.Prompt)
+			}
+			const marker = "Dependency preparation did not complete"
+			if tc.wantPromptRecovery {
+				if !strings.Contains(adapted.Prompt, marker) {
+					t.Fatalf("native prompt missing recovery: %q", adapted.Prompt)
+				}
+				if !strings.Contains(adapted.Prompt, prep.OutcomeSummary()) {
+					t.Errorf("native prompt missing bounded summary %q: %q", prep.OutcomeSummary(), adapted.Prompt)
+				}
+			} else {
+				if !strings.Contains(adapted.SystemPromptAppend, marker) {
+					t.Fatalf("system surface missing recovery: %q", adapted.SystemPromptAppend)
+				}
+				if strings.Contains(adapted.Prompt, marker) {
+					t.Fatalf("user prompt must not duplicate system recovery: %q", adapted.Prompt)
+				}
 			}
 		})
 	}

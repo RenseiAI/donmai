@@ -261,6 +261,56 @@ func TestInstallSessionDependencies_ExpiredContextReportsTimedOut(t *testing.T) 
 	}
 }
 
+// scriptedDepsExecer answers per command: pnpm installs cleanly while any
+// other command blocks until the shared install context expires, like a
+// wedged `go mod download` after a good pnpm install.
+type scriptedDepsExecer struct {
+	mu    sync.Mutex
+	calls []depsCall
+}
+
+func (f *scriptedDepsExecer) Exec(ctx context.Context, dir, command string, _ map[string]string) (int, error) {
+	f.mu.Lock()
+	f.calls = append(f.calls, depsCall{dir: dir, command: command})
+	f.mu.Unlock()
+	if command == pnpmDepsInstallCommand {
+		return 0, nil
+	}
+	<-ctx.Done()
+	return -1, ctx.Err()
+}
+
+func (f *scriptedDepsExecer) recorded() []depsCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]depsCall(nil), f.calls...)
+}
+
+func TestInstallSessionDependencies_TimeoutKeepsCompletedReady(t *testing.T) {
+	t.Parallel()
+	execer := &scriptedDepsExecer{}
+	r := depsTestRunner(t, execer)
+	r.depsInstallTimeout = 100 * time.Millisecond
+
+	wpath := t.TempDir()
+	writeFile(t, wpath, "pnpm-lock.yaml", "lockfileVersion: 9.0\n")
+	writeFile(t, wpath, "go.mod", "module example.test/seed\n\ngo 1.24\n")
+
+	prep := r.installSessionDependencies(context.Background(), QueuedWork{QueuedWork: queuedWorkBase("DEPS-KEEP-READY")}, wpath, false)
+
+	if calls := execer.recorded(); len(calls) != 2 {
+		t.Fatalf("install calls = %d; want 2 (pnpm ok, go bounded attempt)", len(calls))
+	}
+	// A completed install keeps its outcome: only the expired ecosystem
+	// reports timed_out. Overwriting every ready with timed_out fails it.
+	if prep == nil || prep.Pnpm != agent.DependencyPreparationReady || prep.Go != agent.DependencyPreparationTimedOut {
+		t.Fatalf("preparation = %+v; want {pnpm:ready go:timed_out}", prep)
+	}
+	if got := prep.OutcomeSummary(); !strings.Contains(got, "pnpm: ready") || !strings.Contains(got, "go: timed_out") {
+		t.Fatalf("summary = %q; want per-ecosystem outcomes kept", got)
+	}
+}
+
 func TestInstallSessionDependencies_CancelledContextAuthorizesNoWork(t *testing.T) {
 	t.Parallel()
 	execer := &recordingDepsExecer{}

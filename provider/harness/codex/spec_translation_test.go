@@ -142,6 +142,14 @@ func TestSpecFieldCoverage(t *testing.T) {
 		// any stamped level this adapter cannot render. Codex renders index 0
 		// only, so nothing in the JSON-RPC translation depends on it.
 		"ExecutionSecurity",
+		// DependencyPreparation is the digest-exempt post-admission install
+		// outcome: agent.ApplyPreparedHarness projects its failed/timed_out
+		// recovery handoff onto the adapted prompt surfaces after the
+		// equality check passes, and the legacy lane injects the same
+		// handoff at composition time — both before NewSpawnPlan runs. By
+		// translation time the outcome is already ordinary prompt text, so
+		// no JSON-RPC param depends on it.
+		"DependencyPreparation",
 	}
 	all := append([]string{}, translatedFields...)
 	all = append(all, ignoredFields...)
