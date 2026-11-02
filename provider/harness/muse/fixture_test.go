@@ -41,6 +41,17 @@ type fakeHost struct {
 	resumeErr *rpcError
 	// schemaVersion overrides the handshake schema version (0 = 1).
 	schemaVersion int
+	// sessionStartErr, when non-nil, is the JSON-RPC error
+	// session/start answers. Test-only first-turn sync failure door.
+	sessionStartErr *rpcError
+	// turnStartErr, when non-nil, is the JSON-RPC error turn/start
+	// answers. Test-only first-turn sync failure door.
+	turnStartErr *rpcError
+	// failedKind and failedMessage override the failed script's
+	// turn/completed error object. Empty keeps the canned
+	// overloaded/host-overloaded pair.
+	failedKind    string
+	failedMessage string
 }
 
 func newFakeHost() (*fakeHost, *io.PipeWriter, *io.PipeReader) {
@@ -91,6 +102,8 @@ func (fh *fakeHost) run(t *testing.T) {
 		sessionID := fh.sessionID
 		schemaVersion := fh.schemaVersion
 		denyApproval := fh.denyApproval
+		sessionStartErr := fh.sessionStartErr
+		turnStartErr := fh.turnStartErr
 		fh.mu.Unlock()
 		if schemaVersion == 0 {
 			schemaVersion = 1
@@ -112,6 +125,16 @@ func (fh *fakeHost) run(t *testing.T) {
 				},
 			})
 		case method == "session/start" && hasID:
+			if sessionStartErr != nil {
+				fh.write(t, map[string]any{
+					"jsonrpc": "2.0", "id": idRaw,
+					"error": map[string]any{
+						"code": sessionStartErr.Code, "message": sessionStartErr.Message,
+						"data": map[string]any{"kind": "internal"},
+					},
+				})
+				continue
+			}
 			params, _ := msg["params"].(map[string]any)
 			sid, _ := params["sessionId"].(string)
 			if sid == "" {
@@ -153,6 +176,16 @@ func (fh *fakeHost) run(t *testing.T) {
 				},
 			})
 		case method == "turn/start" && hasID:
+			if turnStartErr != nil {
+				fh.write(t, map[string]any{
+					"jsonrpc": "2.0", "id": idRaw,
+					"error": map[string]any{
+						"code": turnStartErr.Code, "message": turnStartErr.Message,
+						"data": map[string]any{"kind": "overloaded"},
+					},
+				})
+				continue
+			}
 			params, _ := msg["params"].(map[string]any)
 			sid, _ := params["sessionId"].(string)
 			cmdID, _ := params["commandId"].(string)
@@ -194,8 +227,15 @@ func (fh *fakeHost) run(t *testing.T) {
 
 // emitScript plays the canned notification sequence for a script name.
 // denyApproval switches the approval script to a deny-by-default bridge
-// policy with an abort-arm choice set (the live shell shape).
+// policy with an abort-arm choice set (the live shell shape). The
+// failed script honors fh.failedKind/failedMessage when set (empty
+// keeps the canned overloaded pair) so tests can plant host error text
+// without touching the shared scripts.
 func (fh *fakeHost) emitScript(t *testing.T, script, sid, turnID string, denyApproval bool) {
+	fh.mu.Lock()
+	failedKind := fh.failedKind
+	failedMessage := fh.failedMessage
+	fh.mu.Unlock()
 	t.Helper()
 	completed := func(terminal string) {
 		fh.write(t, map[string]any{
@@ -325,11 +365,19 @@ func (fh *fakeHost) emitScript(t *testing.T, script, sid, turnID string, denyApp
 			"jsonrpc": "2.0", "method": "turn/started",
 			"params": map[string]any{"sessionId": sid, "turnId": turnID, "viewCursor": "cursor-1"},
 		})
+		kind := "overloaded"
+		if failedKind != "" {
+			kind = failedKind
+		}
+		message := "host overloaded"
+		if failedMessage != "" {
+			message = failedMessage
+		}
 		fh.write(t, map[string]any{
 			"jsonrpc": "2.0", "method": "turn/completed",
 			"params": map[string]any{
 				"sessionId": sid, "terminal": "failed", "turnId": turnID, "viewCursor": "cursor-end",
-				"error": map[string]any{"kind": "overloaded", "message": "host overloaded", "retryable": true},
+				"error": map[string]any{"kind": kind, "message": message, "retryable": true},
 			},
 		})
 	case "approval":
@@ -422,6 +470,33 @@ func (fh *fakeHost) emitScript(t *testing.T, script, sid, turnID string, denyApp
 		// After recovery (session/resume), the turn completes.
 		agentMsg("item-9", "recovered", 1)
 		completed("completed")
+	case "stale-queued-failure":
+		// The acknowledged first turn stays queued while an older
+		// turn's success arrives first. The stale success must not
+		// terminate the session or consume the first-turn diagnostic;
+		// the queued first turn's failure then terminates with one.
+		staleID := "00000000-0000-7000-8000-000000000001"
+		if staleID == turnID {
+			staleID = "00000000-0000-7000-8000-000000000002"
+		}
+		fh.write(t, map[string]any{
+			"jsonrpc": "2.0", "method": "turn/started",
+			"params": map[string]any{"sessionId": sid, "turnId": turnID, "viewCursor": "cursor-1"},
+		})
+		fh.write(t, map[string]any{
+			"jsonrpc": "2.0", "method": "turn/completed",
+			"params": map[string]any{
+				"sessionId": sid, "terminal": "completed", "turnId": staleID, "viewCursor": "cursor-stale",
+				"usage": map[string]any{"cachedTokens": 1, "inputTokens": 10, "outputTokens": 5, "reasoningTokens": 0},
+			},
+		})
+		fh.write(t, map[string]any{
+			"jsonrpc": "2.0", "method": "turn/completed",
+			"params": map[string]any{
+				"sessionId": sid, "terminal": "failed", "turnId": turnID, "viewCursor": "cursor-end",
+				"error": map[string]any{"kind": "overloaded", "message": "host overloaded", "retryable": true},
+			},
+		})
 	}
 }
 
