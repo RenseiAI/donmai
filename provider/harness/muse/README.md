@@ -21,6 +21,37 @@ run with no MCP tools). Sessions with no `mcpServers` soft-pass a
 missing grant with a warning. The pinned export fingerprint is
 advisory (a mismatch warns); the version is enforced.
 
+## Schema audit (host 1.4.14)
+
+Audited against a version-verified 1.4.14 host with the export
+command above (60s timeout, `MUSE_NO_AUTO_UPDATE=1`, scratch
+directory only; exports are not committed):
+
+- Manifest: `schemaVersion: 1`, stable surface, fingerprint
+  `sha256:c94c3d1f2f51e6424074b9ec43eac3eedcf532d3dcd77351ec1383a87d3049c6` —
+  exactly the pin in `schema_fingerprint.go`. No fingerprint drift.
+- 45 exported notifications, all classified (executable inventory:
+  `schema_inventory_test.go`): 22 have dedicated mapper cases, 19
+  map record-only (named nonterminal `SystemEvent`, `Raw`
+  preserved, neutral method message), 2 are reserved for dedicated
+  mappings (`approval/reviewing`, `session/branchChanged`), and 2
+  are client→server only (`initialized`, `userInput/engaged`).
+- The 2 exported server requests (`approval/request`,
+  `userInput/request`) stay on the server-request door in
+  `handle.go`; none is allowlisted as a notification, and
+  genuinely unknown methods keep the `unknown` diagnostic.
+- Record-only params need no new wire types: the mapper never
+  parses them. `userInput/requested` maps to
+  `user_input_prompt_opened`, distinct from the server-request
+  door's `user_input_requested`.
+- Baseline limitation: no prior export is retained in the repo,
+  so this compares the fresh export against the committed pin and
+  projection — not a retained export-to-export diff.
+- Transport note: `session/listChanged` carries no top-level
+  sessionId, so client dispatch drops it before the mapper (the
+  pre-existing `session/started` precedent); it is covered at
+  mapper and handle level rather than through Spawn.
+
 ## Spawn
 
 `muse serve [--trust-workspace] [--disable-sandbox]`; the read-only lane
