@@ -50,6 +50,17 @@ type mapperState struct {
 	// a previous turn's evidence.
 	turnSawBesideInput bool
 
+	// turnPromptTotal accumulates the prompt totals of the current turn's
+	// session/tokenUsage steps (the outer promptTokens when the host
+	// sends it, else the cumulative prompt delta for the step). A
+	// cumulative-only step carries no usage block and therefore sets no
+	// shape flag, but its prompt total still proves the turn's shape at
+	// the terminal: the terminal usage block reports the same turn, so
+	// without step evidence the terminal classifies against this total
+	// instead of guessing from the raw input alone. Consumed (reset)
+	// at every turn/completed with the flags.
+	turnPromptTotal int64
+
 	// items tracks the last revision applied per itemId. Deltas and
 	// updates at a stale revision are dropped; completion always
 	// applies (the host guarantees item/completed is authoritative,
@@ -280,7 +291,9 @@ func mapTurnCompleted(params json.RawMessage, state *mapperState, raw any) []age
 		// or beside input): the turn's steps already proved which
 		// shape this host reports, so the override follows the same
 		// proof. Inside evidence nets the read slice; beside evidence
-		// passes the fresh tokens through; without step evidence the
+		// passes the fresh tokens through; a cumulative-only turn with
+		// no usage-block evidence still proved its prompt total, so the
+		// terminal classifies against it; without any turn evidence the
 		// read-beside shape (read > input, which an including counter
 		// can never produce) still passes through.
 		switch {
@@ -288,6 +301,8 @@ func mapTurnCompleted(params json.RawMessage, state *mapperState, raw any) []age
 			in = netMuseInput(p.Usage.InputTokens, cached)
 		case state.turnSawBesideInput:
 			in = p.Usage.InputTokens
+		case state.turnPromptTotal > 0:
+			in = freshMuseInput(p.Usage.InputTokens, cached, state.turnPromptTotal)
 		default:
 			in = freshMuseInput(p.Usage.InputTokens, cached, 0)
 		}
@@ -302,6 +317,7 @@ func mapTurnCompleted(params json.RawMessage, state *mapperState, raw any) []age
 	// turn never inherits it.
 	state.turnSawInsideInput = false
 	state.turnSawBesideInput = false
+	state.turnPromptTotal = 0
 	cost := &agent.CostData{
 		InputTokens:       in,
 		OutputTokens:      out,
@@ -465,6 +481,12 @@ func mapTokenUsage(params json.RawMessage, state *mapperState, _ any) []agent.Ev
 	stepTotal := p.PromptTokens
 	if stepTotal <= 0 {
 		stepTotal = max(p.Cumulative.PromptTokens-state.totalInputTok, 0)
+	}
+	// Every step proves part of the turn's prompt total for a terminal
+	// that arrives with no usage-block evidence (a cumulative-only step
+	// sets no shape flag, but its total still classifies the terminal).
+	if stepTotal > 0 {
+		state.turnPromptTotal += stepTotal
 	}
 	if p.Usage != nil {
 		usage = *p.Usage

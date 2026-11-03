@@ -996,3 +996,45 @@ func TestMapTurnCompleted_ShapeEvidenceIsTurnScoped(t *testing.T) {
 		}
 	})
 }
+
+// TestMapTurnCompleted_CumulativeStepsProveTerminalShape pins the terminal
+// against a turn whose only steps are cumulative (no usage block, so no
+// shape flag): the steps' prompt totals still prove the turn's shape. A
+// cumulative prompt of 300 carrying a 100-read delta reports 200 fresh
+// input; the terminal usage block reporting the same turn (200 input with
+// 100 reads beside it, 200 + 100 inside the 300 total) must pass those 200
+// fresh tokens through instead of netting the read slice a second time.
+func TestMapTurnCompleted_CumulativeStepsProveTerminalShape(t *testing.T) {
+	state := newMapperState("m")
+	stepEvents := mapNotification("session/tokenUsage", json.RawMessage(`{"cumulative":{"promptTokens":300,"outputTokens":20,"cacheReadTokens":100}}`), state, nil)
+	if len(stepEvents) != 1 {
+		t.Fatalf("tokenUsage produced %v, want one usage event", kindsOf(stepEvents))
+	}
+	step, ok := stepEvents[0].(agent.LlmCallEvent)
+	if !ok {
+		t.Fatalf("event is %T, want LlmCallEvent", stepEvents[0])
+	}
+	if step.InputTokens != 200 || step.CachedInputTokens != 100 {
+		t.Fatalf("step=%+v, want in=200 cached=100", step)
+	}
+	events := mapNotification("turn/completed", json.RawMessage(`{"sessionId":"s","terminal":"completed","turnId":"t1","viewCursor":"c","usage":{"inputTokens":200,"outputTokens":20,"cacheReadTokens":100}}`), state, nil)
+	var llm *agent.LlmCallEvent
+	var result *agent.ResultEvent
+	for _, ev := range events {
+		switch e := ev.(type) {
+		case agent.LlmCallEvent:
+			llm = &e
+		case agent.ResultEvent:
+			result = &e
+		}
+	}
+	if llm == nil || result == nil || result.Cost == nil {
+		t.Fatalf("events=%v, want llm call plus result", kindsOf(events))
+	}
+	if llm.InputTokens != 200 || llm.CachedInputTokens != 100 {
+		t.Errorf("llm=%+v, want in=200 cached=100", llm)
+	}
+	if result.Cost.InputTokens != 200 || result.Cost.CachedInputTokens != 100 {
+		t.Errorf("cost=%+v, want in=200 cached=100", result.Cost)
+	}
+}

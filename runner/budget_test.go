@@ -1337,3 +1337,89 @@ func TestBudgetEnforcer_WriteLastResultWithFreshCountsWhole(t *testing.T) {
 		t.Fatalf("cost=%+v, want in=100 writes=300 usd=0.03 turns=2", got)
 	}
 }
+
+// TestBudgetEnforcer_WriteEqualityMustNotCollapseReads pins the cross-bucket
+// guard: a write-bucket equality must not collapse fields that contradict a
+// running total. Two invocations report 100 then 200 cached reads with a
+// 100-read call between them (reads 200 != 100 + 200, and the turn count is
+// flat at 1 despite the pending call), while the write bucket happens to
+// grow exactly prev+call. The second result is a separate invocation and
+// counts whole: reads 400, writes 300, $0.03, 3 turns, observed 40 —
+// breaching a 35-token cap. Collapsed it would meter 30 and miss the cap.
+func TestBudgetEnforcer_WriteEqualityMustNotCollapseReads(t *testing.T) {
+	enf := NewBudgetEnforcer(&prompt.StageBudget{MaxTokens: 35}, time.Now())
+	call := func(cached, written int64) agent.LlmCallEvent {
+		return agent.LlmCallEvent{
+			CachedInputTokens: cached, CacheWriteTokens: written,
+			UsageSource: agent.LlmUsageProvider,
+		}
+	}
+	result := func(cached, written int64, usd float64) agent.ResultEvent {
+		return agent.ResultEvent{Success: true, Cost: &agent.CostData{
+			CachedInputTokens: cached, CacheWriteTokens: written,
+			TotalCostUsd: usd, NumTurns: 1,
+		}}
+	}
+	events := []agent.Event{
+		call(100, 100), result(100, 100, 0.01),
+		call(200, 100), result(200, 200, 0.02),
+		call(100, 0),
+	}
+	breached := false
+	for _, ev := range events {
+		if err := enf.ObserveEvent(ev); err != nil {
+			breached = true
+		}
+	}
+	if rep := enf.Report(time.Now()); rep.ObservedTokens != 40 {
+		t.Fatalf("ObservedTokens=%d, want 40", rep.ObservedTokens)
+	}
+	if !breached {
+		t.Fatal("want the max-tokens breach at observed=40 limit=35")
+	}
+	if got := enf.cost(); got == nil || got.CachedInputTokens != 400 || got.CacheWriteTokens != 300 || got.TotalCostUsd != 0.03 || got.NumTurns != 3 {
+		t.Fatalf("cost=%+v, want reads=400 writes=300 usd=0.03 turns=3", got)
+	}
+}
+
+// TestBudgetEnforcer_CacheEqualityMustNotCollapseWrites is the mirror pin:
+// a cache-bucket equality must not collapse a contradicting write bucket.
+// The second result's reads grow exactly prev+call while its writes (200
+// vs 100 + 200) and its flat turn count do not. Whole: reads 300, writes
+// 400, $0.03, 3 turns, observed 30 — breaching a 25-token cap. Collapsed
+// it would meter 20 and miss the cap.
+func TestBudgetEnforcer_CacheEqualityMustNotCollapseWrites(t *testing.T) {
+	enf := NewBudgetEnforcer(&prompt.StageBudget{MaxTokens: 25}, time.Now())
+	call := func(cached, written int64) agent.LlmCallEvent {
+		return agent.LlmCallEvent{
+			CachedInputTokens: cached, CacheWriteTokens: written,
+			UsageSource: agent.LlmUsageProvider,
+		}
+	}
+	result := func(cached, written int64, usd float64) agent.ResultEvent {
+		return agent.ResultEvent{Success: true, Cost: &agent.CostData{
+			CachedInputTokens: cached, CacheWriteTokens: written,
+			TotalCostUsd: usd, NumTurns: 1,
+		}}
+	}
+	events := []agent.Event{
+		call(100, 100), result(100, 100, 0.01),
+		call(100, 200), result(200, 200, 0.02),
+		call(0, 100),
+	}
+	breached := false
+	for _, ev := range events {
+		if err := enf.ObserveEvent(ev); err != nil {
+			breached = true
+		}
+	}
+	if rep := enf.Report(time.Now()); rep.ObservedTokens != 30 {
+		t.Fatalf("ObservedTokens=%d, want 30", rep.ObservedTokens)
+	}
+	if !breached {
+		t.Fatal("want the max-tokens breach at observed=30 limit=25")
+	}
+	if got := enf.cost(); got == nil || got.CachedInputTokens != 300 || got.CacheWriteTokens != 400 || got.TotalCostUsd != 0.03 || got.NumTurns != 3 {
+		t.Fatalf("cost=%+v, want reads=300 writes=400 usd=0.03 turns=3", got)
+	}
+}

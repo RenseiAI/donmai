@@ -416,10 +416,14 @@ func addCost(a, b agent.CostData) agent.CostData {
 // per-call usage both carry cached tokens, and the new total grows to
 // exactly their sum. The input/output-free restriction is load-bearing:
 // without it a coincidental cache sum across two independent per-invocation
-// results would collapse their fresh input, dollars and turns. Without
-// that per-bucket evidence the result counts whole — a per-invocation
-// terminal can otherwise sum to a previous cached total by coincidence
-// when the per-call detail omitted the cache the terminal supplies.
+// results would collapse their fresh input, dollars and turns. Every other
+// bucket must read as the same running total too (see
+// otherBucketsReconcileLocked): a match collapses the whole cost, so a
+// contradicting bucket means the result is a separate invocation and
+// counts whole. Without that per-bucket evidence the result counts whole —
+// a per-invocation terminal can otherwise sum to a previous cached total
+// by coincidence when the per-call detail omitted the cache the terminal
+// supplies.
 // Called with e.mu held.
 func (e *BudgetEnforcer) cacheReconcilesLocked(total agent.CostData) bool {
 	if total.InputTokens != 0 || total.OutputTokens != 0 {
@@ -432,8 +436,11 @@ func (e *BudgetEnforcer) cacheReconcilesLocked(total agent.CostData) bool {
 		return false
 	}
 	prev, call := e.lastResult.CachedInputTokens, e.pending.CachedInputTokens
-	return e.pending.NumTurns > 0 && prev > 0 && call > 0 &&
-		total.CachedInputTokens > prev && total.CachedInputTokens == prev+call
+	if !(e.pending.NumTurns > 0 && prev > 0 && call > 0 &&
+		total.CachedInputTokens > prev && total.CachedInputTokens == prev+call) {
+		return false
+	}
+	return e.otherBucketsReconcileLocked(total)
 }
 
 // writeReconcilesLocked is cacheReconcilesLocked for the cache-write
@@ -441,7 +448,8 @@ func (e *BudgetEnforcer) cacheReconcilesLocked(total agent.CostData) bool {
 // side and reconciles only when the previous total and the pending calls
 // both evidence the write growth. The input/output-free restriction keeps
 // a coincidental write sum from discarding fresh input, dollars and
-// turns. Called with e.mu held.
+// turns, and every other bucket must read as the same running total too
+// (see otherBucketsReconcileLocked). Called with e.mu held.
 func (e *BudgetEnforcer) writeReconcilesLocked(total agent.CostData) bool {
 	if total.InputTokens != 0 || total.OutputTokens != 0 {
 		return false
@@ -453,8 +461,45 @@ func (e *BudgetEnforcer) writeReconcilesLocked(total agent.CostData) bool {
 		return false
 	}
 	prev, call := e.lastResult.CacheWriteTokens, e.pending.CacheWriteTokens
-	return e.pending.NumTurns > 0 && prev > 0 && call > 0 &&
-		total.CacheWriteTokens > prev && total.CacheWriteTokens == prev+call
+	if !(e.pending.NumTurns > 0 && prev > 0 && call > 0 &&
+		total.CacheWriteTokens > prev && total.CacheWriteTokens == prev+call) {
+		return false
+	}
+	return e.otherBucketsReconcileLocked(total)
+}
+
+// otherBucketsReconcileLocked reports whether every bucket outside the one
+// the caller already evidenced reads as the same running total: a reconcile
+// match collapses the whole cost via costDifference, so a contradicting
+// bucket (or turn count) means the new result is a separate invocation and
+// must count whole. Token buckets must equal the previous total plus the
+// pending per-call usage exactly; the dollar total only moves one way on a
+// running total (pending calls carry no dollar amount, so growth is the
+// only evidence available — a drop is a restart or a re-price and counts
+// whole); the turn count must grow when both totals report one (a flat
+// turn count despite pending calls is a separate invocation), while a zero
+// turn count on either side is absent evidence and constrains nothing.
+// Called with e.mu held.
+func (e *BudgetEnforcer) otherBucketsReconcileLocked(total agent.CostData) bool {
+	if total.CachedInputTokens != e.lastResult.CachedInputTokens+e.pending.CachedInputTokens {
+		return false
+	}
+	if total.CacheWriteTokens != e.lastResult.CacheWriteTokens+e.pending.CacheWriteTokens {
+		return false
+	}
+	if total.ReasoningTokens != e.lastResult.ReasoningTokens+e.pending.ReasoningTokens {
+		return false
+	}
+	if total.TotalCostUsd < e.lastResult.TotalCostUsd {
+		return false
+	}
+	if e.lastResult.NumTurns > 0 && total.NumTurns > 0 {
+		growth := total.NumTurns - e.lastResult.NumTurns
+		if growth <= 0 || growth > e.pending.NumTurns {
+			return false
+		}
+	}
+	return true
 }
 
 // costDifference returns what a running total adds over the previous one,
