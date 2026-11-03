@@ -340,8 +340,12 @@ func meteredTokens(c agent.CostData) int64 {
 //
 // The two are told apart on evidence, not on the harness's name: when the
 // per-call usage the harness reported since the previous ResultEvent is
-// exactly the difference between this total and that one, the new total
-// provably repeats the earlier usage, and only the difference is new. In
+// exactly the positive growth from the previous total to this one, the new
+// total provably repeats the earlier usage, and only the difference is new.
+// The growth must be strictly positive: cost-only provider calls (no new
+// tokens) between two identical per-invocation results are not evidence of
+// a running total, and collapsing them would mistake two separate
+// invocations for one cumulative report. In
 // every other case the whole cost is counted, exactly as before this rule
 // existed, so a harness without per-call usage — or with per-call usage that
 // does not reconcile — keeps its previous accounting and is never
@@ -377,7 +381,7 @@ func (e *BudgetEnforcer) resultIncrementLocked(cost *agent.CostData) int64 {
 			increment.NumTurns = e.pending.NumTurns
 		}
 	}
-	if previous > 0 && e.pending.NumTurns > 0 && total == previous+callTokens {
+	if previous > 0 && e.pending.NumTurns > 0 && total > previous && total == previous+callTokens {
 		increment = costDifference(*cost, e.lastResult)
 	}
 	e.metered = addCost(e.metered, increment)

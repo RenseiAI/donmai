@@ -1002,3 +1002,61 @@ func TestBudgetEnforcer_CacheOnlyCumulativeCountsOnce(t *testing.T) {
 		t.Fatalf("cost=%+v, want cached 200 usd 0.02", got)
 	}
 }
+
+// Cache-only per-invocation results sum: two separate invocations reporting
+// the same 100 cached tokens and $0.01 each meter 200 cached / $0.02 / 20
+// and breach a 15-token cap, even when cost-only provider calls sit between
+// them. With no positive token growth there is no evidence of a running
+// total, so the second result counts whole instead of reconciling as a
+// cumulative difference. Runs on the raw harness events and again through
+// the span processor, which is how consumeEvents feeds the enforcer.
+func TestBudgetEnforcer_CacheOnlyPerInvocationSums(t *testing.T) {
+	costOnlyCall := func() agent.LlmCallEvent {
+		usd := 0.005
+		return agent.LlmCallEvent{UsageSource: agent.LlmUsageProvider, ObservedCostUsd: &usd}
+	}
+	perInvocationResult := func() agent.ResultEvent {
+		return agent.ResultEvent{Success: true, Cost: &agent.CostData{CachedInputTokens: 100, TotalCostUsd: 0.01, NumTurns: 1}}
+	}
+	for _, viaSpan := range []bool{false, true} {
+		name := "raw"
+		if viaSpan {
+			name = "through the span processor"
+		}
+		t.Run(name, func(t *testing.T) {
+			events := []agent.Event{costOnlyCall(), perInvocationResult(), costOnlyCall(), perInvocationResult()}
+			if viaSpan {
+				processor, err := spanruntime.NewProcessor(spanruntime.ProcessorConfig{
+					SessionID:   "budget-test",
+					OrgID:       "org-test",
+					WorkspaceID: "workspace-test",
+					Sender:      spanruntime.SendFunc(func(agent.Span) bool { return true }),
+				})
+				if err != nil {
+					t.Fatalf("NewProcessor: %v", err)
+				}
+				var out []agent.Event
+				for _, ev := range events {
+					out = append(out, processor.Process(ev)...)
+				}
+				events = out
+			}
+			enf := NewBudgetEnforcer(&prompt.StageBudget{MaxTokens: 15}, time.Now())
+			breached := false
+			for _, ev := range events {
+				if err := enf.ObserveEvent(ev); err != nil {
+					breached = true
+				}
+			}
+			if rep := enf.Report(time.Now()); rep.ObservedTokens != 20 {
+				t.Fatalf("ObservedTokens=%d, want 20", rep.ObservedTokens)
+			}
+			if !breached {
+				t.Fatal("want the max-tokens breach at observed=20 limit=15")
+			}
+			if got := enf.cost(); got == nil || got.CachedInputTokens != 200 || got.TotalCostUsd != 0.02 || got.NumTurns != 2 {
+				t.Fatalf("cost=%+v, want cached 200 usd 0.02 turns 2", got)
+			}
+		})
+	}
+}

@@ -261,11 +261,11 @@ func mapTurnCompleted(params json.RawMessage, state *mapperState, raw any) []age
 		if p.Usage.CacheWriteTokens != nil {
 			cacheWrite = *p.Usage.CacheWriteTokens
 		}
-		// The turn input total folds cached reads back in
-		// (OpenAI-style): report only the fresh slice so the
-		// max-tokens meter and cost rollups stop counting every
-		// cached token twice.
-		in = netMuseInput(p.Usage.InputTokens, cached)
+		// The turn input counter is provider-dependent (cache inside or
+		// beside input): only net the read slice when the shape proves
+		// the input included it. Without a turn prompt total the
+		// read-beside shape (read > input) passes through.
+		in = freshMuseInput(p.Usage.InputTokens, cached, 0)
 		reasoning = p.Usage.ReasoningTokens
 	} else {
 		// Without a turn usage block the result carries the session
@@ -364,13 +364,38 @@ func museStepCacheRead(u TokenUsage) int64 {
 	return u.CachedTokens
 }
 
-// netMuseInput returns the contract-compliant fresh input count for an
-// OpenAI-style provider total that folds cached reads back in: the total
-// minus the read slice, floored at zero so a host that already excludes a
-// class can never drive the count negative. Cache writes are deliberately
-// NOT removed: they ride CacheWriteTokens and the provider total is only
-// proven to include reads.
+// netMuseInput returns the contract-compliant fresh input count for a
+// provider total that provably folds cached reads back in (the cumulative
+// prompt totals): the total minus the read slice, floored at zero.
+// Cache writes are deliberately NOT removed: they ride CacheWriteTokens
+// and the provider total is only proven to include reads.
 func netMuseInput(input, cacheRead int64) int64 {
+	return max(input-cacheRead, 0)
+}
+
+// freshMuseInput returns the contract-compliant fresh input count for a
+// provider raw input counter that is provider-dependent: the host may
+// fold cached reads back into input (inside) or report them beside it.
+// stepTotal is the step's own prompt total when known (>0): the outer
+// promptTokens when the host sends it, else the cumulative prompt delta
+// for the step. When the read slice fits beside the reported input
+// inside that total (input+read <= total), the input is already
+// exclusive and passes through; otherwise the total provably included
+// the reads and only the net slice is fresh, floored at zero. Without a
+// step total the read-beside shape (read > input, which an including
+// counter can never produce) still passes through instead of flooring to
+// zero, so a valid exclusive report never loses its fresh tokens; every
+// other shape nets. Cache writes are never removed here either.
+func freshMuseInput(input, cacheRead, stepTotal int64) int64 {
+	if stepTotal > 0 {
+		if input+cacheRead <= stepTotal {
+			return input
+		}
+		return max(input-cacheRead, 0)
+	}
+	if cacheRead > input {
+		return input
+	}
 	return max(input-cacheRead, 0)
 }
 
@@ -398,13 +423,24 @@ func mapTokenUsage(params json.RawMessage, state *mapperState, _ any) []agent.Ev
 	readDelta, writeDelta := max(cached-state.totalCachedTok, 0), max(cacheWrite-state.cacheWriteTok, 0)
 	usage.CachedTokens = readDelta
 	usage.CacheWriteTokens = &writeDelta
-	// The prompt delta folds the read delta back in (OpenAI-style), so
-	// the fallback step reports only its fresh input; the read slice
-	// rides CachedInputTokens instead (agent.CostData).
+	// The prompt delta provably folds the read delta back in (it is the
+	// step's own prompt total), so the fallback step reports only its
+	// fresh input; the read slice rides CachedInputTokens instead
+	// (agent.CostData).
 	usage.InputTokens = netMuseInput(usage.InputTokens, readDelta)
 	if p.Usage != nil {
 		usage = *p.Usage
-		usage.InputTokens = netMuseInput(usage.InputTokens, museStepCacheRead(usage))
+		// The step input counter is provider-dependent (cache inside
+		// or beside input): the step's own prompt total tells which.
+		// The outer promptTokens names it directly; otherwise the
+		// cumulative prompt delta for the step carries it (the delta
+		// of a restarted counter reads as unknown and falls back to
+		// the read-beside shape check).
+		stepTotal := p.PromptTokens
+		if stepTotal <= 0 {
+			stepTotal = max(p.Cumulative.PromptTokens-state.totalInputTok, 0)
+		}
+		usage.InputTokens = freshMuseInput(usage.InputTokens, museStepCacheRead(usage), stepTotal)
 	}
 	read := usage.CachedTokens
 	if usage.CacheReadTokens != nil {

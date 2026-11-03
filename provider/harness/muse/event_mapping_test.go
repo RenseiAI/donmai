@@ -427,6 +427,20 @@ func TestMapTokenUsage_NetsCacheReads(t *testing.T) {
 			wantWrite:  6,
 		},
 		{
+			name:       "reads beside input pass through (exclusive, step total proves it)",
+			params:     `{"cumulative":{"promptTokens":130,"outputTokens":20,"cacheReadTokens":100},"usage":{"inputTokens":30,"outputTokens":20,"cacheReadTokens":100}}`,
+			wantIn:     30,
+			wantOut:    20,
+			wantCached: 100,
+		},
+		{
+			name:       "outer promptTokens marks reads beside input",
+			params:     `{"promptTokens":130,"cumulative":{"promptTokens":130,"outputTokens":20,"cacheReadTokens":100},"usage":{"inputTokens":30,"outputTokens":20,"cacheReadTokens":100}}`,
+			wantIn:     30,
+			wantOut:    20,
+			wantCached: 100,
+		},
+		{
 			name:       "reads beyond prompt floor at zero",
 			params:     `{"cumulative":{"promptTokens":10,"outputTokens":2,"cacheReadTokens":25},"usage":{"inputTokens":10,"outputTokens":2,"cacheReadTokens":25}}`,
 			wantIn:     0,
@@ -475,8 +489,10 @@ func TestMapTokenUsage_NetsReadsAcrossSteps(t *testing.T) {
 
 // TestMapTurnCompleted_NetsCacheReads pins the same contract for the
 // turn/completed override path: a turn usage block carrying cached reads
-// reports InputTokens net of them, and a turn with no cache-read field
-// passes its input through untouched.
+// inside its input reports InputTokens net of them; reads reported beside
+// the input (read slice larger than the raw input, which an including
+// counter can never produce) pass the fresh tokens through untouched, as
+// does a turn with no cache-read field.
 func TestMapTurnCompleted_NetsCacheReads(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -510,9 +526,19 @@ func TestMapTurnCompleted_NetsCacheReads(t *testing.T) {
 			wantWrite:  20,
 		},
 		{
-			name:       "reads beyond input floor at zero",
+			name:       "usage with reads beside input passes through",
+			usage:      `,"usage":{"inputTokens":30,"outputTokens":20,"cacheReadTokens":100}`,
+			wantIn:     30,
+			wantCached: 100,
+		},
+		{
+			// Without a step total the mapper cannot prove over-report, so
+			// a read slice larger than the raw input reads as the
+			// provider-beside shape and the fresh tokens pass through
+			// instead of flooring to zero.
+			name:       "reads beyond input pass through (no total to prove over-report)",
 			usage:      `,"usage":{"inputTokens":10,"outputTokens":2,"cacheReadTokens":99}`,
-			wantIn:     0,
+			wantIn:     10,
 			wantCached: 99,
 		},
 	}
