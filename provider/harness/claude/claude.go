@@ -36,6 +36,9 @@ type Options struct {
 // returns an independent Handle backed by its own subprocess.
 type Provider struct {
 	binary string
+	// skillTempDir is where per-session skill plugin directories are
+	// created; "" is the OS temporary directory. A test seam.
+	skillTempDir string
 }
 
 // New constructs a Provider after probing for the `claude` binary on
@@ -186,12 +189,25 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 // cleans up the MCP tmpfile and returns an error wrapping
 // agent.ErrSpawnFailed.
 func (p *Provider) spawn(ctx context.Context, spec agent.Spec, resumeSessionID, ownedSessionID string) (agent.Handle, error) {
+	// Materialize the session's native skills on EVERY spawn, fresh and
+	// resumed alike, into a new plugin directory, verified against the
+	// plan before the child starts (skills.go).
+	skills, err := skillMaterializer{tempDir: p.skillTempDir}.MaterializeSkills(spec)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
+	}
+	releaseSkills := func() {
+		if skills.Cleanup != nil {
+			_ = skills.Cleanup()
+		}
+	}
 	mcpPath, err := clijsonl.WriteMCPConfigWithEnv(spec.MCPServers, spec.Env)
 	if err != nil {
+		releaseSkills()
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}
 
-	argv, stdinPrompt := buildArgs(spec, mcpPath, resumeSessionID, ownedSessionID)
+	argv, stdinPrompt := buildArgsWithSkills(spec, mcpPath, resumeSessionID, ownedSessionID, skills.Args)
 	// Between-turn Inject re-enters the session cwd, where a repo-local
 	// settings file could redirect the follow-up turn's bearer: hand the
 	// driver the same routing pin this spawn carries so every --resume
@@ -201,7 +217,18 @@ func (p *Provider) spawn(ctx context.Context, spec agent.Spec, resumeSessionID, 
 	// The owned id rides into the handle ahead of the CLI's own init line
 	// (see SpawnBinaryWithOwnedSessionID): SessionID() is the resume token
 	// from the moment Spawn/Resume returns, not from the first event.
-	return clijsonl.SpawnBinaryWithOwnedSessionID(ctx, p.binary, argv, stdinPrompt, mcpPath, resumePinArgs(spec), spec.Cwd, spec.Env, spec.OnProcessSpawned, ownedSessionIDForHandle(resumeSessionID, ownedSessionID))
+	//
+	// The skill plugin directory rides every Inject --resume too (the
+	// driver admits exactly that pair beside the pin), and is removed when
+	// the handle stops.
+	resumeExtra := append(resumePinArgs(spec), skills.Args...)
+	handle, err := clijsonl.SpawnBinaryWithOwnedSessionID(ctx, p.binary, argv, stdinPrompt, mcpPath, resumeExtra, spec.Cwd, spec.Env, spec.OnProcessSpawned, ownedSessionIDForHandle(resumeSessionID, ownedSessionID))
+	if err != nil {
+		releaseSkills()
+		return nil, err
+	}
+	handle.AddCleanup(skills.Cleanup)
+	return handle, nil
 }
 
 // ownedSessionIDForHandle resolves the resume token the handle owns from

@@ -96,6 +96,11 @@ type Handle struct {
 	confinement     confinementPlan
 	sessionDir      string
 	confinementOnce sync.Once
+	// skillTrust and skillCleanup come from the skill materializer
+	// (setSkills); skillOnce guards the cleanup.
+	skillTrust   bool
+	skillCleanup func() error
+	skillOnce    sync.Once
 
 	state *mapperState
 
@@ -157,6 +162,24 @@ func (h *Handle) setConfinement(plan *confinement.Plan, sessionDir string) {
 		h.confinement = plan
 	}
 	h.sessionDir = sessionDir
+}
+
+// setSkills attaches what the skill materializer wrote for the session:
+// whether the serve host must trust the workspace, and the cleanup that
+// removes the skill directories when the session stops. Set before the
+// child starts.
+func (h *Handle) setSkills(skills agent.MaterializedSkills) {
+	h.skillTrust = skills.TrustWorkspace
+	h.skillCleanup = skills.Cleanup
+}
+
+// releaseSkills removes the session's materialized skill directories once.
+func (h *Handle) releaseSkills() {
+	h.skillOnce.Do(func() {
+		if h.skillCleanup != nil {
+			_ = h.skillCleanup()
+		}
+	})
 }
 
 // releaseConfinement releases the rendered profile and removes the
@@ -289,14 +312,16 @@ func (h *Handle) spawnChild(workspaceRoot string, spec agent.Spec) error {
 	args := []string{"serve"}
 	cwd := ""
 	envExtra := map[string]string(nil)
-	trust := false
+	// A natively delivered skill is the one per-session reason to trust
+	// the workspace (skills.go); the host option trusts every session.
+	trust := h.skillTrust
 	disableSandbox := false
 	if h.provider != nil {
 		bin = h.provider.museBin
 		args = append([]string(nil), h.provider.opts.Args...)
 		cwd = h.provider.opts.Cwd
 		envExtra = h.provider.opts.Env
-		trust = h.provider.opts.TrustWorkspace
+		trust = trust || h.provider.opts.TrustWorkspace
 		disableSandbox = h.provider.opts.DisableSandbox
 	}
 	if bin == "" {
@@ -842,6 +867,7 @@ func (h *Handle) closeEvents() {
 	}
 	_ = h.shutdownChild("events closed")
 	h.releaseConfinement()
+	h.releaseSkills()
 }
 
 // emit publishes an event on the events channel without blocking. If

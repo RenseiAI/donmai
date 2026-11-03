@@ -428,15 +428,12 @@ type PollDeliveryPolicy struct {
 	AllowCleanMerge   bool `json:"allowCleanMerge,omitempty"`
 }
 
-// PollSkill mirrors prompt.SkillSpec for the daemon package so the daemon can
-// decode + forward the agent-card inline skill set (WS5) without importing the
-// prompt package. The runner re-types this into prompt.SkillSpec in
-// detailToQueuedWork. JSON tags are byte-identical to prompt.SkillSpec.
-type PollSkill struct {
-	ID              string   `json:"id,omitempty"`
-	Body            string   `json:"body,omitempty"`
-	DisallowedTools []string `json:"disallowedTools,omitempty"`
-}
+// PollSkill is the work item's skill as the daemon decodes and forwards it:
+// the shared 1.0 wire type (stagewire.Skill, a leaf package, so poll.go stays
+// import-light). prompt.SkillSpec aliases the same type, so the hop from the
+// session detail to the runner is a deep copy, never a field-by-field
+// re-type that could silently drop a field.
+type PollSkill = stagewire.Skill
 
 // LandingWorkItem mirrors one element of the orchestrator's poll-response
 // `landingWork[]` array. It is a per-(orgId,repoId) TRIGGER to run the landing

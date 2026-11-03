@@ -29,6 +29,16 @@ and no other Spec or provider option widens it. Env: `META_API_KEY` is stripped
 unless the Spec sets it; `MUSE_NO_AUTO_UPDATE=1` is always set. The cwd
 is the realpath of the workspace (the host rejects non-canonical roots).
 
+Native skills (`Spec.Skills`, see `skills.go`) are written to reserved
+`.agents/skills/donmai-<id>/` directories in the workspace, excluded from
+`git status` and from backstop commits, and verified before the spawn. The
+host discovers workspace skills only when trusted, so `--trust-workspace`
+is passed exactly when the plan delivers a skill natively. Trust also loads
+the repository's own rules, hooks and skills; the plan records the
+repository-skill policy as achieved `all` in that case and `none`
+otherwise. A directory the runner did not write is never overwritten, and
+every directory it wrote is removed when the session stops.
+
 ## Interactive PTY spawn mode
 
 A session with `Spec.Interactive` set spawns the bare `muse` TUI under a

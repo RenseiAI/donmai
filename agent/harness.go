@@ -143,6 +143,10 @@ type HarnessManifest struct {
 	// entries travel is derived from the ToolLifecycle profiles, not declared
 	// here. The zero value renders index 0 only.
 	ExecutionSecurity ExecutionSecurityRendering `json:"executionSecurity,omitzero"`
+	// Skills declares how this harness receives skills natively and how far
+	// it can govern repository skills (skill_delivery.go). The zero value is
+	// a prompt-only harness that cannot suppress repository skills.
+	Skills SkillDeliveryProfile `json:"skills,omitzero"`
 }
 
 // SpecAdmissionDenialCode classifies a typed denial of a requested Spec

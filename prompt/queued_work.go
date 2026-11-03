@@ -585,23 +585,14 @@ type StageBudget struct {
 	MaxTokens int64 `json:"maxTokens,omitempty"`
 }
 
-// SkillSpec is one INLINE skill carried by the agent card (WS5). It is
-// distinct from a kit file-sourced skill: the skill body arrives verbatim
-// on the wire rather than being read from a SKILL.md on disk. The runner
-// folds Body into the system-prompt SkillAppend block (after kit skills)
-// and unions DisallowedTools into the kit-derived disallowed set
-// (subtractive — skills may only narrow the tool surface, never widen it).
-type SkillSpec struct {
-	// ID is the skill's canonical id (e.g. "spring-debugging"). Used for
-	// log correlation; carried opaquely by the runner.
-	ID string `json:"id,omitempty"`
-
-	// Body is the inline skill body folded into the system prompt's
-	// SkillAppend block. Markdown text, used verbatim.
-	Body string `json:"body,omitempty"`
-
-	// DisallowedTools is the optional set of tool-call patterns this skill
-	// forbids. Unioned into the kit-derived disallowed set and appended to
-	// the agent.Spec's DisallowedTools — subtractive (narrows only).
-	DisallowedTools []string `json:"disallowedTools,omitempty"`
-}
+// SkillSpec is one skill carried by the work item. It is the shared 1.0
+// wire type (stagewire.Skill), aliased so every hop (poll item, session
+// detail, runner work item) decodes and forwards the same fields: the
+// package content for native delivery (files, digest, version, invocation,
+// delivery) and Body, the prompt fallback a pre-1.0 control plane sends
+// alone. It is distinct from a kit file-sourced skill. The runner plans each
+// skill's delivery per harness (agent.PlanSkillDelivery), folds the bodies
+// of prompt-delivered skills into the system-prompt SkillAppend block (after
+// kit skills), and unions every skill's DisallowedTools into the session's
+// disallowed set (subtractive: skills may only narrow the tool surface).
+type SkillSpec = stagewire.Skill

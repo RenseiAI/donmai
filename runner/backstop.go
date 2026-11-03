@@ -79,6 +79,10 @@ var excludePathPrefixes = []string{
 	"target/debug/",
 	"target/release/",
 	".donmai/code-index/",
+	// Skills a harness materializer wrote into the checkout for this
+	// session (.agents/skills/donmai-<id>/): session machinery, never
+	// project content. The project's own .agents/skills/ stays committable.
+	harnessstate.InTreeSkillPathPrefix,
 }
 
 // wipSecretBasenames are exact secret-bearing basenames that must never
