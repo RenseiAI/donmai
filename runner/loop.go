@@ -978,16 +978,31 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// the kit (file-sourced) skills, and union their disallowedTools into the
 	// kit-derived disallowed set. Inline skills carry their body verbatim on
 	// the wire (no SKILL.md on disk). Additive: no card skills → no change.
+	//
+	// Headless codex is the exception: its bodies ride the harness-native
+	// surface (SKILL.md files under the isolated home, delivered from
+	// Spec.Skills at step 6) so they stay out of the prompt until the
+	// model triggers them. Their disallowedTools are still enforced
+	// runner-side here, on every lane.
 	if len(qw.Skills) > 0 {
-		newAppend, inlineDisallow, injected := foldInlineSkills(promptBuilder.SkillAppend, qw.Skills)
-		promptBuilder.SkillAppend = newAppend
-		kitDisallowedTools = append(kitDisallowedTools, inlineDisallow...)
-		if injected > 0 {
-			r.logger.Info("agent-card inline skills injected into system prompt",
+		if codexNativeCardSkills(provider, qw) {
+			inlineDisallow := collectInlineSkillDisallows(qw.Skills)
+			kitDisallowedTools = append(kitDisallowedTools, inlineDisallow...)
+			r.logger.Info("agent-card inline skills routed to native codex delivery",
 				"sessionId", qw.SessionID,
-				"skillCount", injected,
-				"skillBytes", len(newAppend),
+				"skillCount", len(qw.Skills),
 			)
+		} else {
+			newAppend, inlineDisallow, injected := foldInlineSkills(promptBuilder.SkillAppend, qw.Skills)
+			promptBuilder.SkillAppend = newAppend
+			kitDisallowedTools = append(kitDisallowedTools, inlineDisallow...)
+			if injected > 0 {
+				r.logger.Info("agent-card inline skills injected into system prompt",
+					"sessionId", qw.SessionID,
+					"skillCount", injected,
+					"skillBytes", len(newAppend),
+				)
+			}
 		}
 	}
 	// Inject workType-filtered prompt fragments into the prompt builder.
@@ -1115,6 +1130,14 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	if err != nil {
 		res.Status, res.FailureMode, res.Error = "failed", FailureProviderResolve, err.Error()
 		return res, err
+	}
+	// Native card-skill lane: headless codex renders Spec.Skills as
+	// SKILL.md files under its isolated home. Set before the
+	// prepared-source branch below, which never touches Skills. Every
+	// other lane leaves this nil and the prompt fold above carries the
+	// bodies instead.
+	if codexNativeCardSkills(provider, qw) {
+		spec.Skills = toCardSkills(qw.Skills)
 	}
 
 	// Interactive mode: request spawn-under-PTY with a live interactive
@@ -4383,10 +4406,8 @@ func foldInlineSkills(existingAppend string, skills []prompt.SkillSpec) (newAppe
 		if strings.TrimSpace(sk.Body) != "" {
 			inlineBodies = append(inlineBodies, sk.Body)
 		}
-		if len(sk.DisallowedTools) > 0 {
-			disallowed = append(disallowed, sk.DisallowedTools...)
-		}
 	}
+	disallowed = collectInlineSkillDisallows(skills)
 	newAppend = existingAppend
 	if len(inlineBodies) > 0 {
 		inlineAppend := strings.Join(inlineBodies, "\n\n")
@@ -4397,6 +4418,48 @@ func foldInlineSkills(existingAppend string, skills []prompt.SkillSpec) (newAppe
 		}
 	}
 	return newAppend, disallowed, len(inlineBodies)
+}
+
+// collectInlineSkillDisallows returns the union of disallowedTools across
+// card inline skills, in order. A whitespace-only body contributes no
+// text but its restrictions still count — the same rule foldInlineSkills
+// applies. Pure — no I/O.
+func collectInlineSkillDisallows(skills []prompt.SkillSpec) []string {
+	var disallowed []string
+	for _, sk := range skills {
+		disallowed = append(disallowed, sk.DisallowedTools...)
+	}
+	return disallowed
+}
+
+// codexNativeCardSkills reports whether card-skill bodies ride the
+// harness-native surface instead of the system prompt: headless codex
+// sessions only. Interactive codex keeps the prompt fallback because the
+// interactive lane has ambient-home sub-paths where isolated delivery is
+// impossible, and the runner cannot know before spawn which sub-path a
+// session will take (see docs/codex-card-skills-spike.md). Pure — no I/O.
+func codexNativeCardSkills(provider agent.Provider, qw QueuedWork) bool {
+	if provider == nil || provider.Name() != agent.ProviderCodex {
+		return false
+	}
+	return !qw.isInteractive()
+}
+
+// toCardSkills converts wire inline skills to the Spec-native shape the
+// codex harness renders. Pure — no I/O.
+func toCardSkills(skills []prompt.SkillSpec) []agent.CardSkill {
+	if len(skills) == 0 {
+		return nil
+	}
+	out := make([]agent.CardSkill, 0, len(skills))
+	for _, sk := range skills {
+		out = append(out, agent.CardSkill{
+			ID:              sk.ID,
+			Body:            sk.Body,
+			DisallowedTools: append([]string(nil), sk.DisallowedTools...),
+		})
+	}
+	return out
 }
 
 // mergeMCPServers unions the runner's per-session default MCP set (the

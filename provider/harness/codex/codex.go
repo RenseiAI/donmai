@@ -463,6 +463,13 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 		return spawnInteractivePrepared(ctx, p.opts, spec)
 	}
 
+	// Native card skills land in the isolated home before any side
+	// effect (auth link, app-server start, MCP acquisition), so a
+	// delivery failure denies the spawn and leaves nothing behind.
+	if err := p.deliverSpecCardSkills(spec); err != nil {
+		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
+	}
+
 	ready, err := p.ensureHeadlessReady(spec)
 	if err != nil {
 		return nil, err
@@ -504,6 +511,12 @@ func (p *Provider) Resume(ctx context.Context, sessionID string, spec agent.Spec
 	spec, err = agent.PrepareHarness(spec, p.Manifest())
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
+	}
+	// A resume may arrive on a fresh Provider (new process, empty
+	// home), so card skills re-deliver idempotently here exactly as on
+	// Spawn — before any side effect, denying on failure.
+	if err := p.deliverSpecCardSkills(spec); err != nil {
+		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
 	}
 	ready, err := p.ensureHeadlessReady(spec)
 	if err != nil {

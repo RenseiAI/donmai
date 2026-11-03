@@ -383,6 +383,30 @@ type CodeIntelEnforcement struct {
 	FallbackAfterAttempt bool `json:"fallbackAfterAttempt"`
 }
 
+// CardSkill is one agent-card inline skill: guidance text the session's
+// agent card declares, distinct from kit file-sourced skills. The runner
+// threads these onto Spec.Skills for harnesses with a native skill
+// surface (today: headless codex, which renders them as SKILL.md files
+// under its isolated home); every other lane folds Body into the system
+// prompt instead. Capability-gated: harnesses without a native skill
+// surface ignore this field.
+//
+// DisallowedTools is enforced runner-side (unioned into the session's
+// disallowed set before spawn) on every lane, native or prompt, so a
+// native renderer only needs ID + Body.
+type CardSkill struct {
+	// ID is the skill's canonical id (e.g. "spring-debugging").
+	ID string `json:"id,omitempty"`
+
+	// Body is the inline skill body: Markdown guidance, used verbatim.
+	Body string `json:"body,omitempty"`
+
+	// DisallowedTools is the optional set of tool-call patterns this
+	// skill forbids. Unioned into the session's disallowed set
+	// runner-side — subtractive (narrows only).
+	DisallowedTools []string `json:"disallowedTools,omitempty"`
+}
+
 // Spec is the input contract for Provider.Spawn.
 //
 // Verbatim port of the AgentSpawnConfig from the legacy TS providers/types.ts.
@@ -494,6 +518,15 @@ type Spec struct {
 	// should be added to AllowedTools so autonomous agents can call
 	// them.
 	MCPToolNames []string `json:"mcpToolNames,omitempty"`
+
+	// Skills carries the agent card's inline skills for harnesses with
+	// a native skill surface. Today only headless codex reads it
+	// (rendered as SKILL.md files under the isolated home, verified by
+	// readback); every other harness ignores it and the runner folds
+	// the same bodies into the system prompt instead. nil/empty is
+	// inert for every producer (additive, omitempty, wire round-trip
+	// unchanged).
+	Skills []CardSkill `json:"skills,omitempty"`
 
 	// MaxTurns caps agentic turns (API round-trips) before the
 	// provider stops. nil falls back to the provider default.

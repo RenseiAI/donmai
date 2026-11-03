@@ -166,6 +166,21 @@ home, poisons the Provider against later sessions, and is returned from
 Process exit and `Shutdown` also remove the owned home. `-32601 Method not
 found` is therefore a hard pre-thread failure.
 
+## Card skills (native)
+
+Headless `Spawn`/`Resume` render `Spec.Skills` (agent-card inline skills,
+threaded by the runner) as `SKILL.md` files under the session's isolated
+home at `skills/donmai-<card-id>/`, one directory per skill, and verify
+each file by reading it back and comparing sha256 digests. Delivery runs
+before any side effect, so a failure denies the spawn rather than
+running a session with silently partial guidance. Nothing is written to
+the worktree. Tool restrictions stay enforced runner-side on every lane.
+
+Background and the discovery proof: `docs/codex-card-skills-spike.md`.
+Interactive sessions keep the prompt fallback because that lane has
+ambient-home sub-paths where isolated delivery is impossible, and the
+runner cannot know before spawn which sub-path a session will take.
+
 ## Model selection
 
 Both spawn modes honor `Spec.Model` when the platform resolved one for the

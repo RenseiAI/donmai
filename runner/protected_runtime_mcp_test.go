@@ -795,9 +795,26 @@ func assertDualSelectionRuntimeSpawn(t *testing.T, provider *dualSelectionRuntim
 	if spec.PreparedHarness == nil || spec.PreparedHarness.ToolLifecycleReceipt.ProfileID != runtimeWork.profileID {
 		t.Fatalf("spawned session %s profile = %#v, want %q", runtimeWork.work.SessionID, spec.PreparedHarness, runtimeWork.profileID)
 	}
-	if spec.PromptPlan == nil || spec.PromptPlan.HarnessProtocol == nil ||
-		!strings.Contains(spec.PromptPlan.HarnessProtocol.Text, runtimeWork.skillBody) {
-		t.Fatalf("spawned session %s omitted its per-run skill %q", runtimeWork.work.SessionID, runtimeWork.skillBody)
+	if spec.PromptPlan == nil || spec.PromptPlan.HarnessProtocol == nil {
+		t.Fatalf("spawned session %s has no harness protocol prompt", runtimeWork.work.SessionID)
+	}
+	// Native card-skill lane: the per-run skill rides Spec.Skills (the
+	// harness renders it under its isolated home), never the prompt.
+	// An empty skillBody (work without card skills) pins nothing.
+	if runtimeWork.skillBody != "" {
+		found := false
+		for _, skill := range spec.Skills {
+			if skill.Body == runtimeWork.skillBody {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("spawned session %s omitted its per-run skill %q from native delivery", runtimeWork.work.SessionID, runtimeWork.skillBody)
+		}
+		if strings.Contains(spec.PromptPlan.HarnessProtocol.Text, runtimeWork.skillBody) {
+			t.Fatalf("spawned session %s leaked its per-run skill %q into the prompt", runtimeWork.work.SessionID, runtimeWork.skillBody)
+		}
 	}
 	var selected *agent.MCPServerConfig
 	for i := range spec.MCPServers {
@@ -942,7 +959,12 @@ func TestProtectedRuntimeMCPDualSelectionRunsExactV1AndV2SequentiallyAndConcurre
 		spec, _ := provider.spawnedSpec(runtimeWork.work.SessionID)
 		other := concurrent[1-i]
 		if strings.Contains(spec.PromptPlan.HarnessProtocol.Text, other.skillBody) {
-			t.Fatalf("spawned session %s inherited sibling skill %q", runtimeWork.work.SessionID, other.skillBody)
+			t.Fatalf("spawned session %s inherited sibling skill %q in its prompt", runtimeWork.work.SessionID, other.skillBody)
+		}
+		for _, skill := range spec.Skills {
+			if skill.Body == other.skillBody {
+				t.Fatalf("spawned session %s inherited sibling skill %q in native delivery", runtimeWork.work.SessionID, other.skillBody)
+			}
 		}
 	}
 

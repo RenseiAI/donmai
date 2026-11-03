@@ -83,8 +83,18 @@ func buildPreparedSourceSpec(qw QueuedWork, selection harnessSelection, decorate
 		return agent.Spec{}, nil, err
 	}
 	builder := prompt.NewBuilder()
-	inlineAppend, inlineDisallow, _ := foldInlineSkills("", working.Skills)
-	builder.SkillAppend = inlineAppend
+	// Mirror the spawn lane's native/prompt split exactly: headless
+	// codex carries no card-skill bodies in the prompt (they ride
+	// Spec.Skills on the live spec), so the prepared prompt authority
+	// must not contain them either. DisallowedTools still fold here.
+	var inlineDisallow []string
+	if codexNativeCardSkills(provider, working) {
+		inlineDisallow = collectInlineSkillDisallows(working.Skills)
+	} else {
+		inlineAppend, disallow, _ := foldInlineSkills("", working.Skills)
+		builder.SkillAppend = inlineAppend
+		inlineDisallow = disallow
+	}
 	composition, err := builder.BuildComposition(working.QueuedWork)
 	if err != nil {
 		return agent.Spec{}, nil, err
