@@ -319,6 +319,15 @@ func NewSpawnPlan(spec agent.Spec) SpawnPlan {
 func ignoredSpecFields(spec agent.Spec) []SpecFieldNote {
 	var notes []SpecFieldNote
 
+	// Skills: codex has no native skill layout; the runner folded every
+	// skill it could deliver into SystemPromptAppend already.
+	if spec.Skills.HasNative() {
+		notes = append(notes, SpecFieldNote{
+			Field:  "Skills",
+			Reason: "codex declares no native skill layout; only prompt-delivered skills (already in SystemPromptAppend) reach the session",
+		})
+	}
+
 	// Env: not a JSON-RPC param. Plumbed via the codex app-server
 	// child process environment in codex.go (process.env merge).
 	if len(spec.Env) > 0 {

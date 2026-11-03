@@ -21,6 +21,7 @@ var stageWireMembers = map[string]string{
 	"retry":          `{"retries":2,"backoffSeconds":60}`,
 	"stageContext":   `{"stage":{"key":"backlog","name":"Backlog","role":"intake"},"sourceStatus":null,"card":{"id":"card_1","handle":"builder"},"reason":"default","parent":{"identifier":"PRJ-1","title":"Parent"},"children":[{"identifier":"PRJ-2","status":"Done"},{"identifier":"PRJ-3","status":null}]}`,
 	"dispatchReason": `"mention"`,
+	"repoSkills":     `{"policy":"allowlist","allow":["conventions"]}`,
 }
 
 // TestStageWireRoundTripsEveryHop carries each 1.0 field, alone and all
@@ -140,7 +141,7 @@ func TestStageWireAbsentKeepsLegacyBytes(t *testing.T) {
 	if err != nil || !bytes.Equal(canonical, item.OperationalPayload) {
 		t.Fatalf("legacy projection changed: %v\n%s\n%s", err, canonical, item.OperationalPayload)
 	}
-	for _, member := range []string{"stage", "card", "transitions", "retry", "stageContext", "dispatchReason", "batchKind"} {
+	for _, member := range []string{"stage", "card", "transitions", "retry", "stageContext", "dispatchReason", "batchKind", "repoSkills"} {
 		if bytes.Contains(canonical, []byte(`"`+member+`"`)) {
 			t.Fatalf("legacy projection carries %q: %s", member, canonical)
 		}
@@ -180,5 +181,46 @@ func TestStageWireLandingBatchKindDecodes(t *testing.T) {
 	}
 	if len(resp.LandingWork) != 1 || resp.LandingWork[0].BatchKind != "landing-run" || resp.LandingWork[0].WorkType != "landing" {
 		t.Fatalf("landing work = %+v", resp.LandingWork)
+	}
+}
+
+// TestSkillWireRoundTripsEveryHop carries a 1.0 skill package (files,
+// digest, version, invocation, delivery) beside a legacy body-only skill
+// through the poll decode, the session detail and the runner work item,
+// and checks nothing is dropped and the typed operational projection still
+// equals the wire's, so the admission digest is unchanged by decoding.
+func TestSkillWireRoundTripsEveryHop(t *testing.T) {
+	t.Parallel()
+	raw := []byte(`{"sessionId":"skill-wire","workType":"development","resolvedProfile":{},"skills":[` +
+		`{"id":"review","name":"review","description":"Review a change.","version":"1.2.0",` +
+		`"digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111",` +
+		`"files":[{"path":"SKILL.md","contentBase64":"IyBSZXZpZXcK","mode":420,"sha256":"aa"},{"path":"scripts/run.sh","contentBase64":"IyEvYmluL3NoCg==","mode":493,"sha256":"bb"}],` +
+		`"invocation":"model","delivery":"native_preferred","body":"fallback","disallowedTools":["Bash(rm:*)"]},` +
+		`{"id":"legacy","body":"legacy body"}]}`)
+	var item daemon.PollWorkItem
+	if err := json.Unmarshal(raw, &item); err != nil {
+		t.Fatalf("poll decode: %v", err)
+	}
+	if len(item.Skills) != 2 || len(item.Skills[0].Files) != 2 || item.Skills[0].Files[1].Mode != 0o755 || item.Skills[0].Invocation != stagewire.SkillInvocationModel {
+		t.Fatalf("poll item skills = %+v", item.Skills)
+	}
+	detail := daemon.PollItemToSessionDetail(item, nil, "", "", "")
+	detail.OperationalPayload = nil
+	work, err := detailToQueuedWork(detail)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(work.Skills, item.Skills) {
+		t.Fatalf("runner work item skills =\n%+v\nwant\n%+v", work.Skills, item.Skills)
+	}
+	if &work.Skills[0].Files[0] == &item.Skills[0].Files[0] {
+		t.Fatal("runner work item aliases the poll item's skill files")
+	}
+	canonical, err := runner.CanonicalOperationalPayload(work)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(canonical, item.OperationalPayload) {
+		t.Fatalf("typed projection differs from the wire:\n%s\n%s", canonical, item.OperationalPayload)
 	}
 }

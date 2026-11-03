@@ -42,6 +42,7 @@ import (
 	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 	"github.com/RenseiAI/donmai/runtime/worktree"
 	"github.com/RenseiAI/donmai/sessionshim"
+	"github.com/RenseiAI/donmai/stagewire"
 )
 
 // DefaultAgentRunDaemonURL is the local control HTTP address the default
@@ -1861,22 +1862,15 @@ func detailSeatBudget(in *daemon.SessionSeatBudget) *runner.SeatBudget {
 	}
 }
 
-// detailSkills re-types the daemon's PollSkill mirror slice into the
-// runner-consumable prompt.SkillSpec slice (WS5 agent-card inline skills).
-// Field-for-field copy; nil/empty returns nil.
+// detailSkills hands the session detail's skills to the runner. PollSkill
+// and prompt.SkillSpec are the same wire type (stagewire.Skill), so this is
+// a deep copy: every field, including package content, survives the hop.
+// nil/empty returns nil.
 func detailSkills(in []daemon.PollSkill) []prompt.SkillSpec {
 	if len(in) == 0 {
 		return nil
 	}
-	out := make([]prompt.SkillSpec, len(in))
-	for i, s := range in {
-		out[i] = prompt.SkillSpec{
-			ID:              s.ID,
-			Body:            s.Body,
-			DisallowedTools: s.DisallowedTools,
-		}
-	}
-	return out
+	return stagewire.CloneSkills(in)
 }
 
 // providerNameFromDetail projects a non-authoritative compatibility name for

@@ -236,6 +236,9 @@ type Fields struct {
 	Retry          *Retry         `json:"retry,omitempty"`
 	StageContext   *StageContext  `json:"stageContext,omitempty"`
 	DispatchReason DispatchReason `json:"dispatchReason,omitempty"`
+	// RepoSkills is the repository-skill policy (skills.go). Nil reads as
+	// the default policy, all.
+	RepoSkills *RepoSkills `json:"repoSkills,omitempty"`
 }
 
 // HasStageOrCard reports whether the work item carries a stage or a card.
@@ -274,6 +277,10 @@ func (f Fields) CloneFields() Fields {
 	if f.StageContext != nil {
 		v := f.StageContext.clone()
 		out.StageContext = &v
+	}
+	if f.RepoSkills != nil {
+		v := f.RepoSkills.clone()
+		out.RepoSkills = &v
 	}
 	return out
 }

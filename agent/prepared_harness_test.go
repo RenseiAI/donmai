@@ -249,6 +249,19 @@ func TestApplyPreparedHarnessNamesDriftingFields(t *testing.T) {
 			want: []string{"mcpServers"},
 		},
 		{
+			// A skill delivery plan that appears (or changes) between
+			// preflight and spawn is authority drift, named "skills".
+			name: "skill delivery plan differs (a skill turned native after preflight)",
+			mutate: func(s agent.Spec) agent.Spec {
+				s.Skills = &agent.SkillDelivery{Plan: agent.SkillDeliveryPlan{
+					ContractVersion: agent.SkillDeliveryContractVersion, Harness: agent.HarnessCodex,
+					Entries: []agent.SkillDeliveryEntry{{ID: "review", Requested: "native_preferred", Delivery: agent.SkillDeliveredNative}},
+				}}
+				return s
+			},
+			want: []string{"skills"},
+		},
+		{
 			name: "model and allowed tools both differ",
 			mutate: func(s agent.Spec) agent.Spec {
 				s.Model = "different-model"

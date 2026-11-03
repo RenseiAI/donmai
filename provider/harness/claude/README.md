@@ -17,6 +17,7 @@ F.1.1 §10.
 | `claude.go` | `Provider` struct, `New(Options)` constructor, fail-fast probe |
 | `cli_args.go` | `Spec → []string` translator accounting for every Spec field |
 | `mcp.go` | Per-session MCP `--mcp-config` JSON tmpfile writer + cleanup |
+| `skills.go` | Native skill delivery: per-session `--plugin-dir` writer + cleanup |
 | `jsonl.go` | JSONL → `agent.Event` mapper (port of legacy `mapSDKMessage`) |
 | `handle.go` | `Handle` struct: subprocess lifecycle, events channel, Stop |
 | `process_unix.go` | Unix process-group helpers for clean SIGTERM/SIGKILL propagation |
@@ -34,12 +35,20 @@ claude -p \
    --verbose \
    --dangerously-skip-permissions \
    --add-dir <Spec.Cwd> \
-   [optional: --model, --max-turns, --effort,
+   [optional: --plugin-dir /tmp/donmai-skills-*,
+              --model, --max-turns, --effort,
               --append-system-prompt, --permission-mode bypassPermissions,
               --allowedTools, --disallowedTools,
               --mcp-config /tmp/donmai-claude-mcp-*.json --strict-mcp-config,
               --resume <session-id>]
 ```
+
+`--plugin-dir` carries the session's natively delivered skills
+(`Spec.Skills`, see `skills.go`): a fresh directory outside the worktree
+holding `.claude-plugin/plugin.json` and `skills/<id>/`, written and
+verified against the plan before the spawn, re-passed on every `--resume`
+(including `Inject` turns), and removed when the handle stops. Skills the
+plan leaves on the prompt are already inside `--append-system-prompt`.
 
 The prompt is delivered via **stdin** so it never appears in the
 process listing. The CLI reads to EOF, then produces a JSONL stream

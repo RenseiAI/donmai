@@ -37,6 +37,14 @@ func (*Provider) Manifest() agent.HarnessManifest {
 		Family:            agent.FamilyHarness,
 		ContractABI:       "harness/v2",
 		ExecutionSecurity: codexExecutionSecurity,
+		// Skills: no native layout yet, so every skill rides the prompt
+		// fallback and the repository-skill policy is recorded as all.
+		// The candidate is a donmai-<id> directory under the private
+		// CODEX_HOME's skills root, which this CLI line installs into; it
+		// stays off until a live probe shows a thread in an untrusted
+		// platform workspace loads it, and that one app-server never
+		// serves two sessions whose skill sets differ.
+		Skills: agent.SkillDeliveryProfile{},
 		Caps: agent.HarnessCaps{
 			SupportsMessageInjection:         false,
 			SupportsSessionResume:            true,

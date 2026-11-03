@@ -173,6 +173,14 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		refuseForExecutionSecurity(res, err)
 		return res, err
 	}
+	// Plan skill delivery for this exact harness before any side effect, so
+	// a skill the dispatch requires natively that this harness or session
+	// mode cannot deliver refuses the run here (agent.PlanSkillDelivery).
+	skills, err := planSessionSkills(qw, provider, sessionPromptMode(qw, selection.effectiveCell))
+	if err != nil {
+		res.Status, res.FailureMode, res.Error = "failed", FailureProviderResolve, err.Error()
+		return res, err
+	}
 	repositoryDeclaration, provisionDeclaration, executorWorkareaCapabilities, workareaErr := resolveRepositoryWorkareaDeclaration(qw, provider)
 	if workareaErr != nil {
 		res.Status, res.FailureMode, res.Error = "failed", FailureWorktreeProvision, workareaErr.Error()
@@ -974,21 +982,18 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		}
 	}
 
-	// Fold the agent card's INLINE skills (WS5) into the prompt builder AFTER
-	// the kit (file-sourced) skills, and union their disallowedTools into the
-	// kit-derived disallowed set. Inline skills carry their body verbatim on
-	// the wire (no SKILL.md on disk). Additive: no card skills → no change.
+	// Fold the prompt residue of the work item's skills (the skills the plan
+	// did not deliver natively) into the prompt builder AFTER the kit
+	// (file-sourced) skills, and union EVERY skill's disallowedTools into the
+	// kit-derived disallowed set. Additive: no skills → no change.
 	if len(qw.Skills) > 0 {
-		newAppend, inlineDisallow, injected := foldInlineSkills(promptBuilder.SkillAppend, qw.Skills)
+		newAppend, _, injected := foldInlineSkills(promptBuilder.SkillAppend, skills.residue)
 		promptBuilder.SkillAppend = newAppend
-		kitDisallowedTools = append(kitDisallowedTools, inlineDisallow...)
-		if injected > 0 {
-			r.logger.Info("agent-card inline skills injected into system prompt",
-				"sessionId", qw.SessionID,
-				"skillCount", injected,
-				"skillBytes", len(newAppend),
-			)
-		}
+		kitDisallowedTools = append(kitDisallowedTools, skills.disallowed...)
+		r.logger.Info("work-item skills planned",
+			append([]any{"sessionId", qw.SessionID, "skillPromptCount", injected, "skillBytes", len(newAppend)},
+				skillDeliverySummary(skills.delivery)...)...,
+		)
 	}
 	// Inject workType-filtered prompt fragments into the prompt builder.
 	// Fragment bodies are appended after the skill block so the kit's skills
@@ -1116,6 +1121,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		res.Status, res.FailureMode, res.Error = "failed", FailureProviderResolve, err.Error()
 		return res, err
 	}
+	spec.Skills = skills.delivery
 
 	// Interactive mode: request spawn-under-PTY with a live interactive
 	// session surface (interactive-attach-v1). Spec.Interactive is
@@ -1263,6 +1269,10 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		s.CurrentStep = "spawning"
 		s.AttemptCount++
 		s.ExecutionSecurity = report
+		if spec.Skills != nil {
+			plan := spec.Skills.Plan
+			s.SkillDelivery = &plan
+		}
 		return nil
 	}); err != nil {
 		// state.json is best-effort — log and continue.
