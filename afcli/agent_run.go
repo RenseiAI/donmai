@@ -1584,6 +1584,7 @@ func detailToQueuedWork(d *daemon.SessionDetail) (runner.QueuedWork, error) {
 			BaseRef:              d.BaseRef,
 			WorkType:             d.WorkType,
 			WorkTypeRole:         d.WorkTypeRole,
+			Fields:               d.CloneFields(),
 			PromptContext:        d.PromptContext,
 			Body:                 d.Body,
 			Title:                d.Title,

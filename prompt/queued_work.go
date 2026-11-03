@@ -5,6 +5,7 @@ import (
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/internal/kit"
+	"github.com/RenseiAI/donmai/stagewire"
 )
 
 // InteractiveRunMode is the QueuedWork.Mode value for a live PTY-hosted
@@ -145,6 +146,13 @@ type QueuedWork struct {
 	// every wire hop so Go's strict JSON decoder never drops the platform's
 	// emit — the v0.9.3 SystemPromptOverride wire-gap precedent.
 	WorkTypeRole string `json:"workTypeRole,omitempty"`
+
+	// Fields carries the optional 1.0 wire fields (stage, card,
+	// transitions, retry, stageContext, dispatchReason) at the top level
+	// of the JSON object. When a stage or a card is present the renderer
+	// and the runner branch on roles and the card contract, never on
+	// WorkType; absent, every legacy path applies unchanged.
+	stagewire.Fields
 
 	// PromptContext is the rendered Linear issue context block produced
 	// by the platform-side dispatcher. Includes the <issue>, <user>,

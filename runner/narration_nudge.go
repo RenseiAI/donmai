@@ -89,7 +89,7 @@ func (s *narrationNudgeState) recordSent() {
 // no-new-commit continuation. Any other pull request (delivered, or a draft
 // with its own remedy prompt) suppresses the nudge.
 func isNarrationOnlyStop(qw QueuedWork, res *Result, session, turn streamObservation, reportedPR bool, undelivered string) bool {
-	if !RequiresPRURL(qw.WorkType, qw.WorkTypeRole) {
+	if !qw.requiresPR() {
 		return false
 	}
 	if res.PullRequestURL != "" && undelivered != undeliveredNoNewCommit {

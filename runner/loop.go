@@ -1300,7 +1300,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// read from the same clock at Run entry, so the two reads bracket the
 	// preparation phase exactly.
 	res.PreparationSeconds = preparationSeconds(r.now, time.UnixMilli(startedAt))
-	handle, err := provider.Spawn(ctx, spec)
+	handle, err := r.spawnWithRetry(ctx, provider, spec, qw)
 	if err != nil {
 		res.Status = "failed"
 		// No process existed, so the exit code stays null (never zero)
@@ -1641,6 +1641,10 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 
 	stallFollowUps := r.newTurnFollowUps()
 	stallFollowUps.limit = r.stallRetryLimit()
+	if qw.Retry != nil {
+		// A dispatched stage retry policy governs stall retries too.
+		stallFollowUps.limit = qw.Retry.Retries
+	}
 	streamRes, streamErr := r.consumeEventsWithStallRetries(ctx, streamCtx, provider, &handle, runnerStatePath, qw, res, enforcer, sink, traceProcessor, spec, stallFollowUps, beacons)
 	// budgetStop is the budget cap that ended the session, once one did: the
 	// provider is stopped and no further turn starts. The turn it ended is
@@ -1692,7 +1696,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// rework must have moved past.
 	verifyCtx := context.WithoutCancel(ctx)
 	var prVerifier *sessionPullRequestVerifier
-	if RequiresPRURL(qw.WorkType, qw.WorkTypeRole) {
+	if qw.requiresPR() {
 		prVerifier = r.newSessionPullRequestVerifier(verifyCtx, qw, repositoryDeclaration, wpath, branch, reworkStartHead(qw, res, wpath), repositoryFree)
 	}
 	r.acceptSessionPullRequest(verifyCtx, prVerifier, qw, res, &streamRes, streamRes)
@@ -1703,7 +1707,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// continued pull request exactly like the rework pull requests they
 	// already pin: a noop continue run keeps turning instead of ending
 	// completed against an unchanged head.
-	if qw.ContinuePullRequest != nil && !repositoryFree && res.PullRequestURL == "" && RequiresPRURL(qw.WorkType, qw.WorkTypeRole) {
+	if qw.ContinuePullRequest != nil && !repositoryFree && res.PullRequestURL == "" && qw.requiresPR() {
 		if continuedURL := continuePullRequestURL(verifyCtx, qw, repositoryDeclaration, wpath); continuedURL != "" {
 			r.seedContinuedPullRequest(prVerifier, continuedURL, res, &streamRes)
 		}
@@ -1783,8 +1787,9 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// point, the next follow-up prompt asks the agent to wrap up (unless the
 	// request already reached it mid-turn), and once a cap ends the session
 	// no follow-up turn starts.
-	publicationComplete := !RequiresPRURL(qw.WorkType, qw.WorkTypeRole) && res.WorkResult == "passed"
+	publicationComplete := !qw.requiresPR() && res.WorkResult == "passed"
 	followUps := r.newTurnFollowUps()
+	followUps.applyRetryPolicy(qw.Retry)
 	if stallFollowUps.retried > 0 || stallFollowUps.exhausted {
 		// A stall retry already ran on the first turn: carry its count
 		// onto the tail-recovery record so the envelope reports every
@@ -1793,8 +1798,8 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		followUps.retried = stallFollowUps.retried
 		followUps.last = tailRetry
 	}
-	reviewWork := RequiresReviewVerdict(qw.WorkType, qw.WorkTypeRole)
-	continuable := (RequiresPRURL(qw.WorkType, qw.WorkTypeRole) || reviewWork) && (caps.SupportsMessageInjection || caps.SupportsSessionResume)
+	reviewWork := qw.requiresReviewVerdict()
+	continuable := (qw.requiresPR() || reviewWork) && (caps.SupportsMessageInjection || caps.SupportsSessionResume)
 	tailRecoverable := selectedRepositoryMutable || reviewWork
 	narration := r.newNarrationNudgeState()
 tailRecovery:
@@ -1818,7 +1823,7 @@ tailRecovery:
 				ending = turnStoppedEarly
 			}
 		}
-		step := followUps.next(ending, lastTurn.toolCalls > 0, continuable, !publicationComplete && shouldSteer(steerView, caps, qw.WorkType, qw.WorkTypeRole))
+		step := followUps.next(ending, lastTurn.toolCalls > 0, continuable, !publicationComplete && shouldSteerFor(steerView, caps, qw.requiresPR()))
 		// Narration-only stop: a development turn that ended on a
 		// narration-only assistant message with no new commit and no
 		// delivering pull request gets the narration wording on its next
@@ -1901,10 +1906,10 @@ tailRecovery:
 			r.logger.Warn("turn ended on a model provider error; retrying",
 				"sessionId", qw.SessionID,
 				"attempt", followUps.retried+1,
-				"limit", followUps.limit,
+				"limit", followUps.retryLimit,
 				"providerError", lastTurn.providerError,
 			)
-			if err := r.waitRetryBackoff(streamCtx, followUps.retried+1); err != nil {
+			if err := r.waitRetryBackoffFor(streamCtx, qw.Retry, followUps.retried+1); err != nil {
 				stopped, budget, stopErr := r.classifyStreamStop(qw, res, handle, enforcer, pulser, lostOwnership, streamObservation{}, err)
 				if stopped {
 					res.TurnContinuations = followUps.report()
@@ -2030,8 +2035,8 @@ tailRecovery:
 
 	// Amend-existing-branch contract: on ref-bearing runs, skip gh pr create — the
 	// fix lands on the existing branch/PR, not a new one.
-	backstopEligible := !repositoryFree && shouldBackstop(res, qw.WorkType, qw.WorkTypeRole)
-	if repositoryDeclaration != nil && RequiresPRURL(qw.WorkType, qw.WorkTypeRole) {
+	backstopEligible := !repositoryFree && shouldBackstopFor(res, qw.requiresPR())
+	if repositoryDeclaration != nil && qw.requiresPR() {
 		switch res.FailureMode {
 		case FailureLostOwnership, FailureTimeout, FailureProviderResolve, FailureAgentBlocked, FailureOperatorCancelled:
 			backstopEligible = false
@@ -2048,7 +2053,7 @@ tailRecovery:
 	if qw.ContinuePullRequest != nil {
 		probe := *res
 		probe.PullRequestURL = ""
-		backstopEligible = !repositoryFree && shouldBackstop(&probe, qw.WorkType, qw.WorkTypeRole)
+		backstopEligible = !repositoryFree && shouldBackstopFor(&probe, qw.requiresPR())
 	}
 	if !r.skipBackstop && !publicationComplete && backstopEligible && budgetStop == nil {
 		beacons.Report(ctx, StatusBeaconBackstop)
@@ -2098,7 +2103,7 @@ tailRecovery:
 	// other check still applies. Runs only when no failure was already
 	// recorded, so a runner-authored refusal (divergence, provision)
 	// keeps its own typed reason.
-	if qw.ContinuePullRequest != nil && !repositoryFree && RequiresPRURL(qw.WorkType, qw.WorkTypeRole) && res.FailureMode == "" && budgetStop == nil {
+	if qw.ContinuePullRequest != nil && !repositoryFree && qw.requiresPR() && res.FailureMode == "" && budgetStop == nil {
 		startHead := strings.TrimSpace(qw.ContinuePullRequest.HeadSha)
 		if res.PullRequestURL != "" || continuePullRequestURL(verifyCtx, qw, repositoryDeclaration, wpath) != "" {
 			gateCtx, gateCancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -2240,7 +2245,7 @@ tailRecovery:
 	// would flip it to failed → resolveTargetStatus forces effectiveResult
 	// "failed" → the issue transitions to Rejected instead of Delivered.
 	missingPRs := []string(nil)
-	if repositoryDeclaration != nil && RequiresPRURL(qw.WorkType, qw.WorkTypeRole) {
+	if repositoryDeclaration != nil && qw.requiresPR() {
 		missingPRs = missingMutablePullRequests(res, *repositoryDeclaration)
 	}
 	// An exhausted session keeps the failure mode of the bound it ran out
@@ -2249,7 +2254,7 @@ tailRecovery:
 		res.Status = "failed"
 		res.FailureMode = FailureBackstop
 		res.Error = "completion contract missing pull requests for mutable repositories: " + strings.Join(missingPRs, ", ")
-	} else if res.BackstopReport != nil && res.PullRequestURL == "" && RequiresPRURL(qw.WorkType, qw.WorkTypeRole) {
+	} else if res.BackstopReport != nil && res.PullRequestURL == "" && qw.requiresPR() {
 		res.Status = "failed"
 		if res.FailureMode == "" {
 			res.FailureMode = FailureBackstop
@@ -2351,10 +2356,12 @@ tailRecovery:
 	// 11b. Post-session Linear state transition. Runs after
 	// the Result.Status has been finalised so resolveTargetStatus sees
 	// the same "completed"/"failed" classification the platform will
-	// receive. Skipped when SkipPostSession is set, or when the runner
+	// receive. Skipped when SkipPostSession is set, when the runner
 	// has no IssueID to address (e.g. governor work types without a
-	// Linear-side row).
-	if !r.skipPostSession && qw.IssueID != "" {
+	// Linear-side row), and for a work item that carries stage
+	// transitions: Run applies those instead (stage_outcome.go), and the
+	// name-keyed status tables are never consulted for it.
+	if qw.Transitions == nil && !r.skipPostSession && qw.IssueID != "" {
 		r.runPostSession(ctx, qw, res)
 	}
 
@@ -2464,7 +2471,7 @@ func (r *Runner) consumeEventsWithStallRetries(
 			"limit", followUps.limit,
 			"stallTimeout", r.providerStallTimeout.String(),
 		)
-		if werr := r.waitRetryBackoff(streamCtx, followUps.retried+1); werr != nil {
+		if werr := r.waitRetryBackoffFor(streamCtx, qw.Retry, followUps.retried+1); werr != nil {
 			// The backoff was cut short by cancellation (or the retry
 			// clock): the turn ends on that signal, not on the stall.
 			// Still record the provider-side cause on the observation
@@ -2675,7 +2682,7 @@ func (r *Runner) stopAtBudget(qw QueuedWork, handle agent.Handle, enforcer *Budg
 // recorded. Such a session ends completed with the breach recorded, not
 // failed: the cap stopped work that was already done.
 func deliveredAtBudgetStop(qw QueuedWork, res *Result, declaration *workarea.NormalizedDeclaration) bool {
-	if !RequiresPRURL(qw.WorkType, qw.WorkTypeRole) || res.PullRequestURL == "" || res.WorkResult != "passed" {
+	if !qw.requiresPR() || res.PullRequestURL == "" || res.WorkResult != "passed" {
 		return false
 	}
 	if res.FailureMode != "" || res.Status == "failed" {
@@ -2909,6 +2916,10 @@ type streamObservation struct {
 	// blockedReason is the human-readable reason captured from an
 	// "AGENT_BLOCKED: <reason>" marker, surfaced on Result.Error.
 	blockedReason string
+	// close is the structured request of a "WORK_RESULT: close" marker. A
+	// close also sets blocked, so every legacy path treats it as a decline;
+	// the stage-transition path reads it as the close outcome.
+	close *WorkClose
 	// budgetBreach is set when the in-flight enforcer tripped a cap
 	// during ObserveEvent. consumeEvents then ends the turn at its next
 	// boundary and returns the breach, which the runner's budget stop
@@ -3573,11 +3584,12 @@ func (r *Runner) observeEvent(ev agent.Event, obs *streamObservation, worktreePa
 		// obs.blocked so the post-stream classifier forks to
 		// FailureAgentBlocked instead of funneling a reasoned refusal as a
 		// crash/silent-exit (which would trigger backstop + re-dispatch).
-		switch verdict, reason := scanVerdict(e.Text); verdict {
+		switch verdict, reason, closeReq := scanMarker(e.Text); verdict {
 		case "":
 		case "blocked":
 			obs.blocked = true
 			obs.workResult = ""
+			obs.close = closeReq
 			if reason != "" {
 				obs.blockedReason = reason
 			}
@@ -3585,6 +3597,7 @@ func (r *Runner) observeEvent(ev agent.Event, obs *streamObservation, worktreePa
 			obs.workResult = verdict
 			obs.blocked = false
 			obs.blockedReason = ""
+			obs.close = nil
 		}
 		// Structured review outcome, independent of the pass/fail marker:
 		// the latest message carrying a line-anchored REVIEW_VERDICT
@@ -4449,15 +4462,40 @@ func mergeMCPServers(defaults, cardServers []agent.MCPServerConfig) []agent.MCPS
 // is ignored, so it can never set the verdict that drives the post-session
 // transition of result-sensitive work, nor reclassify a successful session as
 // a decline. Matching is case-insensitive over ASCII only (see asciiLower).
+//
+// A `WORK_RESULT: close <reason> [<duplicateOf>]` marker (see
+// parseCloseMarker) reads as "blocked" here, with the close request as the
+// reason: every legacy path treats a close exactly like a decline (no
+// steering, no backstop, no re-dispatch). scanMarker additionally returns the
+// structured close request; an invalid close marker counts as no marker.
 func scanVerdict(text string) (verdict, reason string) {
+	verdict, reason, _ = scanMarker(text)
+	return verdict, reason
+}
+
+// scanMarker is scanVerdict plus the structured close request of a
+// `WORK_RESULT: close` marker (nil for every other verdict).
+func scanMarker(text string) (verdict, reason string, closeReq *WorkClose) {
 	lower := asciiLower(text)
 	loc := workResultRE.FindStringSubmatchIndex(lower)
 	if loc == nil {
-		return "", ""
+		return "", "", nil
 	}
 	if loc[2] >= 0 {
-		if verdict = lower[loc[2]:loc[3]]; verdict != "blocked" {
-			return verdict, ""
+		verdict = lower[loc[2]:loc[3]]
+		if verdict == "close" {
+			rest := text[loc[1]:]
+			if end := strings.IndexAny(rest, "\r\n"); end >= 0 {
+				rest = rest[:end]
+			}
+			req, ok := parseCloseMarker(rest)
+			if !ok {
+				return "", "", nil
+			}
+			return "blocked", req.describe(), req
+		}
+		if verdict != "blocked" {
+			return verdict, "", nil
 		}
 	}
 	// Blocked, in either spelling: the reason is the message's FIRST anchored
@@ -4469,7 +4507,7 @@ func scanVerdict(text string) (verdict, reason string) {
 		// "<!-- AGENT_BLOCKED: reason -->" yields just the reason.
 		reason = strings.TrimSpace(strings.TrimSuffix(reason, "-->"))
 	}
-	return "blocked", reason
+	return "blocked", reason, nil
 }
 
 // scanWorkResult returns the passed|failed|unknown verdict scanVerdict reads
@@ -4560,6 +4598,10 @@ func classifyBlocked(res *Result, obs streamObservation, hasVerifiedPR bool) boo
 	}
 	res.Status = "failed"
 	res.FailureMode = FailureAgentBlocked
+	if obs.close != nil {
+		closeReq := *obs.close
+		res.WorkClose = &closeReq
+	}
 	if res.Error == "" {
 		if obs.blockedReason != "" {
 			res.Error = "agent declined to proceed: " + obs.blockedReason
@@ -4595,7 +4637,7 @@ const markerLead = lineStartPrefix + `(?:<!--[ \t]*)?`
 // at a word boundary, so `WORK_RESULT: passedly` does not count; or
 // `AGENT_BLOCKED` followed by a colon (required, as downstream requires it).
 const verdictMarkerPattern = markerLead + `(?:work_result` + markerSeparator +
-	`(passed|failed|blocked|unknown)\b|agent_blocked[ \t]*:)`
+	`(passed|failed|blocked|unknown|close)\b|agent_blocked[ \t]*:)`
 
 // agentBlockedRE captures the reason of an anchored `AGENT_BLOCKED: <reason>`
 // line, up to the end of that line (possibly empty; never the next line).

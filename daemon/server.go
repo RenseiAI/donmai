@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/afclient"
+	"github.com/RenseiAI/donmai/stagewire"
 )
 
 const drainResponseWriteGrace = time.Second
@@ -1063,6 +1064,29 @@ func (s *Server) handleSessionStop(w http.ResponseWriter, r *http.Request, id st
 	writeJSON(w, http.StatusOK, &afclient.DaemonActionResponse{OK: true, Message: "stopped"})
 }
 
+// projectSessionLabels fills a listed session's display labels (issue
+// identifier, stage, card) from its stored detail. The detail is read only
+// when a label is missing; stage and card are copied, never aliased.
+func projectSessionLabels(handle *SessionHandle, detailOf func(string) (*SessionDetail, bool)) {
+	if handle.IssueIdentifier != "" && handle.Stage != nil && handle.Card != nil {
+		return
+	}
+	detail, ok := detailOf(handle.SessionID)
+	if !ok || detail == nil {
+		return
+	}
+	if handle.IssueIdentifier == "" {
+		handle.IssueIdentifier = detail.IssueIdentifier
+	}
+	labels := stagewire.Fields{Stage: detail.Stage, Card: detail.Card}.CloneFields()
+	if handle.Stage == nil {
+		handle.Stage = labels.Stage
+	}
+	if handle.Card == nil {
+		handle.Card = labels.Card
+	}
+}
+
 // handleSessions multiplexes GET (list active sessions) and POST (accept work).
 func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
@@ -1074,14 +1098,10 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 		// credentialed detail), so serve the redacted form.
 		for i := range handles {
 			handles[i].Repository = redactRepositoryURL(handles[i].Repository)
-			// The issue identifier is known from admission, before the
-			// runner writes any state; project it so a local reader can
-			// label the session from the start.
-			if handles[i].IssueIdentifier == "" {
-				if detail, ok := s.daemon.SessionDetail(handles[i].SessionID); ok && detail != nil {
-					handles[i].IssueIdentifier = detail.IssueIdentifier
-				}
-			}
+			// The issue identifier, stage and card are known from
+			// admission, before the runner writes any state; project them
+			// so a local reader can label the session from the start.
+			projectSessionLabels(&handles[i], s.daemon.SessionDetail)
 		}
 		writeJSON(w, http.StatusOK, handles)
 	case http.MethodPost:

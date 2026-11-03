@@ -18,6 +18,7 @@ import (
 	"github.com/RenseiAI/donmai/kgextract"
 	"github.com/RenseiAI/donmai/runner"
 	"github.com/RenseiAI/donmai/runtime/workarea"
+	"github.com/RenseiAI/donmai/stagewire"
 	"github.com/RenseiAI/donmai/worker"
 )
 
@@ -111,6 +112,12 @@ type PollWorkItem struct {
 	Branch            string                  `json:"branch,omitempty"`
 	ResolvedProfile   *SessionResolvedProfile `json:"resolvedProfile,omitempty"`
 	ModelProfile      *SessionModelProfile    `json:"modelProfile,omitempty"`
+
+	// Fields carries the optional 1.0 wire fields (stage, card,
+	// transitions, retry, stageContext, dispatchReason). Each field type
+	// bounds itself on decode; the daemon forwards them onto SessionDetail
+	// without interpreting them.
+	stagewire.Fields
 
 	// CredentialRequirements, Harness, and ServingHost are additive top-level
 	// projections accepted for producers that stamp resolved execution metadata
@@ -448,8 +455,12 @@ type PollSkill struct {
 type LandingWorkItem struct {
 	BatchJobID string `json:"batchJobId,omitempty"`
 	WorkType   string `json:"workType,omitempty"`
-	OrgID      string `json:"orgId,omitempty"`
-	RepoID     string `json:"repoId,omitempty"`
+	// BatchKind is the 1.0 batch discriminant, sent beside the legacy
+	// WorkType during the lock-step window. Like WorkType it is a sanity
+	// tag here: the landing lane is selected by the array it rides in.
+	BatchKind stagewire.BatchKind `json:"batchKind,omitempty"`
+	OrgID     string              `json:"orgId,omitempty"`
+	RepoID    string              `json:"repoId,omitempty"`
 }
 
 // PollResponse is the body of GET /api/workers/<id>/poll. Only the fields the
@@ -1757,6 +1768,7 @@ func PollItemToSessionDetail(item PollWorkItem, projects []ProjectConfig, platfo
 		BaseRef:                 item.BaseRef,
 		WorkType:                item.WorkType,
 		WorkTypeRole:            item.WorkTypeRole,
+		Fields:                  item.CloneFields(),
 		PromptContext:           item.PromptContext,
 		Body:                    item.Body,
 		Title:                   item.Title,

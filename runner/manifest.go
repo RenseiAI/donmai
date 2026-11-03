@@ -636,6 +636,7 @@ func markFollowUpBlocked(res *Result, obs *streamObservation, followUp streamObs
 	res.WorkResult = ""
 	obs.workResult = ""
 	obs.blocked = true
+	obs.close = followUp.close
 	if followUp.blockedReason != "" {
 		obs.blockedReason = followUp.blockedReason
 	}
