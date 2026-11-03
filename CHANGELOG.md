@@ -10,6 +10,16 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 No unreleased changes.
 
+## v0.73.0 — 2026-11-03
+
+### Features
+
+- Wire 1.0: stages, cards and native skills on the runner
+
+### Chores
+
+- Cover remaining host notifications with record-only mappings
+
 ## v0.72.96 — 2026-11-03
 
 ### Chores
