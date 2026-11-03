@@ -610,11 +610,14 @@ func TestMapNotification_ApprovalReviewingMalformed(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		params json.RawMessage
+		want   string
 	}{
-		{"empty object", json.RawMessage(`{}`)},
-		{"empty bytes", json.RawMessage(``)},
-		{"garbage", json.RawMessage(`{`)},
-		{"missing tool and id", json.RawMessage(`{"sessionId":"s","judgeEscalated":true}`)},
+		{"empty object", json.RawMessage(`{}`), "Approval reviewing: unknown (unknown)"},
+		{"empty bytes", json.RawMessage(``), "Approval reviewing: unknown (unknown)"},
+		{"garbage", json.RawMessage(`{`), "Approval reviewing: unknown (unknown)"},
+		{"missing tool and id", json.RawMessage(`{"sessionId":"s","judgeEscalated":true}`), "Approval reviewing: unknown (unknown) [judgeEscalated]"},
+		{"tool missing id present", json.RawMessage(`{"approvalId":"appr-1","sessionId":"s"}`), "Approval reviewing: unknown (appr-1)"},
+		{"tool present id missing", json.RawMessage(`{"toolName":"shell","sessionId":"s"}`), "Approval reviewing: shell (unknown)"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			state := newMapperState("m")
@@ -626,8 +629,8 @@ func TestMapNotification_ApprovalReviewingMalformed(t *testing.T) {
 			if !ok || sys.Subtype != "approval_reviewing" {
 				t.Fatalf("event=%+v, want approval_reviewing SystemEvent", events[0])
 			}
-			if !strings.Contains(sys.Message, "unknown") {
-				t.Errorf("message=%q, want unknown for the missing display values", sys.Message)
+			if sys.Message != tc.want {
+				t.Errorf("message=%q, want %q", sys.Message, tc.want)
 			}
 		})
 	}
