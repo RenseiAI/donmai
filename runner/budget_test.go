@@ -1223,3 +1223,63 @@ func TestBudgetEnforcer_WriteSumMustNotEraseFresh(t *testing.T) {
 		t.Fatalf("cost=%+v, want in=200 writes=300 usd=0.03 turns=2", got)
 	}
 }
+
+// TestBudgetEnforcer_CacheTotalWithFreshInputCountsWhole pins the total-side
+// input/output-free clause of the cache running-total guard: a cache-only
+// history (previous total and pending calls carry only cached tokens) followed
+// by a fresh-input total whose cached bucket happens to equal prev+call must
+// count whole. Whole: fresh 100 cached 300 $0.03 3 turns, observed 130.
+// Collapsed (difference): fresh 100 cached 200 $0.02 2 turns, observed 120.
+func TestBudgetEnforcer_CacheTotalWithFreshInputCountsWhole(t *testing.T) {
+	enf := NewBudgetEnforcer(&prompt.StageBudget{MaxTokens: 1_000_000}, time.Now())
+	cacheCall := func() agent.LlmCallEvent {
+		return agent.LlmCallEvent{CachedInputTokens: 100, UsageSource: agent.LlmUsageProvider}
+	}
+	events := []agent.Event{
+		cacheCall(),
+		agent.ResultEvent{Success: true, Cost: &agent.CostData{CachedInputTokens: 100, TotalCostUsd: 0.01, NumTurns: 1}},
+		cacheCall(),
+		agent.ResultEvent{Success: true, Cost: &agent.CostData{InputTokens: 100, CachedInputTokens: 200, TotalCostUsd: 0.02, NumTurns: 2}},
+	}
+	for _, ev := range events {
+		if err := enf.ObserveEvent(ev); err != nil {
+			t.Fatalf("ObserveEvent: %v", err)
+		}
+	}
+	if rep := enf.Report(time.Now()); rep.ObservedTokens != 130 {
+		t.Fatalf("ObservedTokens=%d, want 130", rep.ObservedTokens)
+	}
+	if got := enf.cost(); got == nil || got.InputTokens != 100 || got.CachedInputTokens != 300 || got.TotalCostUsd != 0.03 || got.NumTurns != 3 {
+		t.Fatalf("cost=%+v, want in=100 cached=300 usd=0.03 turns=3", got)
+	}
+}
+
+// TestBudgetEnforcer_WriteTotalWithFreshInputCountsWhole is the write-bucket
+// twin: a cache-write-only history followed by a fresh-input total whose
+// write bucket happens to equal prev+call must count whole. Whole: fresh 100
+// writes 300 $0.03 3 turns. Collapsed: fresh 100 writes 200 $0.02 2 turns.
+// Writes are not metered, so the token meter reads 100 in both cases; the
+// pin is on the cost buckets the meter would otherwise drop.
+func TestBudgetEnforcer_WriteTotalWithFreshInputCountsWhole(t *testing.T) {
+	enf := NewBudgetEnforcer(&prompt.StageBudget{MaxTokens: 1_000_000}, time.Now())
+	writeCall := func() agent.LlmCallEvent {
+		return agent.LlmCallEvent{CacheWriteTokens: 100, UsageSource: agent.LlmUsageProvider}
+	}
+	events := []agent.Event{
+		writeCall(),
+		agent.ResultEvent{Success: true, Cost: &agent.CostData{CacheWriteTokens: 100, TotalCostUsd: 0.01, NumTurns: 1}},
+		writeCall(),
+		agent.ResultEvent{Success: true, Cost: &agent.CostData{InputTokens: 100, CacheWriteTokens: 200, TotalCostUsd: 0.02, NumTurns: 2}},
+	}
+	for _, ev := range events {
+		if err := enf.ObserveEvent(ev); err != nil {
+			t.Fatalf("ObserveEvent: %v", err)
+		}
+	}
+	if rep := enf.Report(time.Now()); rep.ObservedTokens != 100 {
+		t.Fatalf("ObservedTokens=%d, want 100", rep.ObservedTokens)
+	}
+	if got := enf.cost(); got == nil || got.InputTokens != 100 || got.CacheWriteTokens != 300 || got.TotalCostUsd != 0.03 || got.NumTurns != 3 {
+		t.Fatalf("cost=%+v, want in=100 writes=300 usd=0.03 turns=3", got)
+	}
+}
