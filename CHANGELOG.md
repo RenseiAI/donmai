@@ -10,6 +10,16 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 No unreleased changes.
 
+## v0.72.96 — 2026-11-03
+
+### Chores
+
+- Carry dispatch trace context through runner posters and relay attach
+- Harden scan and release compiler gates
+- Carry adapter-applied effort through the activity transport
+- Capture bounded safe request-shape diagnostics for failed first turns
+- Report applied effort from final headless launch configuration
+
 ## v0.72.95 — 2026-11-01
 
 ### Chores
