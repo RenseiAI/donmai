@@ -673,6 +673,17 @@ type Spec struct {
 	// D5.5 there is still no cross-harness "supports extensions" boolean;
 	// only the exact profile's ToolPluginDelivery answers the question.
 	AdditionalExtensions []ExtensionDelivery `json:"additionalExtensions,omitempty"`
+
+	// CardSkills is the ORDERED list of agent-card skills a harness with
+	// a trusted-workspace skill surface (currently muse;
+	// provider/harness/muse) materializes as <workspace>/.agents/skills/
+	// files before the session starts, so the host loads them as native
+	// workspace skills. Nil/empty is inert for every producer (additive,
+	// omitempty, wire round-trip unchanged) — a harness without the
+	// surface ignores an absent list, exactly like every other
+	// capability-gated Spec field. Only the selected harness populates
+	// or honors this field; no generic capability flag answers it.
+	CardSkills []CardSkill `json:"cardSkills,omitempty"`
 }
 
 // WithToolLifecycleProfile returns a copy selecting one manifest-declared

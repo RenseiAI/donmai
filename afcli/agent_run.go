@@ -1361,6 +1361,18 @@ func codexCtorOptions(h agentRunCtorHints) providercodex.Options {
 	return providercodex.Options{HostSessionAuth: h.CodexHostSessionAuth}
 }
 
+// museCtorOptions builds the muse provider's construction Options.
+// TrustWorkspace is always on: card skills materialize into the session
+// workspace as .agents/skills/donmai-* files, and only a trusted host
+// start loads workspace skills (alongside the workspace's repo rules
+// and hooks). Split out from the ctor closure in
+// agentRunProviderCtors so tests can assert the threaded value
+// directly, without exercising providermuse.New's real binary/version
+// probe (which is host-dependent).
+func museCtorOptions(agentRunCtorHints) providermuse.Options {
+	return providermuse.Options{TrustWorkspace: true}
+}
+
 func piCtorOptions(h agentRunCtorHints) providerpi.Options {
 	return providerpi.Options{
 		TrustedExtensions: append([]providerpi.TrustedExtensionIdentity(nil), h.PiTrustedExtensions...),
@@ -1407,8 +1419,10 @@ func agentRunProviderCtors(hints ...agentRunCtorHints) []providerCtor {
 		{name: "gemini", new: func() (agent.Provider, error) { return providergemini.New(providergemini.Options{}) }},
 		// muse is registration-only until the harness proves a live
 		// turn: the constructor probes the binary + minimum version
-		// and warns-and-skips when absent, mirroring pi.
-		{name: "muse", new: func() (agent.Provider, error) { return providermuse.New(providermuse.Options{}) }},
+		// and warns-and-skips when absent, mirroring pi. The host
+		// starts trusted (museCtorOptions): card skills load from the
+		// workspace, which requires --trust-workspace.
+		{name: "muse", new: func() (agent.Provider, error) { return providermuse.New(museCtorOptions(h)) }},
 		// opencode's PreferServer threads the resolved profile's Lane-B
 		// signal (opencodeCtorHints above) so a `donmai agent run` session
 		// can select the serve/HTTP adapter (07 §2 Lane B) instead of

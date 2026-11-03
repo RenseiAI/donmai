@@ -83,9 +83,12 @@ type Options struct {
 	// Defaults to 30s.
 	RPCTimeout time.Duration
 
-	// TrustWorkspace passes --trust-workspace (load workspace skills
-	// and rules). Sandbox posture is fixed at host construction and
-	// applies to every session the host loads.
+	// TrustWorkspace passes --trust-workspace. A trusted workspace
+	// loads the workspace's skills AND its repo rules and hooks — the
+	// skills the card materializes under .agents/skills/donmai-* are
+	// only one of the three. Trust is per host start, never saved, and
+	// sandbox posture is fixed at host construction and applies to
+	// every session the host loads.
 	TrustWorkspace bool
 
 	// DisableSandbox passes --disable-sandbox. Prefer the read-only
@@ -278,6 +281,14 @@ func (p *Provider) spawnHandle(ctx context.Context, spec agent.Spec, resumeSessi
 	workspaceRoot, err := canonicalWorkspaceRoot(spec.Cwd)
 	if err != nil {
 		return nil, fmt.Errorf("%w: muse workspace root: %v", agent.ErrSpawnFailed, err)
+	}
+	// Materialize card skills FIRST, before any session state exists: a
+	// trusted host start loads workspace skills from the checkout, so
+	// the files must already be on disk when the serve child starts. A
+	// materialization failure refuses the spawn, never runs the session
+	// without its card skills.
+	if err := materializeCardSkills(workspaceRoot, spec.CardSkills); err != nil {
+		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}
 	// Decide confinement FIRST, before the child starts: a requested
 	// confinement that cannot be met refuses the spawn, never runs

@@ -313,6 +313,13 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 	if err != nil {
 		return nil, fmt.Errorf("%w: muse workspace root: %v", agent.ErrSpawnFailed, err)
 	}
+	// Materialize card skills before any child state, exactly as the
+	// headless lane does: a trusted interactive start loads the same
+	// workspace skills, so the files must already be on disk when the
+	// TUI child starts. A failure refuses the spawn.
+	if err := materializeCardSkills(workspaceRoot, spec.CardSkills); err != nil {
+		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
+	}
 	// Decide confinement FIRST, before the child starts: a requested
 	// confinement that cannot be met refuses the spawn, never runs
 	// unconfined. Process-less (skipProcess) launches spawn nothing and

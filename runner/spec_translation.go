@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/prompt"
 	"github.com/RenseiAI/donmai/runtime/mcp"
 )
 
@@ -212,7 +213,31 @@ func translateSpecWithToolPolicy(qw QueuedWork, caps agent.Capabilities, in Spec
 		spec.MCPToolNames = codeIntelFQToolNames(qw.CodeIntel)
 	}
 
+	// CardSkills: the agent card's inline skills ride Spec only for the
+	// harness whose trusted workspace loads them from disk (muse). Every
+	// other harness keeps today's behavior byte-for-byte: its inline
+	// skills already ride the folded system-prompt append, and an empty
+	// CardSkills stays nil so the wire round-trip is unchanged.
+	if in.ProviderName == string(agent.ProviderMuse) {
+		spec.CardSkills = cardSkillsForSpec(qw.Skills)
+	}
+
 	return spec
+}
+
+// cardSkillsForSpec projects the queued work's inline card skills onto
+// the spawn spec's workspace-materialization channel. Field-for-field
+// copy; nil/empty returns nil so non-carrying specs serialize exactly
+// as before.
+func cardSkillsForSpec(in []prompt.SkillSpec) []agent.CardSkill {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]agent.CardSkill, 0, len(in))
+	for _, s := range in {
+		out = append(out, agent.CardSkill{ID: s.ID, Body: s.Body})
+	}
+	return out
 }
 
 // resolveSandboxLevel maps QueuedWork.PermissionProfile onto the sandbox tier
