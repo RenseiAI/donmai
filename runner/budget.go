@@ -411,28 +411,27 @@ func addCost(a, b agent.CostData) agent.CostData {
 }
 
 // cacheReconcilesLocked reports whether a ResultEvent's cached-input total
-// provably repeats the previous one: a cache-only running total carries no
-// input/output tokens on any side, the previous result and the pending
+// provably repeats the previous one: the previous result and the pending
 // per-call usage both carry cached tokens, and the new total grows to
-// exactly their sum. The input/output-free restriction is load-bearing:
-// without it a coincidental cache sum across two independent per-invocation
-// results would collapse their fresh input, dollars and turns. Every other
-// bucket must read as the same running total too (see
-// otherBucketsReconcileLocked): a match collapses the whole cost, so a
-// contradicting bucket means the result is a separate invocation and
-// counts whole. Without that per-bucket evidence the result counts whole —
-// a per-invocation terminal can otherwise sum to a previous cached total
-// by coincidence when the per-call detail omitted the cache the terminal
-// supplies.
+// exactly their sum. The input/output buckets must read as the same running
+// total too (total equals previous plus pending on each bucket): without
+// that per-bucket equality a coincidental cache sum across two independent
+// per-invocation results would collapse their fresh input, dollars and
+// turns, while a strict zero-only check would miss the step from a
+// cache-only running total (zero fresh input and output after netting) to
+// one that gains output or fresh input. Every other bucket must read as the
+// same running total as well (see otherBucketsReconcileLocked): a match
+// collapses the whole cost, so a contradicting bucket means the result is
+// a separate invocation and counts whole. Without that per-bucket evidence
+// the result counts whole — a per-invocation terminal can otherwise sum to
+// a previous cached total by coincidence when the per-call detail omitted
+// the cache the terminal supplies.
 // Called with e.mu held.
 func (e *BudgetEnforcer) cacheReconcilesLocked(total agent.CostData) bool {
-	if total.InputTokens != 0 || total.OutputTokens != 0 {
+	if total.InputTokens != e.lastResult.InputTokens+e.pending.InputTokens {
 		return false
 	}
-	if e.lastResult.InputTokens != 0 || e.lastResult.OutputTokens != 0 {
-		return false
-	}
-	if e.pending.InputTokens != 0 || e.pending.OutputTokens != 0 {
+	if total.OutputTokens != e.lastResult.OutputTokens+e.pending.OutputTokens {
 		return false
 	}
 	prev, call := e.lastResult.CachedInputTokens, e.pending.CachedInputTokens
@@ -444,20 +443,19 @@ func (e *BudgetEnforcer) cacheReconcilesLocked(total agent.CostData) bool {
 }
 
 // writeReconcilesLocked is cacheReconcilesLocked for the cache-write
-// bucket: a write-only running total carries no input/output tokens on any
-// side and reconciles only when the previous total and the pending calls
-// both evidence the write growth. The input/output-free restriction keeps
-// a coincidental write sum from discarding fresh input, dollars and
-// turns, and every other bucket must read as the same running total too
-// (see otherBucketsReconcileLocked). Called with e.mu held.
+// bucket: it reconciles only when the previous total and the pending calls
+// both evidence the write growth. The input/output buckets must read as the
+// same running total too (total equals previous plus pending on each
+// bucket): that keeps a coincidental write sum from discarding fresh input,
+// dollars and turns, while still reconciling the step from a write-only
+// running total to one that gains output or fresh input. Every other bucket
+// must read as the same running total as well (see
+// otherBucketsReconcileLocked). Called with e.mu held.
 func (e *BudgetEnforcer) writeReconcilesLocked(total agent.CostData) bool {
-	if total.InputTokens != 0 || total.OutputTokens != 0 {
+	if total.InputTokens != e.lastResult.InputTokens+e.pending.InputTokens {
 		return false
 	}
-	if e.lastResult.InputTokens != 0 || e.lastResult.OutputTokens != 0 {
-		return false
-	}
-	if e.pending.InputTokens != 0 || e.pending.OutputTokens != 0 {
+	if total.OutputTokens != e.lastResult.OutputTokens+e.pending.OutputTokens {
 		return false
 	}
 	prev, call := e.lastResult.CacheWriteTokens, e.pending.CacheWriteTokens

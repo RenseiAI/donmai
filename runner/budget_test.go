@@ -1423,3 +1423,60 @@ func TestBudgetEnforcer_CacheEqualityMustNotCollapseWrites(t *testing.T) {
 		t.Fatalf("cost=%+v, want reads=300 writes=400 usd=0.03 turns=3", got)
 	}
 }
+
+// TestBudgetEnforcer_CacheOnlyToOutputReconciles pins the step from a
+// cache-only running total to one that gains output: after netting, the
+// first cumulative result carries zero fresh input and zero output (100
+// prompt / 0 output / 100 reads / $0.01), and the second carries 0 fresh
+// input / 10 output / 200 reads / $0.02 with a pending call evidencing the
+// 100-read and 10-output growth. The second result is the same running
+// total and reconciles by difference: reads 200, $0.02, 2 turns, metered
+// 30. Counted whole it would meter reads 300, $0.03, 3 turns, metered 40.
+func TestBudgetEnforcer_CacheOnlyToOutputReconciles(t *testing.T) {
+	enf := NewBudgetEnforcer(&prompt.StageBudget{MaxTokens: 1_000_000}, time.Now())
+	events := []agent.Event{
+		agent.LlmCallEvent{CachedInputTokens: 100, UsageSource: agent.LlmUsageProvider},
+		agent.ResultEvent{Success: true, Cost: &agent.CostData{CachedInputTokens: 100, TotalCostUsd: 0.01, NumTurns: 1}},
+		agent.LlmCallEvent{OutputTokens: 10, CachedInputTokens: 100, UsageSource: agent.LlmUsageProvider},
+		agent.ResultEvent{Success: true, Cost: &agent.CostData{OutputTokens: 10, CachedInputTokens: 200, TotalCostUsd: 0.02, NumTurns: 2}},
+	}
+	for _, ev := range events {
+		if err := enf.ObserveEvent(ev); err != nil {
+			t.Fatalf("ObserveEvent: %v", err)
+		}
+	}
+	if rep := enf.Report(time.Now()); rep.ObservedTokens != 30 {
+		t.Fatalf("ObservedTokens=%d, want 30", rep.ObservedTokens)
+	}
+	if got := enf.cost(); got == nil || got.InputTokens != 0 || got.OutputTokens != 10 || got.CachedInputTokens != 200 || got.TotalCostUsd != 0.02 || got.NumTurns != 2 {
+		t.Fatalf("cost=%+v, want in=0 out=10 cached=200 usd=0.02 turns=2", got)
+	}
+}
+
+// TestBudgetEnforcer_WriteOnlyToOutputReconciles is the write-bucket twin:
+// a write-only running total (zero fresh input and output) followed by a
+// result that gains output reconciles by difference when the input/output
+// buckets read as the same running total. Whole: writes 300, $0.03,
+// 3 turns. Reconciled: writes 200, $0.02, 2 turns. Writes are not metered,
+// so the token meter reads 10 in both cases; the pin is on the cost
+// buckets the meter would otherwise double-count.
+func TestBudgetEnforcer_WriteOnlyToOutputReconciles(t *testing.T) {
+	enf := NewBudgetEnforcer(&prompt.StageBudget{MaxTokens: 1_000_000}, time.Now())
+	events := []agent.Event{
+		agent.LlmCallEvent{CacheWriteTokens: 100, UsageSource: agent.LlmUsageProvider},
+		agent.ResultEvent{Success: true, Cost: &agent.CostData{CacheWriteTokens: 100, TotalCostUsd: 0.01, NumTurns: 1}},
+		agent.LlmCallEvent{OutputTokens: 10, CacheWriteTokens: 100, UsageSource: agent.LlmUsageProvider},
+		agent.ResultEvent{Success: true, Cost: &agent.CostData{OutputTokens: 10, CacheWriteTokens: 200, TotalCostUsd: 0.02, NumTurns: 2}},
+	}
+	for _, ev := range events {
+		if err := enf.ObserveEvent(ev); err != nil {
+			t.Fatalf("ObserveEvent: %v", err)
+		}
+	}
+	if rep := enf.Report(time.Now()); rep.ObservedTokens != 10 {
+		t.Fatalf("ObservedTokens=%d, want 10", rep.ObservedTokens)
+	}
+	if got := enf.cost(); got == nil || got.InputTokens != 0 || got.OutputTokens != 10 || got.CacheWriteTokens != 200 || got.TotalCostUsd != 0.02 || got.NumTurns != 2 {
+		t.Fatalf("cost=%+v, want in=0 out=10 writes=200 usd=0.02 turns=2", got)
+	}
+}
