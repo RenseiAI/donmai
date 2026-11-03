@@ -547,3 +547,151 @@ func TestEncodeFirstTurnDiagnostic_CapsAtTwoKiB(t *testing.T) {
 		t.Errorf("oversize payload length=%d, want exactly %d (truncated)", len(capped), firstTurnDiagnosticMaxBytes)
 	}
 }
+
+// TestMapNotification_ApprovalReviewing pins the record-only reviewing
+// observation: the message names the tool and approval id, the
+// judgeEscalated/protectedWrite markers appear only when true, Raw is
+// retained, and neither RawArgs nor workspace paths leak into Message.
+func TestMapNotification_ApprovalReviewing(t *testing.T) {
+	params := func(judge, prot bool) json.RawMessage {
+		return json.RawMessage(`{"approvalId":"appr-9","sessionId":"s","toolName":"shell",` +
+			`"rawArgs":"RAWARGS-SENTINEL-map-9f8a","judgeEscalated":` + boolJSON(judge) +
+			`,"protectedWrite":` + boolJSON(prot) +
+			`,"subject":{"kind":"shell","workspaceRoot":"/sentinel/workspace/map-9f8a"}}`)
+	}
+	cases := []struct {
+		name          string
+		judge, prot   bool
+		wantJudgeMark bool
+		wantProtMark  bool
+	}{
+		{"neither", false, false, false, false},
+		{"judge only", true, false, true, false},
+		{"protected only", false, true, false, true},
+		{"both", true, true, true, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			state := newMapperState("m")
+			raw := map[string]any{"approvalId": "appr-9"}
+			events := mapNotification("approval/reviewing", params(tc.judge, tc.prot), state, raw)
+			if len(events) != 1 {
+				t.Fatalf("events=%v, want one approval_reviewing event", kindsOf(events))
+			}
+			sys, ok := events[0].(agent.SystemEvent)
+			if !ok || sys.Subtype != "approval_reviewing" {
+				t.Fatalf("event=%+v, want approval_reviewing SystemEvent", events[0])
+			}
+			if !strings.Contains(sys.Message, "shell") || !strings.Contains(sys.Message, "appr-9") {
+				t.Errorf("message=%q, want it to name the tool and approval id", sys.Message)
+			}
+			if has := strings.Contains(sys.Message, "[judgeEscalated]"); has != tc.wantJudgeMark {
+				t.Errorf("message=%q judge marker present=%v, want %v", sys.Message, has, tc.wantJudgeMark)
+			}
+			if has := strings.Contains(sys.Message, "[protectedWrite]"); has != tc.wantProtMark {
+				t.Errorf("message=%q protected marker present=%v, want %v", sys.Message, has, tc.wantProtMark)
+			}
+			for _, sentinel := range []string{"RAWARGS-SENTINEL-map-9f8a", "/sentinel/workspace/map-9f8a"} {
+				if strings.Contains(sys.Message, sentinel) {
+					t.Errorf("message=%q leaked %q", sys.Message, sentinel)
+				}
+			}
+			if sys.Raw == nil {
+				t.Error("Raw was dropped; the original object must be preserved")
+			}
+		})
+	}
+}
+
+// TestMapNotification_ApprovalReviewingMalformed pins the fail-soft
+// shape: empty or garbage params never panic and use unknown for the
+// missing display values.
+func TestMapNotification_ApprovalReviewingMalformed(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		params json.RawMessage
+	}{
+		{"empty object", json.RawMessage(`{}`)},
+		{"empty bytes", json.RawMessage(``)},
+		{"garbage", json.RawMessage(`{`)},
+		{"missing tool and id", json.RawMessage(`{"sessionId":"s","judgeEscalated":true}`)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			state := newMapperState("m")
+			events := mapNotification("approval/reviewing", tc.params, state, map[string]any{})
+			if len(events) != 1 {
+				t.Fatalf("events=%v, want one fail-soft approval_reviewing event", kindsOf(events))
+			}
+			sys, ok := events[0].(agent.SystemEvent)
+			if !ok || sys.Subtype != "approval_reviewing" {
+				t.Fatalf("event=%+v, want approval_reviewing SystemEvent", events[0])
+			}
+			if !strings.Contains(sys.Message, "unknown") {
+				t.Errorf("message=%q, want unknown for the missing display values", sys.Message)
+			}
+		})
+	}
+}
+
+// TestMapNotification_BranchChanged pins the record-only branch
+// observation: the exact "branch: <branch>" message, Raw retention,
+// and no workspace path in Message.
+func TestMapNotification_BranchChanged(t *testing.T) {
+	state := newMapperState("m")
+	raw := map[string]any{"branch": "feature/x"}
+	events := mapNotification("session/branchChanged", json.RawMessage(`{"sessionId":"s","viewCursor":"c","branch":"feature/x","workspaceRoot":"/sentinel/workspace/map-9f8a"}`), state, raw)
+	if len(events) != 1 {
+		t.Fatalf("events=%v, want one branch_changed event", kindsOf(events))
+	}
+	sys, ok := events[0].(agent.SystemEvent)
+	if !ok || sys.Subtype != "branch_changed" {
+		t.Fatalf("event=%+v, want branch_changed SystemEvent", events[0])
+	}
+	if sys.Message != "branch: feature/x" {
+		t.Errorf("message=%q, want %q", sys.Message, "branch: feature/x")
+	}
+	if strings.Contains(sys.Message, "/sentinel/workspace/map-9f8a") {
+		t.Errorf("message=%q leaked the workspace path", sys.Message)
+	}
+	if sys.Raw == nil {
+		t.Error("Raw was dropped; the original object must be preserved")
+	}
+}
+
+// TestMapNotification_BranchChangedMalformed pins the fail-soft shape:
+// a null (detached HEAD), missing, or empty branch — or garbage
+// params — never panics and surfaces as unknown.
+func TestMapNotification_BranchChangedMalformed(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		params json.RawMessage
+	}{
+		{"null branch", json.RawMessage(`{"sessionId":"s","viewCursor":"c","branch":null,"workspaceRoot":"/w"}`)},
+		{"missing branch", json.RawMessage(`{"sessionId":"s","viewCursor":"c","workspaceRoot":"/w"}`)},
+		{"empty branch", json.RawMessage(`{"sessionId":"s","viewCursor":"c","branch":"","workspaceRoot":"/w"}`)},
+		{"empty object", json.RawMessage(`{}`)},
+		{"garbage", json.RawMessage(`{`)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			state := newMapperState("m")
+			events := mapNotification("session/branchChanged", tc.params, state, map[string]any{})
+			if len(events) != 1 {
+				t.Fatalf("events=%v, want one fail-soft branch_changed event", kindsOf(events))
+			}
+			sys, ok := events[0].(agent.SystemEvent)
+			if !ok || sys.Subtype != "branch_changed" {
+				t.Fatalf("event=%+v, want branch_changed SystemEvent", events[0])
+			}
+			if sys.Message != "branch: unknown" {
+				t.Errorf("message=%q, want %q", sys.Message, "branch: unknown")
+			}
+		})
+	}
+}
+
+func boolJSON(b bool) string {
+	if b {
+		return "true"
+	}
+	return "false"
+}

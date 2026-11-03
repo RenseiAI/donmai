@@ -52,6 +52,16 @@ type fakeHost struct {
 	// overloaded/host-overloaded pair.
 	failedKind    string
 	failedMessage string
+	// reviewJudge and reviewProtected drive the observe script's
+	// approval/reviewing judgeEscalated/protectedWrite flags so the
+	// flag table can run all four combinations through Spawn.
+	reviewJudge     bool
+	reviewProtected bool
+	// branchName overrides the observe script's branchChanged branch
+	// (empty keeps the canned branch). branchNull emits a JSON null
+	// branch instead (the detached-HEAD observation).
+	branchName string
+	branchNull bool
 }
 
 func newFakeHost() (*fakeHost, *io.PipeWriter, *io.PipeReader) {
@@ -235,6 +245,10 @@ func (fh *fakeHost) emitScript(t *testing.T, script, sid, turnID string, denyApp
 	fh.mu.Lock()
 	failedKind := fh.failedKind
 	failedMessage := fh.failedMessage
+	reviewJudge := fh.reviewJudge
+	reviewProtected := fh.reviewProtected
+	branchName := fh.branchName
+	branchNull := fh.branchNull
 	fh.mu.Unlock()
 	t.Helper()
 	completed := func(terminal string) {
@@ -497,6 +511,106 @@ func (fh *fakeHost) emitScript(t *testing.T, script, sid, turnID string, denyApp
 				"error": map[string]any{"kind": "overloaded", "message": "host overloaded", "retryable": true},
 			},
 		})
+	case "observe":
+		// Both record-only observations traverse Spawn before terminal
+		// completion, alongside a foreign-session pair (must stay
+		// excluded) and one unrelated unknown method (must keep its
+		// fallback). Provenance: reconstructed from the 1.4.14 stable
+		// schema export (ApprovalRequestParams for reviewing,
+		// SessionBranchChangedParams for branchChanged) — not a live
+		// capture. The reviewing params carry sentinel RawArgs and a
+		// sentinel workspace path so tests can prove neither leaks
+		// into the surfaced message.
+		fh.write(t, map[string]any{
+			"jsonrpc": "2.0", "method": "turn/started",
+			"params": map[string]any{"sessionId": sid, "turnId": turnID, "viewCursor": "cursor-1"},
+		})
+		reviewing := func(session string) map[string]any {
+			return map[string]any{
+				"approvalId": "appr-9", "sessionId": session, "turnId": turnID,
+				"itemId": "tool-9", "taskId": "task-9", "toolCallId": "call-9",
+				"toolName": "shell", "rawArgs": "RAWARGS-SENTINEL-observe-9f8a",
+				"viewCursor": "cursor-2", "judgeEscalated": reviewJudge, "protectedWrite": reviewProtected,
+				"currentRequirementId": map[string]any{"approvalId": "appr-9", "sourceIndex": 0},
+				"subject":          map[string]any{"kind": "shell", "command": "echo observe", "workspaceRoot": "/sentinel/workspace/observe-9f8a"},
+				"availableChoices": []any{map[string]any{"choiceId": "allow", "decision": "approved", "label": "Allow", "scope": "once"}},
+			}
+		}
+		fh.write(t, map[string]any{
+			"jsonrpc": "2.0", "method": "approval/reviewing",
+			"params": reviewing(sid),
+		})
+		fh.write(t, map[string]any{
+			"jsonrpc": "2.0", "method": "approval/reviewing",
+			"params": reviewing("00000000-0000-7000-8000-000000000099"),
+		})
+		branch := any("observe/feature-branch")
+		if branchName != "" {
+			branch = branchName
+		}
+		if branchNull {
+			branch = nil
+		}
+		branchChanged := func(session string) map[string]any {
+			return map[string]any{
+				"sessionId": session, "viewCursor": "cursor-3",
+				"branch": branch, "workspaceRoot": "/sentinel/workspace/observe-9f8a",
+			}
+		}
+		fh.write(t, map[string]any{
+			"jsonrpc": "2.0", "method": "session/branchChanged",
+			"params": branchChanged(sid),
+		})
+		fh.write(t, map[string]any{
+			"jsonrpc": "2.0", "method": "session/branchChanged",
+			"params": branchChanged("00000000-0000-7000-8000-000000000099"),
+		})
+		fh.write(t, map[string]any{
+			"jsonrpc": "2.0", "method": "something/new",
+			"params": map[string]any{"sessionId": sid, "viewCursor": "cursor-4"},
+		})
+		agentMsg("item-2", "observed and done", 1)
+		completed("completed")
+	case "approval-requested-reviewing":
+		// The full approval presentation with a reviewing sighting in
+		// between: requested (decision door) then reviewing (record
+		// only) then the server-request presentation (receipt only).
+		// The completion is gated on the client's approval/decide
+		// like the approval script. Provenance: same reconstructed
+		// ApprovalRequestParams shape as the observe script.
+		fh.write(t, map[string]any{
+			"jsonrpc": "2.0", "method": "turn/started",
+			"params": map[string]any{"sessionId": sid, "turnId": turnID, "viewCursor": "cursor-1"},
+		})
+		approvalParams := map[string]any{
+			"approvalId": "appr-1", "sessionId": sid, "turnId": turnID,
+			"itemId": "tool-1", "taskId": "task-1", "toolCallId": "call-1",
+			"toolName": "shell", "rawArgs": "echo hi", "viewCursor": "cursor-2",
+			"judgeEscalated": true, "protectedWrite": true,
+			"currentRequirementId": map[string]any{"approvalId": "appr-1", "sourceIndex": 0},
+			"subject": map[string]any{"kind": "shell", "command": "echo hi"},
+			"availableChoices": []any{
+				map[string]any{"choiceId": "allow", "decision": "approved", "label": "Allow", "scope": "once"},
+				map[string]any{"choiceId": "deny", "decision": "denied", "label": "Deny", "scope": "once"},
+			},
+		}
+		fh.write(t, map[string]any{
+			"jsonrpc": "2.0", "method": "approval/requested",
+			"params": approvalParams,
+		})
+		fh.write(t, map[string]any{
+			"jsonrpc": "2.0", "method": "approval/reviewing",
+			"params": approvalParams,
+		})
+		fh.write(t, map[string]any{
+			"jsonrpc": "2.0", "method": "approval/request", "id": 999,
+			"params": approvalParams,
+		})
+		go func() {
+			fh.waitDecided(t)
+			agentMsg("item-2", "approved and done", 1)
+			completed("completed")
+		}()
 	}
 }
 
