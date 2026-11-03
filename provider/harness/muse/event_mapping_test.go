@@ -427,6 +427,15 @@ func TestMapTokenUsage_NetsCacheReads(t *testing.T) {
 			wantWrite:  6,
 		},
 		{
+			// An explicit zero read slice beats the legacy cached
+			// count here too: no slice is netted from the step input.
+			name:       "explicit zero read beats legacy cached count",
+			params:     `{"promptTokens":100,"cumulative":{"promptTokens":100,"outputTokens":5},"usage":{"inputTokens":100,"outputTokens":5,"cachedTokens":99,"cacheReadTokens":0}}`,
+			wantIn:     100,
+			wantOut:    5,
+			wantCached: 0,
+		},
+		{
 			name:       "reads beside input pass through (exclusive, step total proves it)",
 			params:     `{"cumulative":{"promptTokens":130,"outputTokens":20,"cacheReadTokens":100},"usage":{"inputTokens":30,"outputTokens":20,"cacheReadTokens":100}}`,
 			wantIn:     30,
@@ -541,6 +550,31 @@ func TestMapTurnCompleted_NetsCacheReads(t *testing.T) {
 			wantIn:     10,
 			wantCached: 99,
 		},
+		{
+			// A fully cached standalone terminal is an including
+			// counter that proves its own over-report (reads equal the
+			// input), so the fresh slice nets to zero instead of
+			// passing through.
+			name:       "fully cached input nets to zero",
+			usage:      `,"usage":{"inputTokens":100,"outputTokens":5,"cacheReadTokens":100}`,
+			wantIn:     0,
+			wantCached: 100,
+		},
+		{
+			name:       "fully cached legacy input nets to zero",
+			usage:      `,"usage":{"inputTokens":100,"outputTokens":5,"cachedTokens":100}`,
+			wantIn:     0,
+			wantCached: 100,
+		},
+		{
+			// An explicit zero read slice beats the legacy cached
+			// count: the host corrected its own cache report, so no
+			// slice is netted from the input.
+			name:       "explicit zero read beats legacy cached count",
+			usage:      `,"usage":{"inputTokens":100,"outputTokens":5,"cachedTokens":99,"cacheReadTokens":0}`,
+			wantIn:     100,
+			wantCached: 0,
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -564,6 +598,86 @@ func TestMapTurnCompleted_NetsCacheReads(t *testing.T) {
 			}
 			if result.Cost.InputTokens != tc.wantIn || result.Cost.CachedInputTokens != tc.wantCached || result.Cost.CacheWriteTokens != tc.wantWrite {
 				t.Errorf("cost=%+v, want in=%d cached=%d write=%d", result.Cost, tc.wantIn, tc.wantCached, tc.wantWrite)
+			}
+		})
+	}
+}
+
+// TestMapTurnCompleted_FollowsTurnShapeProof pins the terminal override
+// against the turn's proven step shape. The steps' prompt totals tell the
+// two host shapes apart; the terminal usage block reports the same turn,
+// so it follows the same proof instead of guessing from the raw input
+// alone. A step that proves beside-shape input (the read slice fits
+// beside the reported input inside the step total) must see the same
+// counters pass through at the terminal, not net to the read slice a
+// second time.
+func TestMapTurnCompleted_FollowsTurnShapeProof(t *testing.T) {
+	tests := []struct {
+		name       string
+		step       string
+		wantStep   int64
+		usage      string
+		wantIn     int64
+		wantCached int64
+	}{
+		{
+			name:       "fresh input at least as large as the read slice still passes through",
+			step:       `{"promptTokens":300,"cumulative":{"promptTokens":300,"outputTokens":20,"cacheReadTokens":100},"usage":{"inputTokens":200,"outputTokens":20,"cacheReadTokens":100}}`,
+			wantStep:   200,
+			usage:      `,"usage":{"inputTokens":200,"outputTokens":20,"cacheReadTokens":100}`,
+			wantIn:     200,
+			wantCached: 100,
+		},
+		{
+			name:       "beside-shape step counters survive the terminal override",
+			step:       `{"promptTokens":130,"cumulative":{"promptTokens":130,"outputTokens":20},"usage":{"inputTokens":100,"outputTokens":20,"cachedTokens":30}}`,
+			wantStep:   100,
+			usage:      `,"usage":{"inputTokens":100,"outputTokens":20,"cachedTokens":30}`,
+			wantIn:     100,
+			wantCached: 30,
+		},
+		{
+			name:       "fully cached beside-shape counters survive the terminal override",
+			step:       `{"promptTokens":200,"cumulative":{"promptTokens":200,"outputTokens":5},"usage":{"inputTokens":100,"outputTokens":5,"cachedTokens":100}}`,
+			wantStep:   100,
+			usage:      `,"usage":{"inputTokens":100,"outputTokens":5,"cachedTokens":100}`,
+			wantIn:     100,
+			wantCached: 100,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			state := newMapperState("m")
+			stepEvents := mapNotification("session/tokenUsage", json.RawMessage(tc.step), state, nil)
+			if len(stepEvents) != 1 {
+				t.Fatalf("tokenUsage produced %v, want one usage event", kindsOf(stepEvents))
+			}
+			step, ok := stepEvents[0].(agent.LlmCallEvent)
+			if !ok {
+				t.Fatalf("event is %T, want LlmCallEvent", stepEvents[0])
+			}
+			if step.InputTokens != tc.wantStep {
+				t.Fatalf("step=%+v, want in=%d", step, tc.wantStep)
+			}
+			events := mapNotification("turn/completed", json.RawMessage(`{"sessionId":"s","terminal":"completed","turnId":"t1","viewCursor":"c"`+tc.usage+`}`), state, nil)
+			var llm *agent.LlmCallEvent
+			var result *agent.ResultEvent
+			for _, ev := range events {
+				switch e := ev.(type) {
+				case agent.LlmCallEvent:
+					llm = &e
+				case agent.ResultEvent:
+					result = &e
+				}
+			}
+			if llm == nil || result == nil || result.Cost == nil {
+				t.Fatalf("events=%v, want llm call plus result", kindsOf(events))
+			}
+			if llm.InputTokens != tc.wantIn || llm.CachedInputTokens != tc.wantCached {
+				t.Errorf("llm=%+v, want in=%d cached=%d", llm, tc.wantIn, tc.wantCached)
+			}
+			if result.Cost.InputTokens != tc.wantIn || result.Cost.CachedInputTokens != tc.wantCached {
+				t.Errorf("cost=%+v, want in=%d cached=%d", result.Cost, tc.wantIn, tc.wantCached)
 			}
 		})
 	}

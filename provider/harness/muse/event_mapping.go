@@ -35,6 +35,21 @@ type mapperState struct {
 	cacheWriteTok  int64
 	reasoningTok   int64
 
+	// turnSawInsideInput records that a step of the current turn proved
+	// the host folds cached reads into its input counter (the step's
+	// input plus reads exceeded the step prompt total with a nonzero
+	// read slice): the terminal override nets the same way.
+	turnSawInsideInput bool
+	// turnSawBesideInput records that a step of the current turn proved
+	// the host reports cached reads beside its input (the reads fit
+	// beside the reported input inside the step total, or exceeded the
+	// raw input, which an including counter can never produce): the
+	// terminal override passes the fresh tokens through. Inside
+	// evidence wins when a turn proves both. Both are consumed
+	// (reset) at every turn/completed, so a later turn never inherits
+	// a previous turn's evidence.
+	turnSawBesideInput bool
+
 	// items tracks the last revision applied per itemId. Deltas and
 	// updates at a stale revision are dropped; completion always
 	// applies (the host guarantees item/completed is authoritative,
@@ -261,11 +276,21 @@ func mapTurnCompleted(params json.RawMessage, state *mapperState, raw any) []age
 		if p.Usage.CacheWriteTokens != nil {
 			cacheWrite = *p.Usage.CacheWriteTokens
 		}
-		// The turn input counter is provider-dependent (cache inside or
-		// beside input): only net the read slice when the shape proves
-		// the input included it. Without a turn prompt total the
-		// read-beside shape (read > input) passes through.
-		in = freshMuseInput(p.Usage.InputTokens, cached, 0)
+		// The turn input counter is provider-dependent (cache inside
+		// or beside input): the turn's steps already proved which
+		// shape this host reports, so the override follows the same
+		// proof. Inside evidence nets the read slice; beside evidence
+		// passes the fresh tokens through; without step evidence the
+		// read-beside shape (read > input, which an including counter
+		// can never produce) still passes through.
+		switch {
+		case state.turnSawInsideInput:
+			in = netMuseInput(p.Usage.InputTokens, cached)
+		case state.turnSawBesideInput:
+			in = p.Usage.InputTokens
+		default:
+			in = freshMuseInput(p.Usage.InputTokens, cached, 0)
+		}
 		reasoning = p.Usage.ReasoningTokens
 	} else {
 		// Without a turn usage block the result carries the session
@@ -273,6 +298,10 @@ func mapTurnCompleted(params json.RawMessage, state *mapperState, raw any) []age
 		// the same way: net it identically.
 		in = netMuseInput(in, cached)
 	}
+	// The turn's shape evidence is consumed here either way, so a later
+	// turn never inherits it.
+	state.turnSawInsideInput = false
+	state.turnSawBesideInput = false
 	cost := &agent.CostData{
 		InputTokens:       in,
 		OutputTokens:      out,
@@ -428,19 +457,34 @@ func mapTokenUsage(params json.RawMessage, state *mapperState, _ any) []agent.Ev
 	// fresh input; the read slice rides CachedInputTokens instead
 	// (agent.CostData).
 	usage.InputTokens = netMuseInput(usage.InputTokens, readDelta)
+	// The step's own prompt total tells the two host shapes apart. The
+	// outer promptTokens names it directly; otherwise the cumulative
+	// prompt delta for the step carries it (the delta of a restarted
+	// counter reads as unknown and falls back to the read-beside shape
+	// check).
+	stepTotal := p.PromptTokens
+	if stepTotal <= 0 {
+		stepTotal = max(p.Cumulative.PromptTokens-state.totalInputTok, 0)
+	}
 	if p.Usage != nil {
 		usage = *p.Usage
 		// The step input counter is provider-dependent (cache inside
 		// or beside input): the step's own prompt total tells which.
-		// The outer promptTokens names it directly; otherwise the
-		// cumulative prompt delta for the step carries it (the delta
-		// of a restarted counter reads as unknown and falls back to
-		// the read-beside shape check).
-		stepTotal := p.PromptTokens
-		if stepTotal <= 0 {
-			stepTotal = max(p.Cumulative.PromptTokens-state.totalInputTok, 0)
+		raw, read := usage.InputTokens, museStepCacheRead(usage)
+		usage.InputTokens = freshMuseInput(raw, read, stepTotal)
+		// Record what this step proved about the host shape for the
+		// terminal override. Only a nonzero read slice evidences
+		// anything: passing the input through proves beside-shape
+		// (the step total or the read-beside shape allowed it), while
+		// netting against a known total proves inside-shape (a
+		// restart-fallback guess proves nothing).
+		if read > 0 {
+			if usage.InputTokens == raw {
+				state.turnSawBesideInput = true
+			} else if stepTotal > 0 {
+				state.turnSawInsideInput = true
+			}
 		}
-		usage.InputTokens = freshMuseInput(usage.InputTokens, museStepCacheRead(usage), stepTotal)
 	}
 	read := usage.CachedTokens
 	if usage.CacheReadTokens != nil {

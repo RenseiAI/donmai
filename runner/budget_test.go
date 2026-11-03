@@ -1060,3 +1060,99 @@ func TestBudgetEnforcer_CacheOnlyPerInvocationSums(t *testing.T) {
 		})
 	}
 }
+
+// TestBudgetEnforcer_PerInvocationCacheCountsWhole pins the cumulative
+// heuristic against per-call details that omit cache usage. First
+// invocation: call/result report 100 cached tokens, $0.01, one turn.
+// Second: the call reports 100 fresh tokens while its per-invocation
+// result reports 100 fresh + 100 cached, $0.01, one turn. The summed
+// token equality holds by coincidence, but the per-call detail never
+// evidenced the cached growth, so the second result is not a running
+// total: it counts whole (fresh 100, cached 200, $0.02, 2 turns) and a
+// 115-token cap breaches at observed 120.
+func TestBudgetEnforcer_PerInvocationCacheCountsWhole(t *testing.T) {
+	call := func(in, cached int64) agent.LlmCallEvent {
+		return agent.LlmCallEvent{
+			InputTokens: in, CachedInputTokens: cached,
+			UsageSource: agent.LlmUsageProvider,
+		}
+	}
+	result := func(in, cached int64) agent.ResultEvent {
+		return agent.ResultEvent{Success: true, Cost: &agent.CostData{
+			InputTokens: in, CachedInputTokens: cached,
+			TotalCostUsd: 0.01, NumTurns: 1,
+		}}
+	}
+	events := []agent.Event{
+		call(0, 100), result(0, 100),
+		call(100, 0), result(100, 100),
+	}
+	for _, viaSpan := range []bool{false, true} {
+		name := "raw"
+		if viaSpan {
+			name = "through the span processor"
+		}
+		t.Run(name, func(t *testing.T) {
+			in := events
+			if viaSpan {
+				processor, err := spanruntime.NewProcessor(spanruntime.ProcessorConfig{
+					SessionID:   "budget-test",
+					OrgID:       "org-test",
+					WorkspaceID: "workspace-test",
+					Sender:      spanruntime.SendFunc(func(agent.Span) bool { return true }),
+				})
+				if err != nil {
+					t.Fatalf("NewProcessor: %v", err)
+				}
+				in = nil
+				for _, ev := range events {
+					in = append(in, processor.Process(ev)...)
+				}
+			}
+			enf := NewBudgetEnforcer(&prompt.StageBudget{MaxTokens: 115}, time.Now())
+			breached := false
+			for _, ev := range in {
+				if err := enf.ObserveEvent(ev); err != nil {
+					breached = true
+				}
+			}
+			if rep := enf.Report(time.Now()); rep.ObservedTokens != 120 {
+				t.Fatalf("ObservedTokens=%d, want 120", rep.ObservedTokens)
+			}
+			if !breached {
+				t.Fatal("want the max-tokens breach at observed=120 limit=115")
+			}
+			if got := enf.cost(); got == nil || got.InputTokens != 100 || got.CachedInputTokens != 200 || got.TotalCostUsd != 0.02 || got.NumTurns != 2 {
+				t.Fatalf("cost=%+v, want in=100 cached=200 usd=0.02 turns=2", got)
+			}
+		})
+	}
+}
+
+// TestBudgetEnforcer_CacheWritesReconcileCumulative pins the write bucket
+// in the cumulative heuristic: two running-total results carrying 100
+// then 200 cache-write tokens (each evidenced by a per-call write of
+// 100) meter the difference once (writes 200, $0.02, 2 turns), not the
+// whole of both (writes 300, $0.03, 3 turns).
+func TestBudgetEnforcer_CacheWritesReconcileCumulative(t *testing.T) {
+	enf := NewBudgetEnforcer(&prompt.StageBudget{MaxTokens: 1_000_000}, time.Now())
+	call := func() agent.LlmCallEvent {
+		return agent.LlmCallEvent{CacheWriteTokens: 100, UsageSource: agent.LlmUsageProvider}
+	}
+	result := func(written int64, usd float64, turns int) agent.ResultEvent {
+		return agent.ResultEvent{Success: true, Cost: &agent.CostData{
+			CacheWriteTokens: written, TotalCostUsd: usd, NumTurns: turns,
+		}}
+	}
+	for _, ev := range []agent.Event{
+		call(), result(100, 0.01, 1),
+		call(), result(200, 0.02, 2),
+	} {
+		if err := enf.ObserveEvent(ev); err != nil {
+			t.Fatalf("ObserveEvent: %v", err)
+		}
+	}
+	if got := enf.cost(); got == nil || got.CacheWriteTokens != 200 || got.TotalCostUsd != 0.02 || got.NumTurns != 2 {
+		t.Fatalf("cost=%+v, want writes=200 usd=0.02 turns=2", got)
+	}
+}

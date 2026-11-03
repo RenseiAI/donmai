@@ -340,12 +340,17 @@ func meteredTokens(c agent.CostData) int64 {
 //
 // The two are told apart on evidence, not on the harness's name: when the
 // per-call usage the harness reported since the previous ResultEvent is
-// exactly the positive growth from the previous total to this one, the new
-// total provably repeats the earlier usage, and only the difference is new.
-// The growth must be strictly positive: cost-only provider calls (no new
-// tokens) between two identical per-invocation results are not evidence of
-// a running total, and collapsing them would mistake two separate
-// invocations for one cumulative report. In
+// exactly the growth from the previous total to this one, the new total
+// provably repeats the earlier usage, and only the difference is new. The
+// growth must be evidenced on the same bucket it grows on: input/output
+// growth reconciles on the input/output equality, while a cache-only (or
+// write-only) running total — which carries no input/output evidence at
+// all — reconciles only when the previous total and the pending calls both
+// carry that bucket and the new total is exactly their sum. A summed
+// equality alone is not evidence: per-call details that omit cache usage
+// a per-invocation terminal result supplies can sum to a previous total by
+// coincidence, and collapsing those would discard the cached usage,
+// dollars and turns of a separate invocation. In
 // every other case the whole cost is counted, exactly as before this rule
 // existed, so a harness without per-call usage — or with per-call usage that
 // does not reconcile — keeps its previous accounting and is never
@@ -364,9 +369,9 @@ func (e *BudgetEnforcer) resultIncrementLocked(cost *agent.CostData) int64 {
 		// count those calls again.
 		return 0
 	}
-	total := cost.InputTokens + cost.OutputTokens + cost.CachedInputTokens + cost.CacheWriteTokens
-	previous := e.lastResult.InputTokens + e.lastResult.OutputTokens + e.lastResult.CachedInputTokens + e.lastResult.CacheWriteTokens
-	callTokens := e.pending.InputTokens + e.pending.OutputTokens + e.pending.CachedInputTokens + e.pending.CacheWriteTokens
+	total := cost.InputTokens + cost.OutputTokens
+	previous := e.lastResult.InputTokens + e.lastResult.OutputTokens
+	callTokens := e.pending.InputTokens + e.pending.OutputTokens
 	increment := *cost
 	// An empty terminal usage object is not evidence that the calls spent
 	// zero tokens. Keep their disjoint buckets, while retaining any terminal
@@ -381,7 +386,8 @@ func (e *BudgetEnforcer) resultIncrementLocked(cost *agent.CostData) int64 {
 			increment.NumTurns = e.pending.NumTurns
 		}
 	}
-	if previous > 0 && e.pending.NumTurns > 0 && total > previous && total == previous+callTokens {
+	if (previous > 0 && e.pending.NumTurns > 0 && total == previous+callTokens) ||
+		e.cacheReconcilesLocked(*cost) || e.writeReconcilesLocked(*cost) {
 		increment = costDifference(*cost, e.lastResult)
 	}
 	e.metered = addCost(e.metered, increment)
@@ -402,6 +408,29 @@ func addCost(a, b agent.CostData) agent.CostData {
 		TotalCostUsd:      a.TotalCostUsd + b.TotalCostUsd,
 		NumTurns:          a.NumTurns + b.NumTurns,
 	}
+}
+
+// cacheReconcilesLocked reports whether a ResultEvent's cached-input total
+// provably repeats the previous one: the previous result and the pending
+// per-call usage both carry cached tokens, and the new total grows to
+// exactly their sum. Without that per-bucket evidence the result counts
+// whole — a per-invocation terminal can otherwise sum to a previous cached
+// total by coincidence when the per-call detail omitted the cache the
+// terminal supplies. Called with e.mu held.
+func (e *BudgetEnforcer) cacheReconcilesLocked(total agent.CostData) bool {
+	prev, call := e.lastResult.CachedInputTokens, e.pending.CachedInputTokens
+	return e.pending.NumTurns > 0 && prev > 0 && call > 0 &&
+		total.CachedInputTokens > prev && total.CachedInputTokens == prev+call
+}
+
+// writeReconcilesLocked is cacheReconcilesLocked for the cache-write
+// bucket: a write-only running total reconciles only when the previous
+// total and the pending calls both evidence the write growth. Called with
+// e.mu held.
+func (e *BudgetEnforcer) writeReconcilesLocked(total agent.CostData) bool {
+	prev, call := e.lastResult.CacheWriteTokens, e.pending.CacheWriteTokens
+	return e.pending.NumTurns > 0 && prev > 0 && call > 0 &&
+		total.CacheWriteTokens > prev && total.CacheWriteTokens == prev+call
 }
 
 // costDifference returns what a running total adds over the previous one,
