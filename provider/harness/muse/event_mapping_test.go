@@ -916,3 +916,83 @@ func TestCacheOnlyCumulativeMapperEmitsNettedTotals(t *testing.T) {
 		t.Fatalf("second cost=%+v", got.Cost)
 	}
 }
+
+// TestMapTurnCompleted_ShapeEvidenceIsTurnScoped pins that the turn shape
+// proof is consumed at every turn/completed: stale beside evidence must not
+// make the next turn's inclusive terminal pass through, and stale inside
+// evidence must not net the next turn's beside terminal. Each half fails
+// when its own reset assignment is deleted. Inside precedence and the
+// nonzero-read guard are pinned alongside: a turn proving both shapes nets
+// (inside wins), and a zero-read step sets no evidence.
+func TestMapTurnCompleted_ShapeEvidenceIsTurnScoped(t *testing.T) {
+	turnCost := func(t *testing.T, state *mapperState, turnID, usage string) *agent.CostData {
+		t.Helper()
+		events := mapNotification("turn/completed", json.RawMessage(`{"sessionId":"s","terminal":"completed","turnId":"`+turnID+`","viewCursor":"c"`+usage+`}`), state, nil)
+		for _, ev := range events {
+			if r, ok := ev.(agent.ResultEvent); ok {
+				if r.Cost == nil {
+					t.Fatalf("%s produced a result without cost", turnID)
+				}
+				return r.Cost
+			}
+		}
+		t.Fatalf("%s produced %v, want a result", turnID, kindsOf(events))
+		return nil
+	}
+	step := func(t *testing.T, state *mapperState, params string) {
+		t.Helper()
+		events := mapNotification("session/tokenUsage", json.RawMessage(params), state, nil)
+		if len(events) != 1 {
+			t.Fatalf("tokenUsage produced %v, want one usage event", kindsOf(events))
+		}
+	}
+
+	t.Run("beside evidence does not leak into the next turn", func(t *testing.T) {
+		state := newMapperState("m")
+		// Turn 1 proves beside-shape (30 beside 100 inside a 130 total).
+		step(t, state, `{"promptTokens":130,"cumulative":{"promptTokens":130,"outputTokens":20},"usage":{"inputTokens":30,"outputTokens":20,"cacheReadTokens":100}}`)
+		if got := turnCost(t, state, "t1", `,"usage":{"inputTokens":30,"outputTokens":20,"cacheReadTokens":100}`); got.InputTokens != 30 {
+			t.Fatalf("t1 cost=%+v, want in=30", got)
+		}
+		// Turn 2 is standalone inclusive: 200 folds 100 cached back in.
+		// Without the reset the stale beside flag would pass 200 through.
+		if got := turnCost(t, state, "t2", `,"usage":{"inputTokens":200,"outputTokens":20,"cacheReadTokens":100}`); got.InputTokens != 100 {
+			t.Errorf("t2 cost=%+v, want in=100 (netted inclusive terminal)", got)
+		}
+	})
+
+	t.Run("inside evidence does not leak into the next turn", func(t *testing.T) {
+		state := newMapperState("m")
+		// Turn 1 proves inside-shape (300+100 exceeds the 300 total).
+		step(t, state, `{"cumulative":{"promptTokens":300,"outputTokens":20,"cacheReadTokens":100},"usage":{"inputTokens":300,"outputTokens":20,"cacheReadTokens":100}}`)
+		if got := turnCost(t, state, "t1", `,"usage":{"inputTokens":300,"outputTokens":20,"cacheReadTokens":100}`); got.InputTokens != 200 {
+			t.Fatalf("t1 cost=%+v, want in=200", got)
+		}
+		// Turn 2 is standalone beside-shape (read exceeds input).
+		// Without the reset the stale inside flag would net it to zero.
+		if got := turnCost(t, state, "t2", `,"usage":{"inputTokens":30,"outputTokens":20,"cacheReadTokens":100}`); got.InputTokens != 30 {
+			t.Errorf("t2 cost=%+v, want in=30 (beside terminal passes through)", got)
+		}
+	})
+
+	t.Run("inside precedence wins when a turn proves both shapes", func(t *testing.T) {
+		state := newMapperState("m")
+		step(t, state, `{"promptTokens":130,"cumulative":{"promptTokens":130,"outputTokens":20},"usage":{"inputTokens":30,"outputTokens":20,"cacheReadTokens":100}}`)
+		step(t, state, `{"cumulative":{"promptTokens":430,"outputTokens":40,"cacheReadTokens":200},"usage":{"inputTokens":300,"outputTokens":20,"cacheReadTokens":100}}`)
+		// Both flags are set; the terminal nets because inside wins.
+		// Disabling the inside case would pass 400 through instead.
+		if got := turnCost(t, state, "t1", `,"usage":{"inputTokens":400,"outputTokens":20,"cacheReadTokens":200}`); got.InputTokens != 200 {
+			t.Errorf("cost=%+v, want in=200 (inside precedence nets)", got)
+		}
+	})
+
+	t.Run("zero-read step sets no evidence", func(t *testing.T) {
+		state := newMapperState("m")
+		step(t, state, `{"promptTokens":100,"cumulative":{"promptTokens":100,"outputTokens":5},"usage":{"inputTokens":100,"outputTokens":5,"cachedTokens":99,"cacheReadTokens":0}}`)
+		// No evidence was proved, so the inclusive terminal nets to zero.
+		// Admitting zero reads as evidence would pass 100 through instead.
+		if got := turnCost(t, state, "t1", `,"usage":{"inputTokens":100,"outputTokens":5,"cacheReadTokens":100}`); got.InputTokens != 0 {
+			t.Errorf("cost=%+v, want in=0 (inclusive terminal nets)", got)
+		}
+	})
+}

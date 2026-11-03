@@ -411,23 +411,47 @@ func addCost(a, b agent.CostData) agent.CostData {
 }
 
 // cacheReconcilesLocked reports whether a ResultEvent's cached-input total
-// provably repeats the previous one: the previous result and the pending
+// provably repeats the previous one: a cache-only running total carries no
+// input/output tokens on any side, the previous result and the pending
 // per-call usage both carry cached tokens, and the new total grows to
-// exactly their sum. Without that per-bucket evidence the result counts
-// whole — a per-invocation terminal can otherwise sum to a previous cached
-// total by coincidence when the per-call detail omitted the cache the
-// terminal supplies. Called with e.mu held.
+// exactly their sum. The input/output-free restriction is load-bearing:
+// without it a coincidental cache sum across two independent per-invocation
+// results would collapse their fresh input, dollars and turns. Without
+// that per-bucket evidence the result counts whole — a per-invocation
+// terminal can otherwise sum to a previous cached total by coincidence
+// when the per-call detail omitted the cache the terminal supplies.
+// Called with e.mu held.
 func (e *BudgetEnforcer) cacheReconcilesLocked(total agent.CostData) bool {
+	if total.InputTokens != 0 || total.OutputTokens != 0 {
+		return false
+	}
+	if e.lastResult.InputTokens != 0 || e.lastResult.OutputTokens != 0 {
+		return false
+	}
+	if e.pending.InputTokens != 0 || e.pending.OutputTokens != 0 {
+		return false
+	}
 	prev, call := e.lastResult.CachedInputTokens, e.pending.CachedInputTokens
 	return e.pending.NumTurns > 0 && prev > 0 && call > 0 &&
 		total.CachedInputTokens > prev && total.CachedInputTokens == prev+call
 }
 
 // writeReconcilesLocked is cacheReconcilesLocked for the cache-write
-// bucket: a write-only running total reconciles only when the previous
-// total and the pending calls both evidence the write growth. Called with
-// e.mu held.
+// bucket: a write-only running total carries no input/output tokens on any
+// side and reconciles only when the previous total and the pending calls
+// both evidence the write growth. The input/output-free restriction keeps
+// a coincidental write sum from discarding fresh input, dollars and
+// turns. Called with e.mu held.
 func (e *BudgetEnforcer) writeReconcilesLocked(total agent.CostData) bool {
+	if total.InputTokens != 0 || total.OutputTokens != 0 {
+		return false
+	}
+	if e.lastResult.InputTokens != 0 || e.lastResult.OutputTokens != 0 {
+		return false
+	}
+	if e.pending.InputTokens != 0 || e.pending.OutputTokens != 0 {
+		return false
+	}
 	prev, call := e.lastResult.CacheWriteTokens, e.pending.CacheWriteTokens
 	return e.pending.NumTurns > 0 && prev > 0 && call > 0 &&
 		total.CacheWriteTokens > prev && total.CacheWriteTokens == prev+call

@@ -1156,3 +1156,70 @@ func TestBudgetEnforcer_CacheWritesReconcileCumulative(t *testing.T) {
 		t.Fatalf("cost=%+v, want writes=200 usd=0.02 turns=2", got)
 	}
 }
+
+// TestBudgetEnforcer_CacheSumMustNotEraseFresh pins the cache-only guard:
+// two independent per-invocation results whose cached totals sum by
+// coincidence (100 then 200 with a 100-cached call between) must count
+// whole when the fresh input contradicts a running total (100 != 100+100).
+// Whole: fresh 200 cached 300 $0.03 2 turns, observed 230 breaches 225.
+// Collapsed (difference): fresh 100 cached 200 $0.02 1 turn, observed 120.
+func TestBudgetEnforcer_CacheSumMustNotEraseFresh(t *testing.T) {
+	enf := NewBudgetEnforcer(&prompt.StageBudget{MaxTokens: 225}, time.Now())
+	call := func() agent.LlmCallEvent {
+		return agent.LlmCallEvent{InputTokens: 100, CachedInputTokens: 100, UsageSource: agent.LlmUsageProvider}
+	}
+	result := func(in, cached int64, usd float64) agent.ResultEvent {
+		return agent.ResultEvent{Success: true, Cost: &agent.CostData{
+			InputTokens: in, CachedInputTokens: cached, TotalCostUsd: usd, NumTurns: 1,
+		}}
+	}
+	events := []agent.Event{call(), result(100, 100, 0.01), call(), result(100, 200, 0.02)}
+	breached := false
+	for _, ev := range events {
+		if err := enf.ObserveEvent(ev); err != nil {
+			breached = true
+		}
+	}
+	if rep := enf.Report(time.Now()); rep.ObservedTokens != 230 {
+		t.Fatalf("ObservedTokens=%d, want 230", rep.ObservedTokens)
+	}
+	if !breached {
+		t.Fatal("want the max-tokens breach at observed=230 limit=225")
+	}
+	if got := enf.cost(); got == nil || got.InputTokens != 200 || got.CachedInputTokens != 300 || got.TotalCostUsd != 0.03 || got.NumTurns != 2 {
+		t.Fatalf("cost=%+v, want in=200 cached=300 usd=0.03 turns=2", got)
+	}
+}
+
+// TestBudgetEnforcer_WriteSumMustNotEraseFresh is the write-bucket twin:
+// a coincidental write sum (100 then 200 with a 100-write call between)
+// must not discard the second invocation's fresh input, dollars or turn.
+// Whole: fresh 200 writes 300 $0.03 2 turns, observed 200 breaches 150.
+// Collapsed: fresh 100 writes 200 $0.02 1 turn, observed 100.
+func TestBudgetEnforcer_WriteSumMustNotEraseFresh(t *testing.T) {
+	enf := NewBudgetEnforcer(&prompt.StageBudget{MaxTokens: 150}, time.Now())
+	call := func() agent.LlmCallEvent {
+		return agent.LlmCallEvent{InputTokens: 100, CacheWriteTokens: 100, UsageSource: agent.LlmUsageProvider}
+	}
+	result := func(in, written int64, usd float64) agent.ResultEvent {
+		return agent.ResultEvent{Success: true, Cost: &agent.CostData{
+			InputTokens: in, CacheWriteTokens: written, TotalCostUsd: usd, NumTurns: 1,
+		}}
+	}
+	events := []agent.Event{call(), result(100, 100, 0.01), call(), result(100, 200, 0.02)}
+	breached := false
+	for _, ev := range events {
+		if err := enf.ObserveEvent(ev); err != nil {
+			breached = true
+		}
+	}
+	if rep := enf.Report(time.Now()); rep.ObservedTokens != 200 {
+		t.Fatalf("ObservedTokens=%d, want 200", rep.ObservedTokens)
+	}
+	if !breached {
+		t.Fatal("want the max-tokens breach at observed=200 limit=150")
+	}
+	if got := enf.cost(); got == nil || got.InputTokens != 200 || got.CacheWriteTokens != 300 || got.TotalCostUsd != 0.03 || got.NumTurns != 2 {
+		t.Fatalf("cost=%+v, want in=200 writes=300 usd=0.03 turns=2", got)
+	}
+}
