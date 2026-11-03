@@ -219,6 +219,13 @@ func mapNotification(method string, params json.RawMessage, state *mapperState, 
 		}}
 
 	default:
+		if subtype, ok := recordOnlyNotifications[method]; ok {
+			return []agent.Event{agent.SystemEvent{
+				Subtype: subtype,
+				Message: "Muse notification: " + method,
+				Raw:     raw,
+			}}
+		}
 		return []agent.Event{agent.SystemEvent{
 			Subtype: "unknown",
 			Message: "Unhandled muse notification: " + method,
@@ -229,6 +236,46 @@ func mapNotification(method string, params json.RawMessage, state *mapperState, 
 
 func methodToSubtype(m string) string {
 	return strings.ReplaceAll(m, "/", "_")
+}
+
+// recordOnlyNotifications is the explicit allowlist of additional
+// host→client notifications from the pinned stable export that carry
+// no lifecycle semantics for this harness. Each maps to a named
+// nonterminal SystemEvent with Raw preserved verbatim and a neutral
+// method message. It is consulted only after every special case above
+// has missed; anything outside this finite list still falls through
+// to the unknown diagnostic — never broaden this into a catch-all
+// normalizer (methodToSubtype replaces slashes only, so every
+// subtype here is recorded explicitly).
+//
+// Out of scope by design: server requests (approval/request,
+// userInput/request — answered on the server-request door in
+// handle.go), client-to-server notifications (initialized,
+// userInput/engaged — never inbound), and approval/reviewing plus
+// session/branchChanged, reserved for dedicated mappings.
+var recordOnlyNotifications = map[string]string{
+	"computerUseSetup/changed":       "computer_use_setup_changed",
+	"monitor/inboxItemAdmitted":      "monitor_inbox_item_admitted",
+	"monitor/inboxItemDrained":       "monitor_inbox_item_drained",
+	"monitor/inboxItemVoided":        "monitor_inbox_item_voided",
+	"plugin/changed":                 "plugin_changed",
+	"plugin/marketplaceChanged":      "plugin_marketplace_changed",
+	"recap/completed":                "recap_completed",
+	"session/goalChanged":            "session_goal_changed",
+	"session/leaveCompleted":         "session_leave_completed",
+	"session/listChanged":            "session_list_changed",
+	"session/modelChanged":           "session_model_changed",
+	"session/modelRouteUnserved":     "session_model_route_unserved",
+	"session/nameChanged":            "session_name_changed",
+	"session/reasoningEffortChanged": "session_reasoning_effort_changed",
+	"session/viewHealthChanged":      "session_view_health_changed",
+	"skill/changed":                  "skill_changed",
+	"turn/modelRetryScheduled":       "turn_model_retry_scheduled",
+	// userInput/requested is the durable fold of an opened prompt; its
+	// subtype stays distinct from the server-request door's
+	// user_input_requested (handle.go) so the two doors never conflate.
+	"userInput/requested": "user_input_prompt_opened",
+	"userInput/settled":   "user_input_settled",
 }
 
 // mapTurnCompleted handles turn/completed, the only path that emits a
