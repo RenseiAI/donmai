@@ -736,3 +736,43 @@ func TestEncodeFirstTurnDiagnostic_CapsAtTwoKiB(t *testing.T) {
 		t.Errorf("oversize payload length=%d, want exactly %d (truncated)", len(capped), firstTurnDiagnosticMaxBytes)
 	}
 }
+
+// Mapper half: 100/100/$0.01 then 200/200/$0.02 emit netted steps and cumulative costs.
+func TestCacheOnlyCumulativeMapperEmitsNettedTotals(t *testing.T) {
+	state := newMapperState("m")
+	step := func(params string) agent.LlmCallEvent {
+		t.Helper()
+		events := mapNotification("session/tokenUsage", json.RawMessage(params), state, nil)
+		if len(events) != 1 {
+			t.Fatalf("tokenUsage produced %v", kindsOf(events))
+		}
+		call, ok := events[0].(agent.LlmCallEvent)
+		if !ok {
+			t.Fatalf("event is %T", events[0])
+		}
+		return call
+	}
+	result := func(turnID string) agent.ResultEvent {
+		t.Helper()
+		events := mapNotification("turn/completed", json.RawMessage(`{"sessionId":"s","terminal":"completed","turnId":"`+turnID+`","viewCursor":"c"}`), state, nil)
+		for _, ev := range events {
+			if r, ok := ev.(agent.ResultEvent); ok {
+				return r
+			}
+		}
+		t.Fatalf("turn/completed produced %v", kindsOf(events))
+		return agent.ResultEvent{}
+	}
+	if got := step(`{"cumulative":{"promptTokens":100,"outputTokens":0,"cacheReadTokens":100,"cost":{"usd":0.01}}}`); got.InputTokens != 0 || got.CachedInputTokens != 100 {
+		t.Fatalf("first step=%+v", got)
+	}
+	if got := result("t1"); got.Cost == nil || got.Cost.InputTokens != 0 || got.Cost.CachedInputTokens != 100 || got.Cost.TotalCostUsd != 0.01 {
+		t.Fatalf("first cost=%+v", got.Cost)
+	}
+	if got := step(`{"cumulative":{"promptTokens":200,"outputTokens":0,"cacheReadTokens":200,"cost":{"usd":0.02}}}`); got.InputTokens != 0 || got.CachedInputTokens != 100 {
+		t.Fatalf("second step=%+v", got)
+	}
+	if got := result("t2"); got.Cost == nil || got.Cost.InputTokens != 0 || got.Cost.CachedInputTokens != 200 || got.Cost.TotalCostUsd != 0.02 {
+		t.Fatalf("second cost=%+v", got.Cost)
+	}
+}

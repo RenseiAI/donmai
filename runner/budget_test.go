@@ -978,3 +978,27 @@ func TestRun_PreStreamBudgetExpiryReportsBudgetExceeded(t *testing.T) {
 		}
 	})
 }
+
+// Cache-only cumulatives meter once: 100/$0.01 then 200/$0.02 meter 200/$0.02/20 (not 300/$0.03/30).
+func TestBudgetEnforcer_CacheOnlyCumulativeCountsOnce(t *testing.T) {
+	enf := NewBudgetEnforcer(&prompt.StageBudget{MaxTokens: 1_000_000}, time.Now())
+	for _, tc := range []struct {
+		cached int64
+		usd    float64
+	}{
+		{100, 0.01}, {200, 0.02},
+	} {
+		if err := enf.ObserveEvent(agent.LlmCallEvent{CachedInputTokens: 100, UsageSource: agent.LlmUsageProvider}); err != nil {
+			t.Fatalf("ObserveEvent(call): %v", err)
+		}
+		if err := enf.ObserveEvent(agent.ResultEvent{Success: true, Cost: &agent.CostData{CachedInputTokens: tc.cached, TotalCostUsd: tc.usd}}); err != nil {
+			t.Fatalf("ObserveEvent(result): %v", err)
+		}
+	}
+	if rep := enf.Report(time.Now()); rep.ObservedTokens != 20 {
+		t.Fatalf("ObservedTokens=%d, want 20", rep.ObservedTokens)
+	}
+	if got := enf.cost(); got == nil || got.CachedInputTokens != 200 || got.TotalCostUsd != 0.02 {
+		t.Fatalf("cost=%+v, want cached 200 usd 0.02", got)
+	}
+}

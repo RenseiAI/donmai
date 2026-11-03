@@ -360,9 +360,9 @@ func (e *BudgetEnforcer) resultIncrementLocked(cost *agent.CostData) int64 {
 		// count those calls again.
 		return 0
 	}
-	total := cost.InputTokens + cost.OutputTokens
-	previous := e.lastResult.InputTokens + e.lastResult.OutputTokens
-	callTokens := e.pending.InputTokens + e.pending.OutputTokens
+	total := cost.InputTokens + cost.OutputTokens + cost.CachedInputTokens + cost.CacheWriteTokens
+	previous := e.lastResult.InputTokens + e.lastResult.OutputTokens + e.lastResult.CachedInputTokens + e.lastResult.CacheWriteTokens
+	callTokens := e.pending.InputTokens + e.pending.OutputTokens + e.pending.CachedInputTokens + e.pending.CacheWriteTokens
 	increment := *cost
 	// An empty terminal usage object is not evidence that the calls spent
 	// zero tokens. Keep their disjoint buckets, while retaining any terminal
