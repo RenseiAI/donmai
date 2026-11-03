@@ -85,6 +85,13 @@ func codeIntelEnforcementNote(spec agent.Spec) *SpecFieldNote {
 // follow-up — SupportsOneShot is advertised but the SpawnComplete projection
 // is not wired in this cut.
 func rpcArgs(layout sessionLayout, extensionPaths []string, mode launchMode, sessionID string, spec agent.Spec) []string {
+	return rpcArgsWithSkills(layout, extensionPaths, mode, sessionID, spec, nil)
+}
+
+// rpcArgsWithSkills is rpcArgs plus the skill materializer's argv fragment
+// (skills.go: `--no-skills` and one `--skill <dir>` per loaded skill), placed
+// after the session flags on Spawn and Resume alike.
+func rpcArgsWithSkills(layout sessionLayout, extensionPaths []string, mode launchMode, sessionID string, spec agent.Spec, skillArgs []string) []string {
 	args := []string{"--mode", "rpc"}
 	for _, path := range extensionPaths {
 		args = append(args, "-e", path)
@@ -94,6 +101,7 @@ func rpcArgs(layout sessionLayout, extensionPaths []string, mode launchMode, ses
 		"--approve",
 		"--session-dir", layout.root,
 	)
+	args = append(args, skillArgs...)
 	if spec.SessionName != "" && mode == launchPrompt {
 		args = append(args, "--name", spec.SessionName)
 	}

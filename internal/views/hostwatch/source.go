@@ -65,6 +65,13 @@ type SessionCard struct {
 	WorkType         string
 	CurrentStep      string
 	StartedAtUnixMs  int64
+	// StageName, StageRole and StageRunRole are the wire stage's display
+	// name, the role of the stage the work was dispatched from, and the role
+	// the run executes under. They come from the daemon index handle and are
+	// untrusted text: the card renders them only through displayLabel.
+	StageName    string
+	StageRole    string
+	StageRunRole string
 	// LastHeartbeatUnixMs is the most recent session heartbeat the runner
 	// observed (state.json snapshot, unix-ms). Zero when not reported.
 	LastHeartbeatUnixMs int64
@@ -256,6 +263,11 @@ func (s *Source) Snapshot() Snapshot {
 			Protocol:         h.Protocol,
 			WorkType:         h.WorkType,
 			IssueIdentifier:  h.IssueIdentifier,
+		}
+		if st := h.Stage; st != nil {
+			card.StageName = st.Name
+			card.StageRole = string(st.Role)
+			card.StageRunRole = string(st.RunRole)
 		}
 		if card.isHeld() {
 			// A held row has no live process or workarea, even if a malformed

@@ -9,6 +9,7 @@ import (
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/provider/harness/clijsonl"
+	"github.com/RenseiAI/donmai/stagewire"
 )
 
 // Turn continuation — tail recovery for a turn that ended before the work was
@@ -222,8 +223,11 @@ const (
 
 // turnFollowUps is one session's runner-driven follow-up state.
 type turnFollowUps struct {
-	// limit bounds the unproductive streak and, separately, the retries.
+	// limit bounds the unproductive streak.
 	limit int
+	// retryLimit bounds the provider-error retries: limit by default, or
+	// the dispatched stage retry policy's retries when one is present.
+	retryLimit int
 	// ceiling bounds the continuation prompts in total; zero is no ceiling.
 	ceiling int
 	// undeliveredLimit bounds undeliveredSent; zero is no separate bound.
@@ -281,7 +285,15 @@ func (r *Runner) newTurnFollowUps() *turnFollowUps {
 	case undeliveredLimit < 0:
 		undeliveredLimit = 0
 	}
-	return &turnFollowUps{limit: limit, ceiling: ceiling, undeliveredLimit: undeliveredLimit}
+	return &turnFollowUps{limit: limit, retryLimit: limit, ceiling: ceiling, undeliveredLimit: undeliveredLimit}
+}
+
+// applyRetryPolicy lets a dispatched stage retry policy govern the
+// provider-error retries; nil keeps the configured bound.
+func (f *turnFollowUps) applyRetryPolicy(policy *stagewire.Retry) {
+	if policy != nil {
+		f.retryLimit = policy.Retries
+	}
 }
 
 // noteUndelivered records that the session's pull request did not deliver
@@ -338,7 +350,7 @@ func (f *turnFollowUps) decide(ending turnEnding, continuable, canSteer bool) ta
 			// recorded, sending neither a retry nor the pull request nudge.
 			return f.exhaust(boundProviderErrorFatal)
 		case turnProviderError:
-			if f.retried >= f.limit {
+			if f.retried >= f.retryLimit {
 				return f.exhaust(boundRetries)
 			}
 			return tailRetry
@@ -531,9 +543,20 @@ const retryPrompt = "Your previous turn was cut off by a model provider error be
 // waitRetryBackoff waits before the attempt-th provider-error retry, or
 // returns the context's error when it ends first.
 func (r *Runner) waitRetryBackoff(ctx context.Context, attempt int) error {
+	return r.waitRetryBackoffFor(ctx, nil, attempt)
+}
+
+// waitRetryBackoffFor is waitRetryBackoff under a dispatched stage retry
+// policy: when policy is present its backoffSeconds is the wait before
+// every attempt; nil keeps the configured backoff.
+func (r *Runner) waitRetryBackoffFor(ctx context.Context, policy *stagewire.Retry, attempt int) error {
 	backoff := r.providerRetryBackoff
 	if backoff == nil {
 		backoff = defaultProviderRetryBackoff
+	}
+	if policy != nil {
+		fixed := time.Duration(policy.BackoffSeconds) * time.Second
+		backoff = func(int) time.Duration { return fixed }
 	}
 	delay := backoff(attempt)
 	if delay <= 0 {

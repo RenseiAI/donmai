@@ -220,7 +220,7 @@ func cardRows(t theme.Theme, card SessionCard, frame int, selected, plain bool, 
 		status = []segment{{indent + "held", state}, {" " + card.elapsedText(now), primary}}
 		activity = []segment{{indent + "awaiting local execution", tertiary}}
 	} else {
-		context = []segment{{indent + card.repoName() + " · " + labelIfUnknown(card.WorkType, "work type"), secondary}}
+		context = []segment{{indent + card.repoName() + " · " + card.workLabel(), secondary}}
 		model = []segment{{indent + card.modelText(inner-len(indent)), secondary}}
 		status = []segment{{indent + card.displayState(), state}, {" " + card.elapsedText(now), primary}}
 		if card.TurnsReported {
@@ -399,6 +399,58 @@ func labelIfUnknown(value, label string) string {
 		return clean
 	}
 	return label + " unknown"
+}
+
+// Rune bounds on the wire stage text a card shows. Stage names are free text
+// from the control plane; roles are a short closed set.
+const (
+	maxStageNameRunes = 40
+	maxStageRoleRunes = 12
+)
+
+// displayLabel makes untrusted wire text safe for terminal output: it strips
+// escape sequences, control characters and Unicode format characters (the
+// bidi overrides, isolates and marks, zero-width characters and byte-order
+// marks that can reorder or hide text), collapses whitespace, and bounds the
+// result to maxRunes runes. It returns "" when nothing printable remains.
+func displayLabel(s string, maxRunes int) string {
+	// Format characters go first so one spliced into an escape sequence
+	// cannot hide it from the strip below.
+	unformatted := strings.Map(func(r rune) rune {
+		if unicode.Is(unicode.Cf, r) {
+			return -1
+		}
+		return r
+	}, s)
+	return truncateRunes(cleanText(unformatted), maxRunes)
+}
+
+// stageLabel is the wire stage as "<name> · <role>": the stage's display
+// name and the role of the stage the work was dispatched from, else the role
+// the run executes under. The role is left off when neither is known. It is
+// "" when the work item carries no stage name, so the caller falls back.
+func (c SessionCard) stageLabel() string {
+	name := displayLabel(c.StageName, maxStageNameRunes)
+	if name == "" {
+		return ""
+	}
+	role := displayLabel(c.StageRole, maxStageRoleRunes)
+	if role == "" {
+		role = displayLabel(c.StageRunRole, maxStageRoleRunes)
+	}
+	if role == "" {
+		return name
+	}
+	return name + " · " + role
+}
+
+// workLabel is what a live card names its work as: the stage label when the
+// work item carries a stage, else the work type.
+func (c SessionCard) workLabel() string {
+	if label := c.stageLabel(); label != "" {
+		return label
+	}
+	return labelIfUnknown(c.WorkType, "work type")
 }
 
 func (c SessionCard) isHeld() bool {
