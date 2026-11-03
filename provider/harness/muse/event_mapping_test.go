@@ -240,7 +240,8 @@ func TestMapTokenUsage_AccumulatesCost(t *testing.T) {
 		t.Fatalf("tokenUsage produced %v, want one usage event", kindsOf(events))
 	}
 	call, ok := events[0].(agent.LlmCallEvent)
-	if !ok || call.InputTokens != 50 || call.OutputTokens != 20 || call.CachedInputTokens != 5 || call.ReasoningTokens != 2 || call.ObservedCostUsd == nil || *call.ObservedCostUsd != 0.5 || call.UsageSource != agent.LlmUsageProvider || call.TurnCompleted {
+	// The step input nets the cached slice: 50 reported minus 5 cached.
+	if !ok || call.InputTokens != 45 || call.OutputTokens != 20 || call.CachedInputTokens != 5 || call.ReasoningTokens != 2 || call.ObservedCostUsd == nil || *call.ObservedCostUsd != 0.5 || call.UsageSource != agent.LlmUsageProvider || call.TurnCompleted {
 		t.Fatalf("step usage=%+v", events[0])
 	}
 	if !state.hasCost || state.totalCostUSD != 0.5 {
@@ -261,8 +262,8 @@ func TestMapTokenUsage_AccumulatesCost(t *testing.T) {
 	if result == nil || result.ObservedCostUsd == nil || *result.ObservedCostUsd != 0.5 {
 		t.Errorf("result=%+v, want observed cost 0.5", result)
 	}
-	if result.Cost.InputTokens != 11 || result.Cost.OutputTokens != 7 {
-		t.Errorf("cost=%+v, want the turn usage override (11 in, 7 out)", result.Cost)
+	if result.Cost.InputTokens != 10 || result.Cost.OutputTokens != 7 {
+		t.Errorf("cost=%+v, want the turn usage override netted (11 in minus 1 cached, 7 out)", result.Cost)
 	}
 }
 
@@ -364,7 +365,8 @@ func TestMapTokenUsage_CumulativeFallback(t *testing.T) {
 			t.Fatalf("events=%v", kindsOf(events))
 		}
 		call := events[0].(agent.LlmCallEvent)
-		if call.InputTokens != 50 || call.OutputTokens != 20 || call.CachedInputTokens != 5 || call.CacheWriteTokens != 3 || call.ObservedCostUsd != nil {
+		// The cumulative prompt delta (50) nets the read delta (5).
+		if call.InputTokens != 45 || call.OutputTokens != 20 || call.CachedInputTokens != 5 || call.CacheWriteTokens != 3 || call.ObservedCostUsd != nil {
 			t.Fatalf("fallback=%+v", call)
 		}
 	}
@@ -376,6 +378,193 @@ func TestMapTokenUsage_CumulativeFallback(t *testing.T) {
 	}
 	if events := mapNotification("session/tokenUsage", json.RawMessage(`{`), state, nil); len(events) != 0 {
 		t.Fatalf("malformed usage=%v", events)
+	}
+}
+
+// TestMapTokenUsage_NetsCacheReads pins the token accounting contract for
+// the cumulative session/tokenUsage path: the provider's prompt/input
+// counts fold cached reads back in (OpenAI-style), so the mapper reports
+// InputTokens net of the read slice, which rides CachedInputTokens
+// instead (agent.CostData). Cache writes keep their own bucket and are
+// never removed from input here: only the proven-included read slice is
+// netted, floored at zero.
+func TestMapTokenUsage_NetsCacheReads(t *testing.T) {
+	tests := []struct {
+		name       string
+		params     string
+		wantIn     int64
+		wantOut    int64
+		wantCached int64
+		wantWrite  int64
+	}{
+		{
+			name:       "step usage with cacheReadTokens",
+			params:     `{"cumulative":{"promptTokens":100,"outputTokens":20,"cacheReadTokens":30},"usage":{"inputTokens":100,"outputTokens":20,"cacheReadTokens":30}}`,
+			wantIn:     70,
+			wantOut:    20,
+			wantCached: 30,
+		},
+		{
+			name:       "step usage with legacy cachedTokens",
+			params:     `{"cumulative":{"promptTokens":100,"outputTokens":20},"usage":{"inputTokens":100,"outputTokens":20,"cachedTokens":25}}`,
+			wantIn:     75,
+			wantOut:    20,
+			wantCached: 25,
+		},
+		{
+			name:       "cumulative fallback nets reads",
+			params:     `{"cumulative":{"promptTokens":100,"outputTokens":20,"cacheReadTokens":40}}`,
+			wantIn:     60,
+			wantOut:    20,
+			wantCached: 40,
+		},
+		{
+			name:       "cache writes keep their own bucket",
+			params:     `{"cumulative":{"promptTokens":100,"outputTokens":20,"cacheReadTokens":30,"cacheWriteTokens":6},"usage":{"inputTokens":100,"outputTokens":20,"cacheReadTokens":30,"cacheWriteTokens":6}}`,
+			wantIn:     70,
+			wantOut:    20,
+			wantCached: 30,
+			wantWrite:  6,
+		},
+		{
+			name:       "reads beyond prompt floor at zero",
+			params:     `{"cumulative":{"promptTokens":10,"outputTokens":2,"cacheReadTokens":25},"usage":{"inputTokens":10,"outputTokens":2,"cacheReadTokens":25}}`,
+			wantIn:     0,
+			wantOut:    2,
+			wantCached: 25,
+		},
+		{
+			name:    "no cache fields pass through",
+			params:  `{"cumulative":{"promptTokens":12,"outputTokens":3},"usage":{"inputTokens":12,"outputTokens":3}}`,
+			wantIn:  12,
+			wantOut: 3,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			state := newMapperState("m")
+			events := mapNotification("session/tokenUsage", json.RawMessage(tc.params), state, nil)
+			if len(events) != 1 {
+				t.Fatalf("tokenUsage produced %v, want one usage event", kindsOf(events))
+			}
+			call, ok := events[0].(agent.LlmCallEvent)
+			if !ok {
+				t.Fatalf("event is %T, want LlmCallEvent", events[0])
+			}
+			if call.InputTokens != tc.wantIn || call.OutputTokens != tc.wantOut || call.CachedInputTokens != tc.wantCached || call.CacheWriteTokens != tc.wantWrite {
+				t.Errorf("usage=%+v, want in=%d out=%d cached=%d write=%d", call, tc.wantIn, tc.wantOut, tc.wantCached, tc.wantWrite)
+			}
+		})
+	}
+}
+
+// TestMapTokenUsage_NetsReadsAcrossSteps pins the delta math over two
+// cumulative reports: each step reports only its own fresh input.
+func TestMapTokenUsage_NetsReadsAcrossSteps(t *testing.T) {
+	state := newMapperState("m")
+	first := mapNotification("session/tokenUsage", json.RawMessage(`{"cumulative":{"promptTokens":100,"outputTokens":20,"cacheReadTokens":30}}`), state, nil)
+	second := mapNotification("session/tokenUsage", json.RawMessage(`{"cumulative":{"promptTokens":250,"outputTokens":60,"cacheReadTokens":90}}`), state, nil)
+	if len(first) != 1 || len(second) != 1 {
+		t.Fatalf("steps produced %v and %v", kindsOf(first), kindsOf(second))
+	}
+	got := second[0].(agent.LlmCallEvent)
+	if got.InputTokens != 90 || got.OutputTokens != 40 || got.CachedInputTokens != 60 {
+		t.Errorf("second step=%+v, want in=90 out=40 cached=60", got)
+	}
+}
+
+// TestMapTurnCompleted_NetsCacheReads pins the same contract for the
+// turn/completed override path: a turn usage block carrying cached reads
+// reports InputTokens net of them, and a turn with no cache-read field
+// passes its input through untouched.
+func TestMapTurnCompleted_NetsCacheReads(t *testing.T) {
+	tests := []struct {
+		name       string
+		usage      string
+		wantIn     int64
+		wantCached int64
+		wantWrite  int64
+	}{
+		{
+			name:       "usage with cacheReadTokens",
+			usage:      `,"usage":{"inputTokens":200,"outputTokens":40,"cacheReadTokens":150}`,
+			wantIn:     50,
+			wantCached: 150,
+		},
+		{
+			name:       "usage with legacy cachedTokens",
+			usage:      `,"usage":{"inputTokens":200,"outputTokens":40,"cachedTokens":60}`,
+			wantIn:     140,
+			wantCached: 60,
+		},
+		{
+			name:   "usage with no cache-read field passes through",
+			usage:  `,"usage":{"inputTokens":200,"outputTokens":40}`,
+			wantIn: 200,
+		},
+		{
+			name:       "cache writes keep their own bucket",
+			usage:      `,"usage":{"inputTokens":200,"outputTokens":40,"cacheReadTokens":50,"cacheWriteTokens":20}`,
+			wantIn:     150,
+			wantCached: 50,
+			wantWrite:  20,
+		},
+		{
+			name:       "reads beyond input floor at zero",
+			usage:      `,"usage":{"inputTokens":10,"outputTokens":2,"cacheReadTokens":99}`,
+			wantIn:     0,
+			wantCached: 99,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			state := newMapperState("m")
+			events := mapNotification("turn/completed", json.RawMessage(`{"sessionId":"s","terminal":"completed","turnId":"t1","viewCursor":"c"`+tc.usage+`}`), state, nil)
+			var llm *agent.LlmCallEvent
+			var result *agent.ResultEvent
+			for _, ev := range events {
+				switch e := ev.(type) {
+				case agent.LlmCallEvent:
+					llm = &e
+				case agent.ResultEvent:
+					result = &e
+				}
+			}
+			if llm == nil || result == nil || result.Cost == nil {
+				t.Fatalf("events=%v, want llm call plus result", kindsOf(events))
+			}
+			if llm.InputTokens != tc.wantIn || llm.CachedInputTokens != tc.wantCached || llm.CacheWriteTokens != tc.wantWrite {
+				t.Errorf("llm=%+v, want in=%d cached=%d write=%d", llm, tc.wantIn, tc.wantCached, tc.wantWrite)
+			}
+			if result.Cost.InputTokens != tc.wantIn || result.Cost.CachedInputTokens != tc.wantCached || result.Cost.CacheWriteTokens != tc.wantWrite {
+				t.Errorf("cost=%+v, want in=%d cached=%d write=%d", result.Cost, tc.wantIn, tc.wantCached, tc.wantWrite)
+			}
+		})
+	}
+}
+
+// TestMapTurnCompleted_FallsBackToNettedTotals pins the no-usage path:
+// without a turn usage block the result carries the session totals with
+// the cached slice removed from input.
+func TestMapTurnCompleted_FallsBackToNettedTotals(t *testing.T) {
+	state := newMapperState("m")
+	seed := mapNotification("session/tokenUsage", json.RawMessage(`{"cumulative":{"promptTokens":500,"outputTokens":100,"cacheReadTokens":400}}`), state, nil)
+	if len(seed) != 1 {
+		t.Fatalf("seed produced %v", kindsOf(seed))
+	}
+	events := mapNotification("turn/completed", json.RawMessage(`{"sessionId":"s","terminal":"completed","turnId":"t1","viewCursor":"c"}`), state, nil)
+	var result *agent.ResultEvent
+	for _, ev := range events {
+		if r, ok := ev.(agent.ResultEvent); ok {
+			r := r
+			result = &r
+		}
+	}
+	if result == nil || result.Cost == nil {
+		t.Fatalf("events=%v, want a result", kindsOf(events))
+	}
+	if result.Cost.InputTokens != 100 || result.Cost.CachedInputTokens != 400 || result.Cost.OutputTokens != 100 {
+		t.Errorf("cost=%+v, want in=100 out=100 cached=400", result.Cost)
 	}
 }
 

@@ -612,13 +612,15 @@ func TestHandle_StepUsage(t *testing.T) {
 		}
 		if call.UsageSource == agent.LlmUsageAggregate {
 			aggregates++
-			if !call.TurnCompleted || call.InputTokens != 300 || call.ReasoningTokens != 15 {
+			// Three steps of fresh input: 3 × (100 reported − 10 cached).
+			if !call.TurnCompleted || call.InputTokens != 270 || call.ReasoningTokens != 15 {
 				t.Errorf("aggregate=%+v", call)
 			}
 			continue
 		}
 		calls++
-		if call.UsageSource != agent.LlmUsageProvider || call.TurnCompleted || call.Model != "step-model" || call.System != "muse" || call.InputTokens != 100 || call.OutputTokens != 50 || call.CachedInputTokens != 10 || call.CacheWriteTokens != 4 || call.ReasoningTokens != 5 || call.ObservedCostUsd == nil || *call.ObservedCostUsd != 0.25 {
+		// Each step nets its cached slice: 100 reported − 10 cached.
+		if call.UsageSource != agent.LlmUsageProvider || call.TurnCompleted || call.Model != "step-model" || call.System != "muse" || call.InputTokens != 90 || call.OutputTokens != 50 || call.CachedInputTokens != 10 || call.CacheWriteTokens != 4 || call.ReasoningTokens != 5 || call.ObservedCostUsd == nil || *call.ObservedCostUsd != 0.25 {
 			t.Fatalf("step %d=%+v", calls, call)
 		}
 		total.InputTokens += call.InputTokens

@@ -253,7 +253,6 @@ func mapTurnCompleted(params json.RawMessage, state *mapperState, raw any) []age
 
 	in, out, cached, cacheWrite, reasoning := state.totalInputTok, state.totalOutputTok, state.totalCachedTok, state.cacheWriteTok, state.reasoningTok
 	if p.Usage != nil {
-		in = p.Usage.InputTokens
 		out = p.Usage.OutputTokens
 		cached = p.Usage.CachedTokens
 		if p.Usage.CacheReadTokens != nil {
@@ -262,7 +261,17 @@ func mapTurnCompleted(params json.RawMessage, state *mapperState, raw any) []age
 		if p.Usage.CacheWriteTokens != nil {
 			cacheWrite = *p.Usage.CacheWriteTokens
 		}
+		// The turn input total folds cached reads back in
+		// (OpenAI-style): report only the fresh slice so the
+		// max-tokens meter and cost rollups stop counting every
+		// cached token twice.
+		in = netMuseInput(p.Usage.InputTokens, cached)
 		reasoning = p.Usage.ReasoningTokens
+	} else {
+		// Without a turn usage block the result carries the session
+		// totals, whose prompt count folds the read count back in
+		// the same way: net it identically.
+		in = netMuseInput(in, cached)
 	}
 	cost := &agent.CostData{
 		InputTokens:       in,
@@ -345,6 +354,26 @@ func mapTurnCompleted(params json.RawMessage, state *mapperState, raw any) []age
 	}
 }
 
+// museStepCacheRead resolves the read slice of one TokenUsage block: the
+// explicit cacheReadTokens when the host reports it, else the legacy
+// cachedTokens count.
+func museStepCacheRead(u TokenUsage) int64 {
+	if u.CacheReadTokens != nil {
+		return *u.CacheReadTokens
+	}
+	return u.CachedTokens
+}
+
+// netMuseInput returns the contract-compliant fresh input count for an
+// OpenAI-style provider total that folds cached reads back in: the total
+// minus the read slice, floored at zero so a host that already excludes a
+// class can never drive the count negative. Cache writes are deliberately
+// NOT removed: they ride CacheWriteTokens and the provider total is only
+// proven to include reads.
+func netMuseInput(input, cacheRead int64) int64 {
+	return max(input-cacheRead, 0)
+}
+
 // mapTokenUsage emits step usage while retaining cumulative terminal totals.
 // Cost may be re-priced downward; only positive changes are new spend.
 func mapTokenUsage(params json.RawMessage, state *mapperState, _ any) []agent.Event {
@@ -369,8 +398,13 @@ func mapTokenUsage(params json.RawMessage, state *mapperState, _ any) []agent.Ev
 	readDelta, writeDelta := max(cached-state.totalCachedTok, 0), max(cacheWrite-state.cacheWriteTok, 0)
 	usage.CachedTokens = readDelta
 	usage.CacheWriteTokens = &writeDelta
+	// The prompt delta folds the read delta back in (OpenAI-style), so
+	// the fallback step reports only its fresh input; the read slice
+	// rides CachedInputTokens instead (agent.CostData).
+	usage.InputTokens = netMuseInput(usage.InputTokens, readDelta)
 	if p.Usage != nil {
 		usage = *p.Usage
+		usage.InputTokens = netMuseInput(usage.InputTokens, museStepCacheRead(usage))
 	}
 	read := usage.CachedTokens
 	if usage.CacheReadTokens != nil {
