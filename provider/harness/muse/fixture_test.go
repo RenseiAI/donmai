@@ -532,8 +532,8 @@ func (fh *fakeHost) emitScript(t *testing.T, script, sid, turnID string, denyApp
 				"toolName": "shell", "rawArgs": "RAWARGS-SENTINEL-observe-9f8a",
 				"viewCursor": "cursor-2", "judgeEscalated": reviewJudge, "protectedWrite": reviewProtected,
 				"currentRequirementId": map[string]any{"approvalId": "appr-9", "sourceIndex": 0},
-				"subject":          map[string]any{"kind": "shell", "command": "echo observe", "workspaceRoot": "/sentinel/workspace/observe-9f8a"},
-				"availableChoices": []any{map[string]any{"choiceId": "allow", "decision": "approved", "label": "Allow", "scope": "once"}},
+				"subject":              map[string]any{"kind": "shell", "command": "echo observe", "workspaceRoot": "/sentinel/workspace/observe-9f8a"},
+				"availableChoices":     []any{map[string]any{"choiceId": "allow", "decision": "approved", "label": "Allow", "scope": "once"}},
 			}
 		}
 		fh.write(t, map[string]any{
@@ -588,7 +588,7 @@ func (fh *fakeHost) emitScript(t *testing.T, script, sid, turnID string, denyApp
 			"toolName": "shell", "rawArgs": "echo hi", "viewCursor": "cursor-2",
 			"judgeEscalated": true, "protectedWrite": true,
 			"currentRequirementId": map[string]any{"approvalId": "appr-1", "sourceIndex": 0},
-			"subject": map[string]any{"kind": "shell", "command": "echo hi"},
+			"subject":              map[string]any{"kind": "shell", "command": "echo hi"},
 			"availableChoices": []any{
 				map[string]any{"choiceId": "allow", "decision": "approved", "label": "Allow", "scope": "once"},
 				map[string]any{"choiceId": "deny", "decision": "denied", "label": "Deny", "scope": "once"},
