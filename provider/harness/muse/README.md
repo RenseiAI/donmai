@@ -136,7 +136,11 @@ the denial/abort choice — live shell subjects offer `abort`, not
 `denied`); the server-request is answered `{}`. The
 `userInput/request` server-request is answered `{}` (autonomous mode
 has no user to prompt; the prompt is recorded as a
-`user_input_requested` event). MCP servers ride inline
+`user_input_requested` event). Two further notifications are
+record-only observations: `approval/reviewing` (the native reviewer
+holds an approval — `approval_reviewing`, never a decision) and
+`session/branchChanged` (a workspace-branch observation landed —
+`branch_changed`, never authoritative branch binding). MCP servers ride inline
 (`config.mcpServers[<name>]`, streamableHttp + stdio, every server
 `mode: optional` so one unreachable server degrades that server, not
 the turn). Malformed server entries skip with a warning (soft-fail)

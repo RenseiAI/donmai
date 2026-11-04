@@ -1586,3 +1586,245 @@ func TestHandle_FirstTurnDiagnosticEmitsOnce(t *testing.T) {
 		t.Fatalf("second emit with same turn produced %d diagnostics, want 1 (once flag); logs=%q", got, logs.String())
 	}
 }
+
+// TestHandle_ObserveReviewingThroughSpawn drives the record-only
+// reviewing observation through Spawn for all four flag combinations:
+// exactly one approval_reviewing event naming the tool and approval
+// id, each true flag marked, Raw retained, no unknown for that
+// method, and the terminal event still last.
+func TestHandle_ObserveReviewingThroughSpawn(t *testing.T) {
+	cases := []struct {
+		name        string
+		judge, prot bool
+	}{
+		{"neither", false, false},
+		{"judge only", true, false},
+		{"protected only", false, true},
+		{"both", true, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p, fh := newTestProvider(t, "observe")
+			fh.mu.Lock()
+			fh.reviewJudge = tc.judge
+			fh.reviewProtected = tc.prot
+			fh.mu.Unlock()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			h, err := p.Spawn(ctx, agent.Spec{Prompt: "work", Cwd: t.TempDir(), Autonomous: true})
+			if err != nil {
+				t.Fatalf("Spawn: %v", err)
+			}
+
+			events := drainEvents(t, h.Events(), 10*time.Second)
+			var reviewing []agent.SystemEvent
+			for _, ev := range events {
+				sys, ok := ev.(agent.SystemEvent)
+				if !ok {
+					continue
+				}
+				switch sys.Subtype {
+				case "approval_reviewing":
+					reviewing = append(reviewing, sys)
+				case "unknown":
+					if strings.Contains(sys.Message, "approval/reviewing") {
+						t.Errorf("reviewing fell through to unknown: %+v", sys)
+					}
+				}
+			}
+			if len(reviewing) != 1 {
+				t.Fatalf("approval_reviewing events=%d, want exactly 1 (foreign-session reviewing must stay excluded); kinds=%v", len(reviewing), kindsOf(events))
+			}
+			got := reviewing[0]
+			if !strings.Contains(got.Message, "shell") || !strings.Contains(got.Message, "appr-9") {
+				t.Errorf("message=%q, want it to name the tool and approval id", got.Message)
+			}
+			if has := strings.Contains(got.Message, "[judgeEscalated]"); has != tc.judge {
+				t.Errorf("message=%q judge marker present=%v, want %v", got.Message, has, tc.judge)
+			}
+			if has := strings.Contains(got.Message, "[protectedWrite]"); has != tc.prot {
+				t.Errorf("message=%q protected marker present=%v, want %v", got.Message, has, tc.prot)
+			}
+			for _, sentinel := range []string{"RAWARGS-SENTINEL-observe-9f8a", "/sentinel/workspace/observe-9f8a"} {
+				if strings.Contains(got.Message, sentinel) {
+					t.Errorf("message=%q leaked %q", got.Message, sentinel)
+				}
+			}
+			raw, ok := got.Raw.(map[string]any)
+			if !ok || raw["approvalId"] != "appr-9" || raw["rawArgs"] != "RAWARGS-SENTINEL-observe-9f8a" {
+				t.Errorf("Raw=%+v, want the original reviewing object retained", got.Raw)
+			}
+			if err := conformance.CheckTerminalContract(events); err != nil {
+				t.Errorf("terminal-event contract violated: %v", err)
+			}
+		})
+	}
+}
+
+// TestHandle_ObserveBranchChangedThroughSpawn drives the record-only
+// branch observation through Spawn: exactly one branch_changed event
+// with the exact branch message and the original Raw object.
+func TestHandle_ObserveBranchChangedThroughSpawn(t *testing.T) {
+	p, _ := newTestProvider(t, "observe")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	h, err := p.Spawn(ctx, agent.Spec{Prompt: "work", Cwd: t.TempDir(), Autonomous: true})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+
+	events := drainEvents(t, h.Events(), 10*time.Second)
+	var changed []agent.SystemEvent
+	for _, ev := range events {
+		sys, ok := ev.(agent.SystemEvent)
+		if !ok {
+			continue
+		}
+		switch sys.Subtype {
+		case "branch_changed":
+			changed = append(changed, sys)
+		case "unknown":
+			if strings.Contains(sys.Message, "session/branchChanged") {
+				t.Errorf("branchChanged fell through to unknown: %+v", sys)
+			}
+		}
+	}
+	if len(changed) != 1 {
+		t.Fatalf("branch_changed events=%d, want exactly 1 (foreign-session traffic must stay excluded); kinds=%v", len(changed), kindsOf(events))
+	}
+	got := changed[0]
+	if got.Message != "branch: observe/feature-branch" {
+		t.Errorf("message=%q, want %q", got.Message, "branch: observe/feature-branch")
+	}
+	raw, ok := got.Raw.(map[string]any)
+	if !ok || raw["branch"] != "observe/feature-branch" || raw["workspaceRoot"] != "/sentinel/workspace/observe-9f8a" {
+		t.Errorf("Raw=%+v, want the original branchChanged object retained", got.Raw)
+	}
+	if err := conformance.CheckTerminalContract(events); err != nil {
+		t.Errorf("terminal-event contract violated: %v", err)
+	}
+}
+
+// TestHandle_ObserveBranchNullThroughSpawn drives a null-branch
+// (detached HEAD) observation through Spawn: it surfaces as unknown
+// rather than an empty branch.
+func TestHandle_ObserveBranchNullThroughSpawn(t *testing.T) {
+	p, fh := newTestProvider(t, "observe")
+	fh.mu.Lock()
+	fh.branchNull = true
+	fh.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	h, err := p.Spawn(ctx, agent.Spec{Prompt: "work", Cwd: t.TempDir(), Autonomous: true})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+
+	events := drainEvents(t, h.Events(), 10*time.Second)
+	saw := false
+	for _, ev := range events {
+		if sys, ok := ev.(agent.SystemEvent); ok && sys.Subtype == "branch_changed" {
+			saw = true
+			if sys.Message != "branch: unknown" {
+				t.Errorf("message=%q, want %q", sys.Message, "branch: unknown")
+			}
+		}
+	}
+	if !saw {
+		t.Fatalf("no branch_changed event; kinds=%v", kindsOf(events))
+	}
+}
+
+// TestHandle_ObserveMakesNoApprovalDecision pins the record-only
+// fence: a reviewing notification alone causes zero approval/decide
+// calls, while the unrelated unknown method keeps its fallback and
+// the terminal event stays last.
+func TestHandle_ObserveMakesNoApprovalDecision(t *testing.T) {
+	p, fh := newTestProvider(t, "observe")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	h, err := p.Spawn(ctx, agent.Spec{Prompt: "work", Cwd: t.TempDir(), Autonomous: true})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+
+	events := drainEvents(t, h.Events(), 10*time.Second)
+	if res, ok := terminalResult(events); !ok || !res.Success {
+		t.Errorf("terminal result missing or failed: %+v", res)
+	}
+
+	fh.mu.Lock()
+	methods := append([]string(nil), fh.methods...)
+	fh.mu.Unlock()
+	for _, m := range methods {
+		if m == "approval/decide" {
+			t.Fatalf("reviewing alone drove approval/decide; methods=%v", methods)
+		}
+	}
+
+	sawUnknown := false
+	for _, ev := range events {
+		if sys, ok := ev.(agent.SystemEvent); ok && sys.Subtype == "unknown" {
+			sawUnknown = true
+			if !strings.Contains(sys.Message, "something/new") {
+				t.Errorf("unknown event=%+v, want the unrelated method's fallback", sys)
+			}
+		}
+	}
+	if !sawUnknown {
+		t.Errorf("unrelated unknown method lost its fallback; kinds=%v", kindsOf(events))
+	}
+	if err := conformance.CheckTerminalContract(events); err != nil {
+		t.Errorf("terminal-event contract violated: %v", err)
+	}
+}
+
+// TestHandle_RequestedReviewingDecidesOnce pins the decision door:
+// requested plus reviewing plus the server-request presentation still
+// makes exactly one approval/decide call — reviewing never drives a
+// second decision.
+func TestHandle_RequestedReviewingDecidesOnce(t *testing.T) {
+	p, fh := newTestProvider(t, "approval-requested-reviewing")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	h, err := p.Spawn(ctx, agent.Spec{Prompt: "run echo", Cwd: t.TempDir(), Autonomous: true})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+
+	events := drainEvents(t, h.Events(), 10*time.Second)
+	if res, ok := terminalResult(events); !ok || !res.Success {
+		t.Errorf("terminal result missing or failed: %+v", res)
+	}
+
+	fh.mu.Lock()
+	methods := append([]string(nil), fh.methods...)
+	fh.mu.Unlock()
+	decides := 0
+	for _, m := range methods {
+		if m == "approval/decide" {
+			decides++
+		}
+	}
+	if decides != 1 {
+		t.Errorf("approval/decide sent %d times, want exactly once (reviewing must not drive a decision)", decides)
+	}
+
+	sawReviewing := false
+	for _, ev := range events {
+		if sys, ok := ev.(agent.SystemEvent); ok && sys.Subtype == "approval_reviewing" {
+			sawReviewing = true
+		}
+	}
+	if !sawReviewing {
+		t.Errorf("no approval_reviewing event in the requested+reviewing run; kinds=%v", kindsOf(events))
+	}
+	if err := conformance.CheckTerminalContract(events); err != nil {
+		t.Errorf("terminal-event contract violated: %v", err)
+	}
+}
