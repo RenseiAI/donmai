@@ -118,6 +118,13 @@ var linearMCPDisallowList = []string{
 // `--mcp-config` JSON tmpfile prepared by writeMCPConfig (see mcp.go).
 // When empty (no MCP servers configured) the flag is omitted.
 func buildArgs(spec agent.Spec, mcpConfigPath, resumeSessionID, ownedSessionID string) (argv []string, stdinPrompt string) {
+	return buildArgsWithSkills(spec, mcpConfigPath, resumeSessionID, ownedSessionID, nil)
+}
+
+// buildArgsWithSkills is buildArgs plus the argv fragment the skill
+// materializer returned (`--plugin-dir <dir>`), placed after the
+// working-directory grants and before the resume/session id.
+func buildArgsWithSkills(spec agent.Spec, mcpConfigPath, resumeSessionID, ownedSessionID string, skillArgs []string) (argv []string, stdinPrompt string) {
 	argv = []string{
 		"-p",
 		"--output-format", "stream-json",
@@ -157,6 +164,7 @@ func buildArgs(spec agent.Spec, mcpConfigPath, resumeSessionID, ownedSessionID s
 	for _, dir := range addDirs {
 		argv = append(argv, "--add-dir", dir)
 	}
+	argv = append(argv, skillArgs...)
 
 	if resumeSessionID != "" {
 		argv = append(argv, "--resume", resumeSessionID)

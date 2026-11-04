@@ -72,17 +72,25 @@ import (
 // workspace is untrusted even when the operator granted a broad ambient entry
 // such as `/`; standalone sessions retain the historical trusted seed.
 //
-// # The headless app-server lane is deliberately NOT seeded
+// # The headless app-server lane is recorded UNTRUSTED, never trusted
 //
 // The app-server lane cannot hit either modal — it has no UI, and its approval
 // traffic rides the JSON-RPC approval bridge (approval.go), where a decision is
-// computed rather than typed. Pre-trusting its working directory would also
-// have a cost the interactive lane does not pay: a trusted directory makes
-// codex load that directory's `.codex/config.toml` as a `project` configuration
-// layer, and any `mcp_servers` declared there would enter the effective
-// configuration the isolated `CODEX_HOME` boundary exists to keep exclusive
-// (config_boundary.go, and the readback proof in Provider.verifyMCPConfig).
-// Staying untrusted there costs nothing and keeps that proof intact.
+// computed rather than typed. So nothing is pre-answered for it, and trusting
+// its working directory would only cost: a trusted directory makes codex load
+// that directory's `.codex/config.toml` as a `project` configuration layer, and
+// any `mcp_servers` declared there would enter the effective configuration the
+// isolated `CODEX_HOME` boundary exists to keep exclusive (config_boundary.go,
+// and the readback proof in Provider.verifyMCPConfig).
+//
+// Leaving the directory out of the projects table is NOT the same as
+// untrusted. With no entry, codex-cli 0.164.0 applied a repository's
+// `.codex/config.toml` `developer_instructions` to a headless thread; an
+// explicit `trust_level = "untrusted"` entry kept that project layer disabled.
+// Every headless Spawn/Resume therefore writes that entry for the session
+// working directory, under the given and the symlink-resolved path, into the
+// Provider's private config.toml (recordUntrustedWorkspaceLocked), unless the
+// operator's app-server argv sets project trust itself.
 
 const (
 	// codexTrustLevelTrusted is codex's own value for a directory whose
@@ -204,6 +212,56 @@ func sessionWorkspaceTrustDirs(cwd string, getwd func() (string, error)) ([]stri
 	}
 	sort.Strings(dirs)
 	return dirs, nil
+}
+
+// recordUntrustedWorkspaceLocked records the headless session's working
+// directory as an untrusted project in the Provider's private config.toml.
+// An empty cwd names the directory the app-server runs in, which is where a
+// thread/start with no cwd lands. startMu must be held.
+func (p *Provider) recordUntrustedWorkspaceLocked(cwd string) error {
+	if operatorConfiguredProjectTrust(p.opts.Args) {
+		return nil
+	}
+	dirs, err := sessionWorkspaceTrustDirs(cwd, func() (string, error) {
+		if p.opts.Cwd != "" {
+			return p.opts.Cwd, nil
+		}
+		return os.Getwd()
+	})
+	if err != nil {
+		return fmt.Errorf("codex: record the session workspace as untrusted: %w", err)
+	}
+	if err := p.config.appendUntrustedProjects(dirs); err != nil {
+		return fmt.Errorf("codex: record the session workspace as untrusted: %w", err)
+	}
+	return nil
+}
+
+// operatorConfiguredProjectTrust reports whether the app-server argv the
+// operator configured (Options.Args) sets `projects` with a `-c`/`--config`
+// override. That session-flag layer outranks the private config.toml, so the
+// operator's choice stands and the runner records nothing of its own.
+func operatorConfiguredProjectTrust(args []string) bool {
+	for i, arg := range args {
+		var value string
+		switch {
+		case arg == "-c" || arg == "--config":
+			if i+1 >= len(args) {
+				continue
+			}
+			value = args[i+1]
+		case strings.HasPrefix(arg, "--config="):
+			value = strings.TrimPrefix(arg, "--config=")
+		case strings.HasPrefix(arg, "-c") && !strings.HasPrefix(arg, "--"):
+			value = strings.TrimPrefix(strings.TrimPrefix(arg, "-c"), "=")
+		default:
+			continue
+		}
+		if strings.HasPrefix(strings.TrimSpace(value), "projects") {
+			return true
+		}
+	}
+	return false
 }
 
 // trustedProjectsOverride renders the `projects` table codex parses out of a

@@ -44,7 +44,7 @@ func wipAttemptRef(sessionID string) string {
 
 // checkpointFailedSession supplements local rescue with a bounded remote copy.
 func (r *Runner) checkpointFailedSession(qw QueuedWork, res *Result) {
-	if res == nil || res.Status == "completed" || !RequiresPRURL(qw.WorkType, qw.WorkTypeRole) || res.ResumeCheckpoint != nil {
+	if res == nil || res.Status == "completed" || !qw.requiresPR() || res.ResumeCheckpoint != nil {
 		return
 	}
 	target, ok := providerErrorCheckpointTarget(res)

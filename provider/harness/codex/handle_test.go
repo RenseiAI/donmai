@@ -31,6 +31,13 @@ type fakeServer struct {
 	// turnHold, when non-nil, holds turn/completed back until it is
 	// closed (see holdTurnCompletion).
 	turnHold chan struct{}
+
+	// onInitialize, when set, runs as the initialize request arrives, before
+	// it is answered. skillsList, when set, answers skills/list: a non-zero
+	// code replies with that JSON-RPC error instead of result. Both are set
+	// before run starts.
+	onInitialize func()
+	skillsList   func(params map[string]any) (result any, code int)
 }
 
 func newFakeServer() (*fakeServer, *io.PipeWriter, *io.PipeReader) {
@@ -119,7 +126,17 @@ func (fs *fakeServer) run(t *testing.T, threadID string) {
 		fs.mu.Unlock()
 		switch {
 		case method == "initialize" && hasID:
+			if fs.onInitialize != nil {
+				fs.onInitialize()
+			}
 			fs.replyOK(t, idRaw)
+		case method == "skills/list" && hasID && fs.skillsList != nil:
+			result, code := fs.skillsList(params)
+			if code != 0 {
+				fs.write(t, map[string]any{"jsonrpc": "2.0", "id": idRaw, "error": map[string]any{"code": code, "message": "skills/list failed"}})
+				continue
+			}
+			fs.write(t, map[string]any{"jsonrpc": "2.0", "id": idRaw, "result": result})
 		case method == "config/batchWrite" && hasID:
 			params, _ := msg["params"].(map[string]any)
 			edits, _ := params["edits"].([]any)

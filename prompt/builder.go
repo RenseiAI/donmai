@@ -9,6 +9,7 @@ import (
 	"sync"
 	"text/template"
 
+	"github.com/RenseiAI/donmai/stagewire"
 	"github.com/RenseiAI/donmai/templates"
 )
 
@@ -225,7 +226,7 @@ func (b *Builder) Build(qw QueuedWork) (system, user string, err error) {
 		return systemBuf, userBuf, nil
 	}
 
-	userTmpl := userTemplateName(WorkType(qw.WorkType), qw.WorkTypeRole)
+	userTmpl := userTemplateBase(qw) + ".tmpl"
 	userBuf, err := renderTemplate(tmpls, userTmpl, userTemplateData(qw))
 	if err != nil {
 		return "", "", fmt.Errorf("render user prompt %q: %w", userTmpl, err)
@@ -275,7 +276,7 @@ func (b *Builder) buildRaymond(qw QueuedWork, hasStagePrompt bool) (system, user
 		return systemBuf, userBuf, nil
 	}
 
-	userTmplName := userTemplateNameRaymond(WorkType(qw.WorkType), qw.WorkTypeRole)
+	userTmplName := userTemplateBase(qw)
 	userBrand := ResolveBrand()
 	userCTX := map[string]interface{}{
 		"brandDisplay":    userBrand.BrandDisplay,
@@ -306,13 +307,47 @@ func systemTemplateNameRaymond(qw QueuedWork) string {
 	return "system_base"
 }
 
-// userTemplateNameRaymond maps a WorkType to the raymond registry template
-// name. Compiled-in names keep their legacy template byte-for-byte even
-// when a role is stamped alongside them; only an organisation-defined
-// name outside the built-in vocabulary follows its role (review ->
-// user_qa, intake -> user_research, anything else -> user_development),
-// matching [userTemplateName].
-func userTemplateNameRaymond(w WorkType, role string) string {
+// userTemplateBase picks the user template base name shared by both
+// rendering paths (the text/template path appends ".tmpl").
+//
+// A 1.0 work item (a stage or a card is present) selects by role only:
+// the stage's run role, else its dispatch role, else the legacy
+// workTypeRole. The work-type name is never consulted for it. A legacy
+// work item keeps the name-keyed choice byte-for-byte.
+func userTemplateBase(qw QueuedWork) string {
+	if qw.HasStageOrCard() {
+		if role, ok := qw.StageRunRole(); ok {
+			return userTemplateBaseForStageRole(role)
+		}
+		return userTemplateNameForRole(qw.WorkTypeRole)
+	}
+	return legacyUserTemplateBase(WorkType(qw.WorkType), qw.WorkTypeRole)
+}
+
+// userTemplateBaseForStageRole maps a stage role to its user template:
+// review renders the QA template, intake and hold the research template,
+// and every other role (inflight, rework, done, closed) the development
+// template.
+func userTemplateBaseForStageRole(role stagewire.Role) string {
+	switch role {
+	case stagewire.RoleReview:
+		return "user_qa"
+	case stagewire.RoleIntake, stagewire.RoleHold:
+		return "user_research"
+	default:
+		return "user_development"
+	}
+}
+
+// legacyUserTemplateBase is the LEGACY name-keyed template choice, used
+// only for work items that carry neither a stage nor a card (older
+// control planes and standalone use). Compiled-in names keep their legacy
+// template byte-for-byte even when a role is stamped alongside them; only
+// an organisation-defined name outside the built-in vocabulary follows its
+// role (review -> user_qa, intake -> user_research, anything else ->
+// user_development). It is deleted once every dispatch carries a stage or
+// a card.
+func legacyUserTemplateBase(w WorkType, role string) string {
 	switch w {
 	case WorkTypeQA, WorkTypeAcceptance:
 		return "user_qa"
@@ -554,29 +589,6 @@ func resolveContext(qw QueuedWork) string {
 		lines = append(lines, "", qw.Body)
 	}
 	return strings.Join(lines, "\n")
-}
-
-// userTemplateName maps a WorkType to the user template filename.
-// Compiled-in names keep their legacy template byte-for-byte even when a
-// role is stamped alongside them; only an organisation-defined name
-// outside the built-in vocabulary follows its role (review -> user_qa,
-// intake -> user_research, anything else -> user_development) so an
-// organisation-defined review or intake type renders the prompt its role
-// needs. The runner must never crash on an unrecognised value.
-func userTemplateName(w WorkType, role string) string {
-	switch w {
-	case WorkTypeQA, WorkTypeAcceptance:
-		return "user_qa.tmpl"
-	case WorkTypeResearch:
-		return "user_research.tmpl"
-	case WorkTypeDevelopment, "":
-		return "user_development.tmpl"
-	default:
-		if isKnownWorkTypeName(string(w)) {
-			return "user_development.tmpl"
-		}
-		return userTemplateNameForRole(role) + ".tmpl"
-	}
 }
 
 // knownWorkTypeNames is the compiled-in agent work-type vocabulary. A

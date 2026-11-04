@@ -3,6 +3,8 @@ package worker
 import (
 	"encoding/json"
 	"time"
+
+	"github.com/RenseiAI/donmai/stagewire"
 )
 
 // AgentRuntimeProviderCapabilities mirrors the TypeScript AgentProviderCapabilities
@@ -194,8 +196,13 @@ type BatchWorkItem struct {
 	// never a session UUID. Used for log correlation.
 	BatchJobID string `json:"batchJobId"`
 	// WorkType discriminates the batch handler (e.g. "code-survival-scan").
-	// Unknown work-types are logged + skipped (graceful degradation).
+	// Unknown work-types are logged + skipped (graceful degradation). Legacy:
+	// BatchKind replaces it, and Kind prefers BatchKind when present.
 	WorkType string `json:"workType"`
+	// BatchKind is the 1.0 batch discriminant. A control plane sends it
+	// beside the legacy WorkType during the lock-step window; it is bounded
+	// on decode and absent from older control planes.
+	BatchKind stagewire.BatchKind `json:"batchKind,omitempty"`
 	// Raw is the full, undecoded batch item. The router decodes it into the
 	// work-type-specific struct once WorkType is matched.
 	Raw json.RawMessage `json:"-"`
@@ -206,15 +213,26 @@ type BatchWorkItem struct {
 func (b *BatchWorkItem) UnmarshalJSON(data []byte) error {
 	b.Raw = append(b.Raw[:0], data...)
 	var head struct {
-		BatchJobID string `json:"batchJobId"`
-		WorkType   string `json:"workType"`
+		BatchJobID string              `json:"batchJobId"`
+		WorkType   string              `json:"workType"`
+		BatchKind  stagewire.BatchKind `json:"batchKind"`
 	}
 	if err := json.Unmarshal(data, &head); err != nil {
 		return err
 	}
 	b.BatchJobID = head.BatchJobID
 	b.WorkType = head.WorkType
+	b.BatchKind = head.BatchKind
 	return nil
+}
+
+// Kind is the discriminant batch handlers select on: BatchKind when the
+// control plane sent one, else the legacy WorkType.
+func (b BatchWorkItem) Kind() string {
+	if b.BatchKind != "" {
+		return string(b.BatchKind)
+	}
+	return b.WorkType
 }
 
 // HeartbeatRequest is the body of POST /api/workers/{id}/heartbeat. It reports

@@ -4,6 +4,14 @@ import "log/slog"
 
 // Completion contracts.
 //
+// LEGACY: everything in this file is the name-keyed contract resolution. A
+// session reads its contract through QueuedWork.completionContract
+// (stage_contract.go), which uses the dispatched card's contract, then the
+// stage role's default contract, and reaches these tables only for a work
+// item that carries neither a stage nor a card (older control planes and
+// standalone use). The tables are deleted once every dispatch carries a
+// card.
+//
 // Typed declaration of what each work type must produce before a session
 // is considered successful. Verbatim port of the per-workType contract
 // from donmai-libraries/packages/core/src/orchestrator/completion-contracts.ts

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/sessionshim"
+	"github.com/RenseiAI/donmai/stagewire"
 )
 
 // DaemonConfig holds the minimal daemon connection config read from
@@ -531,6 +532,12 @@ type DaemonSessionHandle struct {
 	// WorkType is the workflow discriminant ("development", "qa", ...).
 	// Display-only; absent against an older daemon (renders as unknown).
 	WorkType string `json:"workType,omitempty"`
+
+	// Stage and Card are the 1.0 wire's stage (key, name, roles) and
+	// dispatched card (id, handle, contract). Display-only; absent for
+	// legacy work items and against an older daemon.
+	Stage *stagewire.Stage `json:"stage,omitempty"`
+	Card  *stagewire.Card  `json:"card,omitempty"`
 
 	// IssueIdentifier is the work item's human-readable identifier, known
 	// from admission. Display-only; absent against an older daemon.

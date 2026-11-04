@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -245,5 +246,37 @@ func TestPollLoop_LegacyUnchanged(t *testing.T) {
 	})
 	if got.Load() == 0 {
 		t.Error("legacy PollLoop should still process agent items")
+	}
+}
+
+// TestBatchWorkItemBatchKind pins the 1.0 batch discriminant: batchKind is
+// decoded (bounded) beside the legacy workType, and Kind prefers it.
+func TestBatchWorkItemBatchKind(t *testing.T) {
+	t.Parallel()
+	oversized := strings.Repeat("k", 300)
+	for _, tc := range []struct {
+		name, raw      string
+		wantKind       string
+		wantBatchKind  string
+		wantLegacyType string
+	}{
+		{"batch kind wins", `{"batchJobId":"b1","workType":"legacy-kind","batchKind":"landing-run"}`, "landing-run", "landing-run", "legacy-kind"},
+		{"legacy only", `{"batchJobId":"b2","workType":"code-survival-scan"}`, "code-survival-scan", "", "code-survival-scan"},
+		{"batch kind only", `{"batchJobId":"b3","batchKind":"kg-extraction"}`, "kg-extraction", "kg-extraction", ""},
+		{"oversized batch kind is dropped", `{"batchJobId":"b4","workType":"code-survival-scan","batchKind":"` + oversized + `"}`, "code-survival-scan", "", "code-survival-scan"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var item BatchWorkItem
+			if err := json.Unmarshal([]byte(tc.raw), &item); err != nil {
+				t.Fatal(err)
+			}
+			if item.Kind() != tc.wantKind || string(item.BatchKind) != tc.wantBatchKind || item.WorkType != tc.wantLegacyType {
+				t.Fatalf("item = %+v (kind %q); want kind %q batchKind %q workType %q", item, item.Kind(), tc.wantKind, tc.wantBatchKind, tc.wantLegacyType)
+			}
+			if string(item.Raw) != tc.raw {
+				t.Fatalf("raw not preserved: %s", item.Raw)
+			}
+		})
 	}
 }

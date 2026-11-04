@@ -4,6 +4,8 @@ import (
 	"sort"
 	"strings"
 	"testing"
+
+	"github.com/RenseiAI/donmai/agent"
 )
 
 // TestDirs_ContractOfTheTable pins the properties every consumer relies on,
@@ -66,20 +68,32 @@ func TestDirs_CoversTheKnownHarnessState(t *testing.T) {
 
 // TestExcludeEntries_AreDirectoryPatterns proves each entry is a directory
 // pattern. Without the trailing slash the pattern would also match a FILE of
-// the same name.
+// the same name. One entry per state directory, then the in-tree skill entry.
 func TestExcludeEntries_AreDirectoryPatterns(t *testing.T) {
 	t.Parallel()
 	entries := ExcludeEntries()
-	if len(entries) != len(Dirs()) {
-		t.Fatalf("ExcludeEntries() has %d entries for %d dirs", len(entries), len(Dirs()))
+	if len(entries) != len(Dirs())+1 {
+		t.Fatalf("ExcludeEntries() has %d entries for %d dirs plus the in-tree skill entry", len(entries), len(Dirs()))
 	}
 	for i, e := range entries {
 		if !strings.HasSuffix(e, "/") {
 			t.Errorf("entry %q is not a directory pattern", e)
 		}
-		if strings.TrimSuffix(e, "/") != Dirs()[i] {
+		if i < len(Dirs()) && strings.TrimSuffix(e, "/") != Dirs()[i] {
 			t.Errorf("entry %q does not correspond to dir %q", e, Dirs()[i])
 		}
+	}
+	if last := entries[len(entries)-1]; last != InTreeSkillExcludeEntry {
+		t.Errorf("last entry = %q, want %q", last, InTreeSkillExcludeEntry)
+	}
+}
+
+// TestInTreeSkillPrefix_MatchesAgentReservedPrefix pins the one literal two
+// packages share: the reserved directory prefix a materializer writes.
+func TestInTreeSkillPrefix_MatchesAgentReservedPrefix(t *testing.T) {
+	t.Parallel()
+	if want := ".agents/skills/" + agent.InTreeSkillDirPrefix; InTreeSkillPathPrefix != want {
+		t.Fatalf("InTreeSkillPathPrefix = %q, want %q", InTreeSkillPathPrefix, want)
 	}
 }
 

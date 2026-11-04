@@ -295,3 +295,53 @@ func TestEnsureExcluded_SpawnsNoGitOutsideACheckout(t *testing.T) {
 		t.Fatalf("read marker: %v", err)
 	}
 }
+
+// TestEnsureExcluded_InTreeSkillsOnly proves the in-tree skill entry, in a
+// real checkout: a runner-materialized .agents/skills/donmai-<id>/ is
+// silenced, while the project's own .agents/skills/<name>/ (project content a
+// session may commit) and a file that merely shares the prefix stay visible.
+// Repeated calls write the entry once.
+func TestEnsureExcluded_InTreeSkillsOnly(t *testing.T) {
+	t.Parallel()
+	dir := newGitCheckout(t)
+	for _, rel := range []string{
+		".agents/skills/donmai-review/SKILL.md",
+		".agents/skills/repo-conventions/SKILL.md",
+		".agents/skills/donmai-notes.md",
+	} {
+		full := filepath.Join(dir, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(full), 0o750); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.WriteFile(full, []byte("x\n"), 0o600); err != nil {
+			t.Fatalf("write %s: %v", rel, err)
+		}
+	}
+	for i := 0; i < 2; i++ {
+		if err := EnsureExcluded(dir); err != nil {
+			t.Fatalf("EnsureExcluded (call %d): %v", i+1, err)
+		}
+	}
+	if got := strings.Count(readExcludeFile(t, dir), InTreeSkillExcludeEntry); got != 1 {
+		t.Fatalf("in-tree skill entry appears %d times, want 1", got)
+	}
+	cmd := exec.Command("git", "-C", dir, "status", "--porcelain", "--untracked-files=all") //nolint:gosec // G204: test fixture; dir is t.TempDir().
+	cmd.Env = GitLocationNeutralEnv(os.Environ())
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git status: %v\n%s", err, out)
+	}
+	status := string(out)
+	for _, tc := range []struct {
+		path    string
+		visible bool
+	}{
+		{".agents/skills/donmai-review/SKILL.md", false},
+		{".agents/skills/repo-conventions/SKILL.md", true},
+		{".agents/skills/donmai-notes.md", true},
+	} {
+		if got := strings.Contains(status, tc.path); got != tc.visible {
+			t.Errorf("%s visible in git status = %v, want %v:\n%s", tc.path, got, tc.visible, status)
+		}
+	}
+}
