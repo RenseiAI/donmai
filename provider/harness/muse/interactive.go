@@ -297,6 +297,9 @@ func (b *boundedProbeOutput) String() string { return b.buffer.String() }
 // byte-accurate PTY stream is the product): an InitEvent once the PTY child
 // is up and a single terminal ResultEvent when the process exits.
 func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent.Handle, error) {
+	if err := validateEffort(spec); err != nil {
+		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
+	}
 	// Install evidence FIRST (cheap version check, no credential reads):
 	// a host without a usable CLI surfaces ErrProviderUnavailable, not
 	// the login refusal below.

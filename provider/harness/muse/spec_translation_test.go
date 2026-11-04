@@ -21,10 +21,11 @@ func TestResolveModel_DefaultAndSentinel(t *testing.T) {
 }
 
 // TestResolveEffort_MinimalToMax pins the full host tier ladder: the
-// catalog lists minimal..max, so every tier maps to its wire spelling —
-// including minimal, which has no agent.EffortLevel constant and arrives
-// by its wire spelling. Empty, "default" and "none" all leave the
-// tier unset so the host default applies; no sentinel is ever forwarded.
+// catalog lists minimal..ultra (plus none for no reasoning), so every
+// closed-vocabulary tier maps to its wire spelling — including minimal,
+// none and ultra, which have no agent.EffortLevel constant and arrive by
+// wire spelling. Only the empty (unset) value leaves the tier unset so
+// the host default applies; no sentinel is ever forwarded.
 func TestResolveEffort_MinimalToMax(t *testing.T) {
 	for _, tc := range []struct {
 		effort agent.EffortLevel
@@ -36,33 +37,49 @@ func TestResolveEffort_MinimalToMax(t *testing.T) {
 		{agent.EffortHigh, ReasoningEffortHigh},
 		{agent.EffortXHigh, ReasoningEffortXHigh},
 		{agent.EffortMax, ReasoningEffortMax},
+		{agent.EffortLevel("none"), ReasoningEffortNone},
+		{agent.EffortLevel("ultra"), ReasoningEffortUltra},
 	} {
 		got := resolveEffort(agent.Spec{Effort: tc.effort})
 		if got == nil || *got != tc.want {
 			t.Errorf("effort %q = %v, want %q", tc.effort, got, tc.want)
 		}
 	}
-	for _, sentinel := range []agent.EffortLevel{"", "default", "none"} {
-		if got := resolveEffort(agent.Spec{Effort: sentinel}); got != nil {
-			t.Errorf("effort %q = %v, want unset (never forward a sentinel)", sentinel, *got)
+	if got := resolveEffort(agent.Spec{}); got != nil {
+		t.Errorf("empty effort = %v, want unset (host default applies)", *got)
+	}
+	// Unsupported explicit values resolve to unset at this layer so a
+	// missed validation can never send an invalid variant; validateEffort
+	// (tested below) is the loud refusal that runs at admission.
+	for _, unsupported := range []agent.EffortLevel{"default", "bogus", "Default", "NONE"} {
+		if got := resolveEffort(agent.Spec{Effort: unsupported}); got != nil {
+			t.Errorf("effort %q = %v, want unset at resolve layer (validateEffort refuses it)", unsupported, *got)
 		}
 	}
 }
 
-// TestTurnStartParams_EffortSentinelOmitted pins the wire rule: a
-// sentinel effort leaves reasoningEffort off the turn/start params
-// entirely — the host default applies — while a configured tier rides
-// the params by its wire spelling.
+// TestTurnStartParams_EffortSentinelOmitted pins the wire rule: an
+// unset effort leaves reasoningEffort off the turn/start params entirely
+// — the host default applies — while every closed-vocabulary tier
+// (including none and ultra) rides the params by its wire spelling.
 func TestTurnStartParams_EffortSentinelOmitted(t *testing.T) {
-	minimal := turnStartParams("s", "c", agent.Spec{Effort: agent.EffortLevel("minimal")}, nil, nil)
-	if minimal["reasoningEffort"] != string(ReasoningEffortMinimal) {
-		t.Errorf("minimal reasoningEffort = %v, want %q", minimal["reasoningEffort"], ReasoningEffortMinimal)
-	}
-	for _, sentinel := range []agent.EffortLevel{"", "default", "none"} {
-		params := turnStartParams("s", "c", agent.Spec{Effort: sentinel}, []TurnInputPart{{Type: "text"}}, nil)
-		if _, present := params["reasoningEffort"]; present {
-			t.Errorf("effort %q sent reasoningEffort=%v, want omitted", sentinel, params["reasoningEffort"])
+	for _, tc := range []struct {
+		effort agent.EffortLevel
+		want   string
+	}{
+		{agent.EffortLevel("minimal"), string(ReasoningEffortMinimal)},
+		{agent.EffortLevel("none"), string(ReasoningEffortNone)},
+		{agent.EffortLevel("ultra"), string(ReasoningEffortUltra)},
+		{agent.EffortHigh, string(ReasoningEffortHigh)},
+	} {
+		params := turnStartParams("s", "c", agent.Spec{Effort: tc.effort}, []TurnInputPart{{Type: "text"}}, nil)
+		if params["reasoningEffort"] != tc.want {
+			t.Errorf("effort %q reasoningEffort = %v, want %q", tc.effort, params["reasoningEffort"], tc.want)
 		}
+	}
+	params := turnStartParams("s", "c", agent.Spec{}, []TurnInputPart{{Type: "text"}}, nil)
+	if _, present := params["reasoningEffort"]; present {
+		t.Errorf("empty effort sent reasoningEffort=%v, want omitted", params["reasoningEffort"])
 	}
 }
 
