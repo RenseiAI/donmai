@@ -11,6 +11,7 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 ### Features
 
 - Deliver card skills natively to Codex through the session's private Codex home, confirmed by the app-server's skill listing before the thread starts, with a prompt fallback for any skill it does not confirm
+- `host watch` names the dispatched card on a running session card: the work line reads `<repo> · <stage> · <role> (<card handle>)` when the work item names a card, the handle is sanitised and bounded like the stage text, the `/` filter matches it, and sessions without a card render unchanged
 
 ### Fixes
 

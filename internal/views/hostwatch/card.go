@@ -401,11 +401,12 @@ func labelIfUnknown(value, label string) string {
 	return label + " unknown"
 }
 
-// Rune bounds on the wire stage text a card shows. Stage names are free text
-// from the control plane; roles are a short closed set.
+// Rune bounds on the wire stage text a card shows. Stage names and card
+// handles are free text from the control plane; roles are a short closed set.
 const (
-	maxStageNameRunes = 40
-	maxStageRoleRunes = 12
+	maxStageNameRunes  = 40
+	maxStageRoleRunes  = 12
+	maxCardHandleRunes = 40
 )
 
 // displayLabel makes untrusted wire text safe for terminal output: it strips
@@ -445,12 +446,24 @@ func (c SessionCard) stageLabel() string {
 }
 
 // workLabel is what a live card names its work as: the stage label when the
-// work item carries a stage, else the work type.
+// work item carries a stage, else the work type, followed by the dispatched
+// card's handle in parentheses when the work item names one. A legacy work
+// item names no card, so its label is unchanged.
 func (c SessionCard) workLabel() string {
-	if label := c.stageLabel(); label != "" {
-		return label
+	label := c.stageLabel()
+	if label == "" {
+		label = labelIfUnknown(c.WorkType, "work type")
 	}
-	return labelIfUnknown(c.WorkType, "work type")
+	if handle := c.cardHandle(); handle != "" {
+		label += " (" + handle + ")"
+	}
+	return label
+}
+
+// cardHandle is the dispatched card's handle made safe for display, or ""
+// when the work item names no card.
+func (c SessionCard) cardHandle() string {
+	return displayLabel(c.CardHandle, maxCardHandleRunes)
 }
 
 func (c SessionCard) isHeld() bool {
