@@ -319,6 +319,16 @@ func NewSpawnPlan(spec agent.Spec) SpawnPlan {
 func ignoredSpecFields(spec agent.Spec) []SpecFieldNote {
 	var notes []SpecFieldNote
 
+	// Skills: native skills are written into the private CODEX_HOME before
+	// the app-server starts and confirmed by skills/list (skills.go); the
+	// runner folded the prompt-delivered ones into SystemPromptAppend.
+	if spec.Skills.HasNative() {
+		notes = append(notes, SpecFieldNote{
+			Field:  "Skills",
+			Reason: "native skills are materialized in the private CODEX_HOME before app-server start, not a thread/start param; prompt-delivered skills are already in SystemPromptAppend",
+		})
+	}
+
 	// Env: not a JSON-RPC param. Plumbed via the codex app-server
 	// child process environment in codex.go (process.env merge).
 	if len(spec.Env) > 0 {

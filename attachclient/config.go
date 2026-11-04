@@ -42,6 +42,17 @@ type HostConfig struct {
 	// the exact spawn authority.
 	InitialAuthorityToken string
 
+	// Traceparent and Tracestate carry the dispatch W3C trace context.
+	// They ride the attach handshake (the WSS upgrade headers and the
+	// degraded-lane requests) as correlation-only telemetry so the relay
+	// can join attach traffic with the dispatch trace. The composing
+	// runner sanitizes both at the consumer boundary; the client emits
+	// them verbatim when non-empty, and an older relay ignores the
+	// unknown headers. Trace fields never authorize a tenant, session or
+	// epoch transition — authority stays with the bearer and the PTY epoch.
+	Traceparent string
+	Tracestate  string
+
 	// TokenSource yields the current bearer JWT. It is resolved before each
 	// top-level carrier attempt and may also be called concurrently by degraded-
 	// lane 401 recovery and the background WSS upgrade probe (§ 14/§ 15). Every
@@ -133,6 +144,23 @@ type HostConfig struct {
 	// epochStaleSleep observes stale-retry delays in package tests. Production
 	// leaves it nil and uses sleepCtx.
 	epochStaleSleep func(context.Context, time.Duration) error
+}
+
+// traceHeaders renders the configured dispatch trace context as request
+// headers. Nil when no context is configured, so callers merge nothing
+// and the handshake stays byte-identical to a trace-free attach.
+func (c HostConfig) traceHeaders() http.Header {
+	if c.Traceparent == "" && c.Tracestate == "" {
+		return nil
+	}
+	hdr := http.Header{}
+	if c.Traceparent != "" {
+		hdr.Set("traceparent", c.Traceparent)
+	}
+	if c.Tracestate != "" {
+		hdr.Set("tracestate", c.Tracestate)
+	}
+	return hdr
 }
 
 func (c *HostConfig) withDefaults() error {

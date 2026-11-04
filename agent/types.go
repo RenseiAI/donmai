@@ -687,6 +687,16 @@ type Spec struct {
 	// D5.5 there is still no cross-harness "supports extensions" boolean;
 	// only the exact profile's ToolPluginDelivery answers the question.
 	AdditionalExtensions []ExtensionDelivery `json:"additionalExtensions,omitempty"`
+
+	// Skills is the session's skill delivery (skill_delivery.go): the pure
+	// per-skill plan PlanSkillDelivery computed for this exact harness, and
+	// the content of every skill it delivers natively. Skills the plan left
+	// on the prompt are already folded into SystemPromptAppend; the exact
+	// adapter's SkillMaterializer writes and verifies the native ones before
+	// the child starts. The plan is part of the harness authority digest
+	// ("skills"). Nil — no skills and no repository policy on the work item —
+	// is inert for every harness.
+	Skills *SkillDelivery `json:"skills,omitempty"`
 }
 
 // WithToolLifecycleProfile returns a copy selecting one manifest-declared

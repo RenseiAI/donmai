@@ -150,6 +150,12 @@ func TestSpecFieldCoverage(t *testing.T) {
 		// translation time the outcome is already ordinary prompt text, so
 		// no JSON-RPC param depends on it.
 		"DependencyPreparation",
+		// Skills: native entries are written into the private CODEX_HOME
+		// before the app-server starts and confirmed by skills/list
+		// (skills.go), never a thread/start param; prompt entries are
+		// folded into SystemPromptAppend by the runner before this
+		// translation runs.
+		"Skills",
 	}
 	all := append([]string{}, translatedFields...)
 	all = append(all, ignoredFields...)

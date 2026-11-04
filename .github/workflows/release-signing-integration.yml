@@ -10,6 +10,8 @@ on:
       - scripts/sign-and-notarize.sh
       - scripts/test-sign-and-notarize.sh
       - scripts/test-release-workflows.sh
+      - scripts/verify-go-compiler.sh
+      - scripts/verify-release-binaries.sh
       - go.mod
   push:
     branches: [main]
@@ -20,6 +22,8 @@ on:
       - scripts/sign-and-notarize.sh
       - scripts/test-sign-and-notarize.sh
       - scripts/test-release-workflows.sh
+      - scripts/verify-go-compiler.sh
+      - scripts/verify-release-binaries.sh
       - go.mod
 
 permissions:
@@ -37,6 +41,9 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
+
+      - name: Verify Go compiler
+        run: ./scripts/verify-go-compiler.sh
 
       # Keep this action SHA and version identical to release.yml. The test
       # supplies local replacements for Apple tools and cosign; no release

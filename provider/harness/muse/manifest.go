@@ -21,7 +21,7 @@ var museExecutionSecurity = agent.ExecutionSecurityRendering{DenyChannelNeedsSan
 // servers and a Go-side approval bridge. No wire-level SSE framing —
 // the serve host is the transport surface, so StreamingTransport is
 // "none".
-func (*Provider) Manifest() agent.HarnessManifest {
+func (p *Provider) Manifest() agent.HarnessManifest {
 	headlessEvents := []agent.EventKind{agent.EventInit, agent.EventSystem, agent.EventAssistantText, agent.EventLlmCall, agent.EventToolUse, agent.EventToolResult, agent.EventResult, agent.EventError}
 	// The interactive PTY spawn mode observes only the coarse Init/terminal
 	// boundary the shared ptycli driver emits (byte-accurate terminal stream is
@@ -34,6 +34,7 @@ func (*Provider) Manifest() agent.HarnessManifest {
 		Family:            agent.FamilyHarness,
 		ContractABI:       "harness/v2",
 		ExecutionSecurity: museExecutionSecurity,
+		Skills:            museSkillProfile(p != nil && p.opts.TrustWorkspace),
 		Caps: agent.HarnessCaps{
 			SupportsMessageInjection: true, // turn/steer into the running turn
 			SupportsSessionResume:    true,

@@ -9,6 +9,7 @@ import (
 	"github.com/RenseiAI/donmai/runner/access"
 	"github.com/RenseiAI/donmai/runtime/workarea"
 	"github.com/RenseiAI/donmai/sessionshim"
+	"github.com/RenseiAI/donmai/stagewire"
 )
 
 // CredentialEnvRequirement describes one non-secret credential requirement
@@ -122,6 +123,11 @@ type SessionDetail struct {
 	// belongs to ("inflight", "review", "intake", "terminal").
 	// Forwarded opaquely from the poll item onto the runner work item.
 	WorkTypeRole string `json:"workTypeRole,omitempty"`
+
+	// Fields carries the optional 1.0 wire fields (stage, card,
+	// transitions, retry, stageContext, dispatchReason), forwarded from
+	// the poll item onto the runner work item.
+	stagewire.Fields
 
 	// PromptContext is the rendered Linear issue context block produced
 	// by the platform-side dispatcher.

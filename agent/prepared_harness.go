@@ -313,6 +313,12 @@ type harnessAuthorityProjection struct {
 	// omitempty keeps every plan compiled for a work item without the
 	// section byte-identical to the pre-field projection.
 	ExecutionSecurity *ExecutionSecurity `json:"executionSecurity,omitempty"`
+	// Skills binds the skill delivery plan: which skill is delivered how,
+	// each native file's path, mode and sha256, the repository-skill
+	// receipt. Content is bound through the sha256s, which the materializer
+	// checks every written file against. omitempty keeps a plan for a work
+	// item without skills byte-identical to the pre-field projection.
+	Skills *SkillDeliveryPlan `json:"skills,omitempty"`
 }
 
 func newHarnessAuthorityProjection(spec Spec, plan *PreparedHarness) harnessAuthorityProjection {
@@ -343,7 +349,18 @@ func newHarnessAuthorityProjection(spec Spec, plan *PreparedHarness) harnessAuth
 		ToolLifecyclePlan:  normalized.ToolLifecyclePlan,
 		PromptMode:         normalized.PromptMode,
 		ExecutionSecurity:  normalized.ExecutionSecurity,
+		Skills:             skillPlanAuthority(normalized.Skills),
 	}
+}
+
+// skillPlanAuthority projects a session's skill delivery into the authority
+// digest: the plan only, never the package content it carries.
+func skillPlanAuthority(delivery *SkillDelivery) *SkillDeliveryPlan {
+	if delivery == nil {
+		return nil
+	}
+	plan := delivery.Plan
+	return &plan
 }
 
 func digestValue(v any) string {
@@ -390,6 +407,9 @@ func authorityFieldDigests(p harnessAuthorityProjection) map[string]string {
 	}
 	if p.ExecutionSecurity != nil {
 		digests["executionSecurity"] = digestValue(p.ExecutionSecurity)
+	}
+	if p.Skills != nil {
+		digests["skills"] = digestValue(p.Skills)
 	}
 	return digests
 }
