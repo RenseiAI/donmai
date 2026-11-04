@@ -9,8 +9,9 @@ package result
 // (issueUpdate / commentCreate) so the runner does not have to know the
 // target platform.
 //
-// Reference (TS): packages/linear/src/issue-tracker-proxy.ts and
-// platform/src/app/api/issue-tracker-proxy/route.ts.
+// Reference: the legacy TypeScript proxy client
+// (packages/linear/src/issue-tracker-proxy.ts) and the control plane's
+// proxy route.
 //
 // Wire shape (request):
 //
@@ -31,7 +32,8 @@ package result
 //	4xx
 //	{ "success": false, "error": { "code": "...", "message": "...", "retryable": false } }
 //
-// Supported methods today: updateIssueStatus, createComment. Extend the
+// Supported methods today: updateIssueStatus, updateIssue (state id only,
+// for stage transitions), createComment. Extend the
 // switch in proxyCall when porting more methods.
 
 import (
@@ -97,6 +99,30 @@ func (p *Poster) UpdateIssueStatus(ctx context.Context, issueID, targetStatus st
 	body := proxyRequest{
 		Method: "updateIssueStatus",
 		Args:   []any{issueID, targetStatus},
+	}
+	return p.proxyCall(ctx, body)
+}
+
+// UpdateIssueState moves the issue identified by issueID to the tracker's
+// native workflow state stateID. Unlike [Poster.UpdateIssueStatus] nothing
+// is resolved by name: the control plane already resolved the state from
+// the project's status mapping and sent its id as a stage transition's
+// writeStatus. The proxy call is the generic issue update with only the
+// state member set:
+//
+//	{"method": "updateIssue", "args": ["<issue-id>", {"stateId": "<state-id>"}]}
+//
+// Errors mirror UpdateIssueStatus.
+func (p *Poster) UpdateIssueState(ctx context.Context, issueID, stateID string) error {
+	if strings.TrimSpace(issueID) == "" {
+		return errors.New("result: issueID is required for UpdateIssueState")
+	}
+	if strings.TrimSpace(stateID) == "" {
+		return errors.New("result: stateID is required for UpdateIssueState")
+	}
+	body := proxyRequest{
+		Method: "updateIssue",
+		Args:   []any{issueID, map[string]string{"stateId": stateID}},
 	}
 	return p.proxyCall(ctx, body)
 }

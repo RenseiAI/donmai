@@ -62,6 +62,12 @@ type fakeHost struct {
 	// branch instead (the detached-HEAD observation).
 	branchName string
 	branchNull bool
+	// recordMethod and recordParams drive the "record-only" script:
+	// one extra notification emitted mid-turn before the normal
+	// terminal completion. "__SID__" in recordParams is replaced
+	// with the live session id before sending.
+	recordMethod string
+	recordParams string
 }
 
 func newFakeHost() (*fakeHost, *io.PipeWriter, *io.PipeReader) {
@@ -114,6 +120,8 @@ func (fh *fakeHost) run(t *testing.T) {
 		denyApproval := fh.denyApproval
 		sessionStartErr := fh.sessionStartErr
 		turnStartErr := fh.turnStartErr
+		recordMethod := fh.recordMethod
+		recordParams := fh.recordParams
 		fh.mu.Unlock()
 		if schemaVersion == 0 {
 			schemaVersion = 1
@@ -207,7 +215,7 @@ func (fh *fakeHost) run(t *testing.T) {
 					"startedNewTurn": true, "status": "accepted", "turnId": cmdID,
 				},
 			})
-			fh.emitScript(t, script, sid, cmdID, denyApproval)
+			fh.emitScript(t, script, sid, cmdID, denyApproval, recordMethod, recordParams)
 		case method == "turn/interrupt" && hasID:
 			fh.replyOK(t, idRaw)
 		case method == "turn/steer" && hasID:
@@ -241,7 +249,7 @@ func (fh *fakeHost) run(t *testing.T) {
 // failed script honors fh.failedKind/failedMessage when set (empty
 // keeps the canned overloaded pair) so tests can plant host error text
 // without touching the shared scripts.
-func (fh *fakeHost) emitScript(t *testing.T, script, sid, turnID string, denyApproval bool) {
+func (fh *fakeHost) emitScript(t *testing.T, script, sid, turnID string, denyApproval bool, recordMethod, recordParams string) {
 	fh.mu.Lock()
 	failedKind := fh.failedKind
 	failedMessage := fh.failedMessage
@@ -611,6 +619,24 @@ func (fh *fakeHost) emitScript(t *testing.T, script, sid, turnID string, denyApp
 			agentMsg("item-2", "approved and done", 1)
 			completed("completed")
 		}()
+	case "record-only":
+		// One extra notification mid-turn, then normal terminal
+		// completion. The record-only inventory test drives this
+		// script once per allowlisted method.
+		fh.write(t, map[string]any{
+			"jsonrpc": "2.0", "method": "turn/started",
+			"params": map[string]any{"sessionId": sid, "turnId": turnID, "viewCursor": "cursor-1"},
+		})
+		raw := strings.ReplaceAll(recordParams, "__SID__", sid)
+		var decoded map[string]any
+		if err := json.Unmarshal([]byte(raw), &decoded); err != nil {
+			t.Errorf("record-only params are not valid JSON: %v", err)
+			decoded = map[string]any{"sessionId": sid}
+		}
+		fh.write(t, map[string]any{
+			"jsonrpc": "2.0", "method": recordMethod, "params": decoded,
+		})
+		completed("completed")
 	}
 }
 

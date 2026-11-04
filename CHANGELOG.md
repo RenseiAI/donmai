@@ -10,6 +10,37 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 No unreleased changes.
 
+## v0.73.1 — 2026-11-04
+
+### Features
+
+- Deliver card skills natively to Codex through the session's private Codex home, confirmed by the app-server's skill listing before the thread starts, with a prompt fallback for any skill it does not confirm
+- `host watch` names the dispatched card on a running session card: the work line reads `<repo> · <stage> · <role> (<card handle>)` when the work item names a card, the handle is sanitised and bounded like the stage text, the `/` filter matches it, and sessions without a card render unchanged
+
+### Fixes
+
+- Record the Codex headless working directory as an untrusted project, so a repository's Codex project config no longer reaches the thread
+
+## v0.73.0 — 2026-11-03
+
+### Features
+
+- Wire 1.0: stages, cards and native skills on the runner
+
+### Chores
+
+- Cover remaining host notifications with record-only mappings
+
+## v0.72.96 — 2026-11-03
+
+### Chores
+
+- Carry dispatch trace context through runner posters and relay attach
+- Harden scan and release compiler gates
+- Carry adapter-applied effort through the activity transport
+- Capture bounded safe request-shape diagnostics for failed first turns
+- Report applied effort from final headless launch configuration
+
 ## v0.72.95 — 2026-11-01
 
 ### Chores

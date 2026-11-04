@@ -240,7 +240,7 @@ func TestMapTokenUsage_AccumulatesCost(t *testing.T) {
 		t.Fatalf("tokenUsage produced %v, want one usage event", kindsOf(events))
 	}
 	call, ok := events[0].(agent.LlmCallEvent)
-	if !ok || call.InputTokens != 50 || call.OutputTokens != 20 || call.CachedInputTokens != 5 || call.ReasoningTokens != 2 || call.ObservedCostUsd == nil || *call.ObservedCostUsd != 0.5 || call.UsageSource != agent.LlmUsageProvider || call.TurnCompleted {
+	if !ok || call.InputTokens != 45 || call.OutputTokens != 20 || call.CachedInputTokens != 5 || call.ReasoningTokens != 2 || call.ObservedCostUsd == nil || *call.ObservedCostUsd != 0.5 || call.UsageSource != agent.LlmUsageProvider || call.TurnCompleted {
 		t.Fatalf("step usage=%+v", events[0])
 	}
 	if !state.hasCost || state.totalCostUSD != 0.5 {
@@ -261,7 +261,7 @@ func TestMapTokenUsage_AccumulatesCost(t *testing.T) {
 	if result == nil || result.ObservedCostUsd == nil || *result.ObservedCostUsd != 0.5 {
 		t.Errorf("result=%+v, want observed cost 0.5", result)
 	}
-	if result.Cost.InputTokens != 11 || result.Cost.OutputTokens != 7 {
+	if result.Cost.InputTokens != 10 || result.Cost.OutputTokens != 7 {
 		t.Errorf("cost=%+v, want the turn usage override (11 in, 7 out)", result.Cost)
 	}
 }
@@ -364,7 +364,7 @@ func TestMapTokenUsage_CumulativeFallback(t *testing.T) {
 			t.Fatalf("events=%v", kindsOf(events))
 		}
 		call := events[0].(agent.LlmCallEvent)
-		if call.InputTokens != 50 || call.OutputTokens != 20 || call.CachedInputTokens != 5 || call.CacheWriteTokens != 3 || call.ObservedCostUsd != nil {
+		if call.InputTokens != 45 || call.OutputTokens != 20 || call.CachedInputTokens != 5 || call.CacheWriteTokens != 3 || call.ObservedCostUsd != nil {
 			t.Fatalf("fallback=%+v", call)
 		}
 	}
@@ -546,6 +546,123 @@ func TestEncodeFirstTurnDiagnostic_CapsAtTwoKiB(t *testing.T) {
 	if len(capped) != firstTurnDiagnosticMaxBytes {
 		t.Errorf("oversize payload length=%d, want exactly %d (truncated)", len(capped), firstTurnDiagnosticMaxBytes)
 	}
+}
+
+// TestMuseInputTokensExcludeCache pins the agent.CostData contract at the
+// harness boundary: Muse's inputTokens is the prompt total (cached tokens
+// included), so InputTokens must come out uncached on every emission path.
+func TestMuseInputTokensExcludeCache(t *testing.T) {
+	tests := []struct {
+		name       string
+		usage      string
+		wantIn     int64
+		wantCached int64
+	}{
+		{"cached below input", `{"inputTokens":100,"cachedTokens":0,"cacheReadTokens":30,"outputTokens":5,"reasoningTokens":0}`, 70, 30},
+		{"cached equals input", `{"inputTokens":100,"cachedTokens":0,"cacheReadTokens":100,"outputTokens":5,"reasoningTokens":0}`, 0, 100},
+		{"cached above input clamps to zero", `{"inputTokens":100,"cachedTokens":0,"cacheReadTokens":150,"outputTokens":5,"reasoningTokens":0}`, 0, 150},
+		{"nil cacheRead falls back to cachedTokens", `{"inputTokens":100,"cachedTokens":40,"outputTokens":5,"reasoningTokens":0}`, 60, 40},
+		{"cacheRead wins over cachedTokens", `{"inputTokens":100,"cachedTokens":99,"cacheReadTokens":10,"outputTokens":5,"reasoningTokens":0}`, 90, 10},
+		{"no cache", `{"inputTokens":100,"cachedTokens":0,"outputTokens":5,"reasoningTokens":0}`, 100, 0},
+	}
+	for _, tc := range tests {
+		t.Run("turnCompleted/"+tc.name, func(t *testing.T) {
+			state := newMapperState("m")
+			params := `{"sessionId":"s","terminal":"completed","turnId":"t","viewCursor":"c","usage":` + tc.usage + `}`
+			events := mapNotification("turn/completed", json.RawMessage(params), state, nil)
+			var llm *agent.LlmCallEvent
+			var res *agent.ResultEvent
+			for _, ev := range events {
+				switch e := ev.(type) {
+				case agent.LlmCallEvent:
+					llm = &e
+				case agent.ResultEvent:
+					res = &e
+				}
+			}
+			if llm == nil || res == nil || res.Cost == nil {
+				t.Fatalf("events=%v", kindsOf(events))
+			}
+			if llm.InputTokens != tc.wantIn || llm.CachedInputTokens != tc.wantCached {
+				t.Errorf("llm in=%d cached=%d, want %d/%d", llm.InputTokens, llm.CachedInputTokens, tc.wantIn, tc.wantCached)
+			}
+			if res.Cost.InputTokens != tc.wantIn || res.Cost.CachedInputTokens != tc.wantCached {
+				t.Errorf("cost in=%d cached=%d, want %d/%d", res.Cost.InputTokens, res.Cost.CachedInputTokens, tc.wantIn, tc.wantCached)
+			}
+		})
+		t.Run("tokenUsage/"+tc.name, func(t *testing.T) {
+			state := newMapperState("m")
+			params := `{"sessionId":"s","viewCursor":"c","usage":` + tc.usage + `,"cumulative":{"promptTokens":100,"outputTokens":5,"totalTokens":105}}`
+			events := mapNotification("session/tokenUsage", json.RawMessage(params), state, nil)
+			if len(events) != 1 {
+				t.Fatalf("events=%v", kindsOf(events))
+			}
+			call := events[0].(agent.LlmCallEvent)
+			if call.InputTokens != tc.wantIn || call.CachedInputTokens != tc.wantCached {
+				t.Errorf("in=%d cached=%d, want %d/%d", call.InputTokens, call.CachedInputTokens, tc.wantIn, tc.wantCached)
+			}
+		})
+	}
+
+	// Cumulative-only fallback (no per-step usage): deltas of the prompt
+	// total minus deltas of the cache-read total, then the terminal
+	// aggregate uses the session totals the same way.
+	t.Run("cumulative fallback", func(t *testing.T) {
+		steps := []struct {
+			prompt, read int64
+			wantIn       int64
+		}{
+			{100, 30, 70},
+			{250, 130, 50}, // prompt +150, read +100
+			{300, 400, 0},  // read delta (270) exceeds prompt delta (50): clamp
+			{300, 400, 0},  // no movement
+		}
+		state := newMapperState("m")
+		for i, st := range steps {
+			params, err := json.Marshal(map[string]any{"cumulative": map[string]any{
+				"promptTokens": st.prompt, "outputTokens": 1, "cacheReadTokens": st.read,
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			events := mapNotification("session/tokenUsage", params, state, nil)
+			call := events[0].(agent.LlmCallEvent)
+			if call.InputTokens != st.wantIn {
+				t.Errorf("step %d in=%d, want %d", i, call.InputTokens, st.wantIn)
+			}
+		}
+		res := mapNotification("turn/completed", json.RawMessage(`{"sessionId":"s","terminal":"completed","turnId":"t","viewCursor":"c"}`), state, nil)
+		for _, ev := range res {
+			if r, ok := ev.(agent.ResultEvent); ok {
+				// prompt 300, read 400: clamped, never negative.
+				if r.Cost.InputTokens != 0 || r.Cost.CachedInputTokens != 400 {
+					t.Errorf("aggregate in=%d cached=%d, want 0/400", r.Cost.InputTokens, r.Cost.CachedInputTokens)
+				}
+			}
+		}
+	})
+
+	t.Run("cumulative aggregate", func(t *testing.T) {
+		state := newMapperState("m")
+		mapNotification("session/tokenUsage", json.RawMessage(`{"cumulative":{"promptTokens":300,"outputTokens":9,"cacheReadTokens":120}}`), state, nil)
+		res := mapNotification("turn/completed", json.RawMessage(`{"sessionId":"s","terminal":"completed","turnId":"t","viewCursor":"c"}`), state, nil)
+		for _, ev := range res {
+			if r, ok := ev.(agent.ResultEvent); ok && (r.Cost.InputTokens != 180 || r.Cost.CachedInputTokens != 120) {
+				t.Errorf("aggregate in=%d cached=%d, want 180/120", r.Cost.InputTokens, r.Cost.CachedInputTokens)
+			}
+		}
+	})
+
+	// The context-window notice reports occupancy, not billing: it keeps
+	// the full prompt size, cached tokens included.
+	t.Run("contextUsage stays full size", func(t *testing.T) {
+		state := newMapperState("m")
+		events := mapNotification("session/contextUsage", json.RawMessage(`{"sessionId":"s","usedTokens":900,"windowTokens":1000,"pressure":"normal","viewCursor":"c"}`), state, nil)
+		n, ok := events[0].(agent.ContextUsageEvent)
+		if !ok || n.InputTokens == nil || *n.InputTokens != 900 {
+			t.Fatalf("notice=%+v", events[0])
+		}
+	})
 }
 
 // TestMapNotification_ApprovalReviewing pins the record-only reviewing

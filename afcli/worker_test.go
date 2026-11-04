@@ -296,3 +296,32 @@ func TestBatchHandlerMux_RoutesByWorkType(t *testing.T) {
 		})
 	}
 }
+
+// TestBatchHandlerMux_RoutesByBatchKind pins that the 1.0 batchKind selects
+// the handler ahead of the legacy workType.
+func TestBatchHandlerMux_RoutesByBatchKind(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		item         worker.BatchWorkItem
+		wantSurvival bool
+		wantKG       bool
+	}{
+		{"batch kind beats the legacy work type", worker.BatchWorkItem{WorkType: codesurvival.WorkTypeCodeSurvivalScan, BatchKind: kgextract.WorkTypeKGExtraction}, false, true},
+		{"batch kind alone", worker.BatchWorkItem{BatchKind: codesurvival.WorkTypeCodeSurvivalScan}, true, false},
+		{"unknown batch kind is skipped", worker.BatchWorkItem{WorkType: kgextract.WorkTypeKGExtraction, BatchKind: "some-future-kind"}, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var survivalHits, kgHits int
+			mux := batchHandlerMux(
+				func(context.Context, worker.BatchWorkItem) error { survivalHits++; return nil },
+				func(context.Context, worker.BatchWorkItem) error { kgHits++; return nil },
+			)
+			if err := mux(context.Background(), tc.item); err != nil {
+				t.Fatalf("mux = %v", err)
+			}
+			if survivalHits > 0 != tc.wantSurvival || kgHits > 0 != tc.wantKG {
+				t.Fatalf("survival %d kg %d; want survival %v kg %v", survivalHits, kgHits, tc.wantSurvival, tc.wantKG)
+			}
+		})
+	}
+}

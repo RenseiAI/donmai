@@ -321,10 +321,32 @@ func (p *Provider) spawnHandle(ctx context.Context, spec agent.Spec, resumeSessi
 			_ = cplan.Release()
 		}
 	}
+	// Materialize the session's native skills into the workspace and
+	// verify them before the child starts (skills.go); a native skill is
+	// the only reason this adapter trusts the workspace.
+	skillSpec := spec
+	skillSpec.Cwd = workspaceRoot
+	skills, err := skillMaterializer{}.MaterializeSkills(skillSpec)
+	if err != nil {
+		releasePlan()
+		cleanupSessionDir()
+		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
+	}
 	plan := NewSpawnPlan(spec, workspaceRoot)
 
 	h := newHandle(p, spec, plan, HandleOptions{RPCTimeout: p.opts.RPCTimeout})
 	h.setConfinement(cplan, sessionDir)
+	h.setSkills(skills)
+	// A failed spawn returns only after the skill directories are gone.
+	// The child-exit path may win the race to closeEvents and run the
+	// cleanup on its own goroutine; releaseSkills is once-guarded, so
+	// this call waits for that run to finish rather than repeating it.
+	started := false
+	defer func() {
+		if !started {
+			h.releaseSkills()
+		}
+	}()
 
 	if err := h.spawnChild(workspaceRoot, spec); err != nil {
 		releasePlan()
@@ -372,6 +394,7 @@ func (p *Provider) spawnHandle(ctx context.Context, spec agent.Spec, resumeSessi
 		return nil, p.classifyStartError(err)
 	}
 
+	started = true
 	p.registerHandle(h)
 	//nolint:gosec // G118: session-lifetime goroutine, ctx is honored
 	go h.forward(ctx)

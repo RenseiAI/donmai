@@ -51,6 +51,7 @@ func (p *Provider) Manifest() agent.HarnessManifest {
 		Family:            agent.FamilyHarness,
 		ContractABI:       "harness/v2",
 		ExecutionSecurity: executionSecurityFromAttestation(attestation, ok),
+		Skills:            piSkillProfile,
 		Caps: agent.HarnessCaps{
 			SupportsMessageInjection: true, // steer / follow_up
 			SupportsSessionResume:    true, // session file + cursor replay (get_entries since=<id>)

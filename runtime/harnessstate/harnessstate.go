@@ -106,17 +106,31 @@ func All() []Dir {
 	return out
 }
 
+// InTreeSkillPathPrefix is the checkout-relative prefix of every skill
+// directory a harness materializer writes INSIDE the checkout
+// (.agents/skills/donmai-<id>/; agent.InTreeSkillDirPrefix names the
+// reserved "donmai-" part). It cannot be a top-level state directory: the
+// project's own .agents/skills/ is project content a session may edit and
+// commit. Only the reserved prefix is machinery. The backstop drops every
+// path under it before committing.
+const InTreeSkillPathPrefix = ".agents/skills/donmai-"
+
+// InTreeSkillExcludeEntry is the gitignore-syntax entry for
+// InTreeSkillPathPrefix: anchored to the checkout root, and with a trailing
+// slash so it matches only directories.
+const InTreeSkillExcludeEntry = "/" + InTreeSkillPathPrefix + "*/"
+
 // ExcludeEntries returns one gitignore-syntax entry per state directory —
 // each with a trailing slash, so the pattern matches the directory and
 // everything under it and can never match a FILE that happens to share the
-// name.
+// name — followed by InTreeSkillExcludeEntry.
 func ExcludeEntries() []string {
 	names := Dirs()
-	out := make([]string, 0, len(names))
+	out := make([]string, 0, len(names)+1)
 	for _, n := range names {
 		out = append(out, n+"/")
 	}
-	return out
+	return append(out, InTreeSkillExcludeEntry)
 }
 
 // IsStateDir reports whether name is one of the state directories. The

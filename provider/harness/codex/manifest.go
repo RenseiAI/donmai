@@ -37,6 +37,12 @@ func (*Provider) Manifest() agent.HarnessManifest {
 		Family:            agent.FamilyHarness,
 		ContractABI:       "harness/v2",
 		ExecutionSecurity: codexExecutionSecurity,
+		// Skills: a donmai-<id> directory per skill in the private
+		// CODEX_HOME's skills root, written before the app-server starts
+		// and confirmed by skills/list before thread/start (skills.go).
+		// Codex loads repository skills whatever the workspace trust, so
+		// the repository-skill policy is recorded as all.
+		Skills: codexSkillProfile,
 		Caps: agent.HarnessCaps{
 			SupportsMessageInjection:         false,
 			SupportsSessionResume:            true,

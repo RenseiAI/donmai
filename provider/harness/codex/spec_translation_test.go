@@ -142,6 +142,12 @@ func TestSpecFieldCoverage(t *testing.T) {
 		// any stamped level this adapter cannot render. Codex renders index 0
 		// only, so nothing in the JSON-RPC translation depends on it.
 		"ExecutionSecurity",
+		// Skills: native entries are written into the private CODEX_HOME
+		// before the app-server starts and confirmed by skills/list
+		// (skills.go), never a thread/start param; prompt entries are
+		// folded into SystemPromptAppend by the runner before this
+		// translation runs.
+		"Skills",
 	}
 	all := append([]string{}, translatedFields...)
 	all = append(all, ignoredFields...)

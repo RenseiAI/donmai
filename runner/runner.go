@@ -319,6 +319,10 @@ type Options struct {
 	// visible, authored workflow nodes own optional status and comment writes.
 	// Direct Runner embedders may leave it false while migrating legacy flows.
 	// Tests without /api/issue-tracker-proxy support also set it true.
+	//
+	// It does not govern a work item that carries stage transitions: those
+	// are the work item's one status mover and always apply (see
+	// stage_outcome.go).
 	SkipPostSession bool
 
 	// HeartbeatInterval overrides the per-session heartbeat cadence.
@@ -881,9 +885,15 @@ func (r *Runner) run(ctx context.Context, qw QueuedWork, admission *HarnessAdmis
 	// (see loop.go): only a clean Stop proves the owned writers
 	// stopped and reaped, so a timed-out Stop must not become durable
 	// quiesced evidence.
+	//
+	// A work item carrying stage transitions moves its tracker status here,
+	// not in the legacy post-session block: start before the loop, the
+	// outcome's target after it (stage_outcome.go).
+	stageStart := r.applyStageStart(runCtx, qw)
 	res, runErr := r.runLoop(runCtx, qw, startedAt, admission)
 	r.checkpointProviderError(qw, res)
 	r.checkpointFailedSession(qw, res)
+	r.finishStageTransition(runCtx, qw, res, stageStart)
 	// Retain the runner warning field while copying it to the terminal wire.
 	if res != nil {
 		res.Result.PostSessionWarnings = res.PostSessionWarnings

@@ -378,6 +378,13 @@ func TestShouldExcludeFromBackstop_Table(t *testing.T) {
 		{".scratch/comments.json", true},
 		{"app/.pi", false},
 		{".claude/settings.local.json", true},
+
+		// Skills a harness materializer wrote into the checkout are
+		// session machinery; the project's own .agents/skills is content.
+		{".agents/skills/donmai-review/SKILL.md", true},
+		{".agents/skills/donmai-review/scripts/run.sh", true},
+		{".agents/skills/conventions/SKILL.md", false},
+		{"app/.agents/skills/donmai-review/SKILL.md", false},
 		{".codex/history.jsonl", true},
 		// A directory that merely shares a prefix with a state dir is
 		// ordinary project content.

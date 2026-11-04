@@ -4,6 +4,12 @@ import "log/slog"
 
 // SDLC status mappings + post-session transition decision.
 //
+// LEGACY: the name-keyed status tables and resolveTargetStatus apply only to
+// a work item without stage transitions. A work item that carries
+// `transitions` moves its status through stage_outcome.go, which never
+// consults these tables. They are deleted once every dispatch carries
+// transitions.
+//
 // This file ports the Linear status-mapping tables from the legacy TS
 // orchestrator (donmai-libraries/packages/linear/src/types.ts —
 // WORK_TYPE_COMPLETE_STATUS / WORK_TYPE_FAIL_STATUS) and the

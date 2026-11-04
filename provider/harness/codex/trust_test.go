@@ -1,6 +1,7 @@
 package codex
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -8,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/BurntSushi/toml"
 	"github.com/RenseiAI/donmai/agent"
@@ -399,5 +401,117 @@ func TestGatewayProviderConfigOverride_RestatesFileBlockOnTheCLILayer(t *testing
 				t.Errorf("gatewayProviderConfigOverride arg %d = %q, want --config", i, got[i])
 			}
 		}
+	}
+}
+
+// headlessProjectTrust decodes the private config.toml and returns the
+// trust level recorded per project directory. Decoding real TOML also
+// proves the file stays well-formed (a repeated table fails to decode).
+func headlessProjectTrust(t *testing.T, configPath string) map[string]string {
+	t.Helper()
+	var config struct {
+		Projects map[string]struct {
+			TrustLevel string `toml:"trust_level"`
+		} `toml:"projects"`
+	}
+	if _, err := toml.DecodeFile(configPath, &config); err != nil {
+		t.Fatalf("decode private config.toml: %v", err)
+	}
+	out := make(map[string]string, len(config.Projects))
+	for dir, project := range config.Projects {
+		out[dir] = project.TrustLevel
+	}
+	return out
+}
+
+// TestHeadlessSpawnRecordsWorkspaceUntrusted pins the headless lane's
+// explicit untrusted entry for the session working directory, under both
+// the given and the symlink-resolved path. With no entry, codex applied a
+// repository's .codex/config.toml developer_instructions to the thread.
+// A Resume on the same cwd adds nothing twice.
+func TestHeadlessSpawnRecordsWorkspaceUntrusted(t *testing.T) {
+	t.Parallel()
+	p, _ := newSkillProvider(t, nil)
+	cwd := t.TempDir()
+	h, err := p.Spawn(t.Context(), agent.Spec{Prompt: "go", Cwd: cwd})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	_ = drainEvents(t, h.Events(), 5*time.Second)
+	r, err := p.Resume(t.Context(), "thread-S", agent.Spec{Prompt: "again", Cwd: cwd})
+	if err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	_ = drainEvents(t, r.Events(), 5*time.Second)
+
+	want := map[string]string{cwd: codexTrustLevelUntrusted}
+	if resolved, err := filepath.EvalSymlinks(cwd); err == nil {
+		want[resolved] = codexTrustLevelUntrusted
+	}
+	if got := headlessProjectTrust(t, p.config.configPath); !reflect.DeepEqual(got, want) {
+		t.Fatalf("projects = %v, want %v", got, want)
+	}
+}
+
+// TestHeadlessSpawnKeepsOperatorProjectTrust leaves project trust alone
+// when the operator's app-server argv sets it: that session-flag layer
+// outranks the private config.toml.
+func TestHeadlessSpawnKeepsOperatorProjectTrust(t *testing.T) {
+	t.Parallel()
+	for _, args := range [][]string{
+		{"app-server", "-c", `projects={"/srv/work"={trust_level="trusted"}}`},
+		{"app-server", `--config=projects."/srv/work".trust_level="trusted"`},
+	} {
+		fs, stdinW, stdoutR := newFakeServer()
+		p, err := New(Options{Args: args, skipProcess: true, stdinOverride: stdinW, stdoutOverride: stdoutR, configTempDir: t.TempDir()})
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		go fs.run(t, "thread-S")
+		h, err := p.Spawn(t.Context(), agent.Spec{Prompt: "go", Cwd: t.TempDir()})
+		if err != nil {
+			t.Fatalf("Spawn: %v", err)
+		}
+		_ = drainEvents(t, h.Events(), 5*time.Second)
+		if got := headlessProjectTrust(t, p.config.configPath); len(got) != 0 {
+			t.Fatalf("args %q: projects = %v, want none of the runner's", args, got)
+		}
+		_ = p.Shutdown(context.Background())
+		fs.close()
+	}
+}
+
+// TestUntrustedProjectsFollowTheGatewayBlock keeps the file well-formed in
+// the order a routed spawn writes it: the gateway block's top-level key must
+// stay top-level, ahead of the projects tables.
+func TestUntrustedProjectsFollowTheGatewayBlock(t *testing.T) {
+	t.Parallel()
+	b, err := newCodexConfigBoundary(t.TempDir(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = b.remove() })
+	if _, err := b.appendGatewayProviderBlock("https://gateway.example/v1", "key", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.appendUntrustedProjects([]string{"/work/a", `/work/"quoted"`}); err != nil {
+		t.Fatal(err)
+	}
+	var config struct {
+		ModelProvider string                       `toml:"model_provider"`
+		Projects      map[string]map[string]string `toml:"projects"`
+	}
+	if _, err := toml.DecodeFile(b.configPath, &config); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if config.ModelProvider != codexGatewayProviderID {
+		t.Fatalf("model_provider = %q, want the top-level gateway selection", config.ModelProvider)
+	}
+	want := map[string]map[string]string{
+		"/work/a":        {"trust_level": codexTrustLevelUntrusted},
+		`/work/"quoted"`: {"trust_level": codexTrustLevelUntrusted},
+	}
+	if !reflect.DeepEqual(config.Projects, want) {
+		t.Fatalf("projects = %v, want %v", config.Projects, want)
 	}
 }
