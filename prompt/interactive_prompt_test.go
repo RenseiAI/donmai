@@ -39,7 +39,7 @@ var batchScaffoldingMarkers = []string{
 
 // TestBuilderBuild_InteractiveNeverRendersBatchTemplate is the regression
 // test for the interactive first-prompt bug: a Mode="interactive" QueuedWork
-// with no seed prompt used to fall through userTemplateName's unknown-
+// with no seed prompt used to fall through legacyUserTemplateBase's unknown-
 // work-type default and render user_development.tmpl against the synthetic
 // issue identifier ("Start work on 0b5e88d9-32d… open a PR…"), which the
 // in-session agent correctly self-reported as blocked. Interactive sessions

@@ -13,6 +13,7 @@ import (
 	"github.com/RenseiAI/donmai/executioncell"
 	"github.com/RenseiAI/donmai/prompt"
 	"github.com/RenseiAI/donmai/runtime/workarea"
+	"github.com/RenseiAI/donmai/stagewire"
 )
 
 // OperationalPayload is the one shared, lossless admission-time projection of
@@ -69,12 +70,15 @@ func ProjectOperationalPayload(qw QueuedWork) OperationalPayload {
 		cloned := *qw.Delivery
 		projected.Delivery = &cloned
 	}
+	// The 1.0 wire fields are pointers too: clone them for the same reason.
+	projected.Fields = qw.CloneFields()
 	return projected
 }
 
 var (
 	rawMessageType      = reflect.TypeOf(json.RawMessage{})
 	endpointBindingType = reflect.TypeOf(agent.EndpointBinding{})
+	stageTransitionType = reflect.TypeOf(stagewire.Transition{})
 )
 
 // CanonicalOperationalPayload returns the shared RFC 8785 bytes hashed by
@@ -118,6 +122,12 @@ func losslessOperationalValue(value reflect.Value) (any, error) {
 			return nil, fmt.Errorf("runner: decode operational raw JSON: %w", err)
 		}
 		return document, nil
+	}
+	if value.Type() == stageTransitionType {
+		// A transition's wire value is the string "stay" or an object;
+		// project that exact value, so the typed projection of a decoded
+		// work item matches the projection of its source JSON.
+		return value.Interface().(stagewire.Transition).JSONValue(), nil
 	}
 	if value.Type() == endpointBindingType {
 		endpoint := value.Interface().(agent.EndpointBinding)

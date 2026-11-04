@@ -88,7 +88,7 @@ func TestConformance_EventContract(t *testing.T) {
 					textTurn +
 					event(map[string]any{"type": "agent_settled"}),
 			},
-			wantNotices: []string{agent.SystemSubtypeToolCallBounds},
+			wantNotices: []string{agent.SystemSubtypeToolCallBounds, agent.SystemSubtypeAppliedReasoningEffort},
 		},
 		{
 			name: "spawn, init resolved by agent_start before get_state",
@@ -99,7 +99,7 @@ func TestConformance_EventContract(t *testing.T) {
 					getStateResponse("ses_conf_late") +
 					event(map[string]any{"type": "agent_settled"}),
 			},
-			wantNotices: []string{agent.SystemSubtypeToolCallBounds},
+			wantNotices: []string{agent.SystemSubtypeToolCallBounds, agent.SystemSubtypeAppliedReasoningEffort},
 		},
 		{
 			name: "spawn, every launch notice",
@@ -118,6 +118,7 @@ func TestConformance_EventContract(t *testing.T) {
 				unverifiedVersionSubtype,
 				codeIntelEnforcementUnsupportedSubtype,
 				agent.SystemSubtypeToolCallBounds,
+				agent.SystemSubtypeAppliedReasoningEffort,
 			},
 		},
 		{
@@ -129,7 +130,7 @@ func TestConformance_EventContract(t *testing.T) {
 					event(map[string]any{"type": "agent_start"}) +
 					event(map[string]any{"type": "agent_settled"}),
 			},
-			wantNotices: []string{agent.SystemSubtypeToolCallBounds},
+			wantNotices: []string{agent.SystemSubtypeToolCallBounds, agent.SystemSubtypeAppliedReasoningEffort},
 		},
 	}
 	for _, tc := range cases {

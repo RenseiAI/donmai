@@ -88,6 +88,12 @@ type Config struct {
 	// no auth header — used by tests against unauthenticated httptest.Server
 	// instances.
 	AuthToken string
+	// Traceparent and Tracestate carry the dispatch W3C trace context.
+	// They correlate the beacon with the dispatch trace; the runner
+	// sanitizes both at the consumer boundary, so a beacon only ever emits
+	// values that passed validation (absent stays absent).
+	Traceparent string
+	Tracestate  string
 	// CredentialProvider returns the latest worker id + runtime token. When
 	// set, every post calls it before posting so child runners pick up
 	// daemon-side runtime-token refreshes mid-session.
@@ -318,6 +324,12 @@ func (b *Beacon) post(ctx context.Context, step string) bool {
 		return false
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if b.cfg.Traceparent != "" {
+		req.Header.Set("traceparent", b.cfg.Traceparent)
+	}
+	if b.cfg.Tracestate != "" {
+		req.Header.Set("tracestate", b.cfg.Tracestate)
+	}
 	if creds.AuthToken != "" {
 		req.Header.Set("Authorization", "Bearer "+creds.AuthToken)
 	}

@@ -83,6 +83,13 @@ type Provider struct {
 	pinnedGatewayRouted  bool
 	gatewayRoutePinned   bool
 
+	// skillSetPinned/pinnedSkillSet record the native skill set written into
+	// the private home before the app-server started (skills.go). Codex
+	// loads its skill roots at start, so a later Spawn/Resume delivers
+	// natively only the identical set. Guarded by startMu.
+	skillSetPinned bool
+	pinnedSkillSet string
+
 	// mcpMu serializes app-server-global config changes. mcpUsers counts
 	// live handles holding the current config digest: equal configs may share
 	// it, while an incompatible config is denied until all prior handles have
@@ -463,7 +470,7 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 		return spawnInteractivePrepared(ctx, p.opts, spec)
 	}
 
-	ready, err := p.ensureHeadlessReady(spec)
+	ready, skills, err := p.ensureHeadlessReady(spec)
 	if err != nil {
 		return nil, err
 	}
@@ -473,6 +480,12 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 	}
 	if err := validateCodexCLIMCPServers(spec.MCPServers); err != nil {
 		return nil, fmt.Errorf("%w: codex configure mcp servers: %w", agent.ErrSpawnFailed, persistHeadlessMCPApplicationDenial(spec, err))
+	}
+	// Confirm the session's native skills with the app-server before
+	// thread/start; any it does not list ride developerInstructions.
+	spec, err = p.deliverSkills(ctx, spec, skills, false)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
 	}
 	plan := NewSpawnPlan(spec)
 	releaseMCP, err := p.acquireMCPConfig(ctx, plan.MCPConfig, spec.Cwd)
@@ -505,7 +518,7 @@ func (p *Provider) Resume(ctx context.Context, sessionID string, spec agent.Spec
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}
-	ready, err := p.ensureHeadlessReady(spec)
+	ready, skills, err := p.ensureHeadlessReady(spec)
 	if err != nil {
 		return nil, err
 	}
@@ -518,6 +531,12 @@ func (p *Provider) Resume(ctx context.Context, sessionID string, spec agent.Spec
 	}
 	if sessionID == "" {
 		return nil, agent.ErrSessionNotFound
+	}
+	// A resumed thread keeps the developer instructions it started with, so
+	// a skill that falls back here rides the first turn's input instead.
+	spec, err = p.deliverSkills(ctx, spec, skills, true)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
 	}
 	plan := NewSpawnPlan(spec)
 	releaseMCP, err := p.acquireMCPConfig(ctx, plan.MCPConfig, spec.Cwd)
@@ -569,12 +588,17 @@ func (p *Provider) Resume(ctx context.Context, sessionID string, spec agent.Spec
 // Spec.Env: a gateway-routed cell's child carries the binding-selected key
 // under the gateway env name, so comparing the original layer would refuse a
 // same-session Resume for carrying exactly what the child was started with.
-func (p *Provider) ensureHeadlessReady(spec agent.Spec) (agent.Spec, error) {
+//
+// It also stages the session's native skills in the private home (skills.go)
+// after every other check and before startLocked, because codex loads its
+// skill roots when it starts. The returned stagedSkills still need the
+// app-server's own confirmation (Provider.deliverSkills).
+func (p *Provider) ensureHeadlessReady(spec agent.Spec) (agent.Spec, stagedSkills, error) {
 	p.startMu.Lock()
 	defer p.startMu.Unlock()
 	select {
 	case <-p.shutdown:
-		return spec, fmt.Errorf("%w: %w: codex provider already shut down", agent.ErrSpawnFailed, agent.ErrProviderUnavailable)
+		return spec, stagedSkills{}, fmt.Errorf("%w: %w: codex provider already shut down", agent.ErrSpawnFailed, agent.ErrProviderUnavailable)
 	default:
 	}
 	// Resolve the gateway route first: gatewayBinding is pure (no side
@@ -588,7 +612,7 @@ func (p *Provider) ensureHeadlessReady(spec agent.Spec) (agent.Spec, error) {
 	// ordering: a refused spawn leaves no side effect.
 	baseURL, gatewayKey, gatewayRouted, routeErr := gatewayBinding(spec)
 	if routeErr != nil {
-		return spec, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, routeErr)
+		return spec, stagedSkills{}, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, routeErr)
 	}
 	projectedEnv := spec.Env
 	if gatewayRouted {
@@ -600,40 +624,49 @@ func (p *Provider) ensureHeadlessReady(spec agent.Spec) (agent.Spec, error) {
 	// stayed on the first gateway — a silent misroute. Refuse it here,
 	// before the session-env check and before any side effect.
 	if err := p.checkGatewayRouteLocked(baseURL, gatewayRouted); err != nil {
-		return spec, err
+		return spec, stagedSkills{}, err
 	}
 	if err := p.checkSessionEnvLocked(projectedEnv); err != nil {
-		return spec, err
+		return spec, stagedSkills{}, err
 	}
 	if err := p.prepareHeadlessProtectedMCPAuthorityLocked(spec.MCPServers); err != nil {
-		return spec, err
+		return spec, stagedSkills{}, err
 	}
 	// A gateway-routed cell skips the host-session auth link so the child
 	// cannot fall back to an operator login; the provider block plus the
 	// binding-selected key projected below are its only route.
 	if gatewayRouted {
 		if p.hostAuthFile != "" {
-			return spec, fmt.Errorf("%w: codex gateway route cannot combine with host-session auth", agent.ErrSpawnFailed)
+			return spec, stagedSkills{}, fmt.Errorf("%w: codex gateway route cannot combine with host-session auth", agent.ErrSpawnFailed)
 		}
 		nextEnv, err := p.config.appendGatewayProviderBlock(baseURL, gatewayKey, spec.Env)
 		if err != nil {
-			return spec, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
+			return spec, stagedSkills{}, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
 		}
 		if nextEnv == nil {
 			nextEnv = map[string]string{}
 		}
 		nextEnv[codexGatewayEnvKey] = gatewayKey
 		if strings.TrimSpace(nextEnv[codexGatewayEnvKey]) == "" {
-			return spec, fmt.Errorf("%w: codex gateway route requires a key on %s", agent.ErrSpawnFailed, codexGatewayEnvKey)
+			return spec, stagedSkills{}, fmt.Errorf("%w: codex gateway route requires a key on %s", agent.ErrSpawnFailed, codexGatewayEnvKey)
 		}
 		spec.Env = nextEnv
 	} else if p.hostAuthFile != "" {
 		if err := p.config.linkHostSessionAuth(p.hostAuthFile); err != nil {
-			return spec, fmt.Errorf("%w: codex host-session auth: %w", agent.ErrSpawnFailed, err)
+			return spec, stagedSkills{}, fmt.Errorf("%w: codex host-session auth: %w", agent.ErrSpawnFailed, err)
 		}
 	}
+	// Record the working directory as untrusted before the thread can load
+	// its project config (trust.go).
+	if err := p.recordUntrustedWorkspaceLocked(spec.Cwd); err != nil {
+		return spec, stagedSkills{}, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
+	}
+	skills, err := p.stageSkillsLocked(spec)
+	if err != nil {
+		return spec, stagedSkills{}, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
+	}
 	if err := p.startLocked(spec.Env); err != nil {
-		return spec, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
+		return spec, stagedSkills{}, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
 	}
 	// Freeze the route the child was started with. baseURL is empty when the
 	// session is not gateway-routed, so the pin also refuses a later flip
@@ -641,7 +674,7 @@ func (p *Provider) ensureHeadlessReady(spec agent.Spec) (agent.Spec, error) {
 	p.pinnedGatewayBaseURL = baseURL
 	p.pinnedGatewayRouted = gatewayRouted
 	p.gatewayRoutePinned = true
-	return spec, nil
+	return spec, skills, nil
 }
 
 func (p *Provider) prepareHeadlessProtectedMCPAuthorityLocked(servers []agent.MCPServerConfig) error {

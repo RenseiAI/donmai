@@ -146,6 +146,13 @@ type State struct {
 	// enforcing it (ADR-2026-09-27-execution-security-levels.md D4).
 	ExecutionSecurity *agent.ExecutionSecurityReport `json:"executionSecurityReport,omitempty"`
 
+	// SkillDelivery is the run's skill delivery receipt: how each skill
+	// reached the harness and the repository-skill policy the harness
+	// actually achieved (agent.SkillDeliveryPlan). Identity and digests
+	// only, never skill content. Absent when the work item carried no
+	// skills and no repository policy.
+	SkillDelivery *agent.SkillDeliveryPlan `json:"skillDeliveryReceipt,omitempty"`
+
 	// EventLogStartOffset is the byte boundary in this run's events.jsonl
 	// before its first event. A non-nil zero is valid for a fresh log. The
 	// runner stamps it at run start; readers must not replay older bytes when

@@ -19,6 +19,7 @@ import (
 	"github.com/RenseiAI/donmai/result"
 	"github.com/RenseiAI/donmai/runtime/env"
 	"github.com/RenseiAI/donmai/runtime/mcp"
+	spanruntime "github.com/RenseiAI/donmai/runtime/span"
 	"github.com/RenseiAI/donmai/runtime/state"
 	"github.com/RenseiAI/donmai/runtime/workarea"
 	"github.com/RenseiAI/donmai/runtime/worktree"
@@ -318,6 +319,10 @@ type Options struct {
 	// visible, authored workflow nodes own optional status and comment writes.
 	// Direct Runner embedders may leave it false while migrating legacy flows.
 	// Tests without /api/issue-tracker-proxy support also set it true.
+	//
+	// It does not govern a work item that carries stage transitions: those
+	// are the work item's one status mover and always apply (see
+	// stage_outcome.go).
 	SkipPostSession bool
 
 	// HeartbeatInterval overrides the per-session heartbeat cadence.
@@ -815,12 +820,35 @@ func (r *Runner) RunAdmitted(ctx context.Context, qw QueuedWork, admission *Harn
 	return r.run(ctx, qw, admission)
 }
 
+// recordWriterQuiescence records the ordinary-writer half of the
+// writer-quiescence boundary: the caller proves the terminal generation
+// stopped and reaped through the handle it supervised, then records the
+// outcome here — before lease settlement — so an archive-disposition
+// release carries quiescence evidence into the archive manifest (durable
+// via the lease record, surviving daemon reapers and restarts). Only a
+// clean Stop proves the owned writers gone, so callers pass quiesced=true
+// solely when Stop returned nil; a timed-out or failed Stop records false
+// and the release stays unquiesced evidence, never refused. A nil manager
+// or empty session records nothing; those releases stay unquiesced
+// evidence, never refused.
+func (r *Runner) recordWriterQuiescence(sessionID string, quiesced bool) {
+	if r.wt == nil || sessionID == "" {
+		return
+	}
+	r.wt.RequireWriterQuiescence(sessionID, quiesced)
+}
+
 func (r *Runner) run(ctx context.Context, qw QueuedWork, admission *HarnessAdmission) (*Result, error) {
 	bound, bindErr := bindCapabilityRealizationSelection(qw, r.capabilityRealizations, r.selectionPolicy, true)
 	if bindErr != nil {
 		return nil, fmt.Errorf("runner: bind capability realization selection: %w", bindErr)
 	}
 	qw = bound
+	// Validate the dispatch trace context at the consumer boundary,
+	// before validation, posters, spans or attach wiring read it. See
+	// sanitizeDispatchTrace: malformed context is omitted telemetry,
+	// never fatal, and never authorizes a tenant/session transition.
+	qw.Traceparent, qw.Tracestate = sanitizeDispatchTrace(qw.Traceparent, qw.Tracestate)
 	startedAt := r.now().UnixMilli()
 
 	// Apply the runner-side upper-bound timeout if requested.
@@ -853,9 +881,19 @@ func (r *Runner) run(ctx context.Context, qw QueuedWork, admission *HarnessAdmis
 
 	// Drive the loop. loop.go owns the step sequence; the helpers
 	// here own the result envelope + post-Run teardown.
+	// Writer quiescence is recorded inside runLoop's terminal Stop
+	// (see loop.go): only a clean Stop proves the owned writers
+	// stopped and reaped, so a timed-out Stop must not become durable
+	// quiesced evidence.
+	//
+	// A work item carrying stage transitions moves its tracker status here,
+	// not in the legacy post-session block: start before the loop, the
+	// outcome's target after it (stage_outcome.go).
+	stageStart := r.applyStageStart(runCtx, qw)
 	res, runErr := r.runLoop(runCtx, qw, startedAt, admission)
 	r.checkpointProviderError(qw, res)
 	r.checkpointFailedSession(qw, res)
+	r.finishStageTransition(runCtx, qw, res, stageStart)
 	// Retain the runner warning field while copying it to the terminal wire.
 	if res != nil {
 		res.Result.PostSessionWarnings = res.PostSessionWarnings
@@ -866,10 +904,24 @@ func (r *Runner) run(ctx context.Context, qw QueuedWork, admission *HarnessAdmis
 	// the workarea when the archive cannot be written. Interactive sessions
 	// take the same path except on the completed path, where the publication
 	// hold below already retains an unpublished workarea.
+	//
+	// Preservation runs in two phases sharing one teardown directory. Patches
+	// archive before the terminal lease decision (the disposition needs to
+	// know whether unpublished work survived), while terminal evidence waits
+	// until the final status is known: the lease decision below can flip a
+	// completed session to failed, and sampling evidence before that flip
+	// would drop the failed session's manifest.
 	retainUnpreserved := false
-	if teardownRequired && (!qw.isInteractive() || res == nil || res.Status != "completed") && !r.preserveUnpublishedWork(qw, res) {
-		teardownRequired = false
-		retainUnpreserved = true
+	initialTeardown := teardownRequired
+	var pres *teardownPreservation
+	patchesAttempted := false
+	if initialTeardown && (!qw.isInteractive() || res == nil || res.Status != "completed") {
+		pres = r.newTeardownPreservation(qw.SessionID)
+		patchesAttempted = true
+		if !r.preservePatches(qw, res, pres) {
+			teardownRequired = false
+			retainUnpreserved = true
+		}
 	}
 	leaseAcquired := false
 	leasePrepared := false
@@ -969,6 +1021,25 @@ func (r *Runner) run(ctx context.Context, qw QueuedWork, admission *HarnessAdmis
 					}
 				}
 			}
+		}
+	}
+
+	// Terminal evidence is archived against the FINAL status: the lease
+	// decision above can flip a completed session to failed, and evidence
+	// sampled before that flip would lose the failed session's manifest.
+	// The teardown shares one directory between the patch phase above and
+	// this phase, so one teardown still counts as a single attempt under
+	// the per-session retention boundary.
+	if initialTeardown {
+		finalGate := !qw.isInteractive() || res == nil || res.Status != "completed"
+		if pres == nil && finalGate {
+			pres = r.newTeardownPreservation(qw.SessionID)
+		}
+		if pres != nil && finalGate {
+			r.preserveTerminalEvidenceFinal(qw, res, pres)
+		}
+		if pres != nil && (patchesAttempted || finalGate || pres.archiveDir != "") {
+			r.finalizeTeardownPreservation(qw, pres)
 		}
 	}
 
@@ -1096,6 +1167,27 @@ func markTerminalLeaseFailure(res *Result, err error) {
 	res.FailureMode = FailureTerminalWorkareaLease
 	res.Error = err.Error()
 	res.TerminalWorkareaLease = nil
+}
+
+// sanitizeDispatchTrace validates the dispatch W3C trace context at the
+// consumer boundary, before any poster, span or attach wiring reads it.
+// The trace context is correlation-only telemetry: (organization, session)
+// remains the lifecycle authority, so a trace id never authorizes a
+// tenant or session transition. A malformed traceparent or tracestate is
+// omitted (the run keeps its locally-minted root), never fatal — invalid
+// context must not weaken execution. Each field is judged independently:
+// a valid tracestate still flows when the traceparent is absent, matching
+// the poster emission contract. The optional join identities
+// (storage/public/tracker) pass through verbatim and are never
+// derived from — or gated on — the trace fields.
+func sanitizeDispatchTrace(traceparent, tracestate string) (string, string) {
+	if !spanruntime.ValidTraceparent(traceparent) {
+		traceparent = ""
+	}
+	if !spanruntime.ValidTracestate(tracestate) {
+		tracestate = ""
+	}
+	return traceparent, tracestate
 }
 
 // validateQueuedWork checks the minimum field set required for Run.

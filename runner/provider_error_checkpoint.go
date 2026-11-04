@@ -35,7 +35,7 @@ func (r *Runner) checkpointProviderError(qw QueuedWork, res *Result) {
 	if res == nil || res.Status != "failed" || res.FailureMode != FailureProviderError || res.Resumable || res.ResumeCheckpoint != nil {
 		return
 	}
-	if !RequiresPRURL(qw.WorkType, qw.WorkTypeRole) {
+	if !qw.requiresPR() {
 		res.Resumable = true
 		return
 	}

@@ -12,8 +12,8 @@ import (
 // `npm i -g` line in a worker image Dockerfile.
 var piPinRe = regexp.MustCompile(`@earendil-works/pi-coding-agent@([0-9]+(?:\.[0-9]+)+)`)
 
-// TestPiPin_MatchesProbePinnedVersion guards worker/Dockerfile and
-// worker/e2b/e2b.Dockerfile's @earendil-works/pi-coding-agent npm pin against
+// TestPiPin_MatchesProbePinnedVersion guards the worker image Dockerfiles'
+// @earendil-works/pi-coding-agent npm pin against
 // drifting from provider/harness/pi/probe.go's PinnedVersion — the single
 // source of truth the pi harness enforces at construction time
 // (checkVersionPin denies any binary below MinVersion). A worker image that

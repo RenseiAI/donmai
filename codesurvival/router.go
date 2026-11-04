@@ -24,7 +24,7 @@ import (
 //	c.PollLoopWithBatch(ctx, interval, agentHandler, codesurvival.BatchHandler(exec))
 func BatchHandler(exec *Executor) worker.BatchHandler {
 	return func(ctx context.Context, item worker.BatchWorkItem) error {
-		switch item.WorkType {
+		switch item.Kind() {
 		case WorkTypeCodeSurvivalScan:
 			var csItem BatchWorkItem
 			if err := json.Unmarshal(item.Raw, &csItem); err != nil {
@@ -35,7 +35,7 @@ func BatchHandler(exec *Executor) worker.BatchHandler {
 			// Graceful degradation: a stale worker may receive a work-type a
 			// newer platform dispatched. Log + skip; never crash the loop.
 			slog.Default().Info("codesurvival: unknown batch work-type; skipping",
-				"batchJobId", item.BatchJobID, "workType", item.WorkType)
+				"batchJobId", item.BatchJobID, "batchKind", item.Kind())
 			return nil
 		}
 	}

@@ -10,24 +10,22 @@ package linearcmd
 // JSON output shapes are intentionally preserved for automation compatibility.
 //
 // Auth strategy (per ADR-2026-05-12-cli-linear-proxy):
-//   1. LINEAR_API_KEY (or LINEAR_ACCESS_TOKEN) env var → direct GraphQL calls
-//      to api.linear.app. Preserves the standalone `donmai` path AND the
-//      worker-fleet path where `donmai agent run` injects the env var into the
-//      in-session shell.
-//   1.5. No env key + WORKER_AUTH_TOKEN + DONMAI_API_URL set → in-box cloud
-//      agent. The runner exports the short-lived worker runtime JWT and the
-//      platform URL; proxy GraphQL through /api/cli/linear/graphql under that
-//      JWT (the route accepts it as an additive auth fall-through).
-//   2. No env key + ds() returns an authenticated *afclient.Client (rsk_ token
-//      + base URL) → platform proxy mode via `linear.NewProxiedClient`. The
-//      platform unwraps the rsk_, looks up the org's stored Linear OAuth
-//      credential, and forwards the GraphQL under that credential. This is
-//      the rensei case.
+//   0. In a platform session (DONMAI_API_URL and MCP_GATEWAY_TOKEN_FILE both
+//      set, non-empty after trimming) → platform proxy mode under the session
+//      bearer. The bearer is the trimmed content of the file named by
+//      MCP_GATEWAY_TOKEN_FILE, read when the client is built; when that file
+//      is empty or unreadable, WORKER_AUTH_TOKEN with DONMAI_API_URL is used,
+//      otherwise the command fails naming MCP_GATEWAY_TOKEN_FILE.
+//      LINEAR_API_KEY and LINEAR_ACCESS_TOKEN are ignored in a session, with
+//      no fallback on proxy refusal. This reverses the "Env wins" clause of
+//      ADR-2026-05-12 for the in-session case only.
+//   1. Outside a session, LINEAR_API_KEY (or LINEAR_ACCESS_TOKEN) env var →
+//      direct GraphQL calls to api.linear.app.
+//   1.5. No env key + WORKER_AUTH_TOKEN + DONMAI_API_URL set → worker proxy
+//      mode under that token.
+//   2. No env key + ds() returns an authenticated *afclient.Client (platform
+//      token + base URL) → platform proxy mode via `linear.NewProxiedClient`.
 //   3. Neither → hard error with an actionable message.
-//
-// Env wins precedence is deliberate: it preserves the worker-fleet behavior
-// without conditional logic and matches the explicit-env-overrides-default
-// posture every other afcli command uses.
 //
 // check-deployment is implemented natively in Go (GO-3): it uses the gh CLI
 // to query the GitHub Commit Status API, filters Vercel contexts, and outputs
@@ -96,7 +94,7 @@ func (f CreateDocumentFunc) CreateDocument(ctx context.Context, input DocumentCr
 // is the user-facing binary name (afcli resolves it from Config.BinaryName).
 //
 // `ds` is the platform-DataSource factory; subcommands call it lazily to
-// pick up rsk_ credentials when running embedded under rensei. The factory
+// pick up platform credentials when running embedded. The factory
 // may be nil (e.g. minimal test embedders) — subcommands degrade to the
 // LINEAR_API_KEY env path.
 func New(ds func() afclient.DataSource, bin string, creators ...DocumentCreator) *cobra.Command {
@@ -112,10 +110,13 @@ func New(ds func() afclient.DataSource, bin string, creators ...DocumentCreator)
 Mirrors the TypeScript 'pnpm donmai-linear' surface. Outputs JSON to stdout.
 
 Authentication (in order):
+  0. In a platform session (DONMAI_API_URL and MCP_GATEWAY_TOKEN_FILE both
+     set) → proxied GraphQL under the session bearer; LINEAR_API_KEY and
+     LINEAR_ACCESS_TOKEN are ignored.
   1. LINEAR_API_KEY (or LINEAR_ACCESS_TOKEN) env var → direct calls to api.linear.app.
-  2. Otherwise, when running under rensei with a stored login session (rsk_
-     token), GraphQL is proxied through the platform's /api/cli/linear/graphql
-     route under the org's connected Linear OAuth credential.
+  1.5. WORKER_AUTH_TOKEN + DONMAI_API_URL set → proxied GraphQL under that token.
+  2. Otherwise, with a stored login session, GraphQL is proxied through the
+     platform under the connected Linear credential.
   3. Neither set → hard error.
 
 LINEAR_TEAM_NAME can be set to provide a default team for create-issue.`,
@@ -154,6 +155,40 @@ LINEAR_TEAM_NAME can be set to provide a default team for create-issue.`,
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
+// sessionProxyCredentials resolves the in-session proxy credentials. A
+// platform session is defined as DONMAI_API_URL and MCP_GATEWAY_TOKEN_FILE
+// both set and non-empty after trimming. The runner sets the file only when
+// the platform minted a per-session bearer, so standalone users keep the
+// existing behavior.
+//
+// The session bearer is the trimmed content of the named file, read when the
+// client is built (the file is refreshed in place). An embedder may already
+// have installed the same session bearer as WORKER_AUTH_TOKEN; both are the
+// same credential, and the file is preferred. When the file is empty or
+// unreadable, WORKER_AUTH_TOKEN with DONMAI_API_URL is used (today's worker
+// path). Otherwise the command fails naming MCP_GATEWAY_TOKEN_FILE. This
+// branch never reads the env key.
+func sessionProxyCredentials() (baseURL, bearer string, inSession bool, err error) {
+	baseURL = strings.TrimSpace(os.Getenv("DONMAI_API_URL"))
+	tokenFile := strings.TrimSpace(os.Getenv("MCP_GATEWAY_TOKEN_FILE"))
+	if baseURL == "" || tokenFile == "" {
+		return "", "", false, nil
+	}
+	if data, readErr := os.ReadFile(tokenFile); readErr == nil { //nolint:gosec // G304: provisioner-managed bearer file path from env
+		bearer = strings.TrimSpace(string(data))
+	}
+	if bearer != "" {
+		return baseURL, bearer, true, nil
+	}
+	if token := strings.TrimSpace(os.Getenv("WORKER_AUTH_TOKEN")); token != "" {
+		return baseURL, token, true, nil
+	}
+	return "", "", true, cli.UserError(
+		"the Linear proxy session bearer is unavailable: MCP_GATEWAY_TOKEN_FILE names an empty or unreadable file and WORKER_AUTH_TOKEN is unset",
+		"ensure the platform refreshed the file named by MCP_GATEWAY_TOKEN_FILE, or set WORKER_AUTH_TOKEN",
+	)
+}
+
 // workerAuthProxyCredentials resolves the in-box worker proxy credentials from
 // the environment the runner exports for cloud agents: the worker runtime JWT
 // (WORKER_AUTH_TOKEN) plus the platform base URL (DONMAI_API_URL). Returns
@@ -174,17 +209,32 @@ func workerAuthProxyCredentials() (baseURL, token string, ok bool) {
 // newLinearClient resolves a Linear client following the auth strategy in
 // the package header doc-comment:
 //
-//  1. LINEAR_API_KEY / LINEAR_ACCESS_TOKEN env → direct path.
-//  2. Authenticated DataSource (rsk_ token + platform base URL) → proxy
-//     mode via `linear.NewProxiedClient`.
+//  0. In a platform session → proxy under the session bearer; the env key is
+//     ignored with no fallback.
+//  1. Outside a session, LINEAR_API_KEY / LINEAR_ACCESS_TOKEN env → direct.
+//     1.5. WORKER_AUTH_TOKEN + DONMAI_API_URL → worker proxy mode.
+//  2. Authenticated DataSource (platform token + base URL) → proxy mode via
+//     `linear.NewProxiedClient`.
 //  3. Neither → friendly error.
 //
 // When linearTestBaseURL is non-empty (set by tests via setTestBaseURL),
 // the direct-path client's BaseURL is overridden to point at the test
-// HTTP server. The proxy path is exercised by tests via injecting a
-// MockClient-equivalent DataSource that returns an *afclient.Client whose
-// BaseURL points at the test server.
+// HTTP server. The proxy path is exercised by tests by pointing DONMAI_API_URL
+// (or the DataSource base URL) at the test server.
 func newLinearClient(ds func() afclient.DataSource, bin string) (linear.Linear, error) {
+	// Path 0: in-session proxy-first. This branch never reads the env key:
+	// inside a session the Linear API key is ignored even when set, and a
+	// proxy refusal never falls back to it.
+	if baseURL, bearer, inSession, err := sessionProxyCredentials(); err != nil {
+		return nil, err
+	} else if inSession {
+		client, err := linear.NewProxiedClient(baseURL, bearer)
+		if err != nil {
+			return nil, proxyOriginError(err, "DONMAI_API_URL")
+		}
+		return client, nil
+	}
+
 	// Path 1: env-var direct.
 	if key := cli.APIKey(); key != "" {
 		c, err := linear.NewClient(key)

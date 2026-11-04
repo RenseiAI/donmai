@@ -1746,3 +1746,74 @@ func TestPosterPost_StatusBaseSHASerialized(t *testing.T) {
 		})
 	}
 }
+
+// TestPosterPost_StatusHeadlessFailureEvidenceSerialized pins the four
+// headless failure keys on the terminal status body: a failed run with an
+// exit code, a bounded tail and a phase/decider posts all four keys, and a
+// run without them omits every one. Dropping any buildStatusRequest
+// forwarding line fails the populated row.
+func TestPosterPost_StatusHeadlessFailureEvidenceSerialized(t *testing.T) {
+	t.Parallel()
+	exitCode := 3
+	populated := goodResult()
+	populated.Status = "failed"
+	populated.FailureMode = runner.FailureProviderError
+	populated.Error = "endpoint refused"
+	populated.ExitCode = &exitCode
+	populated.OutputTail = "redacted tail"
+	populated.FailurePhase = "stream"
+	populated.FailureDecidedBy = "runner"
+	cases := []struct {
+		name   string
+		result agent.Result
+		want   map[string]string
+	}{
+		{
+			name:   "failed run posts all four keys",
+			result: populated,
+			want: map[string]string{
+				"exitCode":         `3`,
+				"outputTail":       `"redacted tail"`,
+				"failurePhase":     `"stream"`,
+				"failureDecidedBy": `"runner"`,
+			},
+		},
+		{
+			name:   "run without evidence omits all four keys",
+			result: goodResult(),
+			want:   map[string]string{},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var statusBody []byte
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, _ := io.ReadAll(r.Body)
+				if strings.HasSuffix(r.URL.Path, "/status") {
+					statusBody = body
+				}
+				w.WriteHeader(http.StatusOK)
+			}))
+			t.Cleanup(srv.Close)
+			p := newPoster(t, srv.URL, 0)
+			if err := p.Post(context.Background(), "sess-headless-evidence", tc.result); err != nil {
+				t.Fatalf("Post: %v", err)
+			}
+			var body map[string]json.RawMessage
+			if err := json.Unmarshal(statusBody, &body); err != nil {
+				t.Fatalf("status body not JSON: %v (raw %q)", err, statusBody)
+			}
+			for _, key := range []string{"exitCode", "outputTail", "failurePhase", "failureDecidedBy"} {
+				got, present := body[key]
+				want, wantPresent := tc.want[key]
+				if present != wantPresent {
+					t.Fatalf("%s present = %v; want %v (body %s)", key, present, wantPresent, statusBody)
+				}
+				if wantPresent && string(got) != want {
+					t.Errorf("%s = %s; want %s", key, got, want)
+				}
+			}
+		})
+	}
+}

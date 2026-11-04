@@ -96,8 +96,18 @@ type Handle struct {
 	confinement     confinementPlan
 	sessionDir      string
 	confinementOnce sync.Once
+	// skillTrust and skillCleanup come from the skill materializer
+	// (setSkills); skillOnce guards the cleanup.
+	skillTrust   bool
+	skillCleanup func() error
+	skillOnce    sync.Once
 
 	state *mapperState
+
+	// firstTurn carries the bounded safe summary of the actual
+	// outgoing session/first-turn shape plus the once-only emission
+	// flag. Spawn and Resume share one summary per handle.
+	firstTurn firstTurnShapeState
 }
 
 // HandleOptions tweaks handle behavior. Used by tests; production code
@@ -152,6 +162,24 @@ func (h *Handle) setConfinement(plan *confinement.Plan, sessionDir string) {
 		h.confinement = plan
 	}
 	h.sessionDir = sessionDir
+}
+
+// setSkills attaches what the skill materializer wrote for the session:
+// whether the serve host must trust the workspace, and the cleanup that
+// removes the skill directories when the session stops. Set before the
+// child starts.
+func (h *Handle) setSkills(skills agent.MaterializedSkills) {
+	h.skillTrust = skills.TrustWorkspace
+	h.skillCleanup = skills.Cleanup
+}
+
+// releaseSkills removes the session's materialized skill directories once.
+func (h *Handle) releaseSkills() {
+	h.skillOnce.Do(func() {
+		if h.skillCleanup != nil {
+			_ = h.skillCleanup()
+		}
+	})
 }
 
 // releaseConfinement releases the rendered profile and removes the
@@ -284,14 +312,16 @@ func (h *Handle) spawnChild(workspaceRoot string, spec agent.Spec) error {
 	args := []string{"serve"}
 	cwd := ""
 	envExtra := map[string]string(nil)
-	trust := false
+	// A natively delivered skill is the one per-session reason to trust
+	// the workspace (skills.go); the host option trusts every session.
+	trust := h.skillTrust
 	disableSandbox := false
 	if h.provider != nil {
 		bin = h.provider.museBin
 		args = append([]string(nil), h.provider.opts.Args...)
 		cwd = h.provider.opts.Cwd
 		envExtra = h.provider.opts.Env
-		trust = h.provider.opts.TrustWorkspace
+		trust = trust || h.provider.opts.TrustWorkspace
 		disableSandbox = h.provider.opts.DisableSandbox
 	}
 	if bin == "" {
@@ -395,6 +425,7 @@ func (h *Handle) startSession(ctx context.Context) error {
 	commandID := newUUIDv7()
 	mcpServers := h.plan.MCPServers
 	params := sessionStartParams(h.spec, sessionID, commandID, h.plan.WorkspaceRoot, mcpServers)
+	h.recordSessionShape("session/start", params)
 	raw, err := h.client.Request(ctx, "session/start", params, h.rpcTimeout)
 	if err != nil {
 		return fmt.Errorf("session/start: %w", err)
@@ -424,6 +455,7 @@ func (h *Handle) resumeSession(ctx context.Context, sessionID string) error {
 	h.setSessionID(sessionID)
 	h.client.Subscribe(sessionID, func(n notification) { h.deliver(n) })
 	params := sessionResumeParams(sessionID, newUUIDv7(), h.plan.MCPServers)
+	h.recordSessionShape("session/resume", params)
 	raw, err := h.client.Request(ctx, "session/resume", params, h.rpcTimeout)
 	if err != nil {
 		h.client.Unsubscribe(sessionID)
@@ -451,6 +483,7 @@ func (h *Handle) startTurn(ctx context.Context, input []TurnInputPart) error {
 		roots = []string{h.plan.WorkspaceRoot}
 	}
 	params := turnStartParams(sessionID, commandID, h.spec, input, roots)
+	h.recordTurnShape(params, "")
 	raw, err := h.client.Request(ctx, "turn/start", params, h.rpcTimeout)
 	if err != nil {
 		return fmt.Errorf("turn/start: %w", err)
@@ -463,6 +496,7 @@ func (h *Handle) startTurn(ctx context.Context, input []TurnInputPart) error {
 		return errors.New("turn/start: empty turn id in response")
 	}
 	h.setCurrentTurnID(res.TurnID)
+	h.recordTurnShape(params, res.TurnID)
 	return nil
 }
 
@@ -539,10 +573,28 @@ func (h *Handle) handleNotification(ctx context.Context, n notification) bool {
 		h.decideFromNotification(n.Params, rawObj)
 	}
 
+	var completed TurnCompletedParams
+	isTurnCompleted := n.Method == "turn/completed"
+	if isTurnCompleted {
+		_ = json.Unmarshal(n.Params, &completed)
+	}
+
 	events := mapNotification(n.Method, n.Params, h.state, rawObj)
 	for _, ev := range events {
 		switch e := ev.(type) {
 		case agent.ResultEvent:
+			if isTurnCompleted {
+				if h.isStaleFirstTurnCompletion(completed.TurnID) {
+					// A completion for a turn other than the
+					// acknowledged first turn is not this handle's
+					// terminal: it must not emit the queued shape,
+					// consume the once flag, clear the foreground
+					// turn, or exit the forwarder. The queued
+					// first turn's own completion still reports.
+					continue
+				}
+				h.emitFirstTurnAsyncCompletion(completed.TurnID, completed.Terminal, completed.Error, completed.Reason)
+			}
 			h.clearCurrentTurnID()
 			h.emit(e)
 			return true
@@ -561,8 +613,12 @@ func (h *Handle) handleNotification(ctx context.Context, n notification) bool {
 		h.emit(ev)
 	}
 	// A turn that completed without a terminal ResultEvent (unknown
-	// terminal vocabulary) still ends foreground tracking.
-	if n.Method == "turn/completed" {
+	// terminal vocabulary) still ends foreground tracking, unless it is
+	// a stale turn other than the acknowledged first turn.
+	if isTurnCompleted {
+		if h.isStaleFirstTurnCompletion(completed.TurnID) {
+			return false
+		}
 		h.clearCurrentTurnID()
 	}
 	return false
@@ -811,6 +867,7 @@ func (h *Handle) closeEvents() {
 	}
 	_ = h.shutdownChild("events closed")
 	h.releaseConfinement()
+	h.releaseSkills()
 }
 
 // emit publishes an event on the events channel without blocking. If

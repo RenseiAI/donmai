@@ -673,6 +673,16 @@ type Spec struct {
 	// D5.5 there is still no cross-harness "supports extensions" boolean;
 	// only the exact profile's ToolPluginDelivery answers the question.
 	AdditionalExtensions []ExtensionDelivery `json:"additionalExtensions,omitempty"`
+
+	// Skills is the session's skill delivery (skill_delivery.go): the pure
+	// per-skill plan PlanSkillDelivery computed for this exact harness, and
+	// the content of every skill it delivers natively. Skills the plan left
+	// on the prompt are already folded into SystemPromptAppend; the exact
+	// adapter's SkillMaterializer writes and verifies the native ones before
+	// the child starts. The plan is part of the harness authority digest
+	// ("skills"). Nil — no skills and no repository policy on the work item —
+	// is inert for every harness.
+	Skills *SkillDelivery `json:"skills,omitempty"`
 }
 
 // WithToolLifecycleProfile returns a copy selecting one manifest-declared
@@ -908,6 +918,27 @@ type Result struct {
 	// never recorded the phase stays byte-identical. Additive — old
 	// platforms ignore it.
 	PreparationSeconds int64 `json:"preparationSeconds,omitempty"`
+
+	// ExitCode is the headless process exit when one existed. Nil when no
+	// process existed (a spawn failure) or the harness reported none:
+	// never zero for a spawn failure and never an invented agent verdict.
+	// Additive — old platforms ignore it.
+	ExitCode *int `json:"exitCode,omitempty"`
+
+	// OutputTail is the redacted, bounded diagnostic tail of a failed
+	// headless run. Empty on every other run. Bounded by the
+	// operator-facing byte/line limits and redacted before transport.
+	// Additive — old platforms ignore it.
+	OutputTail string `json:"outputTail,omitempty"`
+
+	// FailurePhase names where a failure was decided (for example
+	// "spawn", "provision" or "stream"). Empty on success.
+	// Additive — old platforms ignore it.
+	FailurePhase string `json:"failurePhase,omitempty"`
+
+	// FailureDecidedBy names who decided a failure (for example
+	// "runner"). Empty on success. Additive — old platforms ignore it.
+	FailureDecidedBy string `json:"failureDecidedBy,omitempty"`
 }
 
 // WIPRef identifies a reserved remote ref preserving a failed session.

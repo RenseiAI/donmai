@@ -37,6 +37,7 @@ func (*Provider) Manifest() agent.HarnessManifest {
 		Family:            agent.FamilyHarness,
 		ContractABI:       "harness/v2",
 		ExecutionSecurity: claudeExecutionSecurity,
+		Skills:            claudeSkillProfile,
 		Caps: agent.HarnessCaps{
 			SupportsMessageInjection: true,
 			// Owned at launch: a fresh spawn mints the session id and

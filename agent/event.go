@@ -166,6 +166,26 @@ func ReasoningEffortEvent(effort EffortLevel) SystemEvent {
 	return SystemEvent{Subtype: SystemSubtypeReasoningEffort, Message: string(effort)}
 }
 
+// SystemSubtypeAppliedReasoningEffort is the SystemEvent subtype an adapter
+// emits once per session, after the execution it launched is established,
+// recording the effort it actually sent. It is distinct from
+// SystemSubtypeReasoningEffort (requested-only): "applied" means the
+// adapter's final translated effort on a successfully established execution,
+// not proof of the provider's internal compute. Message carries the applied
+// level, or is empty when none was reported — in which case no applied effort
+// is known. The adapter-reported ladder is minimal plus every EffortLevel;
+// minimal is passed as EffortLevel("minimal") since it is outside the
+// requested ladder. The activity poster forwards it as a context marker built
+// from that fixed vocabulary, without altering the requested-effort report.
+const SystemSubtypeAppliedReasoningEffort = "applied_reasoning_effort"
+
+// AppliedReasoningEffortEvent builds the
+// SystemSubtypeAppliedReasoningEffort event for the effort an adapter
+// actually sent on an established execution.
+func AppliedReasoningEffortEvent(effort EffortLevel) SystemEvent {
+	return SystemEvent{Subtype: SystemSubtypeAppliedReasoningEffort, Message: string(effort)}
+}
+
 // SystemSubtypeToolCallBounds is the SystemEvent subtype a harness emits
 // once per session, after the session's InitEvent (which stays first, per
 // the event contract) and before any turn output, recording the bound it

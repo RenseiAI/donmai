@@ -635,6 +635,8 @@ func recognizedHarnessToken(token string) (agent.HarnessName, bool) {
 		return agent.HarnessPi, true
 	case string(agent.HarnessShell):
 		return agent.HarnessShell, true
+	case string(agent.HarnessMuse):
+		return agent.HarnessMuse, true
 	default:
 		return "", false
 	}

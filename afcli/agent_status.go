@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"strconv"
+	"strings"
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
@@ -104,8 +105,12 @@ func latestActivity(events []afclient.ActivityEvent) *afclient.ActivityEvent {
 	return &events[len(events)-1]
 }
 
-// writeSessionDetail renders the eight-row detail block to w using tabwriter
+// writeSessionDetail renders the detail block to w using tabwriter
 // for column alignment. Nil pointer fields on SessionDetail render as "-".
+// Terminal diagnostics (reason, budget breach, pull request, summary)
+// render as "unavailable" when absent so a missing diagnostic never
+// reads as a successful outcome; the Status row always carries the
+// server's status verbatim.
 func writeSessionDetail(w io.Writer, s afclient.SessionDetail, current *afclient.ActivityEvent) error {
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 
@@ -118,6 +123,10 @@ func writeSessionDetail(w io.Writer, s afclient.SessionDetail, current *afclient
 		{"Output Tokens:", intPtrValue(s.OutputTokens)},
 		{"Cost (USD):", costValue(s.CostUsd)},
 		{"Current Activity:", activityValue(current)},
+		{"Terminal Reason:", terminalReasonValue(s.TerminalReason)},
+		{"Budget Breach:", budgetBreachValue(s.BudgetBreach)},
+		{"Pull Request:", pullRequestValue(s.PullRequestURL, s.PullRequest)},
+		{"Summary:", summaryValue(s.Summary)},
 	}
 
 	for _, r := range rows {
@@ -153,4 +162,98 @@ func activityValue(a *afclient.ActivityEvent) string {
 		return emDash
 	}
 	return fmt.Sprintf("%s: %s", string(a.Type), a.Content)
+}
+
+// terminalReasonValue renders a structured terminal reason as
+// "code: message (phase/decidedBy)", or "unavailable" when absent.
+func terminalReasonValue(r *afclient.TerminalReason) string {
+	if r == nil {
+		return "unavailable"
+	}
+	code := r.Code
+	message := r.Message
+	switch {
+	case code != "" && message != "":
+		base := fmt.Sprintf("%s: %s", code, message)
+		return appendReasonContext(base, r.Phase, r.DecidedBy)
+	case message != "":
+		return appendReasonContext(message, r.Phase, r.DecidedBy)
+	case code != "":
+		return appendReasonContext(code, r.Phase, r.DecidedBy)
+	default:
+		return "unavailable"
+	}
+}
+
+func appendReasonContext(base, phase, decidedBy string) string {
+	switch {
+	case phase != "" && decidedBy != "":
+		return fmt.Sprintf("%s (%s/%s)", base, phase, decidedBy)
+	case phase != "":
+		return fmt.Sprintf("%s (%s)", base, phase)
+	case decidedBy != "":
+		return fmt.Sprintf("%s (%s)", base, decidedBy)
+	default:
+		return base
+	}
+}
+
+// budgetBreachValue renders a budget breach as "cap: detail",
+// or "unavailable" when absent.
+func budgetBreachValue(b *afclient.SessionBudgetBreach) string {
+	if b == nil {
+		return "unavailable"
+	}
+	switch {
+	case b.Cap != "" && b.Detail != "":
+		return fmt.Sprintf("%s: %s", b.Cap, b.Detail)
+	case b.Cap != "":
+		return b.Cap
+	case b.Detail != "":
+		return b.Detail
+	default:
+		return "unavailable"
+	}
+}
+
+// pullRequestValue renders the pull-request artifact, preferring the
+// structured record and falling back to the flat URL,
+// or "unavailable" when neither is present.
+func pullRequestValue(flatURL *string, pr *afclient.SessionPullRequest) string {
+	url := ""
+	if flatURL != nil {
+		url = *flatURL
+	}
+	number := 0
+	hasNumber := false
+	if pr != nil {
+		if pr.URL != "" {
+			url = pr.URL
+		}
+		if pr.Number != nil {
+			number = *pr.Number
+			hasNumber = true
+		}
+	}
+	switch {
+	case hasNumber && url != "":
+		return fmt.Sprintf("#%d: %s", number, url)
+	case hasNumber:
+		return fmt.Sprintf("#%d", number)
+	case url != "":
+		return url
+	default:
+		return "unavailable"
+	}
+}
+
+// summaryValue renders the session summary, or "unavailable" when absent.
+func summaryValue(s *string) string {
+	if s == nil {
+		return "unavailable"
+	}
+	if trimmed := strings.TrimSpace(*s); trimmed != "" {
+		return trimmed
+	}
+	return "unavailable"
 }

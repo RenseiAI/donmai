@@ -84,6 +84,110 @@ func renderGrid(t theme.Theme, cards []SessionCard, selectedIdx, frame, width, m
 	return windowBlocks(t, blocks, counts, selRow, maxLines, plain, !plain)
 }
 
+// blockWindow describes which blocks windowBlocks shows. expanded means a
+// contiguous lo..hi range fits with markers; partial means the selected
+// block alone exceeds the budget and only its head (visible lines) shows.
+// topMarker/bottomMarker report marker rows; bottomPartial marks the bare
+// "↓ more" marker for a partially shown last block. The mouse hit test
+// shares this exact decision so clicks land on the rendered window.
+type blockWindow struct {
+	lo, hi        int
+	expanded      bool
+	partial       bool
+	visible       int
+	topMarker     bool
+	bottomMarker  bool
+	bottomPartial bool
+}
+
+// computeBlockWindow shares windowBlocks' placement: expand outward from
+// the selection while the cost (blocks plus marker rows) fits, else show
+// the selected head after its frame row. heights holds each block's
+// display lines; counts holds hidden-session counts per block.
+func computeBlockWindow(heights, counts []int, selBlock, maxLines int, framed bool) blockWindow {
+	nBlocks := len(heights)
+	if nBlocks == 0 {
+		return blockWindow{}
+	}
+	sel := max(0, min(selBlock, nBlocks-1))
+	total := 0
+	for _, h := range heights {
+		total += h
+	}
+	if maxLines <= 0 || total <= maxLines {
+		return blockWindow{lo: 0, hi: nBlocks - 1, expanded: true}
+	}
+	hidden := func(from, to int) int {
+		sum := 0
+		for i := from; i < to; i++ {
+			sum += counts[i]
+		}
+		return sum
+	}
+	cost := func(lo, hi int) int {
+		sum := 0
+		for i := lo; i <= hi; i++ {
+			sum += heights[i]
+		}
+		if lo > 0 {
+			sum++
+		}
+		if hi < nBlocks-1 {
+			sum++
+		}
+		return sum
+	}
+	lo, hi := sel, sel
+	if cost(lo, hi) <= maxLines {
+		for {
+			progress := false
+			if lo > 0 && cost(lo-1, hi) <= maxLines {
+				lo--
+				progress = true
+			}
+			if hi < nBlocks-1 && cost(lo, hi+1) <= maxLines {
+				hi++
+				progress = true
+			}
+			if !progress {
+				break
+			}
+		}
+		return blockWindow{lo: lo, hi: hi, expanded: true, topMarker: hidden(0, lo) > 0, bottomMarker: hidden(hi+1, nBlocks) > 0}
+	}
+	// The selected block alone exceeds the pane. Keep its identity row
+	// visible first, then spend the remaining rows on content and markers.
+	// A one-line pane cannot fit both a card row and an overflow marker.
+	effective := heights[sel]
+	if framed && effective > 1 {
+		effective-- // the row's top frame carries no content
+	}
+	above := hidden(0, sel)
+	below := hidden(sel+1, nBlocks)
+	markers := 0
+	if above > 0 && maxLines > 1 {
+		markers++
+	}
+	if below > 0 && maxLines-markers > 1 {
+		markers++
+	}
+	visible := maxLines - markers
+	partial := effective > visible
+	if partial && below == 0 && maxLines-markers > 1 {
+		markers++
+		visible--
+	}
+	visible = min(visible, effective)
+	visible = max(visible, 0)
+	topMarker := above > 0 && markers > 0
+	remain := markers
+	if topMarker {
+		remain--
+	}
+	bottomMarker := remain > 0 && (below > 0 || partial)
+	return blockWindow{lo: sel, hi: sel, partial: true, visible: visible, topMarker: topMarker, bottomMarker: bottomMarker, bottomPartial: bottomMarker && below == 0 && partial}
+}
+
 // windowBlocks trims rendered blocks to at most maxLines display lines,
 // keeping the selected block visible: it expands outward from the selection
 // and collapses hidden blocks above/below into one marker line each
@@ -96,7 +200,7 @@ func windowBlocks(t theme.Theme, blocks []string, counts []int, selBlock, maxLin
 	if len(blocks) == 0 {
 		return ""
 	}
-	selBlock = max(0, min(selBlock, len(blocks)-1))
+	sel := max(0, min(selBlock, len(blocks)-1))
 	heights := make([]int, len(blocks))
 	total := 0
 	for i, b := range blocks {
@@ -106,7 +210,6 @@ func windowBlocks(t theme.Theme, blocks []string, counts []int, selBlock, maxLin
 	if maxLines <= 0 || total <= maxLines {
 		return strings.Join(blocks, "\n")
 	}
-
 	hidden := func(from, to int) int {
 		n := 0
 		for i := from; i < to; i++ {
@@ -114,80 +217,34 @@ func windowBlocks(t theme.Theme, blocks []string, counts []int, selBlock, maxLin
 		}
 		return n
 	}
-	cost := func(lo, hi int) int {
-		n := 0
-		for i := lo; i <= hi; i++ {
-			n += heights[i]
-		}
-		if lo > 0 {
-			n++
-		}
-		if hi < len(blocks)-1 {
-			n++
-		}
-		return n
-	}
-	lo, hi := selBlock, selBlock
-	if cost(lo, hi) <= maxLines {
-		for {
-			progress := false
-			if lo > 0 && cost(lo-1, hi) <= maxLines {
-				lo--
-				progress = true
-			}
-			if hi < len(blocks)-1 && cost(lo, hi+1) <= maxLines {
-				hi++
-				progress = true
-			}
-			if !progress {
-				break
-			}
-		}
+	w := computeBlockWindow(heights, counts, sel, maxLines, framed)
+	if w.expanded {
 		var out []string
-		if n := hidden(0, lo); n > 0 {
-			out = append(out, overflowMarker(t, true, n, plain))
+		if w.topMarker {
+			out = append(out, overflowMarker(t, true, hidden(0, w.lo), plain))
 		}
-		out = append(out, blocks[lo:hi+1]...)
-		if n := hidden(hi+1, len(blocks)); n > 0 {
-			out = append(out, overflowMarker(t, false, n, plain))
+		out = append(out, blocks[w.lo:w.hi+1]...)
+		if w.bottomMarker {
+			out = append(out, overflowMarker(t, false, hidden(w.hi+1, len(blocks)), plain))
 		}
 		return strings.Join(out, "\n")
 	}
-
-	// The selected block alone exceeds the pane. Keep its identity row
-	// visible first, then spend the remaining rows on content and markers.
-	// A one-line pane cannot fit both a card row and an overflow marker.
-	lines := strings.Split(blocks[selBlock], "\n")
+	lines := strings.Split(blocks[sel], "\n")
 	if framed && len(lines) > 1 {
 		lines = lines[1:] // the row's top frame carries no content
 	}
-	above := hidden(0, selBlock)
-	below := hidden(selBlock+1, len(blocks))
-	markers := 0
-	if above > 0 && maxLines > 1 {
-		markers++
-	}
-	if below > 0 && maxLines-markers > 1 {
-		markers++
-	}
-	visible := maxLines - markers
-	partial := len(lines) > visible
-	if partial && below == 0 && maxLines-markers > 1 {
-		markers++
-		visible--
-	}
-	visible = min(visible, len(lines))
+	above := hidden(0, sel)
+	below := hidden(sel+1, len(blocks))
 	var out []string
-	if above > 0 && markers > 0 {
+	if w.topMarker {
 		out = append(out, overflowMarker(t, true, above, plain))
-		markers--
 	}
-	out = append(out, lines[:visible]...)
-	if markers > 0 {
-		if below > 0 {
-			out = append(out, overflowMarker(t, false, below, plain))
-		} else if partial {
+	out = append(out, lines[:min(w.visible, len(lines))]...)
+	if w.bottomMarker {
+		if w.bottomPartial {
 			out = append(out, overflowMarker(t, false, -1, plain))
+		} else {
+			out = append(out, overflowMarker(t, false, below, plain))
 		}
 	}
 	return strings.Join(out, "\n")

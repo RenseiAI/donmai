@@ -35,7 +35,14 @@ import (
 type failClosedVerifier struct{ reason string }
 
 // Verify implements BinaryVerifier. It always refuses the swap.
-func (v failClosedVerifier) Verify(_ context.Context, _, _ string) (bool, string) {
+// It respects cancellation so an expired consent deadline is reported
+// as a cancellation rather than a generic refusal.
+func (v failClosedVerifier) Verify(ctx context.Context, _, _ string) (bool, string) {
+	select {
+	case <-ctx.Done():
+		return false, fmt.Sprintf("update cancelled: %v", ctx.Err())
+	default:
+	}
 	return false, v.reason
 }
 
@@ -131,11 +138,23 @@ func loadUpdateTrustRoot(path string) (root.TrustedMaterial, string, error) {
 // Verify implements BinaryVerifier. signatureValue is the sigstore bundle
 // JSON downloaded from `<binaryURL>.sigstore`; contentHash is the
 // lowercase hex SHA-256 of the downloaded binary (already checked against
-// the manifest by RunUpdate before this point).
-func (v *sigstoreBinaryVerifier) Verify(_ context.Context, contentHash, signatureValue string) (bool, string) {
+// the manifest by RunUpdate before this point). It respects cancellation:
+// a consent deadline that expires during verification must not let the
+// caller proceed to a swap.
+func (v *sigstoreBinaryVerifier) Verify(ctx context.Context, contentHash, signatureValue string) (bool, string) {
+	select {
+	case <-ctx.Done():
+		return false, fmt.Sprintf("update cancelled: %v", ctx.Err())
+	default:
+	}
 	var b bundle.Bundle
 	if err := b.UnmarshalJSON([]byte(signatureValue)); err != nil {
 		return false, fmt.Sprintf("parse sigstore bundle: %v", err)
+	}
+	select {
+	case <-ctx.Done():
+		return false, fmt.Sprintf("update cancelled: %v", ctx.Err())
+	default:
 	}
 	return v.verifyEntity(&b, contentHash)
 }

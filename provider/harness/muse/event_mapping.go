@@ -25,10 +25,14 @@ type mapperState struct {
 	// totalCostUSD is the last cumulative.cost.usd observed. The
 	// host's cost member is the documented exception to
 	// accumulate-only: it may move either way on price re-adoption.
-	totalCostUSD   float64
-	lastCostUSD    float64
-	hasCost        bool
-	costPartial    bool
+	totalCostUSD float64
+	lastCostUSD  float64
+	hasCost      bool
+	costPartial  bool
+	// totalInputTok is the cumulative counted-once PROMPT total
+	// (cumulative.promptTokens), which includes cache-read tokens. It is the
+	// delta base for the next session/tokenUsage; it is NOT the uncached
+	// figure. Emit it through uncachedInput, never raw.
 	totalInputTok  int64
 	totalOutputTok int64
 	totalCachedTok int64
@@ -40,6 +44,12 @@ type mapperState struct {
 	// applies (the host guarantees item/completed is authoritative,
 	// including for itemIds never opened on this connection).
 	items map[string]int
+	// progressSent records the itemIds that already emitted their
+	// single best-effort progress event. Started/updated emit at most
+	// one StreamProgress per item; deltas emit nothing; completion
+	// emits the final text. This bounds intermediate output to one
+	// event per item instead of one per streaming fragment.
+	progressSent map[string]struct{}
 
 	// pendingToolUse records ToolUseEvents emitted for open toolCall /
 	// userShell items so completion can pair the result.
@@ -64,6 +74,7 @@ func newMapperState(model string) *mapperState {
 		model:          model,
 		turnStarted:    make(map[string]int64),
 		items:          make(map[string]int),
+		progressSent:   make(map[string]struct{}),
 		pendingToolUse: make(map[string]pendingTool),
 		seenTurns:      make(map[string]struct{}),
 	}
@@ -145,6 +156,9 @@ func mapNotification(method string, params json.RawMessage, state *mapperState, 
 			NoticeKind: agent.ContextUsageThreshold,
 			Raw:        raw,
 		}
+		// usedTokens is the counted-once prompt plus output occupancy of the
+		// context window, so it deliberately stays the FULL size, cached
+		// tokens included, and is not normalised to uncached input.
 		notice.InputTokens = &used
 		if window > 0 {
 			notice.ContextWindowSize = &window
@@ -212,6 +226,13 @@ func mapNotification(method string, params json.RawMessage, state *mapperState, 
 		}}
 
 	default:
+		if subtype, ok := recordOnlyNotifications[method]; ok {
+			return []agent.Event{agent.SystemEvent{
+				Subtype: subtype,
+				Message: "Muse notification: " + method,
+				Raw:     raw,
+			}}
+		}
 		return []agent.Event{agent.SystemEvent{
 			Subtype: "unknown",
 			Message: "Unhandled muse notification: " + method,
@@ -222,6 +243,46 @@ func mapNotification(method string, params json.RawMessage, state *mapperState, 
 
 func methodToSubtype(m string) string {
 	return strings.ReplaceAll(m, "/", "_")
+}
+
+// recordOnlyNotifications is the explicit allowlist of additional
+// host→client notifications from the pinned stable export that carry
+// no lifecycle semantics for this harness. Each maps to a named
+// nonterminal SystemEvent with Raw preserved verbatim and a neutral
+// method message. It is consulted only after every special case above
+// has missed; anything outside this finite list still falls through
+// to the unknown diagnostic — never broaden this into a catch-all
+// normalizer (methodToSubtype replaces slashes only, so every
+// subtype here is recorded explicitly).
+//
+// Out of scope by design: server requests (approval/request,
+// userInput/request — answered on the server-request door in
+// handle.go), client-to-server notifications (initialized,
+// userInput/engaged — never inbound), and approval/reviewing plus
+// session/branchChanged, reserved for dedicated mappings.
+var recordOnlyNotifications = map[string]string{
+	"computerUseSetup/changed":       "computer_use_setup_changed",
+	"monitor/inboxItemAdmitted":      "monitor_inbox_item_admitted",
+	"monitor/inboxItemDrained":       "monitor_inbox_item_drained",
+	"monitor/inboxItemVoided":        "monitor_inbox_item_voided",
+	"plugin/changed":                 "plugin_changed",
+	"plugin/marketplaceChanged":      "plugin_marketplace_changed",
+	"recap/completed":                "recap_completed",
+	"session/goalChanged":            "session_goal_changed",
+	"session/leaveCompleted":         "session_leave_completed",
+	"session/listChanged":            "session_list_changed",
+	"session/modelChanged":           "session_model_changed",
+	"session/modelRouteUnserved":     "session_model_route_unserved",
+	"session/nameChanged":            "session_name_changed",
+	"session/reasoningEffortChanged": "session_reasoning_effort_changed",
+	"session/viewHealthChanged":      "session_view_health_changed",
+	"skill/changed":                  "skill_changed",
+	"turn/modelRetryScheduled":       "turn_model_retry_scheduled",
+	// userInput/requested is the durable fold of an opened prompt; its
+	// subtype stays distinct from the server-request door's
+	// user_input_requested (handle.go) so the two doors never conflate.
+	"userInput/requested": "user_input_prompt_opened",
+	"userInput/settled":   "user_input_settled",
 }
 
 // mapTurnCompleted handles turn/completed, the only path that emits a
@@ -257,6 +318,9 @@ func mapTurnCompleted(params json.RawMessage, state *mapperState, raw any) []age
 		}
 		reasoning = p.Usage.ReasoningTokens
 	}
+	// Both sources carry the prompt total (cached tokens included); the
+	// shared contract reports the uncached remainder in InputTokens.
+	in = uncachedInput(in, cached)
 	cost := &agent.CostData{
 		InputTokens:       in,
 		OutputTokens:      out,
@@ -338,6 +402,22 @@ func mapTurnCompleted(params json.RawMessage, state *mapperState, raw any) []age
 	}
 }
 
+// uncachedInput converts Muse's prompt-inclusive input count into the shared
+// contract's uncached input (agent.CostData: InputTokens excludes cache read
+// and write tokens, which ride CachedInputTokens and CacheWriteTokens).
+//
+// Muse documents TokenUsage.cachedTokens as living "inside or beside"
+// inputTokens depending on the provider, which is why it also publishes a
+// counted-once promptTokens. Observed production usage shows cache reads are
+// always <= inputTokens and nearly equal to it, i.e. inside (OpenAI-style
+// prompt total). The cache-write split is only reported when a provider
+// distinguishes it and is not documented as part of inputTokens, so it is
+// not subtracted. The result is clamped at 0 so a beside-convention provider
+// or a stale counter can never yield a negative.
+func uncachedInput(prompt, cacheRead int64) int64 {
+	return max(prompt-cacheRead, 0)
+}
+
 // mapTokenUsage emits step usage while retaining cumulative terminal totals.
 // Cost may be re-priced downward; only positive changes are new spend.
 func mapTokenUsage(params json.RawMessage, state *mapperState, _ any) []agent.Event {
@@ -384,6 +464,7 @@ func mapTokenUsage(params json.RawMessage, state *mapperState, _ any) []agent.Ev
 	state.totalCachedTok = cached
 	state.cacheWriteTok = cacheWrite
 	state.reasoningTok += usage.ReasoningTokens
+	usage.InputTokens = uncachedInput(usage.InputTokens, read)
 	var observedCost *float64
 	if p.Cumulative.Cost != nil {
 		delta := max(p.Cumulative.Cost.USD-state.lastCostUSD, 0)
@@ -441,19 +522,49 @@ func mapItemEvent(method string, params json.RawMessage, state *mapperState, raw
 		// prompt in the activity stream.
 		return nil
 	case ItemKindAgentMessage:
+		// Assistant text rides one complete message per item: the
+		// completion snapshot is authoritative and the ONLY
+		// AssistantTextEvent for the item. Started/updated emit at
+		// most one content-free liveness event (StreamProgress) per
+		// item, never text fragments: the runner scans each
+		// AssistantTextEvent for line-anchored verdict markers, so a
+		// marker split across fragments would lose its verdict and
+		// the summary would retain only the trailing fragment (the
+		// ResultEvent carries no Message to repair it). Deltas emit
+		// nothing; completion emits the full snapshot.
 		if isCompleted {
+			delete(state.progressSent, item.ItemID)
 			if text := itemText(&item); text != "" {
 				return []agent.Event{agent.AssistantTextEvent{Text: text, Raw: raw}}
 			}
+			return nil
 		}
-		return nil
+		if _, ok := state.progressSent[item.ItemID]; ok {
+			return nil
+		}
+		if state.progressSent == nil {
+			state.progressSent = make(map[string]struct{})
+		}
+		state.progressSent[item.ItemID] = struct{}{}
+		return []agent.Event{agent.StreamProgressEvent()}
 	case ItemKindReasoning:
+		// Reasoning completes as a single SystemEvent; started/updated
+		// emit at most one liveness event per item, deltas nothing.
 		if isCompleted {
+			delete(state.progressSent, item.ItemID)
 			if msg := reasoningText(&item); msg != "" {
 				return []agent.Event{agent.SystemEvent{Subtype: "reasoning", Message: msg, Raw: raw}}
 			}
+			return nil
 		}
-		return nil
+		if _, ok := state.progressSent[item.ItemID]; ok {
+			return nil
+		}
+		if state.progressSent == nil {
+			state.progressSent = make(map[string]struct{})
+		}
+		state.progressSent[item.ItemID] = struct{}{}
+		return []agent.Event{agent.StreamProgressEvent()}
 	case ItemKindToolCall:
 		return mapToolCall(item, method, isCompleted, state, raw)
 	case ItemKindUserShell:
@@ -490,10 +601,9 @@ func mapItemEvent(method string, params json.RawMessage, state *mapperState, raw
 	}
 }
 
-// mapItemDelta appends a streaming delta to an open item's field. Deltas
-// never bump revision and never emit agent events directly (the full
-// text arrives on item/completed); they are tracked only to prove the
-// item is live. Deltas during a gap are dropped.
+// mapItemDelta never emits agent events directly: the full text arrives
+// on item/completed, so deltas are tracked only to prove the item is
+// live. Deltas during a gap are dropped.
 func mapItemDelta(params json.RawMessage, state *mapperState, raw any) []agent.Event {
 	_ = raw
 	var p ItemDeltaParams
@@ -518,7 +628,12 @@ func itemText(item *Item) string {
 }
 
 func reasoningText(item *Item) string {
-	// summary is an array of parts; join text members.
+	// Current hosts export summary as an array of strings. Older hosts
+	// used text-bearing parts; retain that decoding for existing sessions.
+	var summary []string
+	if json.Unmarshal(item.Summary, &summary) == nil && len(summary) > 0 {
+		return strings.Join(summary, "\n")
+	}
 	if len(item.Summary) > 0 {
 		var parts []struct {
 			Text *string `json:"text"`
