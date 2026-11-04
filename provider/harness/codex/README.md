@@ -289,14 +289,20 @@ broader. A workspace that cannot be resolved to an absolute path fails the
 spawn with an error naming the missing trust, because hanging on the review
 is the worse outcome.
 
-The **headless app-server lane does not receive project-trust, global approval,
-or sandbox seeds**: command/file approvals ride the bridge in `approval.go`,
-and trusting its working directory would make codex load that directory's
+The **headless app-server lane does not receive global approval or sandbox
+seeds, and never trusts its working directory**: command/file approvals ride
+the bridge in `approval.go`, and a trusted directory would make codex load its
 `.codex/config.toml` as a project configuration layer, admitting `mcp_servers`
-the isolated `CODEX_HOME` boundary exists to exclude. MCP tool approval is the
-exception because Codex does not expose it on that bridge. Each requested
-server receives only the scoped `default_tools_approval_mode = "approve"` key
-inside the Provider-owned config.
+the isolated `CODEX_HOME` boundary exists to exclude. Leaving the directory
+out of the projects table is not enough: with no entry, codex-cli 0.164.0
+applied a repository's `.codex/config.toml` `developer_instructions` to the
+thread. Each Spawn/Resume therefore records the working directory (and its
+symlink-resolved form) as `[projects."<dir>"] trust_level = "untrusted"` in
+the Provider-owned `config.toml`, unless the operator's app-server argv
+(`Options.Args`) sets `projects` itself with `-c`/`--config`. MCP tool approval
+is the exception because Codex does not expose it on that bridge. Each
+requested server receives only the scoped `default_tools_approval_mode =
+"approve"` key inside the Provider-owned config.
 
 ## Activity-hook telemetry (platform seats)
 
@@ -445,7 +451,7 @@ surfacing as a spurious `client stopped` Spawn failure.
 | `interactive.go`      | Interactive PTY spawn mode and native name attach |
 | `interactive_name.go` | Per-session app-server name/readback lifecycle    |
 | `skills.go`           | Native skill delivery into the private `CODEX_HOME` |
-| `trust.go`            | Startup trust seeding for the interactive mode    |
+| `trust.go`            | Workspace trust: interactive seeds, headless untrusted entry |
 | `spec_translation.go` | `agent.Spec` → JSON-RPC param mapping             |
 | `event_mapping.go`    | JSON-RPC notification → `agent.Event` mapping     |
 | `signal_unix.go`      | `SIGTERM` lookup (unix)                           |

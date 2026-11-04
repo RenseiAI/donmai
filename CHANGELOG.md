@@ -12,6 +12,10 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 - Deliver card skills natively to Codex through the session's private Codex home, confirmed by the app-server's skill listing before the thread starts, with a prompt fallback for any skill it does not confirm
 
+### Fixes
+
+- Record the Codex headless working directory as an untrusted project, so a repository's Codex project config no longer reaches the thread
+
 ## v0.73.0 — 2026-11-03
 
 ### Features

@@ -656,6 +656,11 @@ func (p *Provider) ensureHeadlessReady(spec agent.Spec) (agent.Spec, stagedSkill
 			return spec, stagedSkills{}, fmt.Errorf("%w: codex host-session auth: %w", agent.ErrSpawnFailed, err)
 		}
 	}
+	// Record the working directory as untrusted before the thread can load
+	// its project config (trust.go).
+	if err := p.recordUntrustedWorkspaceLocked(spec.Cwd); err != nil {
+		return spec, stagedSkills{}, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
+	}
 	skills, err := p.stageSkillsLocked(spec)
 	if err != nil {
 		return spec, stagedSkills{}, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
