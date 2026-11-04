@@ -25,10 +25,14 @@ type mapperState struct {
 	// totalCostUSD is the last cumulative.cost.usd observed. The
 	// host's cost member is the documented exception to
 	// accumulate-only: it may move either way on price re-adoption.
-	totalCostUSD   float64
-	lastCostUSD    float64
-	hasCost        bool
-	costPartial    bool
+	totalCostUSD float64
+	lastCostUSD  float64
+	hasCost      bool
+	costPartial  bool
+	// totalInputTok is the cumulative counted-once PROMPT total
+	// (cumulative.promptTokens), which includes cache-read tokens. It is the
+	// delta base for the next session/tokenUsage; it is NOT the uncached
+	// figure. Emit it through uncachedInput, never raw.
 	totalInputTok  int64
 	totalOutputTok int64
 	totalCachedTok int64
@@ -152,6 +156,9 @@ func mapNotification(method string, params json.RawMessage, state *mapperState, 
 			NoticeKind: agent.ContextUsageThreshold,
 			Raw:        raw,
 		}
+		// usedTokens is the counted-once prompt plus output occupancy of the
+		// context window, so it deliberately stays the FULL size, cached
+		// tokens included, and is not normalised to uncached input.
 		notice.InputTokens = &used
 		if window > 0 {
 			notice.ContextWindowSize = &window
@@ -311,6 +318,9 @@ func mapTurnCompleted(params json.RawMessage, state *mapperState, raw any) []age
 		}
 		reasoning = p.Usage.ReasoningTokens
 	}
+	// Both sources carry the prompt total (cached tokens included); the
+	// shared contract reports the uncached remainder in InputTokens.
+	in = uncachedInput(in, cached)
 	cost := &agent.CostData{
 		InputTokens:       in,
 		OutputTokens:      out,
@@ -392,6 +402,22 @@ func mapTurnCompleted(params json.RawMessage, state *mapperState, raw any) []age
 	}
 }
 
+// uncachedInput converts Muse's prompt-inclusive input count into the shared
+// contract's uncached input (agent.CostData: InputTokens excludes cache read
+// and write tokens, which ride CachedInputTokens and CacheWriteTokens).
+//
+// Muse documents TokenUsage.cachedTokens as living "inside or beside"
+// inputTokens depending on the provider, which is why it also publishes a
+// counted-once promptTokens. Observed production usage shows cache reads are
+// always <= inputTokens and nearly equal to it, i.e. inside (OpenAI-style
+// prompt total). The cache-write split is only reported when a provider
+// distinguishes it and is not documented as part of inputTokens, so it is
+// not subtracted. The result is clamped at 0 so a beside-convention provider
+// or a stale counter can never yield a negative.
+func uncachedInput(prompt, cacheRead int64) int64 {
+	return max(prompt-cacheRead, 0)
+}
+
 // mapTokenUsage emits step usage while retaining cumulative terminal totals.
 // Cost may be re-priced downward; only positive changes are new spend.
 func mapTokenUsage(params json.RawMessage, state *mapperState, _ any) []agent.Event {
@@ -438,6 +464,7 @@ func mapTokenUsage(params json.RawMessage, state *mapperState, _ any) []agent.Ev
 	state.totalCachedTok = cached
 	state.cacheWriteTok = cacheWrite
 	state.reasoningTok += usage.ReasoningTokens
+	usage.InputTokens = uncachedInput(usage.InputTokens, read)
 	var observedCost *float64
 	if p.Cumulative.Cost != nil {
 		delta := max(p.Cumulative.Cost.USD-state.lastCostUSD, 0)
