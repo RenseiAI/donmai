@@ -319,12 +319,13 @@ func NewSpawnPlan(spec agent.Spec) SpawnPlan {
 func ignoredSpecFields(spec agent.Spec) []SpecFieldNote {
 	var notes []SpecFieldNote
 
-	// Skills: codex has no native skill layout; the runner folded every
-	// skill it could deliver into SystemPromptAppend already.
+	// Skills: native skills are written into the private CODEX_HOME before
+	// the app-server starts and confirmed by skills/list (skills.go); the
+	// runner folded the prompt-delivered ones into SystemPromptAppend.
 	if spec.Skills.HasNative() {
 		notes = append(notes, SpecFieldNote{
 			Field:  "Skills",
-			Reason: "codex declares no native skill layout; only prompt-delivered skills (already in SystemPromptAppend) reach the session",
+			Reason: "native skills are materialized in the private CODEX_HOME before app-server start, not a thread/start param; prompt-delivered skills are already in SystemPromptAppend",
 		})
 	}
 

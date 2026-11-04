@@ -223,6 +223,40 @@ authority. A rejected id surfaces as codex's own nonzero exit (or, for the
 headless lane, a JSON-RPC error), never a silent fallback to a different
 model.
 
+## Skills (headless app-server lane)
+
+A work item's skills reach Codex natively through the Provider's private
+`CODEX_HOME` (`skills.go`):
+
+```
+$CODEX_HOME/skills/donmai-<id>/SKILL.md   (+ the rest of the package)
+```
+
+Codex discovers `$CODEX_HOME/skills` at user scope whatever the trust of the
+working directory, with no flag or feature switch (codex-cli 0.164.0). The
+home sits outside the working directory, so nothing reaches the worktree, and
+the session sandbox can read the skills but not write them.
+
+- **Before start.** A skill written after the app-server starts is missing
+  from listings until codex's file watcher catches up, so the skills are
+  written at the first headless Spawn/Resume, before the process starts, and
+  each file is read back against the plan's sha256. The set is pinned: a
+  later Spawn/Resume on the same app-server with the identical set re-reads
+  the files (a changed or removed file falls back and its directory is
+  removed); any other set falls back whole.
+- **Before `thread/start`.** `skills/list {cwds:[cwd], forceReload:true}`
+  must list each `SKILL.md` as an enabled user skill. A skill it does not
+  list, or every skill when the listing fails, falls back.
+- **Fallback.** A skill's body is appended to `developerInstructions` on a
+  fresh thread, or ahead of the first turn's input on a resumed one, under
+  the same cap as the plan's own prompt residue. A `native_required` skill
+  that cannot be confirmed refuses the spawn.
+
+The interactive PTY lane is prompt-only (the plan gives a human-controlled
+session no native layout). Repository skills (`.agents/skills`,
+`.codex/skills`) load whatever the workspace trust, so the plan records the
+repository-skill policy as `all`.
+
 ## Startup trust (interactive spawn mode)
 
 The codex TUI holds modal startup reviews before it reads a keystroke, and a
@@ -410,6 +444,7 @@ surfacing as a spurious `client stopped` Spawn failure.
 | `approval.go`         | Approval bridge (Spec.PermissionConfig → decision) |
 | `interactive.go`      | Interactive PTY spawn mode and native name attach |
 | `interactive_name.go` | Per-session app-server name/readback lifecycle    |
+| `skills.go`           | Native skill delivery into the private `CODEX_HOME` |
 | `trust.go`            | Startup trust seeding for the interactive mode    |
 | `spec_translation.go` | `agent.Spec` → JSON-RPC param mapping             |
 | `event_mapping.go`    | JSON-RPC notification → `agent.Event` mapping     |

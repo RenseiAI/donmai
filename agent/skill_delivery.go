@@ -64,7 +64,9 @@ const (
 // InTreeSkillDirPrefix is the reserved directory-name prefix for a skill the
 // runner writes inside the working directory (.agents/skills/donmai-<id>).
 // The checkout's exclude file and the backstop both key on it
-// (runtime/harnessstate), so such a directory never enters a commit.
+// (runtime/harnessstate), so such a directory never enters a commit. The
+// harness-home layout uses the same prefix, which keeps the runner's skills
+// apart from anything the harness installs in its own skills root.
 const InTreeSkillDirPrefix = "donmai-"
 
 // SkillMarkerFile is written beside a skill the runner materializes inside
@@ -89,6 +91,11 @@ const (
 	// directory per skill inside the working directory, discovered by the
 	// harness once the workspace is trusted.
 	SkillLayoutWorkspace SkillLayout = "workspace"
+	// SkillLayoutHarnessHome is one reserved donmai-<id> directory per
+	// skill in the skills root of the harness's private, per-session home
+	// directory, outside the working directory. The harness discovers it
+	// when it starts, with no flag and whatever the workspace's trust.
+	SkillLayoutHarnessHome SkillLayout = "harness_home"
 )
 
 // RepoSkillsControl names how far a harness can govern repository skills.
@@ -141,6 +148,11 @@ const (
 	SkillReasonDuplicateID       SkillDeliveryReason = "duplicate_id"
 	SkillReasonNoBody            SkillDeliveryReason = "no_body"
 	SkillReasonPromptCap         SkillDeliveryReason = "prompt_cap_exceeded"
+	// SkillReasonNativeUnconfirmed is a skill the plan delivered natively
+	// that the adapter could not confirm before the session started: the
+	// readback failed, or the harness did not list it as loaded. The
+	// adapter then puts the skill's body on the prompt instead.
+	SkillReasonNativeUnconfirmed SkillDeliveryReason = "native_unconfirmed"
 )
 
 // SkillPlannedFile is one file a native entry writes.
@@ -458,7 +470,7 @@ func normalizeRepoSkillAllow(in []string) []string {
 
 // SkillDirName is the directory a native skill is written to for layout.
 func SkillDirName(layout SkillLayout, id string) string {
-	if layout == SkillLayoutWorkspace {
+	if layout == SkillLayoutWorkspace || layout == SkillLayoutHarnessHome {
 		return InTreeSkillDirPrefix + id
 	}
 	return id
