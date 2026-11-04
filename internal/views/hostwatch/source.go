@@ -72,6 +72,11 @@ type SessionCard struct {
 	StageName    string
 	StageRole    string
 	StageRunRole string
+	// CardHandle is the handle of the card the wire dispatched the work to.
+	// It is not the embedder display Handle above. It comes from the daemon
+	// index handle and is untrusted text: the card renders it only through
+	// displayLabel. Empty for legacy work items.
+	CardHandle string
 	// LastHeartbeatUnixMs is the most recent session heartbeat the runner
 	// observed (state.json snapshot, unix-ms). Zero when not reported.
 	LastHeartbeatUnixMs int64
@@ -268,6 +273,9 @@ func (s *Source) Snapshot() Snapshot {
 			card.StageName = st.Name
 			card.StageRole = string(st.Role)
 			card.StageRunRole = string(st.RunRole)
+		}
+		if wc := h.Card; wc != nil {
+			card.CardHandle = wc.Handle
 		}
 		if card.isHeld() {
 			// A held row has no live process or workarea, even if a malformed

@@ -96,6 +96,36 @@ func TestSessionCardWorkLabel(t *testing.T) {
 			card: SessionCard{WorkType: "qa", StageName: strings.Repeat("検", 500)},
 			want: strings.Repeat("検", maxStageNameRunes-1) + "…",
 		},
+		{
+			name: "the stage label names the dispatched card",
+			card: SessionCard{WorkType: "development", StageName: "Persona", StageRole: "intake", CardHandle: "builder"},
+			want: "Persona · intake (builder)",
+		},
+		{
+			name: "the work type fallback names the dispatched card",
+			card: SessionCard{WorkType: "qa", CardHandle: "reviewer"},
+			want: "qa (reviewer)",
+		},
+		{
+			name: "a stage without a card is unchanged",
+			card: SessionCard{WorkType: "development", StageName: "Persona", StageRole: "intake"},
+			want: "Persona · intake",
+		},
+		{
+			name: "escape sequences and control characters are stripped from the handle",
+			card: SessionCard{WorkType: "qa", StageName: "Verify", StageRole: "review", CardHandle: "\u202ebui\x1b[31mld\x1b]0;pwned\x07er\x00\u200b"},
+			want: "Verify · review (builder)",
+		},
+		{
+			name: "a handle that sanitizes to nothing is dropped",
+			card: SessionCard{WorkType: "qa", StageName: "Verify", StageRole: "review", CardHandle: "\u202e\x1b[31m\n\u200b"},
+			want: "Verify · review",
+		},
+		{
+			name: "a long handle is bounded",
+			card: SessionCard{WorkType: "qa", StageName: "Verify", CardHandle: strings.Repeat("h", 500)},
+			want: "Verify (" + strings.Repeat("h", maxCardHandleRunes-1) + "…)",
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -109,7 +139,7 @@ func TestSessionCardWorkLabel(t *testing.T) {
 					t.Fatalf("workLabel() = %q carries unsafe rune %U", got, r)
 				}
 			}
-			if bound := maxStageNameRunes + len(" · ") + maxStageRoleRunes; utf8.RuneCountInString(got) > bound && tc.card.StageName != "" {
+			if bound := maxStageNameRunes + len(" · ") + maxStageRoleRunes + len(" ()") + maxCardHandleRunes; utf8.RuneCountInString(got) > bound && tc.card.StageName != "" {
 				t.Fatalf("workLabel() has %d runes; bound is %d", utf8.RuneCountInString(got), bound)
 			}
 		})
@@ -131,12 +161,29 @@ func TestRenderCardShowsStageLabel(t *testing.T) {
 			name:     "stage replaces the work type",
 			mutate:   func(c *SessionCard) { c.StageName, c.StageRole = "Verify", "review" },
 			wantRow:  "web · Verify · review",
+			wantNone: []string{"development", "("},
+		},
+		{
+			name:     "no stage keeps the work type",
+			mutate:   func(_ *SessionCard) {},
+			wantRow:  "web · development",
+			wantNone: []string{"("},
+		},
+		{
+			name: "a stage with a card names the card",
+			mutate: func(c *SessionCard) {
+				c.StageName, c.StageRole, c.CardHandle = "Persona", "intake", "builder"
+			},
+			wantRow:  "web · Persona · intake (builder)",
 			wantNone: []string{"development"},
 		},
 		{
-			name:    "no stage keeps the work type",
-			mutate:  func(_ *SessionCard) {},
-			wantRow: "web · development",
+			name: "hostile card handle text never reaches the row",
+			mutate: func(c *SessionCard) {
+				c.StageName, c.StageRole, c.CardHandle = "Verify", "review", "\u202ebui\x1b[2Jlder\x07"
+			},
+			wantRow:  "web · Verify · review (builder)",
+			wantNone: []string{"\u202e", "\x1b[2J", "\x07"},
 		},
 		{
 			name:     "hostile stage text never reaches the row",
@@ -168,14 +215,15 @@ func TestRenderCardShowsStageLabel(t *testing.T) {
 	}
 }
 
-// TestSourceSnapshotCarriesStage carries the session handle's wire stage
-// into the card model, and leaves a legacy handle's stage fields empty.
+// TestSourceSnapshotCarriesStage carries the session handle's wire stage and
+// card into the card model, and leaves a legacy handle's fields empty.
 func TestSourceSnapshotCarriesStage(t *testing.T) {
 	t.Parallel()
 	fd := &fakeDaemon{sessions: []afclient.DaemonSessionHandle{
 		{
 			SessionID: "staged", State: "running", WorkType: "development",
 			Stage: &stagewire.Stage{ID: "stg", Key: "backlog", Name: "Backlog", Role: stagewire.RoleIntake, RunRole: stagewire.RoleInflight},
+			Card:  &stagewire.Card{ID: "card_1", Handle: "builder"},
 		},
 		{SessionID: "legacy", State: "running", WorkType: "qa"},
 	}}
@@ -191,11 +239,14 @@ func TestSourceSnapshotCarriesStage(t *testing.T) {
 	if staged.StageName != "Backlog" || staged.StageRole != "intake" || staged.StageRunRole != "inflight" {
 		t.Fatalf("staged card stage = %q/%q/%q; want Backlog/intake/inflight", staged.StageName, staged.StageRole, staged.StageRunRole)
 	}
-	if got, want := staged.workLabel(), "Backlog · intake"; got != want {
+	if staged.CardHandle != "builder" {
+		t.Fatalf("staged card handle = %q; want builder", staged.CardHandle)
+	}
+	if got, want := staged.workLabel(), "Backlog · intake (builder)"; got != want {
 		t.Fatalf("staged workLabel() = %q; want %q", got, want)
 	}
 	legacy := bySession["legacy"]
-	if legacy.StageName != "" || legacy.StageRole != "" || legacy.StageRunRole != "" {
+	if legacy.StageName != "" || legacy.StageRole != "" || legacy.StageRunRole != "" || legacy.CardHandle != "" {
 		t.Fatalf("legacy card gained stage fields: %+v", legacy)
 	}
 	if got, want := legacy.workLabel(), "qa"; got != want {
@@ -206,8 +257,8 @@ func TestSourceSnapshotCarriesStage(t *testing.T) {
 // TestCardMatchesFilterStage finds a run by its stage label.
 func TestCardMatchesFilterStage(t *testing.T) {
 	t.Parallel()
-	card := SessionCard{SessionID: "s", WorkType: "development", StageName: "Verify", StageRole: "review"}
-	for _, query := range []string{"verify", "review", "development"} {
+	card := SessionCard{SessionID: "s", WorkType: "development", StageName: "Verify", StageRole: "review", CardHandle: "Builder"}
+	for _, query := range []string{"verify", "review", "development", "builder"} {
 		if !cardMatchesFilter(card, query) {
 			t.Errorf("cardMatchesFilter(%q) = false; want true", query)
 		}

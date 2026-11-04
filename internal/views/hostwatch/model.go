@@ -1125,8 +1125,9 @@ func (m *Model) visibleCards() []SessionCard {
 
 // cardMatchesFilter reports whether a card matches the lowercased query
 // over the sanitized display surfaces only: display identity, title,
-// repository name, work type, and stage label. All five are cleaned before
-// comparison so ANSI escapes and control characters never reach search.
+// repository name, work type, stage label, and dispatched card handle. All
+// six are cleaned before comparison so ANSI escapes and control characters
+// never reach search.
 func cardMatchesFilter(c SessionCard, lowerQuery string) bool {
 	if lowerQuery == "" {
 		return true
@@ -1144,6 +1145,9 @@ func cardMatchesFilter(c SessionCard, lowerQuery string) bool {
 		return true
 	}
 	if strings.Contains(strings.ToLower(c.stageLabel()), lowerQuery) {
+		return true
+	}
+	if strings.Contains(strings.ToLower(c.cardHandle()), lowerQuery) {
 		return true
 	}
 	return false
