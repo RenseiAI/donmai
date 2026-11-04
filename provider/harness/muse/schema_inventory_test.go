@@ -92,18 +92,20 @@ var exportedServerRequests = []string{
 }
 
 // mappedSpecialMethods is every exported notification with a
-// dedicated mapper case in event_mapping.go (22). Their behavior is
+// dedicated mapper case in event_mapping.go (24). Their behavior is
 // pinned by the existing mapper/Spawn/stream tests; this list exists
 // so the inventory below accounts for them by name.
 var mappedSpecialMethods = []string{
 	"approval/requested",
 	"approval/resolved",
+	"approval/reviewing",
 	"approval/updated",
 	"item/completed",
 	"item/delta",
 	"item/started",
 	"item/updated",
 	"session/approvalModeChanged",
+	"session/branchChanged",
 	"session/closed",
 	"session/contextUsage",
 	"session/started",
@@ -121,12 +123,11 @@ var mappedSpecialMethods = []string{
 }
 
 // reservedMethods are exported notifications reserved for dedicated
-// mappings (approval/reviewing, session/branchChanged): classified
-// here, still yielding the unknown diagnostic until those land.
-var reservedMethods = []string{
-	"approval/reviewing",
-	"session/branchChanged",
-}
+// mappings not yet landed: classified here, still yielding the
+// unknown diagnostic until those land. Currently empty: the
+// approval/reviewing and session/branchChanged reservations were
+// consumed by their dedicated mappings (now in mappedSpecialMethods).
+var reservedMethods = []string{}
 
 // clientToServerMethods are exported notifications that travel
 // client→server only (initialized closes the handshake;
@@ -439,15 +440,13 @@ func TestRecordOnly_HandleLevelCoversSessionIdLess(t *testing.T) {
 }
 
 // TestSchemaInventory_OutOfScopeStaysUnknown pins the diagnostic
-// contract for everything outside the allowlist: reserved for dedicated mappings and
-// client-to-server methods, plus a method absent from the export,
+// contract for everything outside the allowlist: client-to-server
+// methods, plus a method absent from the export,
 // still yield the unknown diagnostic with Raw preserved. RED
 // control: broaden the allowlist fallback to all methods and this
 // fails.
 func TestSchemaInventory_OutOfScopeStaysUnknown(t *testing.T) {
 	for _, method := range []string{
-		"approval/reviewing",
-		"session/branchChanged",
 		"initialized",
 		"userInput/engaged",
 		"session/noSuchNotification",
