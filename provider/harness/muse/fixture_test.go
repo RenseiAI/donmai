@@ -45,8 +45,28 @@ type fakeHost struct {
 	// session/start answers. Test-only first-turn sync failure door.
 	sessionStartErr *rpcError
 	// turnStartErr, when non-nil, is the JSON-RPC error turn/start
-	// answers. Test-only first-turn sync failure door.
+	// answers. The handle emits no applied-effort evidence.
+	// Test-only first-turn sync failure door.
 	turnStartErr *rpcError
+	// turnStartMalformed, when true, answers turn/start with an
+	// acknowledgement that fails validation (empty turn id). The handle
+	// emits no applied-effort evidence.
+	turnStartMalformed bool
+	// turnStartOmitStatus, when true, answers turn/start with the
+	// request's command/turn id and started disposition but omits the
+	// acceptance status. The handle must reject it and emit nothing.
+	turnStartOmitStatus bool
+	// turnStartRejected, when true, answers turn/start with a
+	// non-empty turn id but status rejected. The handle must reject
+	// it and emit nothing.
+	turnStartRejected bool
+	// turnStartTurnIDOnly, when true, answers turn/start with only
+	// {"turnId":"turn-1"}. The handle must reject it and emit
+	// nothing.
+	turnStartTurnIDOnly bool
+	// turnStartHang, when true, never answers turn/start, so the bounded
+	// request times out. The handle emits no applied-effort evidence.
+	turnStartHang bool
 	// failedKind and failedMessage override the failed script's
 	// turn/completed error object. Empty keeps the canned
 	// overloaded/host-overloaded pair.
@@ -120,6 +140,11 @@ func (fh *fakeHost) run(t *testing.T) {
 		denyApproval := fh.denyApproval
 		sessionStartErr := fh.sessionStartErr
 		turnStartErr := fh.turnStartErr
+		turnStartMalformed := fh.turnStartMalformed
+		turnStartHang := fh.turnStartHang
+		turnStartOmitStatus := fh.turnStartOmitStatus
+		turnStartRejected := fh.turnStartRejected
+		turnStartTurnIDOnly := fh.turnStartTurnIDOnly
 		recordMethod := fh.recordMethod
 		recordParams := fh.recordParams
 		fh.mu.Unlock()
@@ -194,6 +219,10 @@ func (fh *fakeHost) run(t *testing.T) {
 				},
 			})
 		case method == "turn/start" && hasID:
+			if turnStartHang {
+				// Never answer: the bounded request times out.
+				continue
+			}
 			if turnStartErr != nil {
 				fh.write(t, map[string]any{
 					"jsonrpc": "2.0", "id": idRaw,
@@ -207,6 +236,47 @@ func (fh *fakeHost) run(t *testing.T) {
 			params, _ := msg["params"].(map[string]any)
 			sid, _ := params["sessionId"].(string)
 			cmdID, _ := params["commandId"].(string)
+			if turnStartMalformed {
+				// Acknowledgement that fails validation: empty turn id.
+				fh.write(t, map[string]any{
+					"jsonrpc": "2.0", "id": idRaw,
+					"result": map[string]any{
+						"commandId": cmdID, "disposition": "started",
+						"startedNewTurn": true, "status": "accepted", "turnId": "",
+					},
+				})
+				continue
+			}
+			if turnStartTurnIDOnly {
+				// Minimal malformed acknowledgement: turn id only.
+				fh.write(t, map[string]any{
+					"jsonrpc": "2.0", "id": idRaw,
+					"result": map[string]any{"turnId": "turn-1"},
+				})
+				continue
+			}
+			if turnStartOmitStatus {
+				// Missing acceptance status with a valid turn id.
+				fh.write(t, map[string]any{
+					"jsonrpc": "2.0", "id": idRaw,
+					"result": map[string]any{
+						"commandId": cmdID, "disposition": "started",
+						"startedNewTurn": true, "turnId": cmdID,
+					},
+				})
+				continue
+			}
+			if turnStartRejected {
+				// Rejected acceptance status with a valid turn id.
+				fh.write(t, map[string]any{
+					"jsonrpc": "2.0", "id": idRaw,
+					"result": map[string]any{
+						"commandId": cmdID, "disposition": "started",
+						"startedNewTurn": true, "status": "rejected", "turnId": cmdID,
+					},
+				})
+				continue
+			}
 			// The returned turnId equals the commandId.
 			fh.write(t, map[string]any{
 				"jsonrpc": "2.0", "id": idRaw,
@@ -642,10 +712,19 @@ func (fh *fakeHost) emitScript(t *testing.T, script, sid, turnID string, denyApp
 
 func newTestProvider(t *testing.T, script string) (*Provider, *fakeHost) {
 	t.Helper()
+	return newTestProviderWithRPCTimeout(t, script, 0)
+}
+
+func newTestProviderWithRPCTimeout(t *testing.T, script string, rpcTimeout time.Duration) (*Provider, *fakeHost) {
+	t.Helper()
 	fh, stdinW, stdoutR := newFakeHost()
 	fh.script = script
 	go fh.run(t)
-	p, err := New(Options{skipProcess: true, stdinOverride: stdinW, stdoutOverride: stdoutR})
+	opts := Options{skipProcess: true, stdinOverride: stdinW, stdoutOverride: stdoutR}
+	if rpcTimeout > 0 {
+		opts.RPCTimeout = rpcTimeout
+	}
+	p, err := New(opts)
 	if err != nil {
 		fh.close()
 		t.Fatalf("New: %v", err)

@@ -87,10 +87,10 @@ const (
 	// appliedReasoningEffortContentPrefix and the two fixed sentences below
 	// are the only content an agent.SystemSubtypeAppliedReasoningEffort
 	// marker can produce (AppliedReasoningEffortContent). The applied
-	// ladder adds minimal to the requested ladder.
+	// ladder adds minimal, none and ultra to the requested ladder.
 	appliedReasoningEffortContentPrefix        = "applied reasoning effort: "
 	appliedReasoningEffortNotConfiguredContent = "applied reasoning effort: not configured; no applied effort was reported, so the harness or model default applies"
-	appliedReasoningEffortUnknownContent       = "applied reasoning effort: the reported value is not a recognized level (minimal, low, medium, high, xhigh, max)"
+	appliedReasoningEffortUnknownContent       = "applied reasoning effort: the reported value is not a recognized level (minimal, low, medium, high, xhigh, max, none, ultra)"
 
 	// signalGuardRefusedContentPrefix prefixes the guard's refusal line
 	// forwarded for a signal-guard refusal marker. The line itself names
@@ -672,7 +672,7 @@ func (p *Poster) maybePostRunning(ctx context.Context) {
 // level only when it is a known agent.EffortLevel).
 // agent.SystemSubtypeAppliedReasoningEffort becomes a context marker with
 // the same fixed-content posture on its own key, naming a level only when
-// it is in the applied ladder (minimal plus every known agent.EffortLevel).
+// it is in the applied ladder (minimal, none and ultra plus every known agent.EffortLevel).
 // Codex rerouting,
 // moderation and safety buffering become warnings; native diagnostics retain
 // their error/warning level without terminating the turn; file/plan deltas become
@@ -945,20 +945,30 @@ const (
 // adapters report it, but it is outside the requested EffortLevels ladder.
 const AppliedReasoningEffortMinimal = "minimal"
 
+// AppliedReasoningEffortNone asks for no reasoning and
+// AppliedReasoningEffortUltra asks for the top tier: both are
+// closed-vocabulary wire values the harness forwards verbatim, so the
+// applied marker names them instead of treating explicit caller intent as
+// unrecognized.
+const (
+	AppliedReasoningEffortNone  = "none"
+	AppliedReasoningEffortUltra = "ultra"
+)
+
 // isAppliedReasoningEffortLevel reports whether level is in the applied
-// ladder: minimal plus every known agent.EffortLevel. The empty value (not
-// reported) is not a level.
+// ladder: minimal, none and ultra plus every known agent.EffortLevel. The
+// empty value (not reported) is not a level.
 func isAppliedReasoningEffortLevel(level agent.EffortLevel) bool {
-	if level == AppliedReasoningEffortMinimal {
+	if level == AppliedReasoningEffortMinimal || level == AppliedReasoningEffortNone || level == AppliedReasoningEffortUltra {
 		return true
 	}
 	return level.Known()
 }
 
 // AppliedReasoningEffortContextValue is the contextValue of an applied-effort
-// marker: the level name when it is in the applied ladder (minimal plus every
-// known agent.EffortLevel), else one of the two sentinels. Like the Content,
-// it never carries free-form text.
+// marker: the level name when it is in the applied ladder (minimal, none and
+// ultra plus every known agent.EffortLevel), else one of the two sentinels.
+// Like the Content, it never carries free-form text.
 func AppliedReasoningEffortContextValue(effort agent.EffortLevel) string {
 	switch {
 	case effort == "":

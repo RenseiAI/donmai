@@ -492,11 +492,21 @@ func (h *Handle) startTurn(ctx context.Context, input []TurnInputPart) error {
 	if err := json.Unmarshal(raw, &res); err != nil {
 		return fmt.Errorf("turn/start: decode response: %w", err)
 	}
+	if res.Status != CommandStatusAccepted {
+		return fmt.Errorf("turn/start: unexpected status %q in response", string(res.Status))
+	}
 	if res.TurnID == "" {
 		return errors.New("turn/start: empty turn id in response")
 	}
 	h.setCurrentTurnID(res.TurnID)
 	h.recordTurnShape(params, res.TurnID)
+	// Post-admission applied-effort evidence: the effort actually present
+	// in the admitted request, emitted only after the host accepts the
+	// turn. All callers (new and resumed headless turns) share this path;
+	// a failed, timed-out, cancelled or malformed acknowledgement returns
+	// above and emits nothing. The event rides the handle's ordered stream
+	// ahead of terminal completion via the non-blocking emit.
+	h.emit(agent.AppliedReasoningEffortEvent(appliedEffortFromTurnParams(params)))
 	return nil
 }
 

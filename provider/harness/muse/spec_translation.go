@@ -269,6 +269,35 @@ func turnStartParams(sessionID, commandID string, spec agent.Spec, input []TurnI
 	return params
 }
 
+// appliedEffortFromTurnParams reports the effort the accepted turn/start
+// request actually carries, for the post-admission activity evidence. It
+// reads the final request's reasoningEffort tier — never Spec.Effort
+// directly — so raw profile input that bypasses translation cannot leak
+// into the receipt. An absent tier reports not-configured (empty) rather
+// than a guessed level; every admitted tier (minimal, low, medium, high,
+// xhigh, max, none, ultra) is reported verbatim. Unrecognized tiers report
+// not-configured as a defensive fallback: admission (validateEffort)
+// refuses them before any request is built, so they never reach the wire.
+func appliedEffortFromTurnParams(params map[string]any) agent.EffortLevel {
+	v, ok := params["reasoningEffort"].(string)
+	if !ok || v == "" {
+		return ""
+	}
+	switch agent.EffortLevel(v) {
+	case agent.EffortLevel("minimal"),
+		agent.EffortLow,
+		agent.EffortMedium,
+		agent.EffortHigh,
+		agent.EffortXHigh,
+		agent.EffortMax,
+		agent.EffortLevel("none"),
+		agent.EffortLevel("ultra"):
+		return agent.EffortLevel(v)
+	default:
+		return ""
+	}
+}
+
 // mcpServersConfig builds the inline session/start config.mcpServers
 // value. Each HTTP server becomes {transport:"streamableHttp",
 // mode:"optional", url, headers}; stdio servers pass through
