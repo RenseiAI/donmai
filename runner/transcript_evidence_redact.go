@@ -182,7 +182,7 @@ func newTranscriptRedactor(values []string) *transcriptRedactor {
 		}
 	}
 	sort.SliceStable(needles, func(i, j int) bool { return len(needles[i]) > len(needles[j]) })
-	pairs := make([]string, 0, 2*len(needles))
+	var pairs []string
 	for _, n := range needles {
 		pairs = append(pairs, n, transcriptRedacted)
 	}
