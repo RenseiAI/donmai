@@ -10,6 +10,7 @@ const { spawnSync } = require('node:child_process')
 const {
   buildTemplate,
   hasGoDockerfile,
+  hasNodePgDockerfile,
   main,
   parseCpuCount,
   parseDockerfileName,
@@ -452,5 +453,152 @@ test('release workflow gates the Go template build on the release checkout', () 
   } finally {
     fs.rmSync(withGo, { recursive: true, force: true })
     fs.rmSync(withoutGo, { recursive: true, force: true })
+  }
+})
+
+test('hasNodePgDockerfile reports the node-pg Dockerfile only when present', () => {
+  const withNodePg = fs.mkdtempSync(path.join(os.tmpdir(), 'build-e2b-hasnodepg-'))
+  const withoutNodePg = fs.mkdtempSync(path.join(os.tmpdir(), 'build-e2b-nonodepg-'))
+  try {
+    fs.writeFileSync(path.join(withNodePg, 'e2b.Dockerfile'), 'FROM debian:bookworm-slim # base\n')
+    fs.writeFileSync(path.join(withNodePg, 'e2b.node-pg.Dockerfile'), 'FROM debian:bookworm-slim # node-pg\n')
+    fs.writeFileSync(path.join(withoutNodePg, 'e2b.Dockerfile'), 'FROM debian:bookworm-slim # base\n')
+    assert.equal(hasNodePgDockerfile(withNodePg), true)
+    assert.equal(hasNodePgDockerfile(withoutNodePg), false)
+    assert.equal(hasNodePgDockerfile(''), false)
+    assert.equal(hasNodePgDockerfile(undefined), false)
+  } finally {
+    fs.rmSync(withNodePg, { recursive: true, force: true })
+    fs.rmSync(withoutNodePg, { recursive: true, force: true })
+  }
+})
+
+test('main() wires the node-pg Dockerfile with 8 vCPU and 16384 MB', async () => {
+  const contextDir = makeTempContext()
+  fs.writeFileSync(path.join(contextDir, 'e2b.node-pg.Dockerfile'), 'FROM debian:bookworm-slim # node-pg\n')
+  const outputFile = path.join(contextDir, 'github-output')
+  fs.writeFileSync(outputFile, '')
+  const calls = []
+  try {
+    await main({
+      env: {
+        E2B_TEMPLATE_REF: 'donmai-worker-node-pg:v1.2.3',
+        E2B_API_KEY: 'test-key',
+        E2B_ADDITIONAL_TAGS: 'default',
+        E2B_DOCKERFILE: 'e2b.node-pg.Dockerfile',
+        E2B_CPU_COUNT: '8',
+        E2B_MEMORY_MB: '16384',
+        GITHUB_OUTPUT: outputFile,
+      },
+      cwd: contextDir,
+      loadSdk: () => makeSdk(calls),
+      stdout: nullStdout(),
+    })
+
+    const call = buildCallFor(calls)
+    assert.equal(call.target, 'donmai-worker-node-pg:v1.2.3')
+    assert.equal(call.options.cpuCount, 8)
+    assert.equal(call.options.memoryMB, 16384)
+    assert.match(dockerfileFor(calls), /# node-pg/)
+    const contextEntry = calls.find((entry) => entry.fileContextPath)
+    assert.equal(contextEntry.fileContextPath, contextDir)
+  } finally {
+    fs.rmSync(contextDir, { recursive: true, force: true })
+  }
+})
+
+test('historical checkout without the node-pg Dockerfile still builds the base template', async () => {
+  // A release checkout that predates worker/e2b/e2b.node-pg.Dockerfile must
+  // still build the base template with default resources, while a node-pg
+  // build in the same layout fails before the SDK so the workflow gates it.
+  const contextDir = fs.mkdtempSync(path.join(os.tmpdir(), 'build-e2b-historical-nodepg-'))
+  fs.writeFileSync(path.join(contextDir, 'e2b.Dockerfile'), 'FROM debian:bookworm-slim # base\n')
+  const outputFile = path.join(contextDir, 'github-output')
+  fs.writeFileSync(outputFile, '')
+  try {
+    assert.equal(hasNodePgDockerfile(contextDir), false)
+
+    const calls = []
+    await main({
+      env: {
+        E2B_TEMPLATE_REF: 'donmai-worker:v0.53.0',
+        E2B_API_KEY: 'test-key',
+        E2B_ADDITIONAL_TAGS: '',
+        GITHUB_OUTPUT: outputFile,
+      },
+      cwd: contextDir,
+      loadSdk: () => makeSdk(calls),
+      stdout: nullStdout(),
+    })
+    const call = buildCallFor(calls)
+    assert.equal(call.target, 'donmai-worker:v0.53.0')
+    assert.ok(!('cpuCount' in call.options), 'cpuCount must be absent for the historical base build')
+    assert.ok(!('memoryMB' in call.options), 'memoryMB must be absent for the historical base build')
+
+    await assert.rejects(
+      main({
+        env: {
+          E2B_TEMPLATE_REF: 'donmai-worker-node-pg:v0.53.0',
+          E2B_API_KEY: 'test-key',
+          E2B_ADDITIONAL_TAGS: '',
+          E2B_DOCKERFILE: 'e2b.node-pg.Dockerfile',
+          E2B_CPU_COUNT: '8',
+          E2B_MEMORY_MB: '16384',
+          GITHUB_OUTPUT: outputFile,
+        },
+        cwd: contextDir,
+        loadSdk: () => makeSdk([]),
+        stdout: nullStdout(),
+      }),
+      /ENOENT|no such file/i,
+    )
+  } finally {
+    fs.rmSync(contextDir, { recursive: true, force: true })
+  }
+})
+
+test('release workflow gates the node-pg template build on the release checkout', () => {
+  // Load-bearing guard for the pre-node-pg retry: the staged suites run
+  // before the release checkout, and the node-pg build/verification only run
+  // when the release contains worker/e2b/e2b.node-pg.Dockerfile. Deleting
+  // either node-pg step condition must fail this test.
+  const workflow = fs.readFileSync(resolveWorkflowPath(), 'utf8')
+  const detect = workflowStepBlock(workflow, 'Detect node-pg template in release checkout')
+  assert.match(detect, /hasNodePgDockerfile/, 'detection must call the production hasNodePgDockerfile helper')
+  assert.match(detect, /present=true/, 'detection must set present=true for node-pg releases')
+  assert.match(detect, /present=false/, 'detection must set present=false for pre-node-pg retries')
+  const nodePgBuild = workflowStepBlock(workflow, 'Build versioned E2B node-pg template')
+  assert.match(
+    nodePgBuild,
+    /steps\.node-pg-template\.outputs\.present\s*==\s*'true'/,
+    'node-pg template build must be gated on the release containing the node-pg Dockerfile'
+  )
+  assert.match(nodePgBuild, /E2B_CPU_COUNT:\s*8/, 'node-pg template build must request 8 vCPU')
+  assert.match(nodePgBuild, /E2B_MEMORY_MB:\s*16384/, 'node-pg template build must request 16384 MB')
+  assert.match(nodePgBuild, /E2B_DOCKERFILE:\s*e2b\.node-pg\.Dockerfile/, 'node-pg build must select the node-pg Dockerfile')
+  const baseBuild = workflowStepBlock(workflow, 'Build versioned E2B template')
+  assert.doesNotMatch(
+    baseBuild,
+    /steps\.node-pg-template/,
+    'base template build must stay ungated so historical retries still rebuild it'
+  )
+  const nodePgVerify = workflowStepBlock(workflow, 'Assert published E2B node-pg template toolchain')
+  assert.match(
+    nodePgVerify,
+    /steps\.node-pg-template\.outputs\.present\s*==\s*'true'/,
+    'node-pg toolchain verification must be gated on the release containing the node-pg Dockerfile'
+  )
+  const conditions = workflow.match(/steps\.node-pg-template\.outputs\.present\s*==\s*'true'/g) || []
+  assert.equal(conditions.length, 2, `both node-pg steps must be gated, found ${conditions.length}`)
+  // Execute the production presence helper against both release layouts.
+  const withNodePg = fs.mkdtempSync(path.join(os.tmpdir(), 'build-e2b-workflow-nodepg-'))
+  const withoutNodePg = fs.mkdtempSync(path.join(os.tmpdir(), 'build-e2b-workflow-nobase-'))
+  try {
+    fs.writeFileSync(path.join(withNodePg, 'e2b.node-pg.Dockerfile'), 'FROM x\n')
+    assert.equal(hasNodePgDockerfile(withNodePg), true)
+    assert.equal(hasNodePgDockerfile(withoutNodePg), false)
+  } finally {
+    fs.rmSync(withNodePg, { recursive: true, force: true })
+    fs.rmSync(withoutNodePg, { recursive: true, force: true })
   }
 })

@@ -66,6 +66,34 @@ function readPinnedPiVersion(repoRoot) {
   return parsePinnedPiVersion(fs.readFileSync(probePath, 'utf8'))
 }
 
+// Node-pg template check list. THE single artifact the verifier executes for
+// the node-pg template: `pnpm --version` proves the pinned package manager
+// resolves, `pg-start` proves the local Postgres 17 cluster comes up as the
+// unprivileged sandbox account, and the probe proves the pgvector extension
+// enables in a scratch database. The socket lives in /tmp (the Dockerfile
+// moves unix_socket_directories there so the
+// unprivileged account always has a writable socket directory), so every
+// client passes -h /tmp. The verifier runs exactly these commands in order
+// (see assertNodePgCheckOutput); removing an entry here removes it from
+// verification, and the node-pg check-list test fails.
+const PNPM_VERSION_COMMAND = 'pnpm --version'
+const PG_START_COMMAND = 'pg-start'
+const PGVECTOR_PROBE_COMMAND =
+  "psql -h /tmp -U postgres -d postgres -c 'DROP DATABASE IF EXISTS pgvector_probe' " +
+  '&& createdb -h /tmp -U postgres pgvector_probe ' +
+  "&& psql -h /tmp -U postgres -d pgvector_probe -c 'CREATE EXTENSION vector'"
+// POSTGRES_VERSION_COMMAND queries the running server for its version so the
+// verifier compares the actual major against the Dockerfile pin instead of
+// trusting pg-start's ready message. No backslashes: the E2B build SDK
+// strips single backslashes from RUN bodies, and the same rule keeps
+// verifier commands free of escapes.
+const POSTGRES_VERSION_COMMAND =
+  "psql -h /tmp -U postgres -d postgres -tAc 'SHOW server_version'"
+
+function nodePgCheckCommands() {
+  return [PNPM_VERSION_COMMAND, PG_START_COMMAND, PGVECTOR_PROBE_COMMAND]
+}
+
 const GO_VERSION_RE = /^\s*go\s+([0-9]+\.[0-9]+(?:\.[0-9]+)?)/m
 const GOLANGCI_LINT_PIN_RE =
   /go\s+install\s+github\.com\/golangci\/golangci-lint\/v2\/cmd\/golangci-lint@v([0-9]+\.[0-9]+\.[0-9]+)/
@@ -131,17 +159,26 @@ function isGoTemplateRef(templateRef) {
   return typeof templateRef === 'string' && templateRef.includes('donmai-worker-go')
 }
 
+// executableDockerfileText returns the Dockerfile text that actually
+// executes: comment lines stripped, line continuations joined. Header
+// comments may name packages, commands, or probes (for example the
+// race-detector note below), so matching the raw text would stay green
+// after deleting the real instruction.
+function executableDockerfileText(dockerfileSource) {
+  return String(dockerfileSource)
+    .split('\n')
+    .filter((line) => !/^\s*#/.test(line))
+    .join('\n')
+    .replace(/\\\n/g, ' ')
+}
+
 // parseAptInstalledPackages extracts the package names from executable
 // `apt-get install` instructions, ignoring Dockerfile comment lines. Header
 // comments may name packages (for example the race-detector note below), so
 // matching the raw Dockerfile text would stay green after deleting the real
 // `apt-get install` entries.
 function parseAptInstalledPackages(dockerfileSource) {
-  const executable = String(dockerfileSource)
-    .split('\n')
-    .filter((line) => !/^\s*#/.test(line))
-    .join('\n')
-  const normalized = executable.replace(/\\\n/g, ' ')
+  const normalized = executableDockerfileText(dockerfileSource)
   const packages = []
   const installRe = /apt-get\s+install\s+([^&;]+)/g
   let match
@@ -163,6 +200,179 @@ function hasCToolchainForRace(dockerfileSource) {
     installed.includes('gcc') &&
     (installed.includes('libc6-dev') || installed.includes('build-essential'))
   )
+}
+
+// parsePnpmVersion reads the single pnpm pin (ARG PNPM_VERSION) off the
+// node-pg Dockerfile. The corepack prepare and the npm-global install both
+// reference ${PNPM_VERSION}, so one pin governs both copies.
+const PNPM_VERSION_ARG_RE = /^\s*ARG\s+PNPM_VERSION=([0-9]+\.[0-9]+\.[0-9]+)/m
+const PNPM_PREPARE_PIN_RE = /corepack\s+prepare\s+pnpm@([0-9]+\.[0-9]+\.[0-9]+)/
+const PNPM_NPM_PIN_RE = /npm\s+i\s+-g\s+[^\n]*?pnpm@([0-9]+\.[0-9]+\.[0-9]+)/
+
+function parsePnpmVersion(dockerfileSource) {
+  const match = dockerfileSource.match(PNPM_VERSION_ARG_RE)
+  if (!match) {
+    throw new Error('could not find PNPM_VERSION pin in the node-pg Dockerfile')
+  }
+  return match[1]
+}
+
+// parsePostgresMajorVersion reads the Postgres major version off the
+// `postgresql-<major>` apt package in the node-pg Dockerfile's executable
+// instructions (the pgvector package shares the same major).
+function parsePostgresMajorVersion(dockerfileSource) {
+  const installed = parseAptInstalledPackages(dockerfileSource)
+  const name = installed.find((candidate) => /^postgresql-(\d+)$/.test(candidate))
+  if (!name) {
+    throw new Error('could not find postgresql-<major> package in the node-pg Dockerfile')
+  }
+  return name.match(/^postgresql-(\d+)$/)[1]
+}
+
+function hasPgvectorPackage(dockerfileSource) {
+  const installed = parseAptInstalledPackages(dockerfileSource)
+  return installed.some((name) => /^postgresql-\d+-pgvector$/.test(name))
+}
+
+// parsePnpmSeedPins reads the warm-store seed's exact dependency pins off
+// the node-pg Dockerfile. Only exact X.Y.Z pins match: a floating range
+// (^, ~) or an unpinned entry is not captured, so weakening the seed fails
+// the seed test.
+const PNPM_SEED_PIN_RE = /"(pg|typescript|vitest)"\s*:\s*"(\d+\.\d+\.\d+)"/g
+
+function parsePnpmSeedPins(dockerfileSource) {
+  const pins = {}
+  let match
+  PNPM_SEED_PIN_RE.lastIndex = 0
+  while ((match = PNPM_SEED_PIN_RE.exec(dockerfileSource)) !== null) {
+    pins[match[1]] = match[2]
+  }
+  return pins
+}
+
+// hasPgStartScript reports whether the node-pg Dockerfile provisions the
+// pg-start helper (start-if-down plus readiness wait) outside of comments.
+function hasPgStartScript(dockerfileSource) {
+  const executable = executableDockerfileText(dockerfileSource)
+  return (
+    executable.includes('/usr/local/bin/pg-start') &&
+    /pg_ctlcluster\s+17\s+main\s+start/.test(executable) &&
+    executable.includes('pg_isready')
+  )
+}
+
+// hasBuildTimeVectorSmoke reports whether the node-pg Dockerfile proves the
+// Postgres path at build time: start the cluster, enable the vector
+// extension in a scratch database, then stop the cluster again.
+function hasBuildTimeVectorSmoke(dockerfileSource) {
+  const executable = executableDockerfileText(dockerfileSource)
+  return (
+    /CREATE EXTENSION vector/.test(executable) &&
+    /pg_ctlcluster\s+17\s+main\s+stop/.test(executable)
+  )
+}
+
+// hasTrustLocalAuth reports whether the node-pg Dockerfile switches the
+// cluster's local authentication to trust (no password baked in, none
+// needed in-box).
+function hasTrustLocalAuth(dockerfileSource) {
+  const executable = executableDockerfileText(dockerfileSource)
+  return executable.includes('pg_hba.conf') && executable.includes('trust')
+}
+
+// hasSandboxUser reports whether the node-pg Dockerfile provisions the
+// unprivileged sandbox account the E2B SDK runs commands as. Without it the
+// chown below has no target and the runtime USER user owns nothing.
+function hasSandboxUser(dockerfileSource) {
+  const executable = executableDockerfileText(dockerfileSource)
+  return (
+    /useradd\s+[^&;\n]*\buser\b/.test(executable) ||
+    /adduser\s+[^&;\n]*\buser\b/.test(executable)
+  )
+}
+
+// hasClusterOwnedBySandboxUser reports whether the node-pg Dockerfile
+// transfers the Postgres cluster to the sandbox account. pg_ctlcluster
+// permits only the cluster owner or root, so a postgres-owned cluster
+// leaves pg-start failing as the unprivileged SDK user even with trust
+// authentication. Comment-only mentions do not count.
+function hasClusterOwnedBySandboxUser(dockerfileSource) {
+  const executable = executableDockerfileText(dockerfileSource)
+  return (
+    /chown\s+-R\s+user[:\s]/.test(executable) &&
+    executable.includes('/var/lib/postgresql') &&
+    executable.includes('/etc/postgresql')
+  )
+}
+
+// hasTmpSocketConfig reports whether the node-pg Dockerfile and its pg-start
+// helper use /tmp for the socket and readiness probe. /var/run is a fresh
+// tmpfs at sandbox boot, so a socket there is unwritable for the
+// unprivileged account even after the chown; /tmp is always writable. It
+// also rejects the removed stats_temp_directory parameter: PostgreSQL 15
+// removed it and 17 refuses to start when postgresql.conf names it (FATAL:
+// unrecognized configuration parameter), which failed the build-time
+// pg-start smoke and blocked template publication.
+function hasTmpSocketConfig(dockerfileSource) {
+  const executable = executableDockerfileText(dockerfileSource)
+  if (/stats_temp_directory\s*=/.test(executable)) {
+    return false
+  }
+  return (
+    executable.includes("unix_socket_directories = '/tmp'") &&
+    executable.includes('pg_isready -h /tmp')
+  )
+}
+
+// hasUnprivilegedPgStart is the blocking-finding guard: pg-start plus the
+// ownership transfer plus the /tmp socket. Any one missing leaves the
+// advertised helper failing as the SDK user.
+function hasUnprivilegedPgStart(dockerfileSource) {
+  return (
+    hasPgStartScript(dockerfileSource) &&
+    hasSandboxUser(dockerfileSource) &&
+    hasClusterOwnedBySandboxUser(dockerfileSource) &&
+    hasTmpSocketConfig(dockerfileSource)
+  )
+}
+
+function hasNodePgTemplate(repoRoot) {
+  if (typeof repoRoot !== 'string' || repoRoot === '') {
+    return false
+  }
+  try {
+    return fs.existsSync(path.join(repoRoot, 'worker', 'e2b', 'e2b.node-pg.Dockerfile'))
+  } catch {
+    return false
+  }
+}
+
+function readNodePgDockerfileSource(repoRoot) {
+  const candidates = [
+    path.join(repoRoot, 'worker', 'e2b', 'e2b.node-pg.Dockerfile'),
+    path.join(repoRoot, 'e2b.node-pg.Dockerfile'),
+  ]
+  for (const candidate of candidates) {
+    try {
+      return fs.readFileSync(candidate, 'utf8')
+    } catch {
+      // try the next candidate
+    }
+  }
+  throw new Error(
+    'could not find e2b.node-pg.Dockerfile under ' + JSON.stringify(repoRoot)
+  )
+}
+
+function isNodePgTemplateRef(templateRef) {
+  return typeof templateRef === 'string' && templateRef.includes('donmai-worker-node-pg')
+}
+
+function shouldExpectNodePgTools({ templateRef, expectNodePg }) {
+  if (expectNodePg === '1' || expectNodePg === 'true') {
+    return true
+  }
+  return isNodePgTemplateRef(templateRef)
 }
 
 // parseE2bPathRaw returns the raw ENV PATH value exactly as the pinned E2B
@@ -341,6 +551,76 @@ function assertGofumptVersionOutput(result, expectedVersion) {
   }
 }
 
+function assertPnpmVersionOutput(result, expectedVersion) {
+  if (!expectedVersion) {
+    throw new Error('the expected pnpm version is required')
+  }
+  if (result.exitCode !== 0) {
+    throw new Error(
+      `pnpm --version exited ${result.exitCode}: ${String(result.stderr || '').trim()}`
+    )
+  }
+  const raw = `${String(result.stdout || '')}\n${String(result.stderr || '')}`.trim()
+  const want = String(expectedVersion).replace(/^v/, '')
+  const got = extractFirstDottedVersion(raw)
+  if (got !== want) {
+    throw new Error(
+      `pnpm --version = ${JSON.stringify(raw.trim())}, parsed version ${JSON.stringify(got)}, want ${JSON.stringify(want)}`
+    )
+  }
+}
+
+function assertPgStartOutput(result) {
+  if (result.exitCode !== 0) {
+    throw new Error(
+      `pg-start exited ${result.exitCode}: ${String(result.stderr || '').trim()}`
+    )
+  }
+}
+
+function assertPgvectorProbeOutput(result) {
+  if (result.exitCode !== 0) {
+    throw new Error(
+      `CREATE EXTENSION vector probe exited ${result.exitCode}: ${String(result.stderr || '').trim()}`
+    )
+  }
+}
+
+function assertPostgresVersionOutput(result, expectedMajorVersion) {
+  if (!expectedMajorVersion) {
+    throw new Error('the expected postgres major version is required')
+  }
+  if (result.exitCode !== 0) {
+    throw new Error(
+      `postgres version query exited ${result.exitCode}: ${String(result.stderr || '').trim()}`
+    )
+  }
+  const raw = String(result.stdout || '').trim()
+  const match = raw.match(/^(\d+)(?:\.|$)/)
+  const got = match ? match[1] : null
+  if (got !== String(expectedMajorVersion)) {
+    throw new Error(
+      `postgres version = ${JSON.stringify(raw)}, parsed major ${JSON.stringify(got)}, want ${JSON.stringify(String(expectedMajorVersion))}`
+    )
+  }
+}
+
+// assertNodePgCheckOutput runs the assertion for one entry of
+// nodePgCheckCommands(). Unknown commands fail closed so a check that
+// nobody asserts can never silently pass.
+function assertNodePgCheckOutput(command, result, { expectedPnpmVersion }) {
+  if (command === PNPM_VERSION_COMMAND) {
+    return assertPnpmVersionOutput(result, expectedPnpmVersion)
+  }
+  if (command === PG_START_COMMAND) {
+    return assertPgStartOutput(result)
+  }
+  if (command === PGVECTOR_PROBE_COMMAND) {
+    return assertPgvectorProbeOutput(result)
+  }
+  throw new Error(`unknown node-pg check: ${JSON.stringify(command)}`)
+}
+
 async function verifyTemplateVersion({
   Sandbox,
   templateRef,
@@ -350,6 +630,8 @@ async function verifyTemplateVersion({
   expectedGoVersion,
   expectedGolangciLintVersion,
   expectedGofumptVersion,
+  expectedPnpmVersion,
+  expectedPostgresMajorVersion,
 }) {
   if (!templateRef) {
     throw new Error('E2B_TEMPLATE_REF is required')
@@ -381,9 +663,26 @@ async function verifyTemplateVersion({
       const fumptResult = await sandbox.commands.run('gofumpt --version')
       assertGofumptVersionOutput(fumptResult, expectedGofumptVersion)
     }
+    const expectNodePg =
+      expectedPnpmVersion !== undefined ||
+      expectedPostgresMajorVersion !== undefined
+    if (expectNodePg) {
+      if (!expectedPnpmVersion || !expectedPostgresMajorVersion) {
+        throw new Error('Node.js/Postgres expectations are incomplete')
+      }
+      for (const command of nodePgCheckCommands()) {
+        const checkResult = await sandbox.commands.run(command)
+        assertNodePgCheckOutput(command, checkResult, { expectedPnpmVersion })
+      }
+      const pgVersionResult = await sandbox.commands.run(POSTGRES_VERSION_COMMAND)
+      assertPostgresVersionOutput(pgVersionResult, expectedPostgresMajorVersion)
+    }
     let verified = `Verified ${templateRef}: donmai version ${expectedVersion}, pi version ${expectedPiVersion}`
     if (expectGo) {
       verified += `, go version ${expectedGoVersion}, golangci-lint version ${expectedGolangciLintVersion}, gofumpt version ${expectedGofumptVersion}`
+    }
+    if (expectNodePg) {
+      verified += `, pnpm version ${expectedPnpmVersion}, postgres ${expectedPostgresMajorVersion} with pgvector (vector)`
     }
     process.stdout.write(`${verified}\n`)
   } catch (error) {
@@ -438,6 +737,8 @@ async function runMain({
   expectedGoVersion,
   expectedGolangciLintVersion,
   expectedGofumptVersion,
+  expectedPnpmVersion,
+  expectedPostgresMajorVersion,
   writeError,
 }) {
   try {
@@ -450,6 +751,8 @@ async function runMain({
       expectedGoVersion,
       expectedGolangciLintVersion,
       expectedGofumptVersion,
+      expectedPnpmVersion,
+      expectedPostgresMajorVersion,
     })
     return 0
   } catch (error) {
@@ -464,6 +767,7 @@ async function main(overrides = {}) {
   const loadSandbox = overrides.loadSandbox || (() => require('e2b').Sandbox)
   const readGo = overrides.readGoVersion || readGoVersion
   const readDocker = overrides.readGoDockerfileSource || readGoDockerfileSource
+  const readNodePg = overrides.readNodePgDockerfileSource || readNodePgDockerfileSource
   const readPi = overrides.readPinnedPiVersion || readPinnedPiVersion
   const runMainFn = overrides.runMain || runMain
   const writeError = overrides.writeError || ((line) => process.stderr.write(line))
@@ -479,6 +783,13 @@ async function main(overrides = {}) {
     expectedGolangciLintVersion = parseGolangciLintVersion(dockerfileSource)
     expectedGofumptVersion = parseGofumptVersion(dockerfileSource)
   }
+  let expectedPnpmVersion
+  let expectedPostgresMajorVersion
+  if (shouldExpectNodePgTools({ templateRef, expectNodePg: env.E2B_EXPECT_NODE_PG_TOOLCHAIN })) {
+    const dockerfileSource = readNodePg(repoRoot)
+    expectedPnpmVersion = parsePnpmVersion(dockerfileSource)
+    expectedPostgresMajorVersion = parsePostgresMajorVersion(dockerfileSource)
+  }
   return runMainFn({
     Sandbox,
     templateRef,
@@ -488,22 +799,45 @@ async function main(overrides = {}) {
     expectedGoVersion,
     expectedGolangciLintVersion,
     expectedGofumptVersion,
+    expectedPnpmVersion,
+    expectedPostgresMajorVersion,
     writeError,
   })
 }
 
 module.exports = {
-  hasGoTemplate,
+  PG_START_COMMAND,
+  PGVECTOR_PROBE_COMMAND,
+  PNPM_VERSION_COMMAND,
+  POSTGRES_VERSION_COMMAND,
   assertGofumptVersionOutput,
   assertGolangciLintVersionOutput,
   assertGoVersionOutput,
+  assertNodePgCheckOutput,
+  assertPgStartOutput,
+  assertPgvectorProbeOutput,
   assertPiVersionOutput,
+  assertPnpmVersionOutput,
+  assertPostgresVersionOutput,
   assertVersionOutput,
+  executableDockerfileText,
   formatFailure,
+  hasBuildTimeVectorSmoke,
   hasCToolchainForRace,
+  hasClusterOwnedBySandboxUser,
   hasE2bCompatibleGoPath,
+  hasGoTemplate,
+  hasNodePgTemplate,
+  hasPgStartScript,
+  hasPgvectorPackage,
+  hasSandboxUser,
+  hasTmpSocketConfig,
+  hasTrustLocalAuth,
+  hasUnprivilegedPgStart,
   isGoTemplateRef,
+  isNodePgTemplateRef,
   main,
+  nodePgCheckCommands,
   parseAptInstalledPackages,
   parseE2bPathEntries,
   parseE2bPathRaw,
@@ -511,12 +845,17 @@ module.exports = {
   parseGolangciLintVersion,
   parseGoVersion,
   parsePinnedPiVersion,
+  parsePnpmSeedPins,
+  parsePnpmVersion,
+  parsePostgresMajorVersion,
   readGoDockerfileSource,
   readGoVersion,
+  readNodePgDockerfileSource,
   readPinnedPiVersion,
   resolveRepoRoot,
   runMain,
   shouldExpectGoTools,
+  shouldExpectNodePgTools,
   verifyTemplateVersion,
 }
 
