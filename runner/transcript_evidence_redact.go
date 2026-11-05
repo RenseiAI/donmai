@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"unicode/utf16"
 	"unicode/utf8"
 
@@ -61,9 +62,16 @@ const transcriptRedacted = "[REDACTED]"
 
 // transcriptEvidenceMaxViews bounds the decoding views of one string. A
 // string whose views exceed the budget is not proved clean and is dropped.
-// A variable so tests can prove the fail-closed budget branch without
-// building a 64-view closure.
-var transcriptEvidenceMaxViews = 64
+// An atomic so a redaction that outlives its per-file deadline (its
+// goroutine keeps running after the caller falls back) cannot race a
+// concurrent redaction that reads the budget. Tests store a small budget
+// to prove the fail-closed budget branch without building a 64-view
+// closure.
+var transcriptEvidenceMaxViews atomic.Int64
+
+func init() {
+	transcriptEvidenceMaxViews.Store(64)
+}
 
 // transcriptEvidenceSecretValues collects every secret value the evidence
 // archiver must redact: the session bearers, ALL session env values, and
@@ -618,7 +626,7 @@ func transcriptDecodingViews(s string) ([]string, bool) {
 			if next == "" || seen[next] {
 				continue
 			}
-			if len(views) >= transcriptEvidenceMaxViews {
+			if len(views) >= int(transcriptEvidenceMaxViews.Load()) {
 				return views, false
 			}
 			seen[next] = true

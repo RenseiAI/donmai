@@ -190,9 +190,9 @@ func TestTranscriptEvidenceHardening_EmbeddedJSONView(t *testing.T) {
 // TestTranscriptEvidenceHardening_CleanBudgetExceeded pins the fail-closed
 // budget: a string whose views exceed the budget is not proved clean.
 func TestTranscriptEvidenceHardening_CleanBudgetExceeded(t *testing.T) {
-	old := transcriptEvidenceMaxViews
-	transcriptEvidenceMaxViews = 1
-	t.Cleanup(func() { transcriptEvidenceMaxViews = old })
+	old := transcriptEvidenceMaxViews.Load()
+	transcriptEvidenceMaxViews.Store(1)
+	t.Cleanup(func() { transcriptEvidenceMaxViews.Store(old) })
 	r := newTranscriptRedactor(nil)
 	if r.clean("prefix aGVsbG8td29ybGQ= suffix", nil) {
 		t.Fatal("clean = true with an exhausted view budget; want false")
@@ -329,13 +329,28 @@ func TestTranscriptEvidenceHardening_BareAuthKey(t *testing.T) {
 	}
 }
 
+// TestTranscriptEvidenceHardening_BareAuthRailValue pins the shared-rail
+// half of the bare auth fix: a non-JSON auth=<secret> line carries no
+// known session secret, so only the shared output rail masks it. The line
+// is archived through the real path and must not survive in cleartext.
+func TestTranscriptEvidenceHardening_BareAuthRailValue(t *testing.T) {
+	qw := QueuedWork{QueuedWork: queuedWorkBase("BAREAUTHRAIL")}
+	got := archiveTranscriptForTest(t, "auth=mysecretpassword123\n", qw)
+	if strings.Contains(got, "mysecretpassword123") {
+		t.Fatalf("archive carries plain-text auth value in cleartext:\n%s", got)
+	}
+	if !strings.Contains(got, "[REDACTED]") {
+		t.Fatalf("archive missing [REDACTED]:\n%s", got)
+	}
+}
+
 // TestTranscriptEvidenceHardening_UnknownSecretsBudget pins the fail-closed
 // view budget inside unknownSecrets: when the decoding closure cannot be
 // completed the input is unclean and the caller must drop the string.
 func TestTranscriptEvidenceHardening_UnknownSecretsBudget(t *testing.T) {
-	old := transcriptEvidenceMaxViews
-	transcriptEvidenceMaxViews = 1
-	t.Cleanup(func() { transcriptEvidenceMaxViews = old })
+	old := transcriptEvidenceMaxViews.Load()
+	transcriptEvidenceMaxViews.Store(1)
+	t.Cleanup(func() { transcriptEvidenceMaxViews.Store(old) })
 	if _, ok := unknownSecrets("prefix aGVsbG8td29ybGQ= suffix"); ok {
 		t.Fatal("unknownSecrets = ok with an exhausted view budget; want !ok")
 	}
