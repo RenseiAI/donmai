@@ -30,7 +30,8 @@ import (
 //
 // under any combination of these decodings, applied repeatedly: JSON and
 // Python-style string escapes, URL percent-encoding, HTML entities, base64
-// tokens, and JSON embedded anywhere inside a string.
+// tokens, and JSON embedded anywhere inside a string. Known secrets also
+// match in any letter case.
 //
 // Design. Earlier versions enumerated encodings inside the redactor, and each
 // review found the next encoding it missed. The redactor is now best-effort
@@ -122,6 +123,9 @@ type transcriptRedactor struct {
 	// replacer replaces every needle in one pass (longest first), so a
 	// replacement marker is never re-scanned by a later needle.
 	replacer *strings.Replacer
+	// folded matches the case-folded needles against case-folded text, so a
+	// secret printed in another letter case is still detected.
+	folded *strings.Replacer
 	// literals is every base secret, used for exact scalar comparison.
 	literals map[string]bool
 	// numbers is the canonical value of every numeric base secret.
@@ -170,6 +174,7 @@ func newTranscriptRedactor(values []string) *transcriptRedactor {
 	}
 	for _, b := range base {
 		addNeedle(b)
+		addNeedle(strings.ToValidUTF8(b, "\uFFFD"))
 		for _, form := range transcriptEvidenceEscapedForms(b) {
 			addNeedle(form)
 		}
@@ -182,25 +187,32 @@ func newTranscriptRedactor(values []string) *transcriptRedactor {
 		}
 	}
 	sort.SliceStable(needles, func(i, j int) bool { return len(needles[i]) > len(needles[j]) })
-	var pairs []string
+	var pairs, foldedPairs []string
 	for _, n := range needles {
 		pairs = append(pairs, n, transcriptRedacted)
+		foldedPairs = append(foldedPairs, strings.ToLower(n), transcriptRedacted)
 	}
 	if len(pairs) > 0 {
 		r.replacer = strings.NewReplacer(pairs...)
+		r.folded = strings.NewReplacer(foldedPairs...)
 	}
 	return r
 }
 
-// containsSecret reports whether text carries a needle by bytes. Markers
-// already written are blanked first so a secret that is a substring of the
-// marker itself cannot make every redacted string look dirty.
+// containsSecret reports whether text carries a needle, by bytes or in any
+// letter case. Markers already written are blanked first so a secret that is
+// a substring of the marker itself cannot make every redacted string look
+// dirty.
 func (r *transcriptRedactor) containsSecret(text string) bool {
 	if r.replacer == nil {
 		return false
 	}
 	blanked := strings.ReplaceAll(text, transcriptRedacted, "\x00")
-	return r.replacer.Replace(blanked) != blanked
+	if r.replacer.Replace(blanked) != blanked {
+		return true
+	}
+	lower := strings.ToLower(blanked)
+	return r.folded.Replace(lower) != lower
 }
 
 // containsNumericSecret reports whether any number literal in text has the

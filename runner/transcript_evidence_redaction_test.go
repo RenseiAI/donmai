@@ -336,6 +336,9 @@ func TestTranscriptEvidence_SecretEncodingClass(t *testing.T) {
 		{name: "standalone-base64", env: map[string]string{"K": "hunter2-secret"}, body: func(t *testing.T) string {
 			return toolResultRecord(t, "echo "+base64.StdEncoding.EncodeToString([]byte("hunter2-secret")))
 		}},
+		{name: "letter-case-variant", env: map[string]string{"K": "AbCdEf0123-Token"}, secrets: []string{"abcdef0123-token"}, body: func(t *testing.T) string {
+			return toolResultRecord(t, "printed lower: abcdef0123-token")
+		}},
 		{name: "secret-as-key", env: map[string]string{"K": "key-shaped-secret"}, body: func(*testing.T) string {
 			return "{\"key-shaped-secret\":1}\n"
 		}},
