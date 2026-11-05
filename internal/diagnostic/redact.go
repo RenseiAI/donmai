@@ -1,7 +1,10 @@
 // Package diagnostic redacts child-process output before it becomes failure evidence.
 package diagnostic
 
-import "regexp"
+import (
+	"regexp"
+	"strings"
+)
 
 // The existing child-stderr rules are shared by app-server and PTY diagnostics.
 // Values end at a closing quote or an unquoted whitespace/query boundary.
@@ -49,4 +52,53 @@ func Redact(s string) string {
 		s = r.pattern.ReplaceAllString(s, r.replacement)
 	}
 	return s
+}
+
+// Unredacted reports whether s still carries a value one of Redact's rules
+// would mask: a rule match whose value is not already the [REDACTED] marker
+// (optionally quoted), or any match of a rule that masks its whole match.
+// Unlike comparing Redact(s) with s it is exact on already-redacted text,
+// where a rule's value pattern may re-match the marker plus trailing
+// punctuation without exposing anything.
+func Unredacted(s string) bool {
+	return len(UnredactedValues(s)) > 0
+}
+
+// UnredactedValues returns the values in s that one of Redact's rules would
+// mask and that are not already the [REDACTED] marker: the value part of a
+// key-prefixed rule (surrounding quotes trimmed) or the whole match of a rule
+// that masks its whole match.
+func UnredactedValues(s string) []string {
+	var out []string
+	for _, r := range diagnosticRedactions {
+		keepsPrefix := strings.HasPrefix(r.replacement, "${1}")
+		for _, m := range r.pattern.FindAllStringSubmatchIndex(s, -1) {
+			if !keepsPrefix || len(m) < 4 || m[3] < 0 {
+				out = append(out, s[m[0]:m[1]])
+				continue
+			}
+			end := m[1]
+			if len(m) >= 6 && m[4] >= 0 {
+				end = m[4]
+			}
+			value := strings.Trim(s[m[3]:end], "\"'")
+			if !isRedactedMarkerValue(value) {
+				out = append(out, value)
+			}
+		}
+	}
+	return out
+}
+
+const redactedMarker = "[REDACTED]"
+
+// isRedactedMarkerValue reports whether a matched value is the marker itself,
+// allowing only the closing punctuation and whitespace a rule's value
+// pattern can run into. A value that merely starts with the marker text
+// ("[REDACTED]secret") is not redacted.
+func isRedactedMarkerValue(v string) bool {
+	if !strings.HasPrefix(v, redactedMarker) {
+		return false
+	}
+	return strings.Trim(v[len(redactedMarker):], "\"',;:.)]}> \t") == ""
 }

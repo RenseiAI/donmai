@@ -1035,6 +1035,29 @@ func (r *Runner) run(ctx context.Context, qw QueuedWork, admission *HarnessAdmis
 		if pres == nil && finalGate {
 			pres = r.newTeardownPreservation(qw.SessionID)
 		}
+		if pres != nil && finalGate && res != nil && res.Status == "failed" && len(res.terminalTranscripts) > 0 {
+			// Failed-session transcript tails share this teardown's directory
+			// with patches and descriptors. When the runner owns the
+			// teardown, tails are fail-closed: a tail failure keeps the
+			// workarea, and only this goroutine performs that teardown
+			// (below), so nothing can race the keep decision. A session
+			// that reached a terminal lease before failing (lease
+			// preparation flipped completed to failed) hands its workarea
+			// to the lease, whose disposition was durably fixed at
+			// acquisition and is executed by the lease reaper. The runner
+			// does not rewrite that disposition after the fact: a late
+			// rewrite races the reaper and cannot be made durable when the
+			// lease store itself is what failed. Tails there are
+			// best-effort and a failure is reported, never claimed retained.
+			if failed, ok := r.archiveFailedSessionEvidence(qw, res, pres.dirFor); !ok {
+				if leaseAcquired {
+					appendTranscriptEvidenceWarning(res, failed, "workarea follows its terminal lease")
+				} else {
+					teardownRequired = false
+					appendTranscriptEvidenceWarning(res, failed, "workarea retained")
+				}
+			}
+		}
 		if pres != nil && finalGate {
 			r.preserveTerminalEvidenceFinal(qw, res, pres)
 		}
