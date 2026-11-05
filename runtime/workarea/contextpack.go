@@ -263,10 +263,23 @@ func MaterializeContextPack(root RootPath, pack ContextPackV1) (ContextPackRepor
 	defer func() { _ = rootHandle.Close() }()
 	finalRel := ContextPackDir(root, pack.PackID)
 	if existing, readErr := readContextPackMarker(rootHandle, finalRel); readErr == nil {
-		if existing.PackID == pack.PackID && sameIncludedDigests(existing.Included, included) {
-			return existing, nil
+		// Redelivery trusts nothing it has not re-proved: the marker
+		// must name exactly this pack (identity, version, directory
+		// and digest set), and every published document must still be
+		// a regular file whose bytes match the recorded digest. An
+		// operator-planted or tampered marker that skips publication,
+		// or a redelivery over deleted, modified or symlinked
+		// documents, refuses instead of reporting the stale receipt.
+		if existing.PackID != pack.PackID ||
+			existing.Version != ContextPackProtocol ||
+			existing.Dir != finalRel ||
+			!sameIncludedDigests(existing.Included, included) {
+			return ContextPackReport{}, &ContextPackError{Reason: ReasonContextPackConflict, Path: pack.PackID, Detail: "different pack occupies context directory"}
 		}
-		return ContextPackReport{}, &ContextPackError{Reason: ReasonContextPackConflict, Path: pack.PackID, Detail: "different pack occupies context directory"}
+		if err := verifyContextPackDocuments(rootHandle, finalRel, included); err != nil {
+			return ContextPackReport{}, err
+		}
+		return ContextPackReport{PackID: pack.PackID, Version: ContextPackProtocol, Dir: finalRel, Included: included}, nil
 	} else if !errors.Is(readErr, os.ErrNotExist) {
 		return ContextPackReport{}, readErr
 	}
@@ -353,19 +366,43 @@ func sameIncludedDigests(a, b []ContextPackIncluded) bool {
 }
 
 func readContextPackMarker(root *os.Root, finalRel string) (ContextPackReport, error) {
+	// Fail closed before opening anything: a FIFO, socket or other
+	// special file at either path would block Open indefinitely, and a
+	// symlink could redirect the trust read. Only a real directory
+	// holding a regular marker file is readable.
+	dirIdent, err := root.Lstat(finalRel)
+	if err != nil {
+		return ContextPackReport{}, err
+	}
+	if dirIdent.Mode()&os.ModeSymlink != 0 || !dirIdent.IsDir() {
+		return ContextPackReport{}, &ContextPackError{Reason: ReasonContextPackUnsafe, Path: finalRel, Detail: "pack directory is not a real directory"}
+	}
 	metadata, err := root.OpenRoot(finalRel)
 	if err != nil {
 		return ContextPackReport{}, err
 	}
 	defer func() { _ = metadata.Close() }()
+	markerIdent, err := metadata.Lstat(ContextPackMarkerName)
+	if err != nil {
+		return ContextPackReport{}, err
+	}
+	if !markerIdent.Mode().IsRegular() {
+		return ContextPackReport{}, &ContextPackError{Reason: ReasonContextPackUnsafe, Path: ContextPackMarkerName, Detail: "pack marker is not a regular file"}
+	}
+	if markerIdent.Size() > maxContextPackCarrierBytes+1 {
+		return ContextPackReport{}, &ContextPackError{Reason: ReasonContextPackLimit, Detail: "pack marker exceeds bound"}
+	}
 	file, err := metadata.Open(ContextPackMarkerName)
 	if err != nil {
 		return ContextPackReport{}, err
 	}
 	defer func() { _ = file.Close() }()
-	body, err := io.ReadAll(io.LimitReader(file, maxContextPackCarrierBytes))
+	body, err := io.ReadAll(io.LimitReader(file, maxContextPackCarrierBytes+1))
 	if err != nil {
 		return ContextPackReport{}, err
+	}
+	if len(body) > maxContextPackCarrierBytes {
+		return ContextPackReport{}, &ContextPackError{Reason: ReasonContextPackLimit, Detail: "pack marker exceeds bound"}
 	}
 	var report ContextPackReport
 	decoder := json.NewDecoder(bytes.NewReader(body))
@@ -373,7 +410,60 @@ func readContextPackMarker(root *os.Root, finalRel string) (ContextPackReport, e
 	if err := decoder.Decode(&report); err != nil {
 		return ContextPackReport{}, err
 	}
+	if err := ensureJSONEOF(decoder); err != nil {
+		return ContextPackReport{}, err
+	}
 	return report, nil
+}
+
+// verifyContextPackDocuments re-proves every published document before a
+// redelivery may reuse it: each entry must still be a regular file (never
+// a symlink, directory, FIFO or other special file) whose byte count and
+// digest match the recorded receipt. Anything else refuses fail-closed so
+// a reused workarea can never launch with missing or altered documents
+// while reporting the original digest.
+func verifyContextPackDocuments(root *os.Root, finalRel string, included []ContextPackIncluded) error {
+	packRoot, err := root.OpenRoot(finalRel)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = packRoot.Close() }()
+	for _, inc := range included {
+		clean, err := cleanContextPackPath(inc.Path)
+		if err != nil {
+			return err
+		}
+		ident, err := packRoot.Lstat(clean)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return &ContextPackError{Reason: ReasonContextPackInvalid, Path: inc.Path, Detail: "published document missing"}
+			}
+			return err
+		}
+		if !ident.Mode().IsRegular() {
+			return &ContextPackError{Reason: ReasonContextPackUnsafe, Path: inc.Path, Detail: "published document is not a regular file"}
+		}
+		file, err := packRoot.Open(clean)
+		if err != nil {
+			return err
+		}
+		body, readErr := io.ReadAll(io.LimitReader(file, MaxContextPackBytesPerDocument+1))
+		closeErr := file.Close()
+		if readErr != nil {
+			return readErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		if len(body) != inc.Bytes {
+			return &ContextPackError{Reason: ReasonContextPackDigest, Path: inc.Path, Detail: "published document changed"}
+		}
+		sum := sha256.Sum256(body)
+		if "sha256:"+hex.EncodeToString(sum[:]) != inc.Digest {
+			return &ContextPackError{Reason: ReasonContextPackDigest, Path: inc.Path, Detail: "published document digest mismatch"}
+		}
+	}
+	return nil
 }
 
 func contextStagingName() (string, error) {

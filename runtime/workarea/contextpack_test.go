@@ -10,7 +10,9 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
 
 func testPackDoc(t *testing.T, path, content string) ContextDocumentV1 {
@@ -257,5 +259,167 @@ func TestMaterializeContextPackRefusesSymlinkEscape(t *testing.T) {
 	}
 	if entries, _ := os.ReadDir(target); len(entries) != 0 {
 		t.Fatal("symlink target changed")
+	}
+}
+
+func publishPackForRedelivery(t *testing.T, root RootPath) ContextPackV1 {
+	t.Helper()
+	pack := ContextPackV1{Version: ContextPackProtocol, PackID: "pack1", Documents: []ContextDocumentV1{
+		testPackDoc(t, "doc.md", "negotiated bytes"),
+		testPackDoc(t, "notes/guide.md", "more bytes"),
+	}}
+	if _, err := MaterializeContextPack(root, pack); err != nil {
+		t.Fatalf("Materialize: %v", err)
+	}
+	return pack
+}
+
+func redeliverMustRefuse(t *testing.T, root RootPath, pack ContextPackV1, what string) error {
+	t.Helper()
+	report, err := MaterializeContextPack(root, pack)
+	if err == nil {
+		t.Fatalf("redelivery accepted %s (included=%d)", what, len(report.Included))
+	}
+	return err
+}
+
+// TestMaterializeContextPackRedeliveryReprovesDocuments pins the
+// redelivery trust fix: after a successful publish, a deleted, modified
+// or symlinked document must refuse instead of reporting the original
+// digest as still included.
+func TestMaterializeContextPackRedeliveryReprovesDocuments(t *testing.T) {
+	finalRel := ContextPackDir(RootPath("."), "pack1")
+	tamper := map[string]func(t *testing.T, abs string){
+		"deleted": func(t *testing.T, abs string) {
+			if err := os.Remove(abs); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"modified": func(t *testing.T, abs string) {
+			if err := os.WriteFile(abs, []byte("tampered bytes!!"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"symlinked": func(t *testing.T, abs string) {
+			outside := filepath.Join(t.TempDir(), "outside.md")
+			if err := os.WriteFile(outside, []byte("outside"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Remove(abs); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(outside, abs); err != nil {
+				t.Fatal(err)
+			}
+		},
+	}
+	for name, fn := range tamper {
+		t.Run(name, func(t *testing.T) {
+			root := RootPath(t.TempDir())
+			pack := publishPackForRedelivery(t, root)
+			docAbs := filepath.Join(string(root), filepath.FromSlash(finalRel), "doc.md")
+			fn(t, docAbs)
+			err := redeliverMustRefuse(t, root, pack, name+" state")
+			var packErr *ContextPackError
+			if !errors.As(err, &packErr) {
+				t.Fatalf("redelivery refusal is not a pack error: %v", err)
+			}
+		})
+	}
+}
+
+// TestMaterializeContextPackRefusesForgedMarker pins the marker-identity
+// fix: a marker with matching pack identity and digest entries but forged
+// dir or version is refused, never returned unchanged.
+func TestMaterializeContextPackRefusesForgedMarker(t *testing.T) {
+	for _, forge := range []func(*ContextPackReport){func(r *ContextPackReport) { r.Dir = "../../outside" }, func(r *ContextPackReport) { r.Version = "unrecognized-version" }} {
+		root := RootPath(t.TempDir())
+		pack := publishPackForRedelivery(t, root)
+		markerAbs := filepath.Join(string(root), filepath.FromSlash(ContextPackDir(root, pack.PackID)), ContextPackMarkerName)
+		raw, err := os.ReadFile(markerAbs)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var stored ContextPackReport
+		if err := json.Unmarshal(raw, &stored); err != nil {
+			t.Fatal(err)
+		}
+		forge(&stored)
+		forged, err := json.Marshal(stored)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(markerAbs, forged, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		err = redeliverMustRefuse(t, root, pack, "forged-report state")
+		var packErr *ContextPackError
+		if !errors.As(err, &packErr) || packErr.Reason != ReasonContextPackConflict {
+			t.Fatalf("forged marker reason = %v, want %q", err, ReasonContextPackConflict)
+		}
+	}
+}
+
+// TestMaterializeContextPackRefusesPlantedMarker pins the fast-path guard:
+// an operator-authored marker that names the dispatched pack identity
+// without any published document refuses instead of reporting success.
+func TestMaterializeContextPackRefusesPlantedMarker(t *testing.T) {
+	root := RootPath(t.TempDir())
+	pack := ContextPackV1{Version: ContextPackProtocol, PackID: "pack1", Documents: []ContextDocumentV1{testPackDoc(t, "doc.md", "x")}}
+	sum := sha256.Sum256([]byte("x"))
+	digest := "sha256:" + hex.EncodeToString(sum[:])
+	planted, err := json.Marshal(ContextPackReport{
+		PackID:  "pack1",
+		Version: ContextPackProtocol,
+		Dir:     ContextPackDir(root, "pack1"),
+		Included: []ContextPackIncluded{
+			{Path: "doc.md", Bytes: 1, Digest: digest},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plantDir := filepath.Join(string(root), filepath.FromSlash(ContextPackDir(root, "pack1")))
+	if err := os.MkdirAll(plantDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(plantDir, ContextPackMarkerName), planted, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	report, err := MaterializeContextPack(root, pack)
+	if err == nil {
+		t.Fatalf("repository marker trusted: included=%d documentMissing=%v", len(report.Included), true)
+	}
+}
+
+// TestMaterializeContextPackMarkerFIFORefusesWithoutBlocking pins the
+// FIFO guard: a pre-existing FIFO at the marker path refuses promptly
+// instead of blocking Open until an external writer connects.
+func TestMaterializeContextPackMarkerFIFORefusesWithoutBlocking(t *testing.T) {
+	root := RootPath(t.TempDir())
+	pack := ContextPackV1{Version: ContextPackProtocol, PackID: "pack1", Documents: []ContextDocumentV1{testPackDoc(t, "doc.md", "x")}}
+	packDir := filepath.Join(string(root), filepath.FromSlash(ContextPackDir(root, "pack1")))
+	if err := os.MkdirAll(packDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mkfifo(filepath.Join(packDir, ContextPackMarkerName), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := MaterializeContextPack(root, pack)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("FIFO marker accepted")
+		}
+		var packErr *ContextPackError
+		if !errors.As(err, &packErr) {
+			t.Fatalf("FIFO refusal is not a pack error: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("materialization blocked opening FIFO")
 	}
 }

@@ -7,13 +7,16 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/result"
 	"github.com/RenseiAI/donmai/runtime/workarea"
+	"github.com/RenseiAI/donmai/runtime/worktree"
 )
 
 type contextPackGateProvider struct {
@@ -192,5 +195,85 @@ func TestRunContextPackAdvertisementMatchesExecution(t *testing.T) {
 	}
 	if _, statErr := os.Stat(filepath.Join(res2.WorkareaRoot, workarea.DeclarationDirName, workarea.ContextPackDirName)); !os.IsNotExist(statErr) {
 		t.Fatal("legacy session created a context directory")
+	}
+}
+
+// TestRunContextPackReachesTerminalStatusPost pins the diagnostics
+// plumbing through the production Run entry: the terminal /status post
+// must carry the materialized pack report, not just the in-memory
+// result value.
+func TestRunContextPackReachesTerminalStatusPost(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	platform := newRecordingPlatformServer(t)
+	wtm, err := worktree.NewManager(worktree.Options{ParentDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("worktree.NewManager: %v", err)
+	}
+	poster, err := result.NewPoster(result.Options{
+		PlatformURL: platform.URL,
+		WorkerID:    "worker-1",
+		AuthToken:   "tok",
+		HTTPClient:  platform.Client(),
+		BaseDelay:   1,
+	})
+	if err != nil {
+		t.Fatalf("result.NewPoster: %v", err)
+	}
+	reg := NewRegistry()
+	provider := &contextPackGateProvider{attests: true}
+	if err := reg.Register(provider); err != nil {
+		t.Fatal(err)
+	}
+	r, err := New(Options{
+		Registry:               reg,
+		WorktreeManager:        wtm,
+		Poster:                 poster,
+		HTTPClient:             platform.Client(),
+		SkipBackstop:           true,
+		SkipSteering:           true,
+		SkipPostSession:        true,
+		PreserveWorktreeAlways: true,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	qw := QueuedWork{
+		QueuedWork:  queuedWorkBase("CONTEXT-PACK-STATUS"),
+		WorkerID:    "worker-1",
+		AuthToken:   "tok",
+		PlatformURL: platform.URL,
+		ResolvedProfile: ResolvedProfile{
+			Provider: agent.ProviderStub,
+		},
+	}
+	qw.WorkType = "acceptance"
+	qw.Repository = makeBareRepo(t)
+	_, raw := testContextPack(t, map[string]string{"doc.md": "negotiated bytes"})
+	qw.ContextPack = raw
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := r.Run(ctx, qw)
+	if err != nil || res.Status != "completed" {
+		t.Fatalf("Run = %+v, err=%v", res, err)
+	}
+	if res.ContextPack == nil || len(res.ContextPack.Included) != 1 {
+		t.Fatalf("diagnostics = %+v", res.ContextPack)
+	}
+	status := platform.terminalStatus(t)
+	posted, ok := status["contextPack"]
+	if !ok {
+		t.Fatalf("terminal /status POST omitted contextPack (keys present: %d)", len(status))
+	}
+	var report workarea.ContextPackReport
+	if err := json.Unmarshal(posted, &report); err != nil {
+		t.Fatalf("posted contextPack is not a pack report: %v", err)
+	}
+	if report.PackID != res.ContextPack.PackID || len(report.Included) != len(res.ContextPack.Included) {
+		t.Fatalf("posted contextPack = %+v, want %+v", report, res.ContextPack)
+	}
+	if len(report.Included) != 1 || report.Included[0].Path != "doc.md" {
+		t.Fatalf("posted included = %+v", report.Included)
 	}
 }
