@@ -64,9 +64,12 @@ func TestAutoUpdateSchedulerBlockedTrustRootRespectsStopDeadline(t *testing.T) {
 	// The FIFO trust root is refused without opening it, so the attempt
 	// completes (fail-closed verification, draining) instead of wedging
 	// with inFlight true. Without the stat guard this wait times out:
-	// construction blocks on the FIFO with no writer.
+	// construction blocks on the FIFO with no writer. Draining alone is
+	// the preflight transition at attempt start; inFlight clear proves the
+	// Update half (manifest re-check plus downloads) finished.
 	waitForUpdateCondition(t, 10*time.Second, "FIFO attempt completed to draining", func() bool {
-		return d.State() == StateDraining
+		sched := d.autoUpdateScheduler
+		return d.State() == StateDraining && sched != nil && !sched.inFlight.Load()
 	})
 	if got := probe.manifestHits.Load(); got < 2 {
 		t.Fatalf("manifest checks = %d, want pre-check plus Update re-check (FIFO refused without blocking)", got)
@@ -148,9 +151,11 @@ func TestAutoUpdateSchedulerUpdateConstructionBoundedByAttemptDeadline(t *testin
 	// reaches Update (draining), performs the manifest re-check and the
 	// downloads, then fails closed at verification. A blocking
 	// construction would wedge here in StateUpdating with one manifest
-	// hit and zero binaries.
+	// hit and zero binaries. Draining alone is the preflight transition
+	// at attempt start; inFlight clear proves the Update half finished.
 	waitForUpdateCondition(t, 10*time.Second, "update reached draining despite FIFO", func() bool {
-		return d.State() == StateDraining
+		sched := d.autoUpdateScheduler
+		return d.State() == StateDraining && sched != nil && !sched.inFlight.Load()
 	})
 	// Stop after the completed attempt terminates promptly within the
 	// caller's deadline.

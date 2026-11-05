@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync/atomic"
@@ -315,6 +316,18 @@ func (s *autoUpdateScheduler) attemptOnce() {
 		return
 	}
 	if result != nil && result.Updated {
+		// Handoff revalidation: the bundle download outlives the
+		// preflight hold window, so a cached preparation that was
+		// valid at tick start can be expired by swap time. Revalidate
+		// the retained permission before requesting process exit:
+		// an expired hold must not become an exit-3 restart. The swap
+		// stays on disk and the daemon stays draining (fail closed);
+		// no restart is requested and applied stays clear so a later
+		// tick can retry once a fresh permission exists.
+		if err := d.validateAutoUpdateRestartHandoff(); err != nil {
+			slog.Warn("daemon: scheduled auto-update swap applied but restart permission no longer held; daemon remains draining", "error", err)
+			return
+		}
 		// The swap is on disk; the restart handoff below owns completion.
 		// Latch first so a second tick can never re-apply the same
 		// release, then ask the supervisor to exec the new binary. The
@@ -342,4 +355,30 @@ func (d *Daemon) checkAutoUpdateRelease(ctx context.Context, cfg *Config) (*Vers
 		SkipExit:       true,
 	})
 	return u.CheckForUpdate(ctx)
+}
+
+// validateAutoUpdateRestartHandoff revalidates the retained restart
+// permission at the scheduled-restart handoff, after the bundle download
+// and swap. The tick's opening preflight can reuse a cached preparation
+// that is still valid at tick start but expires while the download runs;
+// requesting process exit on that expired permission would restart
+// without authorization. Fail closed: an expired or otherwise invalid
+// permission refuses the restart and leaves the daemon draining with the
+// swap on disk, and applied stays clear so a later tick can retry once a
+// fresh permission exists.
+func (d *Daemon) validateAutoUpdateRestartHandoff() error {
+	d.shims.mu.RLock()
+	prep := d.shims.restart
+	d.shims.mu.RUnlock()
+	if prep == nil {
+		return fmt.Errorf("no restart preparation held at handoff")
+	}
+	switch prep.state {
+	case restartPreparationPrepared:
+		return d.validatePreparedRestartPermission(prep, d.restartPreparationNow())
+	case restartPreparationNotRequired:
+		return d.validateNotRequiredRestartPermission(prep)
+	default:
+		return fmt.Errorf("restart preparation %q is not handoff-ready", prep.state)
+	}
 }
