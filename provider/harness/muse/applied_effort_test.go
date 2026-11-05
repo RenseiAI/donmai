@@ -201,20 +201,48 @@ func TestAppliedEffort_ResumeHighCapturesHigh(t *testing.T) {
 	}
 }
 
-// TestAppliedEffort_AbsentAndSentinelReportNotConfigured pins AC-2: an
-// absent or sentinel effort sends no request tier and reports
-// not-configured. Raw profile input (ultra, unknown) cannot bypass
-// translation into a guessed level.
-func TestAppliedEffort_AbsentAndSentinelReportNotConfigured(t *testing.T) {
+// TestAppliedEffort_AbsentReportsNotConfigured pins AC-2's absent half: an
+// unset effort sends no request tier and reports not-configured.
+func TestAppliedEffort_AbsentReportsNotConfigured(t *testing.T) {
+	p, fh := newTestProvider(t, "single-turn")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	h, err := p.Spawn(ctx, agent.Spec{Prompt: "do work", Cwd: t.TempDir(), Autonomous: true})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	if _, present := turnStartEffortParam(t, fh); present {
+		t.Errorf("absent effort sent a reasoningEffort tier, want omitted")
+	}
+	events := drainEvents(t, h.Events(), 10*time.Second)
+	applied, ok := appliedEventOf(events)
+	if !ok {
+		t.Fatalf("no applied event for absent effort; kinds=%v", kindsOf(events))
+	}
+	if applied.Message != "" {
+		t.Errorf("applied Message = %q for absent effort, want empty (not-configured)", applied.Message)
+	}
+	gotCtx, gotContent := postAppliedThroughRealPoster(t, applied)
+	if gotCtx != "appliedReasoningEffort=not-configured" {
+		t.Errorf("poster context = %q, want appliedReasoningEffort=not-configured", gotCtx)
+	}
+	if !strings.Contains(gotContent, "not configured") {
+		t.Errorf("poster content = %q, want the not-configured sentence", gotContent)
+	}
+}
+
+// TestAppliedEffort_NoneAndUltraReportAppliedTiers pins that explicit none
+// and ultra ride the wire verbatim and report as applied tiers: omitting
+// them would silently run the turn at the host default instead of what was
+// asked for.
+func TestAppliedEffort_NoneAndUltraReportAppliedTiers(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		effort agent.EffortLevel
+		wire   string
 	}{
-		{"absent", ""},
-		{"default sentinel", "default"},
-		{"none sentinel", "none"},
-		{"ultra wire value", "ultra"},
-		{"unknown", "turbo"},
+		{"none", "none", "none"},
+		{"ultra", "ultra", "ultra"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			p, fh := newTestProvider(t, "single-turn")
@@ -224,30 +252,51 @@ func TestAppliedEffort_AbsentAndSentinelReportNotConfigured(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Spawn: %v", err)
 			}
-			if _, present := turnStartEffortParam(t, fh); present {
-				t.Errorf("effort %q sent a reasoningEffort tier, want omitted", tc.effort)
+			if got, present := turnStartEffortParam(t, fh); !present || got != tc.wire {
+				t.Fatalf("turn/start reasoningEffort = %q present=%v, want %q", got, present, tc.wire)
 			}
 			events := drainEvents(t, h.Events(), 10*time.Second)
 			applied, ok := appliedEventOf(events)
 			if !ok {
 				t.Fatalf("no applied event for effort %q; kinds=%v", tc.effort, kindsOf(events))
 			}
-			if applied.Message != "" {
-				t.Errorf("applied Message = %q for effort %q, want empty (not-configured)", applied.Message, tc.effort)
-			}
-			// RED pin: building the report directly from Spec.Effort would
-			// carry the raw input ("default"/"ultra"/"turbo") instead of
-			// the translated absence. The harness must read the accepted
-			// final request, not the raw profile.
-			if direct := agent.AppliedReasoningEffortEvent(tc.effort); tc.effort != "" && direct.Message == applied.Message {
-				t.Errorf("direct-from-spec report coincides with translated report for %q; translation bypass not pinned", tc.effort)
+			if applied.Message != tc.wire {
+				t.Errorf("applied Message = %q for effort %q, want %q (wire value must round-trip)", applied.Message, tc.effort, tc.wire)
 			}
 			gotCtx, gotContent := postAppliedThroughRealPoster(t, applied)
-			if gotCtx != "appliedReasoningEffort=not-configured" {
-				t.Errorf("poster context = %q, want appliedReasoningEffort=not-configured", gotCtx)
+			if wantCtx := "appliedReasoningEffort=" + tc.wire; gotCtx != wantCtx {
+				t.Errorf("poster context = %q, want %q", gotCtx, wantCtx)
 			}
-			if !strings.Contains(gotContent, "not configured") {
-				t.Errorf("poster content = %q, want the not-configured sentence", gotContent)
+			if wantContent := "applied reasoning effort: " + tc.wire + " (as applied)"; gotContent != wantContent {
+				t.Errorf("poster content = %q, want %q", gotContent, wantContent)
+			}
+		})
+	}
+}
+
+// TestAppliedEffort_UnsupportedRefusedAtSpawn pins AC-2's refusal half:
+// unsupported values (the "default" sentinel, unknown tiers) are refused
+// at admission, so they never send a request tier nor report a guessed
+// level.
+func TestAppliedEffort_UnsupportedRefusedAtSpawn(t *testing.T) {
+	for _, effort := range []agent.EffortLevel{"default", "turbo"} {
+		t.Run(string(effort), func(t *testing.T) {
+			p, _ := newTestProvider(t, "single-turn")
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if _, err := p.Spawn(ctx, agent.Spec{Prompt: "do work", Cwd: t.TempDir(), Autonomous: true, Effort: effort}); err == nil {
+				t.Fatalf("Spawn with effort %q succeeded, want refusal", effort)
+			} else if !strings.Contains(err.Error(), "unsupported reasoning effort") {
+				t.Fatalf("Spawn with effort %q err = %v, want unsupported reasoning effort refusal", effort, err)
+			}
+			// Resume refuses the same way: both doors share the admission guard.
+			rp, _ := newTestProvider(t, "single-turn")
+			rctx, rcancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer rcancel()
+			if _, err := rp.Resume(rctx, "22222222-2222-7222-8222-222222222222", agent.Spec{Prompt: "continue", Cwd: t.TempDir(), Autonomous: true, Effort: effort}); err == nil {
+				t.Fatalf("Resume with effort %q succeeded, want refusal", effort)
+			} else if !strings.Contains(err.Error(), "unsupported reasoning effort") {
+				t.Fatalf("Resume with effort %q err = %v, want unsupported reasoning effort refusal", effort, err)
 			}
 		})
 	}
@@ -297,11 +346,12 @@ func TestAppliedEffortFromTurnParams_Translation(t *testing.T) {
 		{map[string]any{"reasoningEffort": "xhigh"}, agent.EffortXHigh},
 		{map[string]any{"reasoningEffort": "max"}, agent.EffortMax},
 		{map[string]any{"reasoningEffort": "minimal"}, agent.EffortLevel("minimal")},
+		{map[string]any{"reasoningEffort": "none"}, agent.EffortLevel("none")},
+		{map[string]any{"reasoningEffort": "ultra"}, agent.EffortLevel("ultra")},
 		{map[string]any{}, ""},
 		{map[string]any{"reasoningEffort": ""}, ""},
-		// Rejected/unrecognized wire spellings never become a guessed level.
-		{map[string]any{"reasoningEffort": "ultra"}, ""},
-		{map[string]any{"reasoningEffort": "none"}, ""},
+		// Rejected/unrecognized wire spellings never become a guessed
+		// level (admission refuses them before any request is built).
 		{map[string]any{"reasoningEffort": "bogus"}, ""},
 	} {
 		if got := appliedEffortFromTurnParams(tc.params); got != tc.want {
@@ -326,6 +376,8 @@ func TestAppliedEffort_AllTiersSpawnCapturesApplied(t *testing.T) {
 		{"high", agent.EffortHigh, "high"},
 		{"xhigh", agent.EffortXHigh, "xhigh"},
 		{"max", agent.EffortMax, "max"},
+		{"none", agent.EffortLevel("none"), "none"},
+		{"ultra", agent.EffortLevel("ultra"), "ultra"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			p, fh := newTestProvider(t, "single-turn")
@@ -372,6 +424,8 @@ func TestAppliedEffort_AllTiersResumeCapturesApplied(t *testing.T) {
 		{"high", agent.EffortHigh, "high"},
 		{"xhigh", agent.EffortXHigh, "xhigh"},
 		{"max", agent.EffortMax, "max"},
+		{"none", agent.EffortLevel("none"), "none"},
+		{"ultra", agent.EffortLevel("ultra"), "ultra"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			p, fh := newTestProvider(t, "single-turn")

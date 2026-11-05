@@ -273,9 +273,11 @@ func turnStartParams(sessionID, commandID string, spec agent.Spec, input []TurnI
 // request actually carries, for the post-admission activity evidence. It
 // reads the final request's reasoningEffort tier — never Spec.Effort
 // directly — so raw profile input that bypasses translation cannot leak
-// into the receipt. Absent, sentinel, rejected or unrecognized tiers
-// report not-configured (empty) rather than a guessed level: only the
-// applied ladder (minimal plus every known EffortLevel) is reported.
+// into the receipt. An absent tier reports not-configured (empty) rather
+// than a guessed level; every admitted tier (minimal, low, medium, high,
+// xhigh, max, none, ultra) is reported verbatim. Unrecognized tiers report
+// not-configured as a defensive fallback: admission (validateEffort)
+// refuses them before any request is built, so they never reach the wire.
 func appliedEffortFromTurnParams(params map[string]any) agent.EffortLevel {
 	v, ok := params["reasoningEffort"].(string)
 	if !ok || v == "" {
@@ -287,7 +289,9 @@ func appliedEffortFromTurnParams(params map[string]any) agent.EffortLevel {
 		agent.EffortMedium,
 		agent.EffortHigh,
 		agent.EffortXHigh,
-		agent.EffortMax:
+		agent.EffortMax,
+		agent.EffortLevel("none"),
+		agent.EffortLevel("ultra"):
 		return agent.EffortLevel(v)
 	default:
 		return ""
