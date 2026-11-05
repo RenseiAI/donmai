@@ -1,7 +1,10 @@
 // Package diagnostic redacts child-process output before it becomes failure evidence.
 package diagnostic
 
-import "regexp"
+import (
+	"regexp"
+	"strings"
+)
 
 // The existing child-stderr rules are shared by app-server and PTY diagnostics.
 // Values end at a closing quote or an unquoted whitespace/query boundary.
@@ -50,3 +53,26 @@ func Redact(s string) string {
 	}
 	return s
 }
+
+// Unredacted reports whether s still carries a value one of Redact's rules
+// would mask: a rule match whose value is not already the [REDACTED] marker
+// (optionally quoted), or any match of a rule that masks its whole match.
+// Unlike comparing Redact(s) with s it is exact on already-redacted text,
+// where a rule's value pattern may re-match the marker plus trailing
+// punctuation without exposing anything.
+func Unredacted(s string) bool {
+	for _, r := range diagnosticRedactions {
+		keepsPrefix := strings.HasPrefix(r.replacement, "${1}")
+		for _, m := range r.pattern.FindAllStringSubmatchIndex(s, -1) {
+			if !keepsPrefix || len(m) < 4 || m[3] < 0 {
+				return true
+			}
+			if !strings.HasPrefix(strings.TrimLeft(s[m[3]:], "\"'"), redactedMarker) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+const redactedMarker = "[REDACTED]"

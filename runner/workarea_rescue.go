@@ -323,8 +323,9 @@ func (r *Runner) preserveUnpublishedWork(qw QueuedWork, res *Result) bool {
 	pres := r.newTeardownPreservation(qw.SessionID)
 	preserved := r.preservePatches(qw, res, pres)
 	if wantTails {
-		if !r.archiveFailedSessionEvidence(qw, res, pres.dirFor) {
+		if failed, ok := r.archiveFailedSessionEvidence(qw, res, pres.dirFor); !ok {
 			preserved = false
+			appendTranscriptEvidenceWarning(res, failed, "workarea retained")
 		}
 	}
 	if wantEvidence {

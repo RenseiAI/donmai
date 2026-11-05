@@ -1037,19 +1037,24 @@ func (r *Runner) run(ctx context.Context, qw QueuedWork, admission *HarnessAdmis
 		}
 		if pres != nil && finalGate && res != nil && res.Status == "failed" && len(res.terminalTranscripts) > 0 {
 			// Failed-session transcript tails share this teardown's directory
-			// with patches and descriptors. Unlike descriptors, tails are
-			// fail-closed: a tail failure keeps the workarea so a failed
-			// session never loses evidence silently. A lease acquired for
-			// the pre-flip completed status already holds a destroy
-			// disposition, so flipping teardownRequired alone cannot
-			// retain the workarea once the reaper runs: the lease
-			// itself must be flipped to retain.
-			if !r.archiveFailedSessionEvidence(qw, res, pres.dirFor) {
-				teardownRequired = false
-				if leaseAcquired && leaseProjection != nil {
-					if _, retainErr := r.wt.RetainTerminalLease(context.Background(), leaseProjection.LeaseID, qw.SessionID, terminalResultID, leaseProjection.WorkareaID); retainErr != nil {
-						r.logger.Warn("failed-session evidence retention failed; workarea may not survive reaping", "sessionId", qw.SessionID)
-					}
+			// with patches and descriptors. When the runner owns the
+			// teardown, tails are fail-closed: a tail failure keeps the
+			// workarea, and only this goroutine performs that teardown
+			// (below), so nothing can race the keep decision. A session
+			// that reached a terminal lease before failing (lease
+			// preparation flipped completed to failed) hands its workarea
+			// to the lease, whose disposition was durably fixed at
+			// acquisition and is executed by the lease reaper. The runner
+			// does not rewrite that disposition after the fact: a late
+			// rewrite races the reaper and cannot be made durable when the
+			// lease store itself is what failed. Tails there are
+			// best-effort and a failure is reported, never claimed retained.
+			if failed, ok := r.archiveFailedSessionEvidence(qw, res, pres.dirFor); !ok {
+				if leaseAcquired {
+					appendTranscriptEvidenceWarning(res, failed, "workarea follows its terminal lease")
+				} else {
+					teardownRequired = false
+					appendTranscriptEvidenceWarning(res, failed, "workarea retained")
 				}
 			}
 		}

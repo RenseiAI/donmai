@@ -1419,12 +1419,6 @@ func (m *Manager) MarkTerminalStatusDelivered(ctx context.Context, leaseID, sess
 	return m.leases.MarkTerminalStatusDelivered(ctx, leaseID, sessionID, terminalResultID, workareaID)
 }
 
-// RetainTerminalLease durably flips a leased workarea to retain so a
-// fail-closed evidence failure keeps the workarea across restart and expiry.
-func (m *Manager) RetainTerminalLease(ctx context.Context, leaseID, sessionID, terminalResultID, workareaID string) (*workarea.TerminalLease, error) {
-	return m.leases.Retain(ctx, leaseID, sessionID, terminalResultID, workareaID)
-}
-
 // ReplayTerminalResults performs one bounded durable outbox recovery pass.
 func (m *Manager) ReplayTerminalResults(ctx context.Context, batch int, attemptTimeout time.Duration, sender workarea.TerminalStatusSender) (int, error) {
 	return m.leases.ReplayTerminalResults(ctx, batch, attemptTimeout, sender)
@@ -1535,9 +1529,6 @@ func (m *Manager) releaseLeasedWorkarea(ctx context.Context, lease workarea.Term
 }
 
 func (m *Manager) releaseLeasedWorkareaUnlocked(ctx context.Context, lease workarea.TerminalLease) error {
-	if lease.ReleaseDisposition == "retain" {
-		return nil
-	}
 	repositoryPath := lease.ReleaseMetadata["repositoryWorktreePath"]
 	if repositoryPath == "" {
 		repositoryPath = lease.WorkareaPath
@@ -1588,7 +1579,7 @@ func (m *Manager) releaseLeasedWorkareaUnlocked(ctx context.Context, lease worka
 			}
 		}
 	}
-	if lease.ReleaseDisposition != "destroy" && lease.ReleaseDisposition != "archive" && lease.ReleaseDisposition != "return-to-pool" && lease.ReleaseDisposition != "retain" {
+	if lease.ReleaseDisposition != "destroy" && lease.ReleaseDisposition != "archive" && lease.ReleaseDisposition != "return-to-pool" {
 		return fmt.Errorf("runtime/worktree: unsupported leased release disposition %q", lease.ReleaseDisposition)
 	}
 	strategyValue, err := strconv.Atoi(lease.ReleaseMetadata["strategy"])
