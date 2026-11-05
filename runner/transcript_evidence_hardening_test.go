@@ -303,6 +303,71 @@ func TestTranscriptEvidenceHardening_BoolNullUnderCredentialKey(t *testing.T) {
 	}
 }
 
+// TestTranscriptEvidenceHardening_BareAuthKey pins the bare auth
+// credential key: {"auth":"<non-base64-secret>"} is replaced, and the
+// base64 spelling of the key itself is judged sensitive in every view.
+func TestTranscriptEvidenceHardening_BareAuthKey(t *testing.T) {
+	if !isSensitiveTranscriptKey("auth") {
+		t.Fatal("isSensitiveTranscriptKey(auth) = false; want true")
+	}
+	if !isSensitiveTranscriptKey("AUTH") {
+		t.Fatal("isSensitiveTranscriptKey(AUTH) = false; want true")
+	}
+	if !isSensitiveTranscriptKey("YXV0aA==") {
+		t.Fatal("isSensitiveTranscriptKey(base64 auth) = false; want true")
+	}
+	if isSensitiveTranscriptKey("author") {
+		t.Fatal("isSensitiveTranscriptKey(author) = true; want false")
+	}
+	qw := QueuedWork{QueuedWork: queuedWorkBase("BAREAUTH")}
+	got := archiveTranscriptForTest(t, "{\"auth\":\"mysecretpassword123\",\"msg\":\"clean\"}\n", qw)
+	if strings.Contains(got, "mysecretpassword123") {
+		t.Fatalf("archive carries bare auth value in cleartext:\n%s", got)
+	}
+	if !strings.Contains(got, "[REDACTED]") {
+		t.Fatalf("archive missing [REDACTED]:\n%s", got)
+	}
+}
+
+// TestTranscriptEvidenceHardening_UnknownSecretsBudget pins the fail-closed
+// view budget inside unknownSecrets: when the decoding closure cannot be
+// completed the input is unclean and the caller must drop the string.
+func TestTranscriptEvidenceHardening_UnknownSecretsBudget(t *testing.T) {
+	old := transcriptEvidenceMaxViews
+	transcriptEvidenceMaxViews = 1
+	t.Cleanup(func() { transcriptEvidenceMaxViews = old })
+	if _, ok := unknownSecrets("prefix aGVsbG8td29ybGQ= suffix"); ok {
+		t.Fatal("unknownSecrets = ok with an exhausted view budget; want !ok")
+	}
+}
+
+// TestTranscriptEvidenceHardening_Base64TruncatedMod1NoJoin pins trimming
+// alone: a truncated token with no joinable suffix still decodes only when
+// trailing characters are trimmed before decoding.
+func TestTranscriptEvidenceHardening_Base64TruncatedMod1NoJoin(t *testing.T) {
+	secret := "TRUNCATED-BASE64-SECRET-XYZ"
+	raw := base64.RawStdEncoding.EncodeToString([]byte(secret))
+	token := raw + "X"
+	if len(token)%4 != 1 {
+		t.Fatalf("setup token len mod 4 = %d; want 1", len(token)%4)
+	}
+	if got := decodeBase64TranscriptVariants(token); !containsDecodedSecret(got, secret) {
+		t.Fatalf("trimmed variant missing secret; variants = %q", got)
+	}
+	if got := decodeTranscriptBase64Tokens("prefix " + token); !strings.Contains(got, secret) {
+		t.Fatalf("truncated no-join view missing secret; view = %q", got)
+	}
+}
+
+func containsDecodedSecret(variants []string, secret string) bool {
+	for _, v := range variants {
+		if strings.Contains(v, secret) {
+			return true
+		}
+	}
+	return false
+}
+
 // TestTranscriptEvidenceHardening_UnleasedRetainMetric pins F6: an unleased
 // workarea kept after a tail failure bumps the retained metric the operator
 // sweep reads.

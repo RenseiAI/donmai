@@ -103,7 +103,7 @@ func transcriptEvidenceSecretValues(qw QueuedWork) []string {
 
 // transcriptSensitiveKeyRE mirrors the shared output rail's secret-name
 // list. Any value under one of these keys is replaced, whatever its type.
-var transcriptSensitiveKeyRE = regexp.MustCompile(`(?i)(authorization|bearer|api[_-]?keys?|access[_-]?tokens?|refresh[_-]?tokens?|auth[_-]?tokens?|client[_-]?secrets?|private[_-]?keys?|secrets?|tokens?|passwords?|passwds?|credentials?|cookies?|sessions?)`)
+var transcriptSensitiveKeyRE = regexp.MustCompile(`(?i)(authorization|bearer|api[_-]?keys?|access[_-]?tokens?|refresh[_-]?tokens?|auth[_-]?tokens?|\bauth\b|client[_-]?secrets?|private[_-]?keys?|secrets?|tokens?|passwords?|passwds?|credentials?|cookies?|sessions?)`)
 
 // transcriptUsageCounterKeys allowlists exact token-usage counter names. They
 // are telemetry and stay numeric, but only when the value is a JSON number;
