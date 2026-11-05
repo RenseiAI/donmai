@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"unicode/utf16"
 	"unicode/utf8"
 
@@ -28,16 +29,21 @@ import (
 //     number leaf of a JSON-shaped secret (its booleans and nulls carry no
 //     secret material), and by each line of a multi-line secret;
 //   - a value the shared output rail (diagnostic.Redact) would mask, such as
-//     an unknown password, bearer, or token-shaped string;
+//     an unknown password, bearer, or token-shaped string, or a value the
+//     WIP checkpoint content gate (wipSecretContentRE) would refuse, such as
+//     a PEM block, an access-key ID, a PAT, a JWT, a docker auth entry, a
+//     netrc password, or a SECRET_KEY assignment;
 //   - a value of any type under a credential-named key (the key is judged in
 //     all of its decoding views), including inside JSON embedded in a string;
+//     under such a key both the nested keys and the values are replaced;
 //   - an unknown credential found that way (four bytes or longer) repeated
 //     anywhere else in the same string;
 //
 // under any combination of these decodings, applied repeatedly: JSON and
 // Python-style string escapes, URL percent-encoding, HTML entities, base64
-// tokens, and JSON embedded anywhere inside a string. Known secrets also
-// match in any letter case.
+// tokens (at offsets 0-3 with trimmed lengths, whitespace-joined runs, and
+// UTF-16LE forms), and JSON embedded anywhere inside a string. Known
+// secrets also match in any letter case.
 //
 // Design. Earlier versions enumerated encodings inside the redactor, and each
 // review found the next encoding it missed. The redactor is now best-effort
@@ -56,7 +62,16 @@ const transcriptRedacted = "[REDACTED]"
 
 // transcriptEvidenceMaxViews bounds the decoding views of one string. A
 // string whose views exceed the budget is not proved clean and is dropped.
-const transcriptEvidenceMaxViews = 64
+// An atomic so a redaction that outlives its per-file deadline (its
+// goroutine keeps running after the caller falls back) cannot race a
+// concurrent redaction that reads the budget. Tests store a small budget
+// to prove the fail-closed budget branch without building a 64-view
+// closure.
+var transcriptEvidenceMaxViews atomic.Int64
+
+func init() {
+	transcriptEvidenceMaxViews.Store(64)
+}
 
 // transcriptEvidenceSecretValues collects every secret value the evidence
 // archiver must redact: the session bearers, ALL session env values, and
@@ -96,7 +111,7 @@ func transcriptEvidenceSecretValues(qw QueuedWork) []string {
 
 // transcriptSensitiveKeyRE mirrors the shared output rail's secret-name
 // list. Any value under one of these keys is replaced, whatever its type.
-var transcriptSensitiveKeyRE = regexp.MustCompile(`(?i)(authorization|bearer|api[_-]?keys?|access[_-]?tokens?|refresh[_-]?tokens?|auth[_-]?tokens?|client[_-]?secrets?|private[_-]?keys?|secrets?|tokens?|passwords?|passwds?|credentials?|cookies?|sessions?)`)
+var transcriptSensitiveKeyRE = regexp.MustCompile(`(?i)(authorization|bearer|api[_-]?keys?|access[_-]?tokens?|refresh[_-]?tokens?|auth[_-]?tokens?|\bauth\b|client[_-]?secrets?|private[_-]?keys?|secrets?|tokens?|passwords?|passwds?|credentials?|cookies?|sessions?)`)
 
 // transcriptUsageCounterKeys allowlists exact token-usage counter names. They
 // are telemetry and stay numeric, but only when the value is a JSON number;
@@ -351,15 +366,17 @@ func unknownSecrets(s string) ([]string, bool) {
 }
 
 // clean is the guarantee: no decoding view of s carries a known secret, a
-// numeric secret, one of the unknown secrets found in the input, or an
-// unmasked shared-rail value. Exceeding a budget is treated as unclean.
+// numeric secret, one of the unknown secrets found in the input, an
+// unmasked shared-rail value, or a common token shape the WIP checkpoint
+// gate would refuse (see wipSecretContentRE). Exceeding a budget is treated
+// as unclean.
 func (r *transcriptRedactor) clean(s string, unknown *strings.Replacer) bool {
 	views, complete := transcriptDecodingViews(s)
 	if !complete {
 		return false
 	}
 	for _, v := range views {
-		if r.containsSecret(v) || r.containsNumericSecret(v) || diagnostic.Unredacted(v) {
+		if r.containsSecret(v) || r.containsNumericSecret(v) || diagnostic.Unredacted(v) || wipSecretContentRE.MatchString(v) {
 			return false
 		}
 		if unknown != nil {
@@ -407,7 +424,14 @@ func (r *transcriptRedactor) redactValue(v interface{}, sensitive bool) interfac
 		out := make(map[string]interface{}, len(typed))
 		for k, val := range typed {
 			childSensitive := sensitive || isSensitiveTranscriptKey(k)
-			rk := r.redactString(k)
+			// A map under a credential key holds credential material in its
+			// keys as well as its values: redact both. The credential key
+			// itself is schema and stays readable (it is redacted above only
+			// when it carries a secret value).
+			rk := transcriptRedacted
+			if !sensitive {
+				rk = r.redactString(k)
+			}
 			if !childSensitive && isUsageTranscriptCounterKey(k) {
 				if _, isNumber := val.(json.Number); !isNumber {
 					out[rk] = transcriptRedacted
@@ -602,7 +626,7 @@ func transcriptDecodingViews(s string) ([]string, bool) {
 			if next == "" || seen[next] {
 				continue
 			}
-			if len(views) >= transcriptEvidenceMaxViews {
+			if len(views) >= int(transcriptEvidenceMaxViews.Load()) {
 				return views, false
 			}
 			seen[next] = true
@@ -759,23 +783,109 @@ func percentDecodeTranscriptText(s string, plus bool) string {
 
 // decodeTranscriptBase64Tokens joins the decodings of every base64-shaped
 // token in s into one newline-separated view, so a long text adds one view,
-// not one per word. Bytes that are not printable text (invalid UTF-8,
-// control characters) become line breaks: a secret wrapped in binary noise
-// still reads as a line of its own.
+// not one per word. Each token is decoded at offsets 0-3 with its length
+// trimmed, so a truncated (length mod 4 == 1) or unaligned tail fragment
+// still decodes to the secret it carries. Runs split by whitespace (GNU
+// base64 wraps at 76 columns) are joined and decoded as one. Bytes that
+// are not printable text (invalid UTF-8, control characters) become line
+// breaks: a secret wrapped in binary noise still reads as a line of its
+// own. Base64 of UTF-16LE text decodes to its UTF-8 form as well.
 func decodeTranscriptBase64Tokens(s string) string {
 	var parts []string
-	for _, tok := range transcriptBase64TokenRE.FindAllString(s, -1) {
-		trimmed := strings.TrimRight(tok, "=")
-		for _, enc := range []*base64.Encoding{base64.RawStdEncoding, base64.RawURLEncoding} {
-			if b, err := enc.DecodeString(trimmed); err == nil {
-				if text := printableTranscriptRuns(b); text != "" {
-					parts = append(parts, text)
-				}
-				break
+	seen := map[string]bool{}
+	add := func(texts []string) {
+		for _, text := range texts {
+			if text != "" && !seen[text] {
+				seen[text] = true
+				parts = append(parts, text)
 			}
 		}
 	}
+	for _, tok := range transcriptBase64TokenRE.FindAllString(s, -1) {
+		add(decodeBase64TranscriptVariants(tok))
+	}
+	for _, run := range transcriptBase64RunRE.FindAllString(s, -1) {
+		stripped := strings.Join(strings.Fields(run), "")
+		if len(strings.TrimRight(stripped, "=")) < 8 {
+			continue
+		}
+		add(decodeBase64TranscriptVariants(stripped))
+	}
 	return strings.Join(parts, "\n")
+}
+
+// transcriptBase64RunRE finds whitespace-split base64 runs: GNU base64
+// wraps at 76 columns, so a secret of 58 bytes or more spans a newline.
+// Each piece is at least 4 base64 characters so ordinary word pairs do not
+// join; short runs are skipped by the caller.
+var transcriptBase64RunRE = regexp.MustCompile(`[A-Za-z0-9+/=_-]{4,}(?:\s+[A-Za-z0-9+/=_-]{4,})+`)
+
+// decodeBase64TranscriptVariants decodes tok at offsets 0-3 with 0-2
+// trailing characters trimmed, in both the standard and URL-safe
+// alphabets. Lengths mod 4 == 1 never decode and are skipped. Each
+// successful decode contributes its printable runs and, when the bytes
+// read as UTF-16LE text, the UTF-8 form.
+func decodeBase64TranscriptVariants(tok string) []string {
+	stripped := strings.TrimRight(tok, "=")
+	if len(stripped) < 2 {
+		return nil
+	}
+	var out []string
+	seen := map[string]bool{}
+	addBytes := func(b []byte) {
+		if text := printableTranscriptRuns(b); text != "" && !seen[text] {
+			seen[text] = true
+			out = append(out, text)
+		}
+		if text := utf16LETranscriptText(b); text != "" && !seen[text] {
+			seen[text] = true
+			out = append(out, text)
+		}
+	}
+	for offset := 0; offset < 4 && offset < len(stripped); offset++ {
+		for trim := 0; trim <= 2; trim++ {
+			end := len(stripped) - trim
+			if end <= offset || end-offset < 2 {
+				continue
+			}
+			sub := stripped[offset:end]
+			if len(sub)%4 == 1 {
+				continue
+			}
+			for _, enc := range []*base64.Encoding{base64.RawStdEncoding, base64.RawURLEncoding} {
+				if b, err := enc.DecodeString(sub); err == nil {
+					addBytes(b)
+					break
+				}
+			}
+		}
+	}
+	return out
+}
+
+// utf16LETranscriptText decodes b as UTF-16LE and returns its printable
+// runs, or "" when b does not read as UTF-16LE text. The NUL heuristic
+// keeps ordinary ASCII (no NUL at an odd byte) on the raw view alone, so
+// every base64 token does not gain a redundant second view.
+func utf16LETranscriptText(b []byte) string {
+	if len(b) < 4 || len(b)%2 != 0 {
+		return ""
+	}
+	hasNUL := false
+	for i := 1; i < len(b); i += 2 {
+		if b[i] == 0 {
+			hasNUL = true
+			break
+		}
+	}
+	if !hasNUL {
+		return ""
+	}
+	u16 := make([]uint16, 0, len(b)/2)
+	for i := 0; i+1 < len(b); i += 2 {
+		u16 = append(u16, uint16(b[i])|uint16(b[i+1])<<8)
+	}
+	return printableTranscriptRuns([]byte(string(utf16.Decode(u16))))
 }
 
 // printableTranscriptRuns maps every invalid UTF-8 byte and control
