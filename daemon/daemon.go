@@ -706,13 +706,17 @@ type Daemon struct {
 	// running executable is swapped; tests point it at a temp file so a
 	// successful production swap never touches the test binary.
 	autoUpdateBinaryPath string
-	// updateSwapApplied latches when any Update swaps a newer binary to
-	// disk (Updated=true). It is set while the update lifecycle lease is
-	// still held, before finish releases it, so a concurrent Resume that
-	// acquires the lease afterwards observes it and refuses: new work
-	// must not be admitted after the snapshot that authorized the
-	// impending restart. The process exits (or the test hook records)
-	// with the daemon draining; the flag never clears in-process.
+	// updateSwapApplied latches when a scheduled Update swaps a newer binary to
+	// disk (Updated=true) with a still-valid restart permission. It is set
+	// while the update lifecycle lease is still held, before finish releases
+	// it, so a concurrent Resume that acquires the lease afterwards observes
+	// it and refuses: new work must not be admitted after the snapshot that
+	// authorized the impending restart. It is cleared again only when the
+	// post-swap handoff finds the retained permission already expired: the
+	// swap stays on disk but no restart is owned, so the fence must not
+	// strand later ticks or explicit prepare/resume. The process exits (or
+	// the test hook records) with the daemon draining; a latched flag never
+	// clears except through that expired-handoff recovery.
 	updateSwapApplied atomic.Bool
 
 	// Landing callbacks are independent of worker spawning, so they have their
@@ -4209,9 +4213,22 @@ func (a *updateAttempt) runWithConfig(ctx context.Context, cfg *Config, fenceSwa
 		res, err = updater.RunUpdate(ctx)
 	}
 	if fenceSwap && err == nil && res != nil && res.Updated {
-		// Latched while the update lease is still held (deferred
-		// finish releases it), so a Resume that acquires the lease
-		// afterwards observes the fence with no window.
+		// Handoff revalidation under the update lease: the bundle download
+		// outlives the preflight hold window, so a preparation that was
+		// valid at tick start can be expired by swap time. Latch the fence
+		// only while the retained permission is still valid; on expiry
+		// abandon the stale preparation and leave the fence clear so a
+		// later tick can retry with a fresh permission and explicit
+		// prepare/resume stay available. Latched while the lease is still
+		// held (deferred finish releases it), so a Resume that acquires
+		// the lease afterwards observes the fence with no window.
+		if handoffErr := d.validateAutoUpdateRestartHandoff(); handoffErr != nil {
+			if abandonErr := d.abandonRestartPreparation(ctx); abandonErr != nil {
+				slog.Warn("daemon: scheduled auto-update handoff expired; abandon failed", "error", abandonErr)
+			}
+			d.updateSwapApplied.Store(false)
+			return res, fmt.Errorf("scheduled auto-update handoff refused: %w", handoffErr)
+		}
 		d.updateSwapApplied.Store(true)
 	}
 	return res, err

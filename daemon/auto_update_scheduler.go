@@ -322,9 +322,18 @@ func (s *autoUpdateScheduler) attemptOnce() {
 		// the retained permission before requesting process exit:
 		// an expired hold must not become an exit-3 restart. The swap
 		// stays on disk and the daemon stays draining (fail closed);
-		// no restart is requested and applied stays clear so a later
-		// tick can retry once a fresh permission exists.
+		// no restart is requested and applied stays clear. The fence is
+		// also cleared and the stale preparation abandoned here for the
+		// narrow window in which the hold lapsed after the leased
+		// revalidation inside runWithConfig: without this a later tick
+		// would reuse the same expired preparation and explicit
+		// prepare/resume would keep refusing, stranding the host
+		// draining with no restart owner.
 		if err := d.validateAutoUpdateRestartHandoff(); err != nil {
+			if abandonErr := d.abandonRestartPreparation(ctx); abandonErr != nil {
+				slog.Warn("daemon: scheduled auto-update handoff abandon failed", "error", abandonErr)
+			}
+			d.updateSwapApplied.Store(false)
 			slog.Warn("daemon: scheduled auto-update swap applied but restart permission no longer held; daemon remains draining", "error", err)
 			return
 		}
@@ -364,8 +373,9 @@ func (d *Daemon) checkAutoUpdateRelease(ctx context.Context, cfg *Config) (*Vers
 // requesting process exit on that expired permission would restart
 // without authorization. Fail closed: an expired or otherwise invalid
 // permission refuses the restart and leaves the daemon draining with the
-// swap on disk, and applied stays clear so a later tick can retry once a
-// fresh permission exists.
+// swap on disk, and applied stays clear. Callers abandon the stale
+// preparation and clear the swap fence on refusal so a later tick can
+// retry with a fresh permission and explicit prepare/resume stay available.
 func (d *Daemon) validateAutoUpdateRestartHandoff() error {
 	d.shims.mu.RLock()
 	prep := d.shims.restart
