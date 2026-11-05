@@ -19,31 +19,23 @@ import (
 // spike never tracks a branch: every matrix lane below reports against this
 // revision, and a rerun first re-verifies the checkout hash.
 //
-// Upstream: the Ghostty terminal emulator repository, tag v1.3.1
-// (release commit). The libghostty-vt C ABI at this pin is a stateless
-// surface (OSC/SGR/key-encode/paste helpers only); the stateful Terminal
-// with the screen model lives in the Zig module sources in the same tree.
-// Toolchain floor for any source-level build of that tree: the minimum Zig
-// version recorded in the tree's build.zig.zon at this commit.
+// Upstream: the Ghostty terminal emulator repository, tag v1.4.0
+// (release commit). The libghostty-vt C API now includes a complete terminal
+// emulator API, including the screen model. It can build freestanding, but
+// API/ABI breaks are expected before libghostty 1.0; pin bindings and artifacts
+// together. See vt_spike_matrix.md for adoption and security findings.
 //
-// The candidate adapter in this file does NOT link that tree: there is no
-// Zig toolchain in this repo's dependency stack, no Cgo in the release
-// builds (see below), and the pinned C ABI exposes no screen model to
-// point a snapshot authority at. The candidate is therefore the narrowest
-// meaningful stand-in the spike can build in pure Go behind the existing
-// terminal seam: an independent line/grid state machine with its own
-// scrollback, wrap, cursor, and mode books, answering the same live
-// query-response contract. It exists so the parity harness below measures
-// the SEAM (same corpus, same contract, same bytes) rather than any one
-// foreign engine — and so a future rerun against a real stateful candidate
-// (vendored engine or a later C ABI that grows a screen model) plugs into
-// the same harness unchanged.
+// The candidate adapter in this file does NOT link that tree: it remains an
+// independent pure-Go stand-in measuring the terminal SEAM, not upstream
+// emulator behavior. There is no binding/cgo shim to migrate in this spike.
+// A real C adapter still needs integration and distribution measurements,
+// including compatibility with CGO_ENABLED=0 release builds.
 const (
 	// vtCandidateUpstream is the pinned source revision the candidate is
 	// evaluated against. Full 40-hex commit, not a tag name: tags move.
-	vtCandidateUpstream = "332b2aefc6e72d363aa93ab6ecfc86eeeeb5ed28"
+	vtCandidateUpstream = "83fb95624b0439ee660c2679b43b38c8b63769cd"
 	// vtCandidateUpstreamTag is the human label for that commit.
-	vtCandidateUpstreamTag = "v1.3.1"
+	vtCandidateUpstreamTag = "v1.4.0"
 	// vtCandidateControl is the control revision: the owned continuation
 	// engine's upstream source (see internal/terminalvt/UPSTREAM.json).
 	vtCandidateControl = "v0.0.0-20260712004152-b16d026a9d2e"
@@ -57,8 +49,8 @@ const (
 // and the evaluation fixtures. A rerun pins by re-verifying these with
 // `git rev-parse` in the pinned checkout — never by trusting a tag.
 var vtCandidateSHAs = map[string]string{
-	// Candidate upstream release commit (tag v1.3.1).
-	"candidate": "332b2aefc6e72d363aa93ab6ecfc86eeeeb5ed28",
+	// Candidate upstream release commit (tag v1.4.0).
+	"candidate": vtCandidateUpstream,
 	// Control: x/vt pseudo-version recorded in go.mod / UPSTREAM.json.
 	"control": "b16d026a9d2e",
 }
@@ -66,11 +58,11 @@ var vtCandidateSHAs = map[string]string{
 // vtCandidateToolchain records the build toolchain this spike was evaluated
 // with. Any source-level build of the upstream tree additionally requires
 // the minimum Zig version in that tree's build.zig.zon, which this repo
-// does not vendor and which is absent from PATH here.
+// does not vendor and which is not part of the release dependency stack.
 var vtCandidateToolchain = map[string]string{
-	"go":  "go1.27.2",
+	"go":  "go1.27.3 (host); go1.26.10 (Linux suite and lint floor)",
 	"cgo": "CGO_ENABLED=1 for tests; release builds ship CGO_ENABLED=0 (see .goreleaser.yaml)",
-	"zig": "minimum 0.15.2 at pin (build.zig.zon); measured macOS arm64: 0.15.2 links nothing (host-SDK drift), 0.17.0 cannot analyze the pin build scripts; no Zig toolchain in this repo's dependency stack",
+	"zig": "minimum 0.17.0 at pin (build.zig.zon); no Zig toolchain in this repo's dependency stack",
 }
 
 // candidatePin reports the exact upstream pins this spike evaluated. It

@@ -12,54 +12,66 @@ production dependency.
 
 | Role      | Revision                                   | Note                                   |
 |-----------|--------------------------------------------|----------------------------------------|
-| Candidate | `332b2aefc6e72d363aa93ab6ecfc86eeeeb5ed28` | Upstream tag `v1.3.1` (release commit) |
+| Candidate | `83fb95624b0439ee660c2679b43b38c8b63769cd` | Upstream tag `v1.4.0` (release commit) |
 | Control   | `b16d026a9d2e`                             | Owned engine upstream (`x/vt` pseudo-version; `internal/terminalvt/UPSTREAM.json`, `go.mod`) |
 
 Candidate pin, full 40-hex commit (tags move; the hash does not):
 
 ```text
-332b2aefc6e72d363aa93ab6ecfc86eeeeb5ed28
+83fb95624b0439ee660c2679b43b38c8b63769cd
 ```
 
-Rerun rule: re-verify with `git rev-parse HEAD` in a checkout of that hash
-before trusting any number below (a `--branch v1.3.1 --depth 1` checkout
-resolves to exactly this commit). The constants `vtCandidateUpstream`,
-`vtCandidateSHAs`, and `vtCandidateToolchain` in `ptyhost/vt_candidate.go`
-record the same pins in code.
+Rerun rule: verify the local checkout before running the matrix. The tag is
+annotated: its tag-object hash is not the checkout commit above. Fetching is
+an explicit preparation step, never performed by a test:
 
-Toolchain floor: Go `go1.27.2` (this repo); any source-level build of the
-upstream tree additionally requires the minimum Zig version in that tree's
-`build.zig.zon` — `0.15.2` at the pin. Neither the pinned nor the current
-Zig toolchain can build the pin's `lib-vt` step on macOS arm64 (measured
-in the upstream build lane below). Release builds ship `CGO_ENABLED=0`
-(`.goreleaser.yaml`); tests run with `CGO_ENABLED=1`.
+```sh
+git clone --depth 1 --branch v1.4.0 https://github.com/ghostty-org/ghostty.git /tmp/ghostty-vt-spike
+GOWORK=off go test -race ./ptyhost -run '^TestCandidateCheckout$' -v -args -vt-candidate-checkout=/tmp/ghostty-vt-spike
+GOWORK=off go test -race ./ptyhost -run TestCandidate -v -args -vt-candidate-checkout=/tmp/ghostty-vt-spike
+```
+
+The checkout lane fails closed on a Git error or any other HEAD commit.
+Without the flag it explicitly skips; the hermetic stand-in matrix still runs.
+The constants `vtCandidateUpstream`, `vtCandidateSHAs`, and
+`vtCandidateToolchain` record the same pins in code.
+Toolchains: Go `go1.27.3` (host), `go1.26.10` (module floor / Linux suite);
+Zig `0.17.0` in the pin's
+`build.zig.zon`. Release builds ship `CGO_ENABLED=0`; race tests use Cgo.
 
 License at pin: MIT (`LICENSE` file header in the upstream tree). No legal
 blocker found; the verdict is architectural, not legal.
 
 ## Why HOLD (not ADOPT, not REJECT)
 
-The pinned C ABI (`include/ghostty/vt.h` at the pin) is a **stateless**
-surface: OSC/SGR/key-encode/paste helpers plus a WASM allocator shim. It
-exposes **no hosted screen model** — no terminal/screen/cursor/grid entry
-point — so there is nothing in it a snapshot authority can point at. A Go
-adapter over that ABI could only re-host the state machine this repo already
-owns (grid, scrollback, modes, wrap, cursor books): a rewrite of the grid,
-not an adoption.
+At v1.4.0 the previous missing-screen-model blocker is removed:
+`include/ghostty/vt.h` includes terminal, grid, render, formatter and snapshot
+APIs. `ghostty_terminal_new`, `ghostty_terminal_vt_write`,
+`ghostty_terminal_resize`, and `ghostty_terminal_grid_ref` expose stateful
+terminal operation to C consumers. There is no existing binding/cgo shim in
+this spike to migrate: the candidate remains a pure-Go seam stand-in.
 
-The stateful Terminal (grid, scrollback, modes, wrap, Kitty keyboard stack,
-query responders) exists in the same pinned tree only as a **Zig module**
-(`src/lib_vt.zig` re-exporting `src/terminal/*`). Reaching it from Go means
-driving a Zig build artifact: a second toolchain this repo does not ship,
-plus a C ABI or static-link seam that does not exist at the pin. That is a
-larger integration than a snapshot-authority swap — new toolchain, new link
-model, new signing/symbol surface — and it is not justified while the C ABI
-cannot host the authority at all.
+The [upstream release notes](https://ghostty.org/docs/install/release-notes/1-4-0#libghostty)
+describe a complete terminal emulator API and freestanding builds without
+libc++. That removes the earlier API obstacle; it does not prove a Go binding,
+static linking, or compatibility with our Cgo-free release lane. The API/ABI
+is still unstable, with further breaks expected before libghostty 1.0.
+Pin source, headers, binding and artifact together on any adoption attempt.
+HOLD now means integration and distribution evidence is outstanding, rather
+than that upstream lacks a screen API. Do not adopt or track upstream `main`.
 
-REJECT would overclaim: a later upstream revision may grow a stateful C
-screen model, at which point the parity harness in this spike plugs a real
-candidate in unchanged. HOLD says: keep the seam, keep the harness, revisit
-when the upstream C surface can actually host a screen.
+### Security implications for adoption
+
+The [v1.4.0 security fixes](https://ghostty.org/docs/install/release-notes/1-4-0#security)
+include GHSA-mhff-mv4q-fp63 (Kitty graphics crash, hang, excessive allocation,
+and file access outside temporary directories) and GHSA-w9q4-5jvv-mcv4
+(scrollback-clear memory corruption with small limits and styled/hyperlinked
+cursors). Both process untrusted terminal output and matter to a future VT
+embedding. Keep graphics disabled unless deliberately integrated; test zero
+and small scrollback limits with styled/hyperlinked cursors in a real binding.
+The stand-in neither links the vulnerable code nor validates these upstream
+fixes. Moving the evaluation pin is not security-regression evidence for a
+linked emulator. Full Kitty graphics support does not expand this corpus.
 
 ## Parity harness (same corpus, same contract, same bytes)
 
@@ -114,55 +126,54 @@ strips the Kitty keyboard query viewer-side; that behavior is unchanged.
 
 | Lane | Result |
 |------|--------|
-| macOS (arm64, this host): `go vet`, `go test -race` on `ptyhost` | PASS (quoted below) |
-| Linux | **Not run from here** — reported, not passed. Rerun under `make test-podman` (Linux container) before any follow-up. |
+| macOS arm64 | Candidate matrix passes with `-race`; full host suite fails the firehose throughput floor (1.34 / 1.16 MB/s, required 2.0). |
+| Linux | `make test-podman` passes, including `ok  	github.com/RenseiAI/donmai/ptyhost	34.625s`. |
 | Local daemon path (`Session.Spawn` construction) | Unchanged — the spike does not alter `Spawn`; the candidate is test-only and never constructed outside tests. |
-| Sandbox/in-box distribution, binary size, startup, CPU/memory | **Not measured** — no linkable candidate artifact exists at the pin (no screen model in the C ABI). Any future stateful candidate must report: static vs dynamic link, `CGO_ENABLED` impact on the `CGO_ENABLED=0` release builds, cross-builds (darwin arm64/amd64, linux arm64/amd64), sandbox/in-box delivery, binary-size delta, startup cost, steady-state CPU/memory vs control, shipped symbols, and signing/notarization consequences. |
-| Cross-builds | **Not attempted** — same reason. The Zig-toolchain requirement alone blocks the existing `CGO_ENABLED=0` release lane. |
-| C ABI / Cgo integration | Headers consumable (`cc -fsyntax-only` clean); link blocked (no artifact — see upstream build lane). The pinned C ABI cannot host a snapshot authority (no screen model). A Cgo or static-link lane is premature until a stateful C entry point exists. |
-| Upstream source build at pin (`zig build lib-vt`) | **Attempted, measured, failed on toolchain drift** — see lane below. No artifact, so binary size / startup / CPU / symbols / signing stay unmeasurable. |
+| Sandbox/in-box distribution, binary size, startup, CPU/memory | **Not measured** — no upstream artifact is linked into this spike. Any future stateful candidate must report: static vs dynamic link, `CGO_ENABLED` impact on the `CGO_ENABLED=0` release builds, cross-builds (darwin arm64/amd64, linux arm64/amd64), sandbox/in-box delivery, binary-size delta, startup cost, steady-state CPU/memory vs control, shipped symbols, and signing/notarization consequences. |
+| Cross-builds | **Not measured** — a separate source toolchain and Go link design still need evaluation for the `CGO_ENABLED=0` release lane. |
+| C ABI / Cgo integration | Stateful C entry points exist at this pin; no Go binding is linked. Header and source-build observations are recorded below; neither proves snapshot parity with upstream. |
+| Upstream source build at pin (`zig build -Demit-lib-vt=true`) | See the v1.4.0 source-build lane below; prior-pin build failures are not results for this pin. |
 
 Unavailable lanes are reported, not passed — per the brief.
 
-## Upstream build lane (measured, macOS arm64)
+## Upstream build lane (v1.4.0, macOS arm64)
 
-Checkout: `git clone --depth 1 --branch v1.3.1 <upstream>`;
-`git rev-parse HEAD` reads `332b2aefc6e72d363aa93ab6ecfc86eeeeb5ed28`,
-matching the pin. Minimum Zig at the pin (`build.zig.zon`): `0.15.2`.
+Verify the checkout first using the checkout lane above. Documented source
+build step for this pin (the former `lib-vt` step is replaced by an option):
 
-- Pinned toolchain `0.15.2` (release tarball, checksum-verified):
-  `zig build lib-vt` fails while linking the build runner itself —
-  undefined `_fork`, `_free`, `_getenv`, `_waitpid`, and more. A minimal
-  `pub fn main() void {}` fails the same way (`_abort`, `_bzero`,
-  `__availability_version_check` from its own compiler-rt), so this is
-  toolchain/host-SDK drift, not a Ghostty source failure. Result: the
-  pinned toolchain links nothing on this host.
-- Current toolchain `0.17.0`: `zig build lib-vt` fails earlier, analyzing
-  the pin's build scripts — `src/build/Config.zig` uses
-  `std.process.EnvMap` and `@cImport`, both gone in `0.17.0`. Result: the
-  current toolchain cannot evaluate the pin's build at all.
-- Headers without a link: `cc -fsyntax-only -I include
-  example/c-vt-sgr/src/main.c` exits clean — the C surface is consumable,
-  only unbuildable here.
-- Export inventory (read from source, no link needed): the linkable root
-  `src/terminal/c/main.zig` re-exports only OSC, color, SGR, key, paste
-  (plus WASM allocator helpers). The stateful names — `Terminal`,
-  `Screen`, `PageList`, `Parser`, `Stream` — appear only in
-  `src/lib_vt.zig` for Zig-module consumers. Even a successful link would
-  yield no C-callable screen model.
+```sh
+cd /tmp/ghostty-vt-spike
+zig build -Demit-lib-vt=true
+# Isolate the native library from optional Apple packaging:
+zig build -Demit-lib-vt=true -Demit-xcframework=false
+cc -fsyntax-only -I include example/c-vt-grid-traverse/src/main.c
+```
 
-Consequence for the matrix: with no buildable artifact, the binary-size,
-startup, CPU/memory, symbol, signing, cross-build, and sandbox-delivery
-lanes remain unmeasurable from the pin — reported, not passed. A revisit
-needs a newer upstream revision whose C surface (or build scripts) meets a
-shippable toolchain before any of those lanes can turn green.
+These are manual evaluation steps, never run by Go tests. Upstream source
+is data; no other upstream scripts are part of this spike. The pin's
+`src/terminal/c/main.zig` exports terminal and grid APIs as well as the earlier
+parser/encoder helpers. Prior v1.3.1 toolchain failures and export inventory
+are superseded; they must not be reported as v1.4.0 measurements.
+
+Build observation: the default command attempts an xcframework on this host;
+Zig 0.17.0 reports `error: no field named 'fd' in struct
+'Io.Threaded.NullFile__struct_14'` while compiling an iOS simulator dependency;
+the remaining default-build work was stopped after that diagnostic.
+The native-only command passes (exit 0), producing static and shared libraries. The C grid-traversal example
+passes `cc -fsyntax-only` (exit 0). Freestanding support is reported
+upstream and present in the build configuration; it is not a measured Go
+release-distribution lane. Binary-size, startup, CPU/memory, symbol, signing,
+cross-build and sandbox-delivery measurements remain outstanding until a real
+adapter is linked.
 
 ## Costs (measured where measurable)
 
 - Parity-harness code: ~1.5k lines test-only (`vt_candidate.go`,
   `vt_candidate_parity_test.go`), zero production
   lines changed. No new module dependencies (`go.mod` untouched).
-- Full `ptyhost` suite with `-race` on this host: green (quoted below).
+- Full `ptyhost` suite with `-race`: Linux container passes; host throughput
+  failures are recorded above rather than reported as green. The unchanged
+  main source snapshot also fails the same floor (0.82 / 1.01 MB/s).
 - Upstream integration cost if revisited: Zig toolchain vendoring +
   pinning, C ABI or static-link design, `CGO_ENABLED=0` release-lane
   impact, cross-build matrix, signing/symbol review, and a migration that
