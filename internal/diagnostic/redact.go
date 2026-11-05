@@ -61,18 +61,33 @@ func Redact(s string) string {
 // where a rule's value pattern may re-match the marker plus trailing
 // punctuation without exposing anything.
 func Unredacted(s string) bool {
+	return len(UnredactedValues(s)) > 0
+}
+
+// UnredactedValues returns the values in s that one of Redact's rules would
+// mask and that are not already the [REDACTED] marker: the value part of a
+// key-prefixed rule (surrounding quotes trimmed) or the whole match of a rule
+// that masks its whole match.
+func UnredactedValues(s string) []string {
+	var out []string
 	for _, r := range diagnosticRedactions {
 		keepsPrefix := strings.HasPrefix(r.replacement, "${1}")
 		for _, m := range r.pattern.FindAllStringSubmatchIndex(s, -1) {
 			if !keepsPrefix || len(m) < 4 || m[3] < 0 {
-				return true
+				out = append(out, s[m[0]:m[1]])
+				continue
 			}
-			if !strings.HasPrefix(strings.TrimLeft(s[m[3]:], "\"'"), redactedMarker) {
-				return true
+			end := m[1]
+			if len(m) >= 6 && m[4] >= 0 {
+				end = m[4]
+			}
+			value := strings.Trim(s[m[3]:end], "\"'")
+			if !strings.HasPrefix(value, redactedMarker) {
+				out = append(out, value)
 			}
 		}
 	}
-	return false
+	return out
 }
 
 const redactedMarker = "[REDACTED]"

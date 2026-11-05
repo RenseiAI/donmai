@@ -2,6 +2,14 @@ package diagnostic
 
 import "testing"
 
+func TestUnredactedValues(t *testing.T) {
+	got := UnredactedValues(`password="hunter2" token=[REDACTED] https://u:pw@example.test`)
+	want := []string{"hunter2", "pw"}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("UnredactedValues = %q; want %q", got, want)
+	}
+}
+
 func TestUnredacted(t *testing.T) {
 	cases := []struct {
 		in   string

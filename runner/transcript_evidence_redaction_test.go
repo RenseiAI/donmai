@@ -77,7 +77,7 @@ func evidenceOracleViews(s string) []string {
 }
 
 var (
-	oracleBase64RE  = regexp.MustCompile(`[A-Za-z0-9+/_-]{8,}={0,2}`)
+	oracleBase64RE  = regexp.MustCompile(`[A-Za-z0-9+/_-]{2,}={0,2}`)
 	oracleUnicodeRE = regexp.MustCompile(`\\u([dD][89abAB][0-9a-fA-F]{2})\\u([dD][c-fC-F][0-9a-fA-F]{2})|\\[uU]([0-9a-fA-F]{4})|\\x([0-9a-fA-F]{2})|\\(["\\/bfnrt])`)
 	oracleNumberRE  = regexp.MustCompile(`-?[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?`)
 )
@@ -339,6 +339,24 @@ func TestTranscriptEvidence_SecretEncodingClass(t *testing.T) {
 		{name: "letter-case-variant", env: map[string]string{"K": "AbCdEf0123-Token"}, secrets: []string{"abcdef0123-token"}, body: func(t *testing.T) string {
 			return toolResultRecord(t, "printed lower: abcdef0123-token")
 		}},
+		{name: "short-base64", bearer: "sh0rt", body: func(t *testing.T) string {
+			return toolResultRecord(t, "echo "+base64.StdEncoding.EncodeToString([]byte("sh0rt")))
+		}},
+		{name: "short-base64-unaligned", bearer: "s3cr", body: func(t *testing.T) string {
+			return toolResultRecord(t, "id "+base64.StdEncoding.EncodeToString([]byte("\x01s3cr")))
+		}},
+		{name: "base64-with-control-bytes", env: map[string]string{"K": "ctl-wrapped-secret"}, body: func(t *testing.T) string {
+			return toolResultRecord(t, "blob "+base64.StdEncoding.EncodeToString([]byte("\x00\x01ctl-wrapped-secret\x02\xff")))
+		}},
+		{name: "embedded-credential-object", secrets: []string{"unknown-canary-value"}, body: func(t *testing.T) string {
+			return toolResultRecord(t, `result: {"credentials":{"value":"unknown-canary-value"}}`)
+		}},
+		{name: "embedded-credential-array", secrets: []string{"unknown-array-canary"}, body: func(t *testing.T) string {
+			return toolResultRecord(t, `config dump [{"api_key":["unknown-array-canary"]}] end`)
+		}},
+		{name: "repeated-unknown-password", secrets: []string{"hunter2xyz"}, body: func(t *testing.T) string {
+			return toolResultRecord(t, "export PASSWORD=hunter2xyz\n$ echo $PASSWORD\nhunter2xyz")
+		}},
 		{name: "secret-as-key", env: map[string]string{"K": "key-shaped-secret"}, body: func(*testing.T) string {
 			return "{\"key-shaped-secret\":1}\n"
 		}},
@@ -379,24 +397,29 @@ func TestTranscriptEvidence_CleanRecordsKeepContent(t *testing.T) {
 	qw := QueuedWork{QueuedWork: queuedWorkBase("FIDELITY")}
 	qw.Env = map[string]string{"API_KEY": "an-unrelated-secret-value"}
 	body := toolResultRecord(t, `go test ./... FAIL: TestX (0.01s) {"ok":false,"n":3}`) +
+		toolResultRecord(t, `result: {"credentials":{"value":"unknown-canary-value"},"region":"eu-west-1"} trailing ok`) +
 		"{\"type\":\"assistant\",\"usage\":{\"input_tokens\":1234,\"output_tokens\":56},\"text\":\"I will retry the build.\"}\n" +
 		"plain stderr line: exit status 2\n"
 	got := archiveTranscriptForTest(t, body, qw)
 	lines := strings.Split(strings.TrimSuffix(got, "\n"), "\n")
-	if len(lines) != 3 {
-		t.Fatalf("archived %d records; want 3:\n%s", len(lines), got)
+	if len(lines) != 4 {
+		t.Fatalf("archived %d records; want 4:\n%s", len(lines), got)
 	}
 	for i, want := range []string{
 		`go test ./... FAIL: TestX (0.01s) {"ok":false,"n":3}`,
+		// The credential object is redacted in place, by structure (the
+		// shared rail may then trim its punctuation); the rest of the tool
+		// output survives.
+		`\"region\":\"eu-west-1\"} trailing ok`,
 		"I will retry the build.",
 		"plain stderr line: exit status 2",
 	} {
-		if !strings.Contains(oracleDecodedText(t, lines[i]), want) {
+		if !strings.Contains(oracleDecodedText(t, lines[i]), want) && !strings.Contains(lines[i], want) {
 			t.Fatalf("record %d lost clean content %q:\n%s", i, want, lines[i])
 		}
 	}
-	if !strings.Contains(lines[1], `"input_tokens":1234`) {
-		t.Fatalf("usage counters lost numeric shape: %s", lines[1])
+	if !strings.Contains(lines[2], `"input_tokens":1234`) {
+		t.Fatalf("usage counters lost numeric shape: %s", lines[2])
 	}
 }
 

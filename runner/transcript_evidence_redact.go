@@ -26,7 +26,10 @@ import (
 //     JSON-shaped secret, nor any line of a multi-line secret;
 //   - a value the shared output rail (diagnostic.Redact) would mask, such as
 //     an unknown password, bearer, or token-shaped string;
-//   - a value of any type under a credential-named key;
+//   - a value of any type under a credential-named key, including inside
+//     JSON embedded in a string;
+//   - an unknown credential found that way (four bytes or longer) repeated
+//     anywhere else in the same string;
 //
 // under any combination of these decodings, applied repeatedly: JSON and
 // Python-style string escapes, URL percent-encoding, HTML entities, base64
@@ -181,7 +184,7 @@ func newTranscriptRedactor(values []string) *transcriptRedactor {
 		addNeedle(url.QueryEscape(b))
 		addNeedle(url.PathEscape(b))
 		addNeedle(html.EscapeString(b))
-		if len(b) >= 6 {
+		if len(b) >= 3 {
 			addNeedle(base64.RawStdEncoding.EncodeToString([]byte(b)))
 			addNeedle(base64.RawURLEncoding.EncodeToString([]byte(b)))
 		}
@@ -229,18 +232,95 @@ func (r *transcriptRedactor) containsNumericSecret(text string) bool {
 	return false
 }
 
-// rewrite is the best-effort text pass: secret needles, then the shared rail.
-func (r *transcriptRedactor) rewrite(s string) string {
+// rewrite is the best-effort text pass. Embedded JSON objects and arrays
+// are redacted structurally first, while their key context is intact (a
+// text rule applied to a credential object would mask only its opening
+// brace). Then secret needles, then the shared rail. It reports false when
+// the embedded-JSON parse budget runs out.
+func (r *transcriptRedactor) rewrite(s string) (string, bool) {
+	s, ok := r.spliceEmbeddedJSON(s)
+	if !ok {
+		return "", false
+	}
 	if r.replacer != nil {
 		s = r.replacer.Replace(s)
 	}
-	return diagnostic.Redact(s)
+	return diagnostic.Redact(s), true
 }
 
-// clean is the guarantee: no decoding view of s carries a secret, a numeric
-// secret, or an unmasked shared-rail value. Exceeding the view budget is
-// treated as unclean.
-func (r *transcriptRedactor) clean(s string) bool {
+// spliceEmbeddedJSON replaces each JSON object or array embedded in s with
+// its structurally redacted encoding, leaving spans that need no change
+// byte-for-byte as written.
+func (r *transcriptRedactor) spliceEmbeddedJSON(s string) (string, bool) {
+	if !strings.ContainsAny(s, "{[") {
+		return s, true
+	}
+	budget := transcriptEmbeddedJSONBudget(s)
+	var sb strings.Builder
+	prev := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] != '{' && s[i] != '[' {
+			continue
+		}
+		v, n, ok := decodeEmbeddedTranscriptJSON(s[i:], &budget)
+		if budget < 0 {
+			return "", false
+		}
+		if !ok {
+			continue
+		}
+		before, err1 := json.Marshal(v)
+		after, err2 := json.Marshal(r.redactValue(v, false))
+		if err1 != nil || err2 != nil {
+			return "", false
+		}
+		if string(before) != string(after) {
+			sb.WriteString(s[prev:i])
+			sb.Write(after)
+			prev = i + n
+		}
+		i += n - 1
+	}
+	if prev == 0 {
+		return s, true
+	}
+	sb.WriteString(s[prev:])
+	return sb.String(), true
+}
+
+// unknownSecrets returns the values the shared rail would mask, and every
+// scalar under a credential-named key of embedded JSON, found in any
+// decoding view of the input. They are unknown credentials local to this
+// string: the output must not carry them anywhere, whatever the rewrite did
+// to their surroundings. Values shorter than four bytes are left to the
+// in-place rewrite, because as needles they would match ordinary text.
+func unknownSecrets(s string) ([]string, bool) {
+	views, complete := transcriptDecodingViews(s)
+	if !complete {
+		return nil, false
+	}
+	var out []string
+	for _, v := range views {
+		out = append(out, diagnostic.UnredactedValues(v)...)
+		sensitive, ok := embeddedSensitiveTranscriptValues(v)
+		if !ok {
+			return nil, false
+		}
+		out = append(out, sensitive...)
+	}
+	kept := out[:0]
+	for _, v := range out {
+		if v = strings.TrimSpace(v); len(v) >= 4 && v != transcriptRedacted {
+			kept = append(kept, v)
+		}
+	}
+	return kept, true
+}
+
+// clean is the guarantee: no decoding view of s carries a known secret, a
+// numeric secret, one of the unknown secrets found in the input, or an
+// unmasked shared-rail value. Exceeding a budget is treated as unclean.
+func (r *transcriptRedactor) clean(s string, unknown *strings.Replacer) bool {
 	views, complete := transcriptDecodingViews(s)
 	if !complete {
 		return false
@@ -248,6 +328,12 @@ func (r *transcriptRedactor) clean(s string) bool {
 	for _, v := range views {
 		if r.containsSecret(v) || r.containsNumericSecret(v) || diagnostic.Unredacted(v) {
 			return false
+		}
+		if unknown != nil {
+			blanked := strings.ToLower(strings.ReplaceAll(v, transcriptRedacted, "\x00"))
+			if unknown.Replace(blanked) != blanked {
+				return false
+			}
 		}
 	}
 	return true
@@ -257,11 +343,23 @@ func (r *transcriptRedactor) clean(s string) bool {
 // otherwise a JSON-shaped s redacted structurally when that is provably
 // clean, otherwise the marker. It never returns unproved text.
 func (r *transcriptRedactor) redactString(s string) string {
-	if out := r.rewrite(s); r.clean(out) {
+	found, ok := unknownSecrets(s)
+	if !ok {
+		return transcriptRedacted
+	}
+	var unknown *strings.Replacer
+	if len(found) > 0 {
+		pairs := make([]string, 0, len(found))
+		for _, v := range found {
+			pairs = append(pairs, strings.ToLower(v), transcriptRedacted)
+		}
+		unknown = strings.NewReplacer(pairs...)
+	}
+	if out, ok := r.rewrite(s); ok && r.clean(out, unknown) {
 		return out
 	}
 	if parsed, ok := parseWholeTranscriptJSON(s); ok {
-		if b, err := json.Marshal(r.redactValue(parsed, false)); err == nil && r.clean(string(b)) {
+		if b, err := json.Marshal(r.redactValue(parsed, false)); err == nil && r.clean(string(b), unknown) {
 			return string(b)
 		}
 	}
@@ -408,7 +506,7 @@ func transcriptScalarLeaves(v interface{}) []string {
 var (
 	transcriptJSONNumberRE  = regexp.MustCompile(`^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?$`)
 	transcriptNumberTokenRE = regexp.MustCompile(`-?[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?`)
-	transcriptBase64TokenRE = regexp.MustCompile(`[A-Za-z0-9+/_-]{8,}={0,2}`)
+	transcriptBase64TokenRE = regexp.MustCompile(`[A-Za-z0-9+/_-]{2,}={0,2}`)
 )
 
 // canonicalTranscriptNumber renders a decimal literal as sign, significant
@@ -615,18 +713,19 @@ func percentDecodeTranscriptText(s string, plus bool) string {
 	return out.String()
 }
 
-// decodeTranscriptBase64Tokens joins the printable decodings of every
-// base64-shaped token in s into one newline-separated view, so a long text
-// adds one view, not one per word. Ordinary words that happen to decode
-// yield binary noise, which cannot spell a printable secret, and is skipped.
+// decodeTranscriptBase64Tokens joins the decodings of every base64-shaped
+// token in s into one newline-separated view, so a long text adds one view,
+// not one per word. Bytes that are not printable text (invalid UTF-8,
+// control characters) become line breaks: a secret wrapped in binary noise
+// still reads as a line of its own.
 func decodeTranscriptBase64Tokens(s string) string {
 	var parts []string
 	for _, tok := range transcriptBase64TokenRE.FindAllString(s, -1) {
 		trimmed := strings.TrimRight(tok, "=")
 		for _, enc := range []*base64.Encoding{base64.RawStdEncoding, base64.RawURLEncoding} {
 			if b, err := enc.DecodeString(trimmed); err == nil {
-				if printableTranscriptText(b) {
-					parts = append(parts, string(b))
+				if text := printableTranscriptRuns(b); text != "" {
+					parts = append(parts, text)
 				}
 				break
 			}
@@ -635,38 +734,123 @@ func decodeTranscriptBase64Tokens(s string) string {
 	return strings.Join(parts, "\n")
 }
 
+// printableTranscriptRuns maps every invalid UTF-8 byte and control
+// character (other than tab) in b to a line break and drops empty lines.
+func printableTranscriptRuns(b []byte) string {
+	var sb strings.Builder
+	for len(b) > 0 {
+		r, size := utf8.DecodeRune(b)
+		if (r == utf8.RuneError && size <= 1) || (r < 0x20 && r != '\t') || r == 0x7f {
+			sb.WriteByte('\n')
+		} else {
+			sb.Write(b[:size])
+		}
+		b = b[size:]
+	}
+	var lines []string
+	for _, line := range strings.Split(sb.String(), "\n") {
+		if line != "" {
+			lines = append(lines, line)
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+// transcriptEmbeddedJSONBudget bounds the bytes all embedded-JSON parse
+// attempts over s may read, so adversarial nesting cannot make a scan
+// quadratic.
+func transcriptEmbeddedJSONBudget(s string) int64 {
+	return int64(16*len(s)) + 64*1024
+}
+
+// decodeEmbeddedTranscriptJSON decodes one JSON value at the start of s,
+// charging the bytes read to budget. It returns the value and its length.
+func decodeEmbeddedTranscriptJSON(s string, budget *int64) (interface{}, int, bool) {
+	src := &countingTranscriptReader{r: strings.NewReader(s)}
+	dec := json.NewDecoder(src)
+	dec.UseNumber()
+	var v interface{}
+	err := dec.Decode(&v)
+	*budget -= src.n
+	if err != nil {
+		return nil, 0, false
+	}
+	n := int(dec.InputOffset())
+	if n <= 0 || n > len(s) {
+		return nil, 0, false
+	}
+	return v, n, true
+}
+
 // embeddedTranscriptJSONLeaves decodes every JSON value embedded in s
 // (starting at a brace, bracket, or quote) and joins its keys and scalar
 // leaves into one newline-separated view, so escapes inside embedded
-// strings are decoded by JSON's own rules. Parsing is budgeted by bytes
-// read: adversarial nesting cannot turn the scan quadratic. It reports false
-// when the budget runs out, which the caller treats as unclean.
+// strings are decoded by JSON's own rules. It reports false when the parse
+// budget runs out, which the caller treats as unclean.
 func embeddedTranscriptJSONLeaves(s string) (string, bool) {
-	if !strings.ContainsAny(s, `{["`) {
-		return "", true
-	}
-	budget := int64(16*len(s)) + 64*1024
 	var parts []string
-	for i := 0; i < len(s); i++ {
-		if s[i] != '{' && s[i] != '[' && s[i] != '"' {
-			continue
-		}
-		src := &countingTranscriptReader{r: strings.NewReader(s[i:])}
-		dec := json.NewDecoder(src)
-		dec.UseNumber()
-		var v interface{}
-		err := dec.Decode(&v)
-		budget -= src.n
-		if budget < 0 {
-			return "", false
-		}
-		if err != nil {
-			continue
-		}
+	ok := forEachEmbeddedTranscriptJSON(s, `{["`, func(v interface{}) {
 		parts = appendTranscriptJSONText(parts, v)
-		i += int(dec.InputOffset()) - 1
+	})
+	return strings.Join(parts, "\n"), ok
+}
+
+// embeddedSensitiveTranscriptValues returns every scalar found under a
+// credential-named key in the JSON objects and arrays embedded in s.
+func embeddedSensitiveTranscriptValues(s string) ([]string, bool) {
+	var out []string
+	ok := forEachEmbeddedTranscriptJSON(s, "{[", func(v interface{}) {
+		out = appendSensitiveTranscriptLeaves(out, v, false)
+	})
+	return out, ok
+}
+
+// forEachEmbeddedTranscriptJSON calls fn for each JSON value that starts at
+// one of the starts bytes in s, skipping past each decoded value.
+func forEachEmbeddedTranscriptJSON(s, starts string, fn func(interface{})) bool {
+	if !strings.ContainsAny(s, starts) {
+		return true
 	}
-	return strings.Join(parts, "\n"), true
+	budget := transcriptEmbeddedJSONBudget(s)
+	for i := 0; i < len(s); i++ {
+		if strings.IndexByte(starts, s[i]) < 0 {
+			continue
+		}
+		v, n, ok := decodeEmbeddedTranscriptJSON(s[i:], &budget)
+		if budget < 0 {
+			return false
+		}
+		if !ok {
+			continue
+		}
+		fn(v)
+		i += n - 1
+	}
+	return true
+}
+
+// appendSensitiveTranscriptLeaves appends the scalar leaves of v that sit
+// under a credential-named key (sensitive marks that context).
+func appendSensitiveTranscriptLeaves(out []string, v interface{}, sensitive bool) []string {
+	switch typed := v.(type) {
+	case map[string]interface{}:
+		for k, val := range typed {
+			out = appendSensitiveTranscriptLeaves(out, val, sensitive || isSensitiveTranscriptKey(k))
+		}
+	case []interface{}:
+		for _, e := range typed {
+			out = appendSensitiveTranscriptLeaves(out, e, sensitive)
+		}
+	case string:
+		if sensitive {
+			out = append(out, typed)
+		}
+	case json.Number:
+		if sensitive {
+			out = append(out, string(typed))
+		}
+	}
+	return out
 }
 
 // countingTranscriptReader counts bytes handed to a JSON decoder.
@@ -679,20 +863,6 @@ func (c *countingTranscriptReader) Read(p []byte) (int, error) {
 	n, err := c.r.Read(p)
 	c.n += int64(n)
 	return n, err
-}
-
-// printableTranscriptText reports whether b is valid UTF-8 text without
-// control characters other than tab and line breaks.
-func printableTranscriptText(b []byte) bool {
-	if !utf8.Valid(b) {
-		return false
-	}
-	for _, r := range string(b) {
-		if r < 0x20 && r != '\t' && r != '\n' && r != '\r' {
-			return false
-		}
-	}
-	return true
 }
 
 func appendTranscriptJSONText(parts []string, v interface{}) []string {
