@@ -224,8 +224,8 @@ func TestAutoUpdateSchedulerSnapshotSurvivesTrustRootReload(t *testing.T) {
 	d = newRestartTestDaemon(t, nil)
 	d.opts.Version = "0.1.0"
 	d.config = &Config{AutoUpdate: AutoUpdateConfig{
-		Channel: ChannelStable, Schedule: ScheduleNightly, DrainTimeoutSeconds: 1,
-		Source: srv.URL,
+		Channel: ChannelStable, Schedule: ScheduleNightly, Scheduled: true, DrainTimeoutSeconds: 1,
+		CDNBase: srv.URL,
 		Signers: []UpdateSigner{
 			{SAN: "releases@example.com", Issuer: "https://issuer.example"},
 		},

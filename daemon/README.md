@@ -329,21 +329,25 @@ autoUpdate:
   channel: stable
   schedule: nightly
   drainTimeoutSeconds: 600
-  source: https://updates.example.com
+  scheduled: true
+  cdnBase: https://updates.example.com
   signers:
     - sanRegex: ^https://github\.com/<org>/<repo>/\.github/workflows/release\.yml@refs/tags/v.+$
       issuer: https://token.actions.githubusercontent.com
 ```
 
-`autoUpdate.source` names the update origin (the `<cdnBase>` above).
+`autoUpdate.cdnBase` names the update origin (the `<cdnBase>` above).
 Empty is the default and disables every check: the scheduled loop never
 starts, the manual endpoint's updater reports up-to-date without a
 request, and nothing is ever dialed by default. A non-empty value must
-be an `http(s)` URL with a host. Opt-in needs all three: a `nightly`
-or `on-release` schedule, a configured `source`, and at least one
-`signers` entry (the operator's local consent to swap, independent of
-any platform request). A defaulted `nightly` schedule alone never opts
-in.
+be an `http(s)` URL with a host. Scheduled pull needs all four: `scheduled: true`,
+a `nightly` or `on-release` schedule, a configured `cdnBase` (or link-time
+default), and at least one `signers` entry (the operator's local consent
+to swap, independent of any platform request). Configuring `cdnBase` alone
+(as needed for consented push upgrades) never starts background pulls:
+`scheduled` is off by default. A downstream build may set the default origin
+at link time with `-ldflags "-X github.com/RenseiAI/donmai/daemon.UpdateCDNBase=<origin>"`;
+an explicit `cdnBase` always wins.
 
 ## Scheduled checks
 
@@ -358,7 +362,7 @@ SaaS/webhook delivery, which an OSS host has no channel for — the hourly
 poll is the local approximation with the same observable contract).
 `manual` never schedules; the manual `POST /api/daemon/update` endpoint
 is unchanged. Editing `daemon.yaml` takes effect without a restart: the
-watcher adopts `autoUpdate` live, so clearing `source`, selecting
+watcher adopts `autoUpdate` live, so setting `scheduled: false`, clearing `cdnBase`, selecting
 `manual`, or removing `signers` stops the loop and the next tick is
 inert.
 

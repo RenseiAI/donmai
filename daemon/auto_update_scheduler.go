@@ -14,8 +14,8 @@ import (
 // operator explicitly opted in (see autoUpdateSchedulerWanted), and every
 // tick re-checks that opt-in against the live config before touching the
 // network. The yaml watcher adopts AutoUpdate edits live, so a revoked
-// opt-in (cleared source, manual schedule, removed signers) stops the
-// loop without a restart and the next tick is inert. Each tick performs
+// opt-in (scheduled off, cleared cdnBase, manual schedule, removed signers)
+// stops the loop without a restart and the next tick is inert. Each tick performs
 // a lightweight manifest pre-check FIRST; only a strictly newer release
 // enters Update, so an unchanged release never drains the machine. The
 // actual work reuses Daemon.Update — restart preflight, the fail-closed
@@ -82,12 +82,14 @@ func (systemUpdateClock) Now() time.Time { return time.Now() }
 func (systemUpdateClock) After(d time.Duration) <-chan time.Time { return time.After(d) }
 
 // autoUpdateSchedulerWanted reports whether the loaded config opts in to
-// scheduled checks. All three guards must hold:
+// scheduled checks. All four guards must hold:
 //
+//   - scheduled is true (off by default: a configured cdnBase alone, as
+//     needed for consented push upgrades, never starts background pulls);
 //   - schedule is nightly or on-release (manual, empty and unknown mean
 //     "never schedule" — a defaulted nightly alone is not opt-in);
-//   - source names an explicit update origin (empty disables everything,
-//     so no default infrastructure is ever dialed);
+//   - the effective origin names an explicit update origin (empty disables
+//     everything, so no default infrastructure is ever dialed);
 //   - signers pins at least one trusted release identity (the operator's
 //     local consent to swap, retained independently of any platform
 //     request; fail-closed verification would refuse every swap without
@@ -96,12 +98,15 @@ func autoUpdateSchedulerWanted(cfg *Config) bool {
 	if cfg == nil {
 		return false
 	}
+	if !cfg.AutoUpdate.Scheduled {
+		return false
+	}
 	switch cfg.AutoUpdate.Schedule {
 	case ScheduleNightly, ScheduleOnRelease:
 	default:
 		return false
 	}
-	if strings.TrimSpace(cfg.AutoUpdate.Source) == "" {
+	if strings.TrimSpace(effectiveUpdateCDNBase(cfg.AutoUpdate)) == "" {
 		return false
 	}
 	return len(cfg.AutoUpdate.Signers) != 0
@@ -333,7 +338,7 @@ func (d *Daemon) checkAutoUpdateRelease(ctx context.Context, cfg *Config) (*Vers
 	u := NewUpdater(UpdaterOptions{
 		CurrentVersion: d.EffectiveVersion(),
 		Config:         cfg.AutoUpdate,
-		CDNBase:        strings.TrimSpace(cfg.AutoUpdate.Source),
+		CDNBase:        effectiveUpdateCDNBase(cfg.AutoUpdate),
 		SkipExit:       true,
 	})
 	return u.CheckForUpdate(ctx)

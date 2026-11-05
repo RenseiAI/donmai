@@ -511,16 +511,14 @@ type AutoUpdateConfig struct {
 	Schedule            UpdateSchedule `yaml:"schedule"            json:"schedule"`
 	DrainTimeoutSeconds int            `yaml:"drainTimeoutSeconds" json:"drainTimeoutSeconds"`
 
-	// Source is the operator-configured update origin: the base URL of
-	// the CDN that hosts release manifests and binaries (see
-	// auto_update.go for the per-channel layout). Empty is the default
-	// and disables every update check — the binary ships with no
-	// default origin, so an unconfigured daemon never dials any
-	// vendor infrastructure, and a default nightly schedule alone is
-	// never consent. The scheduled checker and the manual update path
-	// both forward this value to the updater; without it the updater
-	// reports up-to-date without a request.
-	Source string `yaml:"source,omitempty" json:"source,omitempty"`
+	// Scheduled opts the host into scheduled pull checks owned by
+	// Start/Stop (nightly at 03:00 local time, or hourly for on-release).
+	// Off by default: configuring a cdnBase alone (needed for consented
+	// push upgrades) never starts background self-updates. The scheduled
+	// loop runs only when scheduled is true plus a nightly/on-release
+	// schedule, a configured cdnBase origin (or link-time default), and
+	// at least one signers entry.
+	Scheduled bool `yaml:"scheduled,omitempty" json:"scheduled,omitempty"`
 
 	// Signers is the allowlist of identities trusted to sign release
 	// binaries. Auto-update is fail-closed: when this list is empty the
@@ -536,6 +534,14 @@ type AutoUpdateConfig struct {
 	// deployments. Empty = the embedded public Sigstore production trust
 	// root (the same root kit verification uses; see kit_trust.go).
 	TrustRootPath string `yaml:"trustRootPath,omitempty" json:"trustRootPath,omitempty"`
+
+	// CDNBase is the operator-configured base URL for release manifests
+	// and binaries (<cdnBase>/<channel>/latest.json). Empty means
+	// auto-update is disabled: the OSS binary ships with no default CDN
+	// (see UpdateCDNBase) and never dials a vendor default. A host
+	// upgrade refuses without a swap until the operator sets this
+	// alongside the signer allowlist.
+	CDNBase string `yaml:"cdnBase,omitempty" json:"cdnBase,omitempty"`
 }
 
 // UpdateSigner pins one identity trusted to sign release binaries.
@@ -1216,10 +1222,10 @@ func validateConfig(c *Config) error {
 	default:
 		return fmt.Errorf("autoUpdate.schedule invalid: %q", c.AutoUpdate.Schedule)
 	}
-	if src := strings.TrimSpace(c.AutoUpdate.Source); src != "" {
+	if src := strings.TrimSpace(c.AutoUpdate.CDNBase); src != "" {
 		u, err := url.Parse(src)
 		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-			return fmt.Errorf("autoUpdate.source must be an http(s) URL with a host: %q", c.AutoUpdate.Source)
+			return fmt.Errorf("autoUpdate.cdnBase must be an http(s) URL with a host: %q", c.AutoUpdate.CDNBase)
 		}
 	}
 	for i, s := range c.AutoUpdate.Signers {

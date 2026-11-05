@@ -91,8 +91,8 @@ func TestAutoUpdateSchedulerAppliedSwapFencesResume(t *testing.T) {
 	d.opts.Version = "0.1.0"
 	probe := newUpdateProbeServer(t, "9.9.9", []byte("new-binary"), "not-a-bundle")
 	d.config = &Config{AutoUpdate: AutoUpdateConfig{
-		Channel: ChannelStable, Schedule: ScheduleNightly, DrainTimeoutSeconds: 1,
-		Source: probe.srv.URL,
+		Channel: ChannelStable, Schedule: ScheduleNightly, Scheduled: true, DrainTimeoutSeconds: 1,
+		CDNBase: probe.srv.URL,
 		Signers: []UpdateSigner{
 			{SAN: "releases@example.com", Issuer: "https://issuer.example"},
 		},
@@ -132,8 +132,8 @@ func TestAutoUpdateSchedulerProductionSwapFencesResume(t *testing.T) {
 	d := newRestartTestDaemon(t, nil)
 	d.opts.Version = "0.1.0"
 	d.config = &Config{AutoUpdate: AutoUpdateConfig{
-		Channel: ChannelStable, Schedule: ScheduleNightly, DrainTimeoutSeconds: 1,
-		Source: probe.srv.URL,
+		Channel: ChannelStable, Schedule: ScheduleNightly, Scheduled: true, DrainTimeoutSeconds: 1,
+		CDNBase: probe.srv.URL,
 		Signers: []UpdateSigner{
 			{SAN: "releases@example.com", Issuer: "https://issuer.example"},
 		},
@@ -203,8 +203,8 @@ func TestManualHTTPUpdateSwapLeavesResumeAvailable(t *testing.T) {
 	d := newRestartTestDaemon(t, nil)
 	d.opts.Version = "0.1.0"
 	d.config = &Config{AutoUpdate: AutoUpdateConfig{
-		Channel: ChannelStable, Schedule: ScheduleManual, DrainTimeoutSeconds: 1,
-		Source: probe.srv.URL,
+		Channel: ChannelStable, Schedule: ScheduleManual, Scheduled: true, DrainTimeoutSeconds: 1,
+		CDNBase: probe.srv.URL,
 		Signers: []UpdateSigner{
 			{SAN: "releases@example.com", Issuer: "https://issuer.example"},
 		},

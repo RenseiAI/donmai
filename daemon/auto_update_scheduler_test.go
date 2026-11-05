@@ -106,7 +106,12 @@ func newUpdateProbeServer(t *testing.T, version string, binary []byte, bundle st
 	return p
 }
 
-func writeAutoUpdateDaemonConfig(t *testing.T, schedule, source string, signers bool) string {
+func writeAutoUpdateDaemonConfig(t *testing.T, schedule, cdnBase string, signers bool) string {
+	t.Helper()
+	return writeAutoUpdateDaemonConfigScheduled(t, schedule, cdnBase, true, signers)
+}
+
+func writeAutoUpdateDaemonConfigScheduled(t *testing.T, schedule, cdnBase string, scheduled, signers bool) string {
 	t.Helper()
 	dir := t.TempDir()
 	signerBlock := ""
@@ -115,6 +120,10 @@ func writeAutoUpdateDaemonConfig(t *testing.T, schedule, source string, signers 
     - san: releases@example.com
       issuer: https://issuer.example
 `
+	}
+	scheduledYAML := "false"
+	if scheduled {
+		scheduledYAML = "true"
 	}
 	body := fmt.Sprintf(`apiVersion: donmai.dev/v1
 kind: LocalDaemon
@@ -133,8 +142,9 @@ autoUpdate:
   channel: stable
   schedule: %s
   drainTimeoutSeconds: 1
-  source: %s
-%s`, schedule, source, signerBlock)
+  scheduled: %s
+  cdnBase: %s
+%s`, schedule, scheduledYAML, cdnBase, signerBlock)
 	path := filepath.Join(dir, "daemon.yaml")
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
@@ -142,7 +152,7 @@ autoUpdate:
 	return path
 }
 
-func TestAutoUpdateSource_RoundTrip(t *testing.T) {
+func TestAutoUpdateCDNBase_RoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "daemon.yaml")
 	body := []byte(`apiVersion: donmai.dev/v1
@@ -162,7 +172,8 @@ autoUpdate:
   channel: stable
   schedule: nightly
   drainTimeoutSeconds: 600
-  source: https://updates.example.com/cdn
+  scheduled: true
+  cdnBase: https://updates.example.com/cdn
   signers:
     - san: releases@example.com
       issuer: https://issuer.example
@@ -174,8 +185,11 @@ autoUpdate:
 	if err != nil {
 		t.Fatalf("LoadConfig: %v", err)
 	}
-	if got := cfg.AutoUpdate.Source; got != "https://updates.example.com/cdn" {
-		t.Fatalf("Source = %q, want the configured origin", got)
+	if got := cfg.AutoUpdate.CDNBase; got != "https://updates.example.com/cdn" {
+		t.Fatalf("CDNBase = %q, want the configured origin", got)
+	}
+	if !cfg.AutoUpdate.Scheduled {
+		t.Fatal("Scheduled = false, want true (opt-in round-trips)")
 	}
 	if err := WriteConfig(path, cfg); err != nil {
 		t.Fatalf("WriteConfig: %v", err)
@@ -184,15 +198,18 @@ autoUpdate:
 	if err != nil {
 		t.Fatalf("reload: %v", err)
 	}
-	if reloaded.AutoUpdate.Source != "https://updates.example.com/cdn" {
-		t.Fatalf("round-trip Source = %q", reloaded.AutoUpdate.Source)
+	if reloaded.AutoUpdate.CDNBase != "https://updates.example.com/cdn" {
+		t.Fatalf("round-trip CDNBase = %q", reloaded.AutoUpdate.CDNBase)
+	}
+	if !reloaded.AutoUpdate.Scheduled {
+		t.Fatal("round-trip Scheduled = false, want true")
 	}
 }
 
-func TestAutoUpdateSource_Validation(t *testing.T) {
+func TestAutoUpdateCDNBase_Validation(t *testing.T) {
 	cases := []struct {
 		name    string
-		source  string
+		cdnBase string
 		wantErr bool
 	}{
 		{"empty stays inert", "", false},
@@ -207,44 +224,77 @@ func TestAutoUpdateSource_Validation(t *testing.T) {
 			cfg := &Config{
 				Machine:      MachineConfig{ID: "m"},
 				Orchestrator: OrchestratorConfig{URL: "https://platform.example.com"},
-				AutoUpdate:   AutoUpdateConfig{Channel: ChannelStable, Schedule: ScheduleNightly, Source: c.source},
+				AutoUpdate:   AutoUpdateConfig{Channel: ChannelStable, Schedule: ScheduleNightly, Scheduled: true, CDNBase: c.cdnBase},
 			}
 			err := validateConfig(cfg)
 			if c.wantErr && err == nil {
-				t.Fatalf("validateConfig(%q) = nil, want rejection", c.source)
+				t.Fatalf("validateConfig(%q) = nil, want rejection", c.cdnBase)
 			}
 			if !c.wantErr && err != nil {
-				t.Fatalf("validateConfig(%q) = %v, want acceptance", c.source, err)
+				t.Fatalf("validateConfig(%q) = %v, want acceptance", c.cdnBase, err)
 			}
 		})
 	}
 }
 
+func TestEffectiveUpdateCDNBase_LinkTimeOverride(t *testing.T) {
+	// The compiled default is empty in this repo, so an unconfigured host
+	// stays inert. A downstream build sets it at link time:
+	// go build -ldflags "-X github.com/RenseiAI/donmai/daemon.UpdateCDNBase=<origin>"
+	orig := UpdateCDNBase
+	t.Cleanup(func() { UpdateCDNBase = orig })
+	UpdateCDNBase = ""
+	if got := effectiveUpdateCDNBase(AutoUpdateConfig{}); got != "" {
+		t.Fatalf("effective with empty default = %q, want empty (inert)", got)
+	}
+	UpdateCDNBase = "https://compiled.example.com"
+	if got := effectiveUpdateCDNBase(AutoUpdateConfig{}); got != "https://compiled.example.com" {
+		t.Fatalf("effective with compiled default = %q, want the link-time origin", got)
+	}
+	cfg := AutoUpdateConfig{CDNBase: "https://operator.example.com"}
+	if got := effectiveUpdateCDNBase(cfg); got != "https://operator.example.com" {
+		t.Fatalf("explicit cdnBase = %q, want operator precedence over the link-time default", got)
+	}
+	u := NewUpdater(UpdaterOptions{CurrentVersion: "0.1.0", Config: AutoUpdateConfig{Channel: ChannelStable}})
+	wantPrefix := "https://compiled.example.com/stable/latest.json"
+	if got := u.BuildManifestURL(ChannelStable); got != wantPrefix {
+		t.Fatalf("NewUpdater manifest URL = %q, want %q (link-time default reached the updater)", got, wantPrefix)
+	}
+}
+
 func TestAutoUpdateSchedulerWanted(t *testing.T) {
-	withSource := "https://updates.example.com"
+	withOrigin := "https://updates.example.com"
 	signed := []UpdateSigner{{SAN: "releases@example.com", Issuer: "https://issuer.example"}}
 	cases := []struct {
-		name     string
-		schedule UpdateSchedule
-		source   string
-		signers  []UpdateSigner
-		want     bool
+		name      string
+		schedule  UpdateSchedule
+		scheduled bool
+		cdnBase   string
+		signers   []UpdateSigner
+		want      bool
 	}{
-		{"nightly opted-in", ScheduleNightly, withSource, signed, true},
-		{"on-release opted-in", ScheduleOnRelease, withSource, signed, true},
-		{"manual never schedules", ScheduleManual, withSource, signed, false},
-		{"empty schedule never schedules", "", withSource, signed, false},
-		{"missing source stays inert", ScheduleNightly, "", signed, false},
-		{"absent consent stays inert", ScheduleNightly, withSource, nil, false},
-		{"unconfigured stays inert", "", "", nil, false},
+		{"nightly opted-in", ScheduleNightly, true, withOrigin, signed, true},
+		{"on-release opted-in", ScheduleOnRelease, true, withOrigin, signed, true},
+		{"scheduled off stays inert", ScheduleNightly, false, withOrigin, signed, false},
+		{"scheduled off with on-release stays inert", ScheduleOnRelease, false, withOrigin, signed, false},
+		{"manual never schedules", ScheduleManual, true, withOrigin, signed, false},
+		{"empty schedule never schedules", "", true, withOrigin, signed, false},
+		{"missing origin stays inert", ScheduleNightly, true, "", signed, false},
+		{"absent consent stays inert", ScheduleNightly, true, withOrigin, nil, false},
+		{"unconfigured stays inert", "", false, "", nil, false},
+		// A configured origin alone (as needed for consented push
+		// upgrades) must never start background pulls: scheduled pull
+		// is opt-in and off by default.
+		{"origin alone without scheduled stays inert", ScheduleNightly, false, withOrigin, signed, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			cfg := &Config{AutoUpdate: AutoUpdateConfig{
-				Channel:  ChannelStable,
-				Schedule: c.schedule,
-				Source:   c.source,
-				Signers:  c.signers,
+				Channel:   ChannelStable,
+				Schedule:  c.schedule,
+				Scheduled: c.scheduled,
+				CDNBase:   c.cdnBase,
+				Signers:   c.signers,
 			}}
 			if got := autoUpdateSchedulerWanted(cfg); got != c.want {
 				t.Fatalf("wanted = %v, want %v", got, c.want)
@@ -280,11 +330,11 @@ func TestNextAutoUpdateDelay(t *testing.T) {
 
 func startOptedInSchedulerDaemon(t *testing.T, schedule string, probe *updateProbeServer) (*Daemon, *manualUpdateClock) {
 	t.Helper()
-	source := ""
+	cdnBase := ""
 	if probe != nil {
-		source = probe.srv.URL
+		cdnBase = probe.srv.URL
 	}
-	path := writeAutoUpdateDaemonConfig(t, schedule, source, true)
+	path := writeAutoUpdateDaemonConfig(t, schedule, cdnBase, true)
 	clock := newManualUpdateClock(time.Date(2026, 5, 4, 1, 0, 0, 0, time.Local))
 	d := New(Options{
 		ConfigPath:       path,
@@ -352,22 +402,27 @@ func TestAutoUpdateScheduler_StartStop_OptedInRunsAtApprovedTick(t *testing.T) {
 func TestAutoUpdateScheduler_StartStop_InertWithoutOptIn(t *testing.T) {
 	probe := newUpdateProbeServer(t, "9.9.9", []byte("new-binary"), "not-a-bundle")
 	cases := []struct {
-		name     string
-		schedule string
-		source   bool
-		signers  bool
+		name      string
+		schedule  string
+		scheduled bool
+		cdnBase   bool
+		signers   bool
 	}{
-		{"manual makes no calls", string(ScheduleManual), true, true},
-		{"missing source makes no calls", string(ScheduleNightly), false, true},
-		{"absent consent makes no calls", string(ScheduleNightly), true, false},
+		{"manual makes no calls", string(ScheduleManual), true, true, true},
+		{"missing origin makes no calls", string(ScheduleNightly), true, false, true},
+		{"absent consent makes no calls", string(ScheduleNightly), true, true, false},
+		// A configured origin alone (push consent) never schedules:
+		// scheduled pull is opt-in and off by default.
+		{"scheduled off makes no calls", string(ScheduleNightly), false, true, true},
+		{"scheduled off on-release makes no calls", string(ScheduleOnRelease), false, true, true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			source := ""
-			if c.source {
-				source = probe.srv.URL
+			cdnBase := ""
+			if c.cdnBase {
+				cdnBase = probe.srv.URL
 			}
-			path := writeAutoUpdateDaemonConfig(t, c.schedule, source, c.signers)
+			path := writeAutoUpdateDaemonConfigScheduled(t, c.schedule, cdnBase, c.scheduled, c.signers)
 			clock := newManualUpdateClock(time.Date(2026, 5, 4, 1, 0, 0, 0, time.Local))
 			d := New(Options{
 				ConfigPath:       path,
@@ -407,8 +462,8 @@ func TestAutoUpdateScheduler_OverlappingTicksInvokeOneAttempt(t *testing.T) {
 	d := newRestartTestDaemon(t, nil)
 	d.opts.Version = "0.1.0"
 	d.config = &Config{AutoUpdate: AutoUpdateConfig{
-		Channel: ChannelStable, Schedule: ScheduleNightly, DrainTimeoutSeconds: 1,
-		Source: probe.srv.URL,
+		Channel: ChannelStable, Schedule: ScheduleNightly, Scheduled: true, DrainTimeoutSeconds: 1,
+		CDNBase: probe.srv.URL,
 		Signers: []UpdateSigner{
 			{SAN: "releases@example.com", Issuer: "https://issuer.example"},
 		},
@@ -520,8 +575,8 @@ func TestAutoUpdateScheduler_AttemptBoundedByTotalDeadline(t *testing.T) {
 	d := newRestartTestDaemon(t, nil)
 	d.opts.Version = "0.1.0"
 	d.config = &Config{AutoUpdate: AutoUpdateConfig{
-		Channel: ChannelStable, Schedule: ScheduleOnRelease, DrainTimeoutSeconds: 1,
-		Source: hanging.URL,
+		Channel: ChannelStable, Schedule: ScheduleOnRelease, Scheduled: true, DrainTimeoutSeconds: 1,
+		CDNBase: hanging.URL,
 		Signers: []UpdateSigner{
 			{SAN: "releases@example.com", Issuer: "https://issuer.example"},
 		},
@@ -551,8 +606,8 @@ func TestAutoUpdateScheduler_UpToDateReleaseNeverDrains(t *testing.T) {
 	d := newRestartTestDaemon(t, nil)
 	d.opts.Version = "0.1.0"
 	d.config = &Config{AutoUpdate: AutoUpdateConfig{
-		Channel: ChannelStable, Schedule: ScheduleNightly, DrainTimeoutSeconds: 1,
-		Source: probe.srv.URL,
+		Channel: ChannelStable, Schedule: ScheduleNightly, Scheduled: true, DrainTimeoutSeconds: 1,
+		CDNBase: probe.srv.URL,
 		Signers: []UpdateSigner{
 			{SAN: "releases@example.com", Issuer: "https://issuer.example"},
 		},
@@ -578,8 +633,8 @@ func TestAutoUpdateScheduler_NewerReleaseReachesRealUpdateFailsClosed(t *testing
 	d := newRestartTestDaemon(t, nil)
 	d.opts.Version = "0.1.0"
 	d.config = &Config{AutoUpdate: AutoUpdateConfig{
-		Channel: ChannelStable, Schedule: ScheduleNightly, DrainTimeoutSeconds: 1,
-		Source: probe.srv.URL,
+		Channel: ChannelStable, Schedule: ScheduleNightly, Scheduled: true, DrainTimeoutSeconds: 1,
+		CDNBase: probe.srv.URL,
 		Signers: []UpdateSigner{
 			{SAN: "releases@example.com", Issuer: "https://issuer.example"},
 		},
@@ -612,8 +667,8 @@ func TestAutoUpdateScheduler_PreflightRefusalBlocksBinaryFetch(t *testing.T) {
 	d := newRestartTestDaemon(t, nil)
 	d.opts.Version = "0.1.0"
 	d.config = &Config{AutoUpdate: AutoUpdateConfig{
-		Channel: ChannelStable, Schedule: ScheduleNightly, DrainTimeoutSeconds: 1,
-		Source: probe.srv.URL,
+		Channel: ChannelStable, Schedule: ScheduleNightly, Scheduled: true, DrainTimeoutSeconds: 1,
+		CDNBase: probe.srv.URL,
 		Signers: []UpdateSigner{
 			{SAN: "releases@example.com", Issuer: "https://issuer.example"},
 		},
@@ -649,7 +704,8 @@ func TestAutoUpdateScheduler_RevokedConsentStopsScheduledRequests(t *testing.T) 
 		mutate func(*Config)
 		desc   string
 	}{
-		{"cleared source", func(c *Config) { c.AutoUpdate.Source = "" }, "cleared source"},
+		{"cleared origin", func(c *Config) { c.AutoUpdate.CDNBase = "" }, "cleared origin"},
+		{"scheduled off", func(c *Config) { c.AutoUpdate.Scheduled = false }, "scheduled off"},
 		{"manual schedule", func(c *Config) { c.AutoUpdate.Schedule = ScheduleManual }, "manual schedule"},
 		{"removed signers", func(c *Config) { c.AutoUpdate.Signers = nil }, "removed signers"},
 	}
@@ -696,9 +752,13 @@ func TestAutoUpdateScheduler_RevokedConsentStopsScheduledRequests(t *testing.T) 
 				t.Fatal("config missing after reload")
 			}
 			switch r.name {
-			case "cleared source":
-				if got := after.AutoUpdate.Source; got != "" {
-					t.Fatalf("Source after %s = %q, want empty", r.desc, got)
+			case "cleared origin":
+				if got := after.AutoUpdate.CDNBase; got != "" {
+					t.Fatalf("CDNBase after %s = %q, want empty", r.desc, got)
+				}
+			case "scheduled off":
+				if after.AutoUpdate.Scheduled {
+					t.Fatalf("Scheduled after %s = true, want false", r.desc)
 				}
 			case "manual schedule":
 				if got := after.AutoUpdate.Schedule; got != ScheduleManual {
@@ -747,8 +807,8 @@ func TestAutoUpdateScheduler_SuccessfulSwapRequestsRestartOnce(t *testing.T) {
 	d.opts.Version = "0.1.0"
 	probe := newUpdateProbeServer(t, "9.9.9", []byte("new-binary"), "not-a-bundle")
 	d.config = &Config{AutoUpdate: AutoUpdateConfig{
-		Channel: ChannelStable, Schedule: ScheduleNightly, DrainTimeoutSeconds: 1,
-		Source: probe.srv.URL,
+		Channel: ChannelStable, Schedule: ScheduleNightly, Scheduled: true, DrainTimeoutSeconds: 1,
+		CDNBase: probe.srv.URL,
 		Signers: []UpdateSigner{
 			{SAN: "releases@example.com", Issuer: "https://issuer.example"},
 		},
@@ -782,13 +842,13 @@ func TestAutoUpdateScheduler_SuccessfulSwapRequestsRestartOnce(t *testing.T) {
 	}
 }
 
-func TestUpdate_ForwardsConfiguredSourceToProductionUpdater(t *testing.T) {
+func TestUpdate_ForwardsConfiguredOriginToProductionUpdater(t *testing.T) {
 	probe := newUpdateProbeServer(t, "9.9.9", []byte("new-binary"), "not-a-bundle")
 	d := newRestartTestDaemon(t, nil)
 	d.opts.Version = "0.1.0"
 	d.config = &Config{AutoUpdate: AutoUpdateConfig{
-		Channel: ChannelStable, Schedule: ScheduleManual, DrainTimeoutSeconds: 1,
-		Source: probe.srv.URL,
+		Channel: ChannelStable, Schedule: ScheduleManual, Scheduled: true, DrainTimeoutSeconds: 1,
+		CDNBase: probe.srv.URL,
 		Signers: []UpdateSigner{
 			{SAN: "releases@example.com", Issuer: "https://issuer.example"},
 		},
@@ -796,11 +856,11 @@ func TestUpdate_ForwardsConfiguredSourceToProductionUpdater(t *testing.T) {
 	if _, err := d.Update(context.Background()); err != nil {
 		t.Fatalf("Update: %v", err)
 	}
-	// Without source forwarding the updater short-circuits to up-to-date
+	// Without origin forwarding the updater short-circuits to up-to-date
 	// with zero requests; any manifest hit proves the configured origin
 	// reached the production NewUpdater call.
 	if got := probe.manifestHits.Load(); got == 0 {
-		t.Fatal("manual update made zero manifest requests: configured source never reached the updater")
+		t.Fatal("manual update made zero manifest requests: configured origin never reached the updater")
 	}
 	if got := probe.binaryHits.Load(); got != 1 {
 		t.Fatalf("binary downloads = %d, want 1 (full Update ran)", got)

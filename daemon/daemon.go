@@ -4201,16 +4201,16 @@ func (a *updateAttempt) runWithConfig(ctx context.Context, cfg *Config, fenceSwa
 func (d *Daemon) newUpdaterWithContext(_ context.Context, cfg *Config) (*Updater, error) {
 	currentVersion := d.EffectiveVersion()
 	autoCfg := cfg.AutoUpdate
-	source := strings.TrimSpace(cfg.AutoUpdate.Source)
 	verifier := d.autoUpdateVerifier
 	binaryPath := d.autoUpdateBinaryPath
 	opts := UpdaterOptions{
 		CurrentVersion: currentVersion,
 		Config:         autoCfg,
-		// The explicitly configured update origin reaches the production
-		// updater here; empty keeps the updater inert (up-to-date
-		// without a request) on both the manual and scheduled paths.
-		CDNBase:  source,
+		// The single configured update origin reaches the production
+		// updater here (operator cdnBase, else the link-time default);
+		// empty keeps the updater inert (up-to-date without a request)
+		// on both the manual and scheduled paths.
+		CDNBase:  effectiveUpdateCDNBase(cfg.AutoUpdate),
 		SkipExit: true, // HTTP-driven update: caller decides to exit.
 	}
 	if verifier != nil {

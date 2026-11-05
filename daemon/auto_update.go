@@ -23,7 +23,24 @@ import (
 // auto-update is opt-in and only runs when the operator configures a CDN base
 // (via UpdaterOptions.CDNBase). When unset, auto-update is disabled rather than
 // pointing at any vendor's infrastructure.
-const UpdateCDNBase = ""
+//
+// It is a var (not a const) so a downstream build can set a default origin at
+// link time without forking the source, e.g.:
+// go build -ldflags "-X github.com/RenseiAI/donmai/daemon.UpdateCDNBase=<origin>"
+// The OSS binary leaves it empty; an explicitly configured autoUpdate.cdnBase
+// always takes precedence (see effectiveUpdateCDNBase).
+var UpdateCDNBase = ""
+
+// effectiveUpdateCDNBase resolves the update source the production updater
+// checks: the operator-configured autoUpdate.cdnBase when set, otherwise the
+// compiled default (empty in OSS builds, so auto-update stays disabled until
+// the operator opts in). Empty means no source is configured.
+func effectiveUpdateCDNBase(cfg AutoUpdateConfig) string {
+	if strings.TrimSpace(cfg.CDNBase) != "" {
+		return strings.TrimSpace(cfg.CDNBase)
+	}
+	return strings.TrimSpace(UpdateCDNBase)
+}
 
 // VersionManifest is the schema of <channel>/latest.json.
 type VersionManifest struct {
@@ -224,6 +241,15 @@ func (u *Updater) RunUpdate(ctx context.Context) (*UpdateResult, error) {
 	valid, reason := u.opts.Verifier.Verify(ctx, hash, signature)
 	if !valid {
 		return &UpdateResult{Updated: false, Version: u.opts.CurrentVersion, Reason: "sig-rejected: " + reason}, nil
+	}
+
+	// Consent bounds the swap itself, not just admission: the host-upgrade
+	// execution context expires at the request deadline, and verification
+	// can cross it. Check cancellation after verification and before any
+	// irreversible filesystem change so an expired request never replaces
+	// the binary and then reports a refusal.
+	if err := ctx.Err(); err != nil {
+		return &UpdateResult{Updated: false, Version: u.opts.CurrentVersion, Reason: "update-cancelled: " + err.Error()}, err
 	}
 
 	if u.opts.CurrentBinaryPath == "" {
