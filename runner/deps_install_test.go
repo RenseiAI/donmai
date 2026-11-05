@@ -66,7 +66,7 @@ func TestInstallSessionDependencies_PnpmBeforeGo(t *testing.T) {
 	writeFile(t, wpath, "pnpm-lock.yaml", "lockfileVersion: 9.0\n")
 	writeFile(t, wpath, "go.mod", "module example.test/seed\n\ngo 1.24\n")
 
-	r.installSessionDependencies(context.Background(), QueuedWork{QueuedWork: queuedWorkBase("DEPS-ORDER")}, wpath, false)
+	prep := r.installSessionDependencies(context.Background(), QueuedWork{QueuedWork: queuedWorkBase("DEPS-ORDER")}, wpath, false)
 
 	calls := execer.recorded()
 	if len(calls) != 2 {
@@ -83,9 +83,12 @@ func TestInstallSessionDependencies_PnpmBeforeGo(t *testing.T) {
 			t.Errorf("call %d dir = %q; want worktree %q", i, call.dir, wpath)
 		}
 	}
+	if prep == nil || prep.Pnpm != agent.DependencyPreparationReady || prep.Go != agent.DependencyPreparationReady {
+		t.Fatalf("preparation = %+v; want {pnpm:ready go:ready}", prep)
+	}
 }
 
-func TestInstallSessionDependencies_SkipsPnpmWhenNodeModulesPresent(t *testing.T) {
+func TestInstallSessionDependencies_RunsPnpmDespiteNodeModulesPresent(t *testing.T) {
 	t.Parallel()
 	execer := &recordingDepsExecer{}
 	r := depsTestRunner(t, execer)
@@ -94,14 +97,24 @@ func TestInstallSessionDependencies_SkipsPnpmWhenNodeModulesPresent(t *testing.T
 	writeFile(t, wpath, "pnpm-lock.yaml", "lockfileVersion: 9.0\n")
 	writeFile(t, wpath, filepath.Join("node_modules", ".bin", "keep"), "")
 
-	r.installSessionDependencies(context.Background(), QueuedWork{QueuedWork: queuedWorkBase("DEPS-SKIP")}, wpath, false)
+	// A leftover .bin directory proves nothing about the checked-out
+	// lockfile: the existing installer still runs before spawn. Restoring
+	// the .bin skip leaves zero calls and fails this test (AC-1 RED).
+	prep := r.installSessionDependencies(context.Background(), QueuedWork{QueuedWork: queuedWorkBase("DEPS-SKIP")}, wpath, false)
 
-	if calls := execer.recorded(); len(calls) != 0 {
-		t.Fatalf("install calls = %v; want none (kit hook already installed)", calls)
+	calls := execer.recorded()
+	if len(calls) != 1 {
+		t.Fatalf("install calls = %v; want the pnpm install despite .bin", calls)
+	}
+	if calls[0].command != pnpmDepsInstallCommand || calls[0].dir != wpath {
+		t.Errorf("call = %+v; want pnpm install in %q", calls[0], wpath)
+	}
+	if prep == nil || prep.Pnpm != agent.DependencyPreparationReady || prep.Go != "" {
+		t.Fatalf("preparation = %+v; want {pnpm:ready} (go undetected)", prep)
 	}
 }
 
-func TestInstallSessionDependencies_SkipsOnlyInstalledEcosystem(t *testing.T) {
+func TestInstallSessionDependencies_RunsBothEcosystemsDespiteNodeModulesPresent(t *testing.T) {
 	t.Parallel()
 	execer := &recordingDepsExecer{}
 	r := depsTestRunner(t, execer)
@@ -111,14 +124,20 @@ func TestInstallSessionDependencies_SkipsOnlyInstalledEcosystem(t *testing.T) {
 	writeFile(t, wpath, filepath.Join("node_modules", ".bin", "keep"), "")
 	writeFile(t, wpath, "go.mod", "module example.test/seed\n\ngo 1.24\n")
 
-	r.installSessionDependencies(context.Background(), QueuedWork{QueuedWork: queuedWorkBase("DEPS-PARTIAL")}, wpath, false)
+	prep := r.installSessionDependencies(context.Background(), QueuedWork{QueuedWork: queuedWorkBase("DEPS-PARTIAL")}, wpath, false)
 
 	calls := execer.recorded()
-	if len(calls) != 1 {
-		t.Fatalf("install calls = %v; want only the go install", calls)
+	if len(calls) != 2 {
+		t.Fatalf("install calls = %v; want pnpm then go despite .bin", calls)
 	}
-	if calls[0].command != goDepsInstallCommand || calls[0].dir != wpath {
-		t.Errorf("call = %+v; want go install in %q", calls[0], wpath)
+	if calls[0].command != pnpmDepsInstallCommand || calls[0].dir != wpath {
+		t.Errorf("first call = %+v; want pnpm install in %q", calls[0], wpath)
+	}
+	if calls[1].command != goDepsInstallCommand || calls[1].dir != wpath {
+		t.Errorf("second call = %+v; want go install in %q", calls[1], wpath)
+	}
+	if prep == nil || prep.Pnpm != agent.DependencyPreparationReady || prep.Go != agent.DependencyPreparationReady {
+		t.Fatalf("preparation = %+v; want {pnpm:ready go:ready}", prep)
 	}
 }
 
@@ -130,10 +149,13 @@ func TestInstallSessionDependencies_NoManifestsRunsNothing(t *testing.T) {
 	wpath := t.TempDir()
 	writeFile(t, wpath, "README.md", "# no manifests here\n")
 
-	r.installSessionDependencies(context.Background(), QueuedWork{QueuedWork: queuedWorkBase("DEPS-NONE")}, wpath, false)
+	prep := r.installSessionDependencies(context.Background(), QueuedWork{QueuedWork: queuedWorkBase("DEPS-NONE")}, wpath, false)
 
 	if calls := execer.recorded(); len(calls) != 0 {
 		t.Fatalf("install calls = %v; want none", calls)
+	}
+	if prep != nil {
+		t.Fatalf("preparation = %+v; want nil (omitted with no detected ecosystem)", prep)
 	}
 }
 
@@ -146,10 +168,13 @@ func TestInstallSessionDependencies_ReadOnlyCheckoutSkips(t *testing.T) {
 	writeFile(t, wpath, "pnpm-lock.yaml", "lockfileVersion: 9.0\n")
 	writeFile(t, wpath, "go.mod", "module example.test/seed\n\ngo 1.24\n")
 
-	r.installSessionDependencies(context.Background(), QueuedWork{QueuedWork: queuedWorkBase("DEPS-RO")}, wpath, true)
+	prep := r.installSessionDependencies(context.Background(), QueuedWork{QueuedWork: queuedWorkBase("DEPS-RO")}, wpath, true)
 
 	if calls := execer.recorded(); len(calls) != 0 {
 		t.Fatalf("install calls = %v; want none on a read-only checkout", calls)
+	}
+	if prep == nil || prep.Pnpm != agent.DependencyPreparationSkippedReadOnly || prep.Go != agent.DependencyPreparationSkippedReadOnly {
+		t.Fatalf("preparation = %+v; want {pnpm:skipped_read_only go:skipped_read_only}", prep)
 	}
 }
 
@@ -164,11 +189,14 @@ func TestInstallSessionDependencies_FailureContinuesToNextEcosystem(t *testing.T
 
 	// Must not panic, abort, or return an error: a failed install is
 	// logged and the run continues with whatever is on disk.
-	r.installSessionDependencies(context.Background(), QueuedWork{QueuedWork: queuedWorkBase("DEPS-FAIL")}, wpath, false)
+	prep := r.installSessionDependencies(context.Background(), QueuedWork{QueuedWork: queuedWorkBase("DEPS-FAIL")}, wpath, false)
 
 	calls := execer.recorded()
 	if len(calls) != 2 {
 		t.Fatalf("install calls = %d; want 2 (failure must not skip go)", len(calls))
+	}
+	if prep == nil || prep.Pnpm != agent.DependencyPreparationFailed || prep.Go != agent.DependencyPreparationFailed {
+		t.Fatalf("preparation = %+v; want {pnpm:failed go:failed}", prep)
 	}
 }
 
@@ -180,10 +208,202 @@ func TestInstallSessionDependencies_ExecErrorContinues(t *testing.T) {
 	wpath := t.TempDir()
 	writeFile(t, wpath, "go.mod", "module example.test/seed\n\ngo 1.24\n")
 
-	r.installSessionDependencies(context.Background(), QueuedWork{QueuedWork: queuedWorkBase("DEPS-ERR")}, wpath, false)
+	prep := r.installSessionDependencies(context.Background(), QueuedWork{QueuedWork: queuedWorkBase("DEPS-ERR")}, wpath, false)
 
 	if calls := execer.recorded(); len(calls) != 1 {
 		t.Fatalf("install calls = %d; want 1", len(calls))
+	}
+	if prep == nil || prep.Go != agent.DependencyPreparationFailed || prep.Pnpm != "" {
+		t.Fatalf("preparation = %+v; want {go:failed} (pnpm undetected)", prep)
+	}
+}
+
+// contextBlockingExecer blocks until ctx expires, then reports the
+// context error like the production execer does on timeout.
+type contextBlockingExecer struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (f *contextBlockingExecer) Exec(ctx context.Context, _, _ string, _ map[string]string) (int, error) {
+	f.mu.Lock()
+	f.calls++
+	f.mu.Unlock()
+	<-ctx.Done()
+	return -1, ctx.Err()
+}
+
+func (f *contextBlockingExecer) recorded() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
+func TestInstallSessionDependencies_ExpiredContextReportsTimedOut(t *testing.T) {
+	t.Parallel()
+	execer := &contextBlockingExecer{}
+	r := depsTestRunner(t, execer)
+	r.depsInstallTimeout = 50 * time.Millisecond
+
+	wpath := t.TempDir()
+	writeFile(t, wpath, "go.mod", "module example.test/seed\n\ngo 1.24\n")
+
+	prep := r.installSessionDependencies(context.Background(), QueuedWork{QueuedWork: queuedWorkBase("DEPS-TIMEOUT")}, wpath, false)
+
+	if prep == nil || prep.Go != agent.DependencyPreparationTimedOut || prep.Pnpm != "" {
+		t.Fatalf("preparation = %+v; want {go:timed_out} (pnpm undetected)", prep)
+	}
+	if n := execer.recorded(); n != 1 {
+		t.Fatalf("install calls = %d; want 1 bounded attempt", n)
+	}
+	if got := prep.DetectedEcosystems(); len(got) != 1 || got[0] != "go" {
+		t.Errorf("ecosystems = %v; want [go]", got)
+	}
+}
+
+// scriptedDepsExecer answers per command: pnpm installs cleanly while any
+// other command blocks until the shared install context expires, like a
+// wedged `go mod download` after a good pnpm install.
+type scriptedDepsExecer struct {
+	mu    sync.Mutex
+	calls []depsCall
+}
+
+func (f *scriptedDepsExecer) Exec(ctx context.Context, dir, command string, _ map[string]string) (int, error) {
+	f.mu.Lock()
+	f.calls = append(f.calls, depsCall{dir: dir, command: command})
+	f.mu.Unlock()
+	if command == pnpmDepsInstallCommand {
+		return 0, nil
+	}
+	<-ctx.Done()
+	return -1, ctx.Err()
+}
+
+func (f *scriptedDepsExecer) recorded() []depsCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]depsCall(nil), f.calls...)
+}
+
+func TestInstallSessionDependencies_TimeoutKeepsCompletedReady(t *testing.T) {
+	t.Parallel()
+	execer := &scriptedDepsExecer{}
+	r := depsTestRunner(t, execer)
+	r.depsInstallTimeout = 100 * time.Millisecond
+
+	wpath := t.TempDir()
+	writeFile(t, wpath, "pnpm-lock.yaml", "lockfileVersion: 9.0\n")
+	writeFile(t, wpath, "go.mod", "module example.test/seed\n\ngo 1.24\n")
+
+	prep := r.installSessionDependencies(context.Background(), QueuedWork{QueuedWork: queuedWorkBase("DEPS-KEEP-READY")}, wpath, false)
+
+	if calls := execer.recorded(); len(calls) != 2 {
+		t.Fatalf("install calls = %d; want 2 (pnpm ok, go bounded attempt)", len(calls))
+	}
+	// A completed install keeps its outcome: only the expired ecosystem
+	// reports timed_out. Overwriting every ready with timed_out fails it.
+	if prep == nil || prep.Pnpm != agent.DependencyPreparationReady || prep.Go != agent.DependencyPreparationTimedOut {
+		t.Fatalf("preparation = %+v; want {pnpm:ready go:timed_out}", prep)
+	}
+	if got := prep.OutcomeSummary(); !strings.Contains(got, "pnpm: ready") || !strings.Contains(got, "go: timed_out") {
+		t.Fatalf("summary = %q; want per-ecosystem outcomes kept", got)
+	}
+}
+
+func TestInstallSessionDependencies_CancelledContextAuthorizesNoWork(t *testing.T) {
+	t.Parallel()
+	execer := &recordingDepsExecer{}
+	r := depsTestRunner(t, execer)
+
+	wpath := t.TempDir()
+	writeFile(t, wpath, "pnpm-lock.yaml", "lockfileVersion: 9.0\n")
+	writeFile(t, wpath, "go.mod", "module example.test/seed\n\ngo 1.24\n")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	prep := r.installSessionDependencies(ctx, QueuedWork{QueuedWork: queuedWorkBase("DEPS-CANCEL")}, wpath, false)
+
+	if calls := execer.recorded(); len(calls) != 0 {
+		t.Fatalf("install calls = %v; want none: cancellation must not authorize work", calls)
+	}
+	if prep == nil || prep.Pnpm != agent.DependencyPreparationTimedOut || prep.Go != agent.DependencyPreparationTimedOut {
+		t.Fatalf("preparation = %+v; want {pnpm:timed_out go:timed_out}", prep)
+	}
+}
+
+func TestInstallSessionDependencies_RestrictedContextReportsSkippedSecurity(t *testing.T) {
+	t.Parallel()
+	execer := &recordingDepsExecer{}
+	r := depsTestRunner(t, execer)
+
+	wpath := t.TempDir()
+	writeFile(t, wpath, "pnpm-lock.yaml", "lockfileVersion: 9.0\n")
+	writeFile(t, wpath, "go.mod", "module example.test/seed\n\ngo 1.24\n")
+
+	qw := QueuedWork{QueuedWork: queuedWorkBase("DEPS-RESTRICTED")}
+	qw.ExecutionSecurity = executionSecuritySection(nil)
+	qw.ExecutionSecurity.Levels.Network = agent.NetworkLogged
+
+	prep := r.installSessionDependencies(context.Background(), qw, wpath, false)
+
+	if calls := execer.recorded(); len(calls) != 0 {
+		t.Fatalf("install calls = %v; want none under restricted execution", calls)
+	}
+	if prep == nil || prep.Pnpm != agent.DependencyPreparationSkippedSecurity || prep.Go != agent.DependencyPreparationSkippedSecurity {
+		t.Fatalf("preparation = %+v; want {pnpm:skipped_security go:skipped_security}", prep)
+	}
+	if got := prep.DetectedEcosystems(); len(got) != 2 {
+		t.Errorf("ecosystems = %v; want both detected ecosystems on the skipped report", got)
+	}
+}
+
+func TestInjectDependencyPreparationPartial(t *testing.T) {
+	t.Parallel()
+	base := "# Operating protocol\nFollow the harness protocol."
+	for _, tc := range []struct {
+		name       string
+		prep       *agent.DependencyPreparation
+		wantChange bool
+	}{
+		{name: "nil omits", prep: nil},
+		{name: "ready adds nothing", prep: &agent.DependencyPreparation{Pnpm: agent.DependencyPreparationReady}},
+		{name: "read-only skip adds no bypass", prep: &agent.DependencyPreparation{Pnpm: agent.DependencyPreparationSkippedReadOnly}},
+		{name: "security skip adds no bypass", prep: &agent.DependencyPreparation{Go: agent.DependencyPreparationSkippedSecurity}},
+		{name: "failed hands recovery", prep: &agent.DependencyPreparation{Pnpm: agent.DependencyPreparationFailed}, wantChange: true},
+		{name: "mixed failed and ready hands recovery", prep: &agent.DependencyPreparation{Pnpm: agent.DependencyPreparationFailed, Go: agent.DependencyPreparationReady}, wantChange: true},
+		{name: "timed out hands recovery", prep: &agent.DependencyPreparation{Pnpm: agent.DependencyPreparationTimedOut, Go: agent.DependencyPreparationTimedOut}, wantChange: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := injectDependencyPreparationPartial(base, tc.prep)
+			if !tc.wantChange {
+				if got != base {
+					t.Fatalf("protocol changed for %+v; want byte-identical", tc.prep)
+				}
+				return
+			}
+			if got == base {
+				t.Fatalf("protocol unchanged for %+v; want recovery handoff", tc.prep)
+			}
+			if !strings.Contains(got, base) {
+				t.Fatalf("existing protocol lost in recovery handoff")
+			}
+			if !strings.Contains(got, "Dependencies are not ready.") {
+				t.Errorf("recovery handoff missing not-ready statement: %q", got)
+			}
+			if !strings.Contains(got, "report blocked with the reason") {
+				t.Errorf("recovery handoff missing blocked report: %q", got)
+			}
+			if !strings.Contains(got, tc.prep.OutcomeSummary()) {
+				t.Errorf("recovery handoff missing bounded summary %q: %q", tc.prep.OutcomeSummary(), got)
+			}
+			for _, sentinel := range []string{"binary missing", "install-stdout", "exit 1", "/bin/sh"} {
+				if strings.Contains(got, sentinel) {
+					t.Errorf("recovery prompt leaks raw installer text %q: %q", sentinel, got)
+				}
+			}
+		})
 	}
 }
 
@@ -640,6 +860,65 @@ func TestRun_DependencyInstallTimeoutStillSpawns(t *testing.T) {
 	}
 	if !strings.Contains(logs.String(), "context deadline exceeded") {
 		t.Fatal("expired install was not logged")
+	}
+}
+
+// pnpmFailGoBlockExecer fails the pnpm install fast and blocks the go
+// install until the shared context expires. It drives the combined
+// failed-plus-timed-out state so the timed_out-over-failed priority is
+// pinned: swapping the switch cases reports failed instead and fails the
+// test below.
+type pnpmFailGoBlockExecer struct {
+	mu    sync.Mutex
+	calls []depsCall
+}
+
+func (f *pnpmFailGoBlockExecer) Exec(ctx context.Context, dir, command string, _ map[string]string) (int, error) {
+	f.mu.Lock()
+	f.calls = append(f.calls, depsCall{dir: dir, command: command})
+	f.mu.Unlock()
+	if strings.HasPrefix(command, "pnpm install ") {
+		return 1, nil
+	}
+	<-ctx.Done()
+	return -1, ctx.Err()
+}
+
+func (f *pnpmFailGoBlockExecer) recorded() []depsCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]depsCall(nil), f.calls...)
+}
+
+// TestInstallSessionDependencies_FailedPnpmAndTimedOutGoKeepsPerEcosystemOutcomes
+// pins per-ecosystem fidelity when outcomes combine: a failed pnpm plus
+// a go install that expires with the shared context reports failed for
+// pnpm and timed_out for go, and the combined report still needs
+// recovery. Collapsing the two into one status loses which ecosystem
+// needs repair and fails this test.
+func TestInstallSessionDependencies_FailedPnpmAndTimedOutGoKeepsPerEcosystemOutcomes(t *testing.T) {
+	t.Parallel()
+	execer := &pnpmFailGoBlockExecer{}
+	r := depsTestRunner(t, execer)
+	r.depsInstallTimeout = 200 * time.Millisecond
+
+	wpath := t.TempDir()
+	writeFile(t, wpath, "pnpm-lock.yaml", "lockfileVersion: 9.0\n")
+	writeFile(t, wpath, "go.mod", "module example.test/seed\n\ngo 1.24\n")
+
+	prep := r.installSessionDependencies(context.Background(), QueuedWork{QueuedWork: queuedWorkBase("DEPS-BOTH")}, wpath, false)
+
+	if calls := execer.recorded(); len(calls) != 2 {
+		t.Fatalf("install calls = %d; want 2 (failed pnpm then bounded go)", len(calls))
+	}
+	if prep == nil || prep.Pnpm != agent.DependencyPreparationFailed || prep.Go != agent.DependencyPreparationTimedOut {
+		t.Fatalf("preparation = %+v; want {pnpm:failed go:timed_out}", prep)
+	}
+	if !prep.NeedsRecovery() {
+		t.Fatalf("preparation = %+v; want recovery for a failed/timed_out combination", prep)
+	}
+	if got := prep.DetectedEcosystems(); len(got) != 2 || got[0] != "pnpm" || got[1] != "go" {
+		t.Errorf("ecosystems = %v; want [pnpm go]", got)
 	}
 }
 

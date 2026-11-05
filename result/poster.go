@@ -334,6 +334,16 @@ type statusRequest struct {
 	// result recorded none — old platforms ignore it.
 	PreparationSeconds int64 `json:"preparationSeconds,omitempty"`
 
+	// DependencyPreparation is the bounded per-ecosystem dependency-install
+	// outcome retained from the runner's preparation phase. It is a closed
+	// per-ecosystem object ({"pnpm": <outcome>, "go": <outcome>}, keys
+	// only for detected ecosystems) with the closed outcome vocabulary
+	// ready, failed, timed_out, skipped_read_only, skipped_security.
+	// Additive; omitted when the result recorded none (no detected
+	// ecosystem or a result that predates the report) — old platforms
+	// ignore it.
+	DependencyPreparation *agent.DependencyPreparation `json:"dependencyPreparation,omitempty"`
+
 	// BudgetBreach names the session budget cap the runner stopped the
 	// session at: the failure reason on a failed session, and on a completed
 	// one the flag that the delivered work ran over its budget. Additive;
@@ -766,8 +776,8 @@ func buildStatusRequest(creds RuntimeCredentials, r agent.Result, projection *wo
 		TerminalWorkareaLease:    projection,
 		TerminalArchiveReference: archiveReference,
 		ExecutionSecurityRefusal: r.ExecutionSecurityRefusal, TurnContinuations: r.TurnContinuations,
-		PreparationSeconds: r.PreparationSeconds,
-		BudgetBreach:       r.BudgetBreach, Resumable: r.Resumable, ResumeCheckpoint: r.ResumeCheckpoint, WIPRef: r.WIPRef,
+		PreparationSeconds: r.PreparationSeconds, DependencyPreparation: r.DependencyPreparation,
+		BudgetBreach: r.BudgetBreach, Resumable: r.Resumable, ResumeCheckpoint: r.ResumeCheckpoint, WIPRef: r.WIPRef,
 		PostSessionWarnings: r.PostSessionWarnings,
 		UpstreamError:       agent.CanonicalUpstreamError(r.Upstream), ToolCalls: r.ToolCalls,
 		FinalProvider: r.FinalProvider, FinalModel: r.FinalModel, ProviderAttempts: r.ProviderAttempts,

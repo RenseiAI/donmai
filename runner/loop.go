@@ -789,10 +789,15 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// (step 2b) and before spawn: a pnpm lockfile triggers
 	// `pnpm install --prefer-offline --frozen-lockfile`, a go.mod
 	// triggers `go mod download`. Bounded by one timeout; a failure is
-	// logged and the run continues. Skipped when the kit hook already
-	// installed (node_modules/.bin present) and when the selected
-	// repository is read-only.
-	r.installSessionDependencies(ctx, qw, wpath, selectedRepositoryReadOnly)
+	// logged and the run continues with whatever is on disk
+	// (best-effort spawn). The bounded outcome is retained on the
+	// terminal result; failed/timed_out outcomes also render a short
+	// runner-authored recovery handoff in the delivered harness protocol
+	// (step 5b), never an automatic second install. Skipped when the
+	// selected repository is read-only or the execution-security gate
+	// requires confinement; omitted when no manifest is detected.
+	depsPrep := r.installSessionDependencies(ctx, qw, wpath, selectedRepositoryReadOnly)
+	res.DependencyPreparation = depsPrep
 
 	// 2c. Post-clone kit skill + prompt-fragment re-detection.
 	//
@@ -1052,6 +1057,24 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// no-op when the block is absent (byte-identical prompt to today).
 	composition.HarnessProtocol = injectCodeIntelPartialForDelivery(composition.HarnessProtocol, caps, qw.CodeIntel, codeIntelDelivery)
 	composition.HarnessProtocol = injectWorkareaProtocolPartial(composition.HarnessProtocol, repositoryDeclaration != nil)
+	// Failed or timed-out dependency preparation hands an explicit,
+	// bounded recovery instruction to the model-driving harness: the
+	// checkout is not ready, repair with permitted tools before relying
+	// on dependency-based checks, report blocked when repair cannot
+	// finish. Ready, skipped, and no-manifest outcomes add nothing;
+	// a bare shell never receives executable recovery prose (its user
+	// surface executes commands, so no non-user authority is projected
+	// there) — it keeps the terminal report as evidence only.
+	// Receipt-bearing (prepared) spawns skip this composition-time
+	// injection: the prepared authority compiled at admission cannot
+	// contain a post-admission outcome, and any post-authority prompt
+	// mutation would trip the ApplyPreparedHarness digest check and turn
+	// a recoverable install failure into a session failure. The outcome
+	// rides the digest-exempt Spec.DependencyPreparation runtime channel
+	// instead, projected after the equality check passes (below).
+	if provider.Name() != agent.ProviderShell && len(selection.receipt.Bytes()) == 0 {
+		composition.HarnessProtocol = injectDependencyPreparationPartial(composition.HarnessProtocol, depsPrep)
+	}
 	if signalGuard.degraded {
 		composition.HarnessProtocol = injectSignalGuardDegradedProtocolPartial(composition.HarnessProtocol)
 	} else {
@@ -1160,6 +1183,19 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 			}
 		}
 		spec = applyPreparedSourceAuthority(spec, preparedSource, preparedPlan)
+		// The install ran after admission compiled the prepared authority,
+		// so the replacement above carries no preparation outcome — and
+		// must not be amended here: PromptPlan and SystemPromptAppend are
+		// digest-covered, and any post-authority mutation trips the
+		// provider's ApplyPreparedHarness check. The outcome rides the
+		// digest-exempt Spec.DependencyPreparation runtime channel
+		// instead; ApplyPreparedHarness projects the bounded handoff
+		// after the equality check passes. Ready, skipped, and
+		// no-manifest outcomes are no-ops there; the bare-shell lane
+		// stays excluded, matching the composition gate above.
+		if provider.Name() != agent.ProviderShell && dependencyPreparationNeedsRecovery(depsPrep) {
+			spec.DependencyPreparation = depsPrep
+		}
 	} else {
 		spec.OnPromptAdapted = func(receipt agent.PromptDeliveryReceipt) error {
 			_, err := r.store.Update(runnerStatePath, func(s *state.State) error {
