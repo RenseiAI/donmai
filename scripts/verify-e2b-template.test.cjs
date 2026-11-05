@@ -2280,6 +2280,25 @@ test('unprivileged-start guard ignores comment-only ownership mentions', () => {
   assert.equal(hasUnprivilegedPgStart(commentOnly), false)
 })
 
+test('node-pg socket config rejects the removed stats_temp_directory parameter', () => {
+  // PostgreSQL 15 removed stats_temp_directory and 17 refuses to start
+  // when postgresql.conf names it (FATAL: unrecognized configuration
+  // parameter), which failed the build-time pg-start smoke and blocked
+  // template publication. Re-adding the setting must fail the guard even
+  // though the /tmp socket lines are intact.
+  const reverted = [
+    'FROM debian:bookworm-slim',
+    'RUN useradd -m -s /bin/bash user',
+    'RUN chown -R user:user /var/lib/postgresql /etc/postgresql',
+    'RUN echo "unix_socket_directories = \'/tmp\'" >> /etc/postgresql/17/main/postgresql.conf',
+    'RUN echo "stats_temp_directory = \'/tmp/pg_stat_tmp\'" >> /etc/postgresql/17/main/postgresql.conf',
+    'RUN echo \'pg_ctlcluster 17 main start\' >> /usr/local/bin/pg-start',
+    'RUN echo \'if pg_isready -h /tmp -U postgres >/dev/null 2>&1; then\' >> /usr/local/bin/pg-start',
+  ].join('\n')
+  assert.equal(hasTmpSocketConfig(reverted), false)
+  assert.equal(hasUnprivilegedPgStart(reverted), false)
+})
+
 test('e2b.node-pg.Dockerfile proves an unprivileged start at build time', () => {
   // The build-time smoke must repeat the start and the vector probe as
   // user: a postgres-owned cluster passes the root half and fails here,

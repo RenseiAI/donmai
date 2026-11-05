@@ -71,7 +71,7 @@ function readPinnedPiVersion(repoRoot) {
 // resolves, `pg-start` proves the local Postgres 17 cluster comes up as the
 // unprivileged sandbox account, and the probe proves the pgvector extension
 // enables in a scratch database. The socket lives in /tmp (the Dockerfile
-// moves unix_socket_directories and stats_temp_directory there so the
+// moves unix_socket_directories there so the
 // unprivileged account always has a writable socket directory), so every
 // client passes -h /tmp. The verifier runs exactly these commands in order
 // (see assertNodePgCheckOutput); removing an entry here removes it from
@@ -308,12 +308,18 @@ function hasClusterOwnedBySandboxUser(dockerfileSource) {
 // hasTmpSocketConfig reports whether the node-pg Dockerfile and its pg-start
 // helper use /tmp for the socket and readiness probe. /var/run is a fresh
 // tmpfs at sandbox boot, so a socket there is unwritable for the
-// unprivileged account even after the chown; /tmp is always writable.
+// unprivileged account even after the chown; /tmp is always writable. It
+// also rejects the removed stats_temp_directory parameter: PostgreSQL 15
+// removed it and 17 refuses to start when postgresql.conf names it (FATAL:
+// unrecognized configuration parameter), which failed the build-time
+// pg-start smoke and blocked template publication.
 function hasTmpSocketConfig(dockerfileSource) {
   const executable = executableDockerfileText(dockerfileSource)
+  if (/stats_temp_directory\s*=/.test(executable)) {
+    return false
+  }
   return (
     executable.includes("unix_socket_directories = '/tmp'") &&
-    executable.includes('/tmp/pg_stat_tmp') &&
     executable.includes('pg_isready -h /tmp')
   )
 }

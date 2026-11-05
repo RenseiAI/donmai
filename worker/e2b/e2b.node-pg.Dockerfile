@@ -27,8 +27,7 @@
 #   password: this template is an ephemeral single-tenant sandbox, and no
 #   credential is baked in (there is no password to bake). The cluster data,
 #   config, log, and run directories are transferred to the unprivileged
-#   sandbox account (see below), and the socket plus stats temp directories
-#   live under /tmp, so the unprivileged account holds OS permission to
+#   sandbox account (see below), and the socket directory lives under /tmp, so the unprivileged account holds OS permission to
 #   start the server and always has a writable socket directory, even when
 #   the runtime tmpfs hides the build-time /var/run/postgresql. `pg-start`
 #   (in /usr/local/bin, on the login default PATH) brings the cluster up on
@@ -103,9 +102,12 @@ RUN curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
 # in-box `*.pg.test.ts` suites connect with no credential setup. Remote TCP
 # is untouched (no listen_addresses change here; the default is
 # localhost-only). The chown below transfers the cluster to user so
-# pg_ctlcluster accepts the runtime account; the socket overrides move the
-# socket and stats temp files to /tmp, which the runtime account can always
-# write even when /var/run is a fresh tmpfs at sandbox boot.
+# pg_ctlcluster accepts the runtime account; the socket override moves the
+# socket files to /tmp, which the runtime account can always
+# write even when /var/run is a fresh tmpfs at sandbox boot. Do NOT append
+# stats_temp_directory here: PostgreSQL 15 removed it and 17 refuses to
+# start when postgresql.conf names it (FATAL: unrecognized configuration
+# parameter), which fails the build-time pg-start smoke below.
 # NOTE: no backslashes in any RUN command body. The E2B template build SDK
 # parses the Dockerfile with dockerfile-ast and re-emits each RUN joined by
 # single spaces, which strips every single backslash before the builder
@@ -118,7 +120,6 @@ RUN sed -i \
       /etc/postgresql/17/main/pg_hba.conf \
     && grep -E '^(local|host)' /etc/postgresql/17/main/pg_hba.conf \
     && echo "unix_socket_directories = '/tmp'" >> /etc/postgresql/17/main/postgresql.conf \
-    && echo "stats_temp_directory = '/tmp/pg_stat_tmp'" >> /etc/postgresql/17/main/postgresql.conf \
     && chown -R user:user /var/lib/postgresql /etc/postgresql /var/log/postgresql /var/run/postgresql \
     && ls -ld /var/lib/postgresql/17/main
 
@@ -139,7 +140,6 @@ RUN echo '#!/bin/sh' > /usr/local/bin/pg-start \
     && echo 'if pg_lsclusters 17 main 2>/dev/null | grep -q " online"; then' >> /usr/local/bin/pg-start \
     && echo 'echo "postgres 17/main already online"' >> /usr/local/bin/pg-start \
     && echo 'else' >> /usr/local/bin/pg-start \
-    && echo 'mkdir -p /tmp/pg_stat_tmp' >> /usr/local/bin/pg-start \
     && echo 'pg_ctlcluster 17 main start' >> /usr/local/bin/pg-start \
     && echo 'fi' >> /usr/local/bin/pg-start \
     && echo 'for _ in $(seq 1 30); do' >> /usr/local/bin/pg-start \
