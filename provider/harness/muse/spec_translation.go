@@ -2,6 +2,7 @@ package muse
 
 import (
 	"log/slog"
+	"strconv"
 	"strings"
 
 	"github.com/RenseiAI/donmai/agent"
@@ -52,13 +53,13 @@ func resolveModel(spec agent.Spec) string {
 // configured) leaves the tier unset so the host default applies. The
 // "minimal" tier has no agent.EffortLevel constant (the shared ladder
 // runs low..max) but the host catalog lists it, so it is matched by its
-// wire spelling. The "default" and "none" sentinels are never
-// forwarded: an unset tier and a default tier are the same request to the
-// host (run at its default), and "none" is not a selectable tier.
-// "ultra" is a declared wire value (types.go) the shared ladder does
-// not name: it is refused loudly rather than silently degraded to the
-// host default, so a caller asking for the top tier never unknowingly
-// runs at a lower one.
+// wire spelling. "none" asks for no reasoning and "ultra" asks for the
+// top tier: both are closed-vocabulary wire values the host accepts, so an
+// explicit request for either rides the params verbatim — omitting them
+// would silently run the turn at the host default instead of what the
+// caller asked for. Every other non-empty value (including the "default"
+// sentinel and any unknown tier) is unsupported: validateEffort refuses it
+// loudly at admission so a caller never unknowingly runs at a lower tier.
 func resolveEffort(spec agent.Spec) *ReasoningEffort {
 	switch spec.Effort {
 	case agent.EffortLevel("minimal"):
@@ -79,9 +80,58 @@ func resolveEffort(spec agent.Spec) *ReasoningEffort {
 	case agent.EffortMax:
 		e := ReasoningEffortMax
 		return &e
+	case agent.EffortLevel("none"):
+		e := ReasoningEffortNone
+		return &e
+	case agent.EffortLevel("ultra"):
+		e := ReasoningEffortUltra
+		return &e
 	default:
 		return nil
 	}
+}
+
+// validEffortTiers is the closed reasoning-tier vocabulary the host
+// accepts on turn/start: the pinned schema's ReasoningEffort enum.
+// Empty means unset (omit the member so the host default applies) and
+// is the only non-explicit value.
+var validEffortTiers = map[agent.EffortLevel]struct{}{
+	"":                           {},
+	agent.EffortLevel("minimal"): {},
+	agent.EffortLow:              {},
+	agent.EffortMedium:           {},
+	agent.EffortHigh:             {},
+	agent.EffortXHigh:            {},
+	agent.EffortMax:              {},
+	agent.EffortLevel("none"):    {},
+	agent.EffortLevel("ultra"):   {},
+}
+
+// validateEffort refuses an explicit but unsupported reasoning tier
+// before any host process starts. Empty (unset) passes so the host
+// default applies; every closed-vocabulary tier passes so explicit
+// caller intent (including "none" for no reasoning and "ultra" for the
+// top tier) is preserved verbatim. Anything else — the "default"
+// sentinel, a capitalised variant, or an unknown tier — is rejected
+// loudly rather than silently omitted (which would run the turn at the
+// host default instead of what was asked) or silently remapped.
+func validateEffort(spec agent.Spec) error {
+	if _, ok := validEffortTiers[spec.Effort]; ok {
+		return nil
+	}
+	return &SpecEffortError{Effort: string(spec.Effort)}
+}
+
+// SpecEffortError names an unsupported explicit reasoning tier. It
+// carries only the offending value's spelling (never prompt or
+// credential content) so the refusal is diagnosable from the error
+// string alone.
+type SpecEffortError struct {
+	Effort string
+}
+
+func (e *SpecEffortError) Error() string {
+	return "muse: unsupported reasoning effort " + strconv.Quote(e.Effort) + " (want one of minimal, low, medium, high, xhigh, max, none, ultra, or unset)"
 }
 
 // resolveApprovalMode maps the session posture to the MSP approval mode.

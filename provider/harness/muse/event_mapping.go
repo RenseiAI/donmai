@@ -205,6 +205,53 @@ func mapNotification(method string, params json.RawMessage, state *mapperState, 
 	case "approval/updated":
 		return []agent.Event{agent.SystemEvent{Subtype: "approval_updated", Raw: raw}}
 
+	case "approval/reviewing":
+		// Record-only: the native reviewer holds an approval. Typed
+		// activity, never a decision door — the handle still decides
+		// only from approval/requested. Params share the
+		// ApprovalRequestParams shape; RawArgs never enters Message.
+		var p ApprovalRequestParams
+		_ = json.Unmarshal(params, &p)
+		tool := p.ToolName
+		if tool == "" {
+			tool = "unknown"
+		}
+		id := p.ApprovalID
+		if id == "" {
+			id = "unknown"
+		}
+		msg := fmt.Sprintf("Approval reviewing: %s (%s)", tool, id)
+		if p.JudgeEscalated {
+			msg += " [judgeEscalated]"
+		}
+		if p.ProtectedWrite {
+			msg += " [protectedWrite]"
+		}
+		return []agent.Event{agent.SystemEvent{
+			Subtype: "approval_reviewing",
+			Message: msg,
+			Raw:     raw,
+		}}
+
+	case "session/branchChanged":
+		// Record-only: a durable workspace-branch observation landed.
+		// Never authoritative branch binding — the runner assigns no
+		// authority from this subtype. Branch is null on a detached
+		// HEAD; workspaceRoot never enters Message.
+		var p struct {
+			Branch *string `json:"branch"`
+		}
+		_ = json.Unmarshal(params, &p)
+		branch := "unknown"
+		if p.Branch != nil && *p.Branch != "" {
+			branch = *p.Branch
+		}
+		return []agent.Event{agent.SystemEvent{
+			Subtype: "branch_changed",
+			Message: "branch: " + branch,
+			Raw:     raw,
+		}}
+
 	case "session/approvalModeChanged":
 		// Observed live: the host announces approval-mode transitions
 		// (e.g. after session/start applies the requested mode).

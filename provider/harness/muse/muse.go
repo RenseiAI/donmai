@@ -275,6 +275,9 @@ func (p *Provider) Resume(ctx context.Context, sessionID string, spec agent.Spec
 // confinement plan, child env, process start, handshake, session
 // start/resume, first turn.
 func (p *Provider) spawnHandle(ctx context.Context, spec agent.Spec, resumeSessionID string) (*Handle, error) {
+	if err := validateEffort(spec); err != nil {
+		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
+	}
 	workspaceRoot, err := canonicalWorkspaceRoot(spec.Cwd)
 	if err != nil {
 		return nil, fmt.Errorf("%w: muse workspace root: %v", agent.ErrSpawnFailed, err)
