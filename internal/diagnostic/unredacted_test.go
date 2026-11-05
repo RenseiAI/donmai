@@ -26,6 +26,8 @@ func TestUnredacted(t *testing.T) {
 		{"https://user:[REDACTED]@example.test/repo", false},
 		{"https://[REDACTED]:[REDACTED]@example.test/repo", false},
 		{"key sk-abcdefghijklmnop0", true},
+		{"password=[REDACTED]leftover-secret", true},
+		{`{"token":[REDACTED]}, next`, false},
 	}
 	for _, tc := range cases {
 		if got := Unredacted(tc.in); got != tc.want {

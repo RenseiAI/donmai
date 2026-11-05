@@ -2,6 +2,7 @@ package runner
 
 import (
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"html"
 	"io"
@@ -22,12 +23,14 @@ import (
 // Contract. An archived record is valid JSON, and no key, string, or scalar
 // it carries lets a reader recover:
 //   - a known session secret (see transcriptEvidenceSecretValues), compared
-//     by bytes, by numeric value for numeric secrets, and leaf-by-leaf for a
-//     JSON-shaped secret, nor any line of a multi-line secret;
+//     by bytes, by numeric value for numeric secrets (including zero-padded
+//     ones with at least four significant digits), by each string and
+//     number leaf of a JSON-shaped secret (its booleans and nulls carry no
+//     secret material), and by each line of a multi-line secret;
 //   - a value the shared output rail (diagnostic.Redact) would mask, such as
 //     an unknown password, bearer, or token-shaped string;
-//   - a value of any type under a credential-named key, including inside
-//     JSON embedded in a string;
+//   - a value of any type under a credential-named key (the key is judged in
+//     all of its decoding views), including inside JSON embedded in a string;
 //   - an unknown credential found that way (four bytes or longer) repeated
 //     anywhere else in the same string;
 //
@@ -43,9 +46,10 @@ import (
 // rewritten text is checked. A string that cannot be proved clean is
 // replaced wholesale with [REDACTED]. The record keeps its other fields, and
 // only the unprovable string is dropped. A missed encoding therefore costs
-// that one string, never a leak. Transforms outside the decoding set
-// (hashing, splitting a secret across values, encrypting) cannot be found by
-// any text redactor and are outside this contract. The archive remains
+// that one string, never a leak. Known secrets are also rewritten in their
+// hex spelling. Transforms outside the decoding set (hashing, splitting a
+// secret across values, encrypting, Unicode normalization) cannot be found
+// by any text redactor and are outside this contract. The archive remains
 // local-only, with owner-only modes.
 
 const transcriptRedacted = "[REDACTED]"
@@ -116,8 +120,26 @@ func isUsageTranscriptCounterKey(k string) bool {
 	return transcriptUsageCounterKeys[norm]
 }
 
+// isSensitiveTranscriptKey reports whether a key names a credential in any
+// of its decoding views (pass%77ord, base64 of "password", ...). A key whose
+// views cannot all be computed is treated as sensitive.
 func isSensitiveTranscriptKey(k string) bool {
-	return !isUsageTranscriptCounterKey(k) && transcriptSensitiveKeyRE.MatchString(k)
+	if isUsageTranscriptCounterKey(k) {
+		return false
+	}
+	if transcriptSensitiveKeyRE.MatchString(k) {
+		return true
+	}
+	views, complete := transcriptDecodingViews(k)
+	if !complete {
+		return true
+	}
+	for _, v := range views {
+		if transcriptSensitiveKeyRE.MatchString(v) {
+			return true
+		}
+	}
+	return false
 }
 
 // transcriptRedactor holds the matching state derived from one session's
@@ -151,6 +173,14 @@ func newTranscriptRedactor(values []string) *transcriptRedactor {
 		base = append(base, v)
 		if transcriptJSONNumberRE.MatchString(v) {
 			r.numbers[canonicalTranscriptNumber(v)] = true
+		} else if transcriptPaddedNumberRE.MatchString(v) {
+			// A zero-padded PIN printed as a number loses its padding
+			// (012345 -> 12345). Padded values with fewer than four
+			// significant digits are left to byte matching: as numbers
+			// they would match ordinary small counts everywhere.
+			if c := canonicalTranscriptNumber(v); len(strings.TrimLeft(strings.SplitN(c, "e", 2)[0], "-")) >= 4 {
+				r.numbers[c] = true
+			}
 		}
 	}
 	for _, v := range values {
@@ -187,6 +217,9 @@ func newTranscriptRedactor(values []string) *transcriptRedactor {
 		if len(b) >= 3 {
 			addNeedle(base64.RawStdEncoding.EncodeToString([]byte(b)))
 			addNeedle(base64.RawURLEncoding.EncodeToString([]byte(b)))
+		}
+		if len(b) >= 4 {
+			addNeedle(hex.EncodeToString([]byte(b)))
 		}
 	}
 	sort.SliceStable(needles, func(i, j int) bool { return len(needles[i]) > len(needles[j]) })
@@ -504,9 +537,10 @@ func transcriptScalarLeaves(v interface{}) []string {
 }
 
 var (
-	transcriptJSONNumberRE  = regexp.MustCompile(`^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?$`)
-	transcriptNumberTokenRE = regexp.MustCompile(`-?[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?`)
-	transcriptBase64TokenRE = regexp.MustCompile(`[A-Za-z0-9+/_-]{2,}={0,2}`)
+	transcriptPaddedNumberRE = regexp.MustCompile(`^-?0[0-9]+(?:\.[0-9]+)?$`)
+	transcriptJSONNumberRE   = regexp.MustCompile(`^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?$`)
+	transcriptNumberTokenRE  = regexp.MustCompile(`-?[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?`)
+	transcriptBase64TokenRE  = regexp.MustCompile(`[A-Za-z0-9+/_-]{2,}={0,2}`)
 )
 
 // canonicalTranscriptNumber renders a decimal literal as sign, significant
@@ -580,7 +614,7 @@ func transcriptDecodingViews(s string) ([]string, bool) {
 
 // unescapeTranscriptText decodes one layer of backslash escapes: JSON
 // (\" \\ \/ \b \f \n \r \t \uXXXX with surrogate pairs) and Python-style
-// \xHH and \UXXXXXXXX. Unknown escapes are kept as written.
+// \' \xHH \UXXXXXXXX, and C-style octal \NNN. Unknown escapes are kept as written.
 func unescapeTranscriptText(s string) string {
 	if !strings.Contains(s, `\`) {
 		return s
@@ -593,7 +627,7 @@ func unescapeTranscriptText(s string) string {
 			continue
 		}
 		switch c := s[i+1]; c {
-		case '"', '\\', '/':
+		case '"', '\'', '\\', '/':
 			out.WriteByte(c)
 			i++
 		case 'b':
@@ -614,6 +648,14 @@ func unescapeTranscriptText(s string) string {
 		case 'x':
 			if v, ok := parseTranscriptHexByte(s, i+2); ok {
 				out.WriteByte(v)
+				i += 3
+				continue
+			}
+			out.WriteByte(s[i])
+		case '0', '1', '2', '3':
+			// C-style octal byte (\303\251), as git and ls quote names.
+			if i+3 < len(s) && isOctalDigit(s[i+2]) && isOctalDigit(s[i+3]) {
+				out.WriteByte((c-'0')<<6 | (s[i+2]-'0')<<3 | (s[i+3] - '0'))
 				i += 3
 				continue
 			}
@@ -649,6 +691,8 @@ func unescapeTranscriptText(s string) string {
 	}
 	return out.String()
 }
+
+func isOctalDigit(c byte) bool { return c >= '0' && c <= '7' }
 
 func parseTranscriptHex(s string, start, n int) (rune, bool) {
 	if start+n > len(s) {

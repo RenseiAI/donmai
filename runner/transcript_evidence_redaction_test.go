@@ -52,6 +52,11 @@ func evidenceOracleViews(s string) []string {
 			push(v)
 		}
 		push(html.UnescapeString(cur))
+		for _, tok := range oracleHexRE.FindAllString(cur, -1) {
+			if b, err := hex.DecodeString(tok[:len(tok)/2*2]); err == nil {
+				push(string(b))
+			}
+		}
 		for _, tok := range oracleBase64RE.FindAllString(cur, -1) {
 			for _, enc := range []*base64.Encoding{base64.StdEncoding, base64.URLEncoding, base64.RawStdEncoding, base64.RawURLEncoding} {
 				if b, err := enc.DecodeString(tok); err == nil {
@@ -77,8 +82,9 @@ func evidenceOracleViews(s string) []string {
 }
 
 var (
+	oracleHexRE     = regexp.MustCompile(`[0-9a-fA-F]{8,}`)
 	oracleBase64RE  = regexp.MustCompile(`[A-Za-z0-9+/_-]{2,}={0,2}`)
-	oracleUnicodeRE = regexp.MustCompile(`\\u([dD][89abAB][0-9a-fA-F]{2})\\u([dD][c-fC-F][0-9a-fA-F]{2})|\\[uU]([0-9a-fA-F]{4})|\\x([0-9a-fA-F]{2})|\\(["\\/bfnrt])`)
+	oracleUnicodeRE = regexp.MustCompile(`\\u([dD][89abAB][0-9a-fA-F]{2})\\u([dD][c-fC-F][0-9a-fA-F]{2})|\\[uU]([0-9a-fA-F]{4})|\\x([0-9a-fA-F]{2})|\\(["'\\/bfnrt])|\\([0-3][0-7]{2})`)
 	oracleNumberRE  = regexp.MustCompile(`-?[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?`)
 )
 
@@ -95,8 +101,11 @@ func oracleUnescapeJSONish(s string) string {
 		case sub[4] != "":
 			b, _ := hex.DecodeString(sub[4])
 			return string(b)
+		case sub[6] != "":
+			v, _ := strconv.ParseUint(sub[6], 8, 8)
+			return string([]byte{byte(v)})
 		default:
-			return map[string]string{`"`: `"`, `\`: `\`, `/`: `/`, "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t"}[sub[5]]
+			return map[string]string{`"`: `"`, `'`: `'`, `\`: `\`, `/`: `/`, "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t"}[sub[5]]
 		}
 	})
 }
@@ -356,6 +365,30 @@ func TestTranscriptEvidence_SecretEncodingClass(t *testing.T) {
 		}},
 		{name: "repeated-unknown-password", secrets: []string{"hunter2xyz"}, body: func(t *testing.T) string {
 			return toolResultRecord(t, "export PASSWORD=hunter2xyz\n$ echo $PASSWORD\nhunter2xyz")
+		}},
+		{name: "percent-encoded-credential-key", secrets: []string{"unknown-key-canary-value"}, body: func(*testing.T) string {
+			return "{\"details\":{\"pass%77ord\":\"unknown-key-canary-value\"}}\n"
+		}},
+		{name: "escaped-credential-key-in-text", secrets: []string{"unknown-key-canary-value"}, body: func(t *testing.T) string {
+			return toolResultRecord(t, `{"pass\u0077ord":"unknown-key-canary-value"}`)
+		}},
+		{name: "base64-credential-key", secrets: []string{"unknown-key-canary-value"}, body: func(*testing.T) string {
+			return "{\"details\":{\"cGFzc3dvcmQ=\":\"unknown-key-canary-value\"}}\n"
+		}},
+		{name: "marker-prefixed-credential", secrets: []string{"shadow-canary-value"}, body: func(t *testing.T) string {
+			return toolResultRecord(t, "password%3D%5BREDACTED%5Dshadow-canary-value")
+		}},
+		{name: "python-repr-apostrophe", env: map[string]string{"K": `alpha'bravo"charlie`}, body: func(t *testing.T) string {
+			return toolResultRecord(t, `'alpha\'bravo"charlie'`)
+		}},
+		{name: "leading-zero-numeric", env: map[string]string{"K": "012345"}, secrets: []string{"12345"}, body: func(t *testing.T) string {
+			return toolResultRecord(t, "pin is 12345")
+		}},
+		{name: "git-octal-quoted", env: map[string]string{"K": "café-octal-secret"}, body: func(t *testing.T) string {
+			return toolResultRecord(t, `?? "caf\303\251-octal-secret.txt"`)
+		}},
+		{name: "hex-dump", env: map[string]string{"K": "hexed-secret-42"}, body: func(t *testing.T) string {
+			return toolResultRecord(t, "xxd -p: "+hex.EncodeToString([]byte("hexed-secret-42")))
 		}},
 		{name: "secret-as-key", env: map[string]string{"K": "key-shaped-secret"}, body: func(*testing.T) string {
 			return "{\"key-shaped-secret\":1}\n"

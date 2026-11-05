@@ -82,7 +82,7 @@ func UnredactedValues(s string) []string {
 				end = m[4]
 			}
 			value := strings.Trim(s[m[3]:end], "\"'")
-			if !strings.HasPrefix(value, redactedMarker) {
+			if !isRedactedMarkerValue(value) {
 				out = append(out, value)
 			}
 		}
@@ -91,3 +91,14 @@ func UnredactedValues(s string) []string {
 }
 
 const redactedMarker = "[REDACTED]"
+
+// isRedactedMarkerValue reports whether a matched value is the marker itself,
+// allowing only the closing punctuation and whitespace a rule's value
+// pattern can run into. A value that merely starts with the marker text
+// ("[REDACTED]secret") is not redacted.
+func isRedactedMarkerValue(v string) bool {
+	if !strings.HasPrefix(v, redactedMarker) {
+		return false
+	}
+	return strings.Trim(v[len(redactedMarker):], "\"',;:.)]}> \t") == ""
+}
