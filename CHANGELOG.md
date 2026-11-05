@@ -10,6 +10,21 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 No unreleased changes.
 
+## v0.73.2 — 2026-11-05
+
+### Fixes
+
+- Report uncached input tokens at the harness boundary
+
+### Chores
+
+- Bump golang.org/x/tools
+- Preserve explicit reasoning tiers and refuse unsupported values
+- Bump the actions group across 1 directory with 2 updates
+- Surface record-only approval-review and branch-change observations
+- Make failed dependency preparation an explicit recovery handoff
+- Bump VT evaluation spike to Ghostty v1.4.0
+
 ## v0.73.1 — 2026-11-04
 
 ### Features
