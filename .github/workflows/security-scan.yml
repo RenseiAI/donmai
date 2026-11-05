@@ -25,21 +25,42 @@ jobs:
       - uses: actions/checkout@v7
         with: { fetch-depth: 0 }
       - name: TruffleHog
-        uses: trufflesecurity/trufflehog@e63326d6545de8f425d93ce24078c6e68d83f70e # v3.99.3
+        uses: trufflesecurity/trufflehog@31ce31ee1abbcc7dc8eee5764c17121c3044c8b2 # v3.99.7
         with:
           extra_args: --only-verified
   govulncheck:
-    name: Go vuln scan (report-only)
+    name: Go vuln scan
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with: { go-version-file: go.mod }
+      - name: Verify Go compiler
+        run: ./scripts/verify-go-compiler.sh
       - name: govulncheck
         run: |
+          set -euo pipefail
           go install golang.org/x/vuln/cmd/govulncheck@latest
-          govulncheck ./... || echo "::warning::govulncheck reported vulnerabilities (report-only)"
+          govulncheck ./... | tee "${RUNNER_TEMP}/govulncheck.log"
+      - name: Record scanned commit
+        run: |
+          set -euo pipefail
+          {
+            echo "### govulncheck"
+            echo
+            echo "commit SHA: ${GITHUB_SHA}"
+            echo "workflow SHA: ${{ github.sha }}"
+          } >> "${GITHUB_STEP_SUMMARY}"
+          echo "govulncheck scanned commit ${GITHUB_SHA}"
+      - name: Upload govulncheck report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: govulncheck-${{ github.sha }}
+          path: ${{ runner.temp }}/govulncheck.log
+          if-no-files-found: error
+          retention-days: 30
   semgrep:
     name: SAST (semgrep, report-only)
     runs-on: ubuntu-latest

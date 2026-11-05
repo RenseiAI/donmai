@@ -55,6 +55,13 @@ type PosterConfig struct {
 	EndpointPath string
 	AuthToken    string
 
+	// Traceparent and Tracestate carry the dispatch W3C trace context.
+	// They correlate the additive ingest request with the dispatch trace;
+	// the runner sanitizes both at the consumer boundary, so a poster only
+	// ever emits values that passed validation (absent stays absent).
+	Traceparent string
+	Tracestate  string
+
 	CredentialProvider CredentialProvider
 	HTTPClient         *http.Client
 	Logger             *slog.Logger
@@ -368,6 +375,12 @@ func (p *Poster) post(ctx context.Context, body []byte) error {
 		return permanentHTTPError{status: 0, err: fmt.Errorf("build span request: %w", err)}
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if p.cfg.Traceparent != "" {
+		req.Header.Set("traceparent", p.cfg.Traceparent)
+	}
+	if p.cfg.Tracestate != "" {
+		req.Header.Set("tracestate", p.cfg.Tracestate)
+	}
 	creds := p.cfg.credentials(ctx)
 	if creds.AuthToken != "" {
 		req.Header.Set("Authorization", "Bearer "+creds.AuthToken)

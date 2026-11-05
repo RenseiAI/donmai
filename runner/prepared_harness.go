@@ -82,8 +82,12 @@ func buildPreparedSourceSpec(qw QueuedWork, selection harnessSelection, decorate
 	if err != nil {
 		return agent.Spec{}, nil, err
 	}
+	skills, err := planSessionSkills(working, provider, mode)
+	if err != nil {
+		return agent.Spec{}, nil, err
+	}
 	builder := prompt.NewBuilder()
-	inlineAppend, inlineDisallow, _ := foldInlineSkills("", working.Skills)
+	inlineAppend, _, _ := foldInlineSkills("", skills.residue)
 	builder.SkillAppend = inlineAppend
 	composition, err := builder.BuildComposition(working.QueuedWork)
 	if err != nil {
@@ -125,11 +129,12 @@ func buildPreparedSourceSpec(qw QueuedWork, selection harnessSelection, decorate
 		Prompt: userPrompt, SystemPromptAppend: composition.SystemPrompt(), PromptPlan: promptPlan,
 		InitialContext: composition.InitialContext, MCPServers: mcpServers, Env: maps.Clone(working.Env),
 		Autonomous: mode == agent.PromptModeAutonomous, ProviderName: string(provider.Name()),
-	}, codeIntelDelivery, inlineDisallow)
+	}, codeIntelDelivery, skills.disallowed)
 	if err != nil {
 		return agent.Spec{}, nil, err
 	}
 	spec.PromptMode = mode
+	spec.Skills = skills.delivery
 	if working.toolLifecycleProfileID != "" {
 		spec = agent.WithToolLifecycleProfile(spec, working.toolLifecycleProfileID)
 	}
@@ -287,6 +292,7 @@ func applyPreparedSourceAuthority(target, source agent.Spec, plan *agent.Prepare
 	target.PromptPlan = source.PromptPlan
 	target.ToolLifecyclePlan = source.ToolLifecyclePlan
 	target.AdditionalExtensions = boundRuntimeExtensionDeliveries(source)
+	target.Skills = source.Skills.Clone()
 	target.CapabilityRuntimeMaterializations = make([]agent.CapabilityRuntimeMaterializationV1, len(source.CapabilityRuntimeMaterializations))
 	for i := range source.CapabilityRuntimeMaterializations {
 		target.CapabilityRuntimeMaterializations[i] = cloneCapabilityRuntimeMaterialization(source.CapabilityRuntimeMaterializations[i])

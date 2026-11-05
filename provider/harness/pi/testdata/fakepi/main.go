@@ -34,6 +34,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -119,7 +120,7 @@ func main() {
 	}
 
 	restoreSessionEnvironment()
-	extPath, sessionDelay := parseArgs(os.Args[1:])
+	extPath, sessionDir, sessionDelay := parseArgs(os.Args[1:])
 	token := os.Getenv("DONMAI_PI_HANDSHAKE")
 	sha := extensionSHAOf(extPath)
 
@@ -159,7 +160,7 @@ func main() {
 			if sessionDelay > 0 {
 				time.Sleep(sessionDelay)
 			}
-			runTurn(out)
+			runTurn(out, sessionDir, sessionID)
 		case "abort":
 			return
 		}
@@ -171,11 +172,12 @@ func main() {
 // enough for handle.go's mapEvent to produce an AssistantTextEvent, an
 // LlmCallEvent and a ResultEvent, which is what the load harness's
 // consumeEvents-equivalent and the runner wait on.
-func runTurn(out *bufio.Writer) {
+func runTurn(out *bufio.Writer, sessionDir, sessionID string) {
 	reply := os.Getenv(replyEnvVar)
 	if reply == "" {
 		reply = "ok"
 	}
+	maybeWriteEvidenceTranscript(sessionDir, sessionID)
 	writeEvent(out, map[string]any{"type": "agent_start"})
 	writeEvent(out, map[string]any{
 		"type":                  "message_update",
@@ -194,16 +196,70 @@ func runTurn(out *bufio.Writer) {
 	writeEvent(out, map[string]any{"type": "agent_settled"})
 }
 
+// maybeWriteEvidenceTranscript writes one session-owned JSONL transcript
+// under sessionDir when FAKEPI_WRITE_TRANSCRIPT=1, so evidence tests can
+// drive the production Spawn entry against a real subprocess that owns its
+// transcript. The last line carries FAKEPI_TRANSCRIPT_LAST_LINE (or a
+// default marker) so tests can prove the trailing write survives the
+// session. Best-effort: a write failure never fails the turn.
+func maybeWriteEvidenceTranscript(sessionDir, sessionID string) {
+	if os.Getenv("FAKEPI_WRITE_TRANSCRIPT") != "1" || sessionDir == "" {
+		return
+	}
+	if err := os.MkdirAll(sessionDir, 0o700); err != nil {
+		return
+	}
+	last := os.Getenv("FAKEPI_TRANSCRIPT_LAST_LINE")
+	if last == "" {
+		last = "FINAL_TURN_MARKER"
+	}
+	// Session-scoped filename (like real pi's <timestamp>_<sessionID>.jsonl):
+	// concurrent sessions in one checkout must not share a transcript file.
+	safeID := strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			return r
+		}
+		return '_'
+	}, sessionID)
+	if safeID == "" {
+		safeID = "evidence"
+	}
+	path := filepath.Join(sessionDir, "20990101T000000Z_"+safeID+".jsonl")
+	//nolint:gosec // G304: path joins the harness-provided session dir with a session-scoped fixture name.
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return
+	}
+	defer func() { _ = f.Close() }()
+	first, _ := json.Marshal(map[string]any{
+		"type": "message", "id": "evidence-1",
+		"message": map[string]any{"role": "assistant", "content": []any{
+			map[string]any{"type": "text", "text": "evidence turn"},
+		}},
+	})
+	second, _ := json.Marshal(map[string]any{
+		"type": "message", "id": "evidence-2",
+		"message": map[string]any{"role": "assistant", "content": []any{
+			map[string]any{"type": "text", "text": last},
+		}},
+	})
+	_, _ = f.Write(append(first, '\n'))
+	_, _ = f.Write(append(second, '\n'))
+}
+
 // parseArgs pulls the first `-e` path (the boundary extension always loads
-// first — ADR-2026-08-12 D1) and an optional FAKEPI_TURN_DELAY-derived delay
-// out of argv. Every other flag (--no-extensions, --approve, --session-dir,
-// --provider, --model, --session) is accepted and ignored: this stub answers
-// the same regardless of them, since none of the load harness's measurements
-// depend on pi's own routing/model behavior.
-func parseArgs(args []string) (extPath string, turnDelay time.Duration) {
+// first — ADR-2026-08-12 D1), the `--session-dir` session state root, and an
+// optional FAKEPI_TURN_DELAY-derived delay out of argv. Every other flag
+// (--no-extensions, --approve, --provider, --model, --session) is accepted
+// and ignored: this stub answers the same regardless of them, since none of
+// the load harness's measurements depend on pi's own routing/model behavior.
+func parseArgs(args []string) (extPath, sessionDir string, turnDelay time.Duration) {
 	for i, a := range args {
 		if a == "-e" && extPath == "" && i+1 < len(args) {
 			extPath = args[i+1]
+		}
+		if a == "--session-dir" && sessionDir == "" && i+1 < len(args) {
+			sessionDir = args[i+1]
 		}
 	}
 	if raw := os.Getenv("FAKEPI_TURN_DELAY_MS"); raw != "" {
@@ -211,7 +267,7 @@ func parseArgs(args []string) (extPath string, turnDelay time.Duration) {
 			turnDelay = time.Duration(ms) * time.Millisecond
 		}
 	}
-	return extPath, turnDelay
+	return extPath, sessionDir, turnDelay
 }
 
 // extensionSHAOf hashes the boundary extension's on-disk bytes exactly the

@@ -155,7 +155,7 @@ func TestModel_PanesKeepAllocatedRows(t *testing.T) {
 			if !strings.HasPrefix(lines[wantTitleRow], "session stream") {
 				t.Fatalf("plain=%v %s: stream title not at row %d:\n%s", plain, when, wantTitleRow, strings.Join(lines, "\n"))
 			}
-			if !strings.HasPrefix(lines[height-1], "↑↓/jk select") {
+			if !strings.HasPrefix(lines[height-1], "? help") {
 				t.Fatalf("plain=%v %s: help not on the last row: %q", plain, when, lines[height-1])
 			}
 		}

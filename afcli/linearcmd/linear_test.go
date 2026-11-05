@@ -35,6 +35,26 @@ import (
 	"github.com/RenseiAI/donmai/internal/linear"
 )
 
+// TestMain keeps this package's suite hermetic. Production code routes to the
+// platform proxy whenever DONMAI_API_URL and MCP_GATEWAY_TOKEN_FILE are both
+// set, so running the suite inside a session environment would otherwise
+// divert these tests' traffic to the live proxy (including writes). Clear
+// every session-detection variable before m.Run() so no test inherits a live
+// session. Tests that exercise the in-session path opt back in explicitly via
+// t.Setenv and a temp bearer file. MCP_GATEWAY_TOKEN_FILE is left unset (not
+// pointed at a missing path) so worker-credential tests that set
+// DONMAI_API_URL without a bearer file stay on the worker path instead of
+// silently moving onto the session path.
+func TestMain(m *testing.M) {
+	for _, key := range []string{"DONMAI_API_URL", "WORKER_AUTH_TOKEN", "MCP_GATEWAY_TOKEN_FILE"} {
+		if err := os.Unsetenv(key); err != nil {
+			_, _ = os.Stderr.WriteString("TestMain: clear " + key + ": " + err.Error() + "\n")
+			os.Exit(1)
+		}
+	}
+	os.Exit(m.Run())
+}
+
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
 // writeLinearGQLData writes a GraphQL success envelope wrapping the given JSON data.
@@ -4267,5 +4287,279 @@ func TestResolveListIssueColumns(t *testing.T) {
 				t.Errorf("columns = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+// writeSessionBearer creates a temp file holding content and returns its path.
+func writeSessionBearer(t *testing.T, content string) string {
+	t.Helper()
+	path := t.TempDir() + "/bearer"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write bearer file: %v", err)
+	}
+	return path
+}
+
+func runSessionGetIssue(t *testing.T, proxyOrigin string) (*atomic.Int32, *atomic.Int32, string, string, string, error) {
+	t.Helper()
+	directHits := &atomic.Int32{}
+	proxyHits := &atomic.Int32{}
+	var auth, path string
+	directSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		directHits.Add(1)
+		writeLinearGQLData(w, `{"issue":{"id":"id-1","identifier":"ENG-1","title":"X","state":{"name":"Backlog"},"team":{"name":"Engineering"},"project":null,"labels":{"nodes":[]}}}`)
+	}))
+	t.Cleanup(directSrv.Close)
+	proxySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxyHits.Add(1)
+		auth = r.Header.Get("Authorization")
+		path = r.URL.Path
+		writeLinearGQLData(w, `{"issue":{"id":"id-1","identifier":"ENG-1","title":"X","state":{"name":"Backlog"},"team":{"name":"Engineering"},"project":null,"labels":{"nodes":[]}}}`)
+	}))
+	t.Cleanup(proxySrv.Close)
+	setTestBaseURL(directSrv.URL)
+	t.Cleanup(func() { setTestBaseURL("") })
+	origin := proxyOrigin
+	if origin == "proxy" {
+		origin = proxySrv.URL
+	}
+	t.Setenv("DONMAI_API_URL", origin)
+	root := New(nil, "donmai")
+	root.SilenceErrors = true
+	var buf bytes.Buffer
+	root.SetOut(&buf)
+	root.SetErr(&buf)
+	root.SetArgs([]string{"get-issue", "ENG-1"})
+	err := root.Execute()
+	return directHits, proxyHits, auth, path, buf.String(), err
+}
+
+func TestLinearSessionIgnoresEnvKey(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		key   string
+		token string
+	}{
+		{"api_key", "direct-key-should-be-ignored", ""},
+		{"access_token", "", "direct-token-should-be-ignored"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("LINEAR_API_KEY", tc.key)
+			t.Setenv("LINEAR_ACCESS_TOKEN", tc.token)
+			t.Setenv("WORKER_AUTH_TOKEN", "")
+			t.Setenv("MCP_GATEWAY_TOKEN_FILE", writeSessionBearer(t, "session-bearer-abc"))
+			directHits, proxyHits, auth, path, out, err := runSessionGetIssue(t, "proxy")
+			if err != nil {
+				t.Fatalf("get-issue failed: %v\nout: %s", err, out)
+			}
+			if directHits.Load() != 0 {
+				t.Errorf("direct server got %d requests, want 0", directHits.Load())
+			}
+			if proxyHits.Load() != 1 {
+				t.Errorf("proxy server got %d requests, want 1", proxyHits.Load())
+			}
+			if auth != "Bearer session-bearer-abc" {
+				t.Errorf("proxy Authorization = %q, want Bearer session bearer", auth)
+			}
+			if !strings.HasSuffix(path, "/linear/graphql") {
+				t.Errorf("proxy path = %q, want proxied GraphQL route", path)
+			}
+		})
+	}
+}
+
+func TestLinearOutsideSessionEnvWinsOverWorker(t *testing.T) {
+	t.Setenv("LINEAR_API_KEY", "direct-key-wins")
+	t.Setenv("LINEAR_ACCESS_TOKEN", "")
+	t.Setenv("WORKER_AUTH_TOKEN", "worker-token-ignored")
+	t.Setenv("MCP_GATEWAY_TOKEN_FILE", "")
+	directHits, proxyHits, _, _, out, err := runSessionGetIssue(t, "proxy")
+	if err != nil {
+		t.Fatalf("get-issue failed: %v\nout: %s", err, out)
+	}
+	if proxyHits.Load() != 0 {
+		t.Errorf("proxy got %d requests, want 0", proxyHits.Load())
+	}
+	if directHits.Load() != 1 {
+		t.Errorf("direct got %d requests, want 1", directHits.Load())
+	}
+}
+
+func TestLinearSessionRequiresPlatformURL(t *testing.T) {
+	t.Setenv("LINEAR_API_KEY", "direct-key-wins")
+	t.Setenv("LINEAR_ACCESS_TOKEN", "")
+	t.Setenv("WORKER_AUTH_TOKEN", "")
+	t.Setenv("MCP_GATEWAY_TOKEN_FILE", writeSessionBearer(t, "session-bearer-abc"))
+	t.Setenv("DONMAI_API_URL", "")
+	var directAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		directAuth = r.Header.Get("Authorization")
+		writeLinearGQLData(w, `{"issue":{"id":"id-1","identifier":"ENG-1","title":"X","state":{"name":"Backlog"},"team":{"name":"Engineering"},"project":null,"labels":{"nodes":[]}}}`)
+	}))
+	t.Cleanup(srv.Close)
+	setTestBaseURL(srv.URL)
+	t.Cleanup(func() { setTestBaseURL("") })
+	root := New(nil, "donmai")
+	root.SilenceErrors = true
+	var buf bytes.Buffer
+	root.SetOut(&buf)
+	root.SetErr(&buf)
+	root.SetArgs([]string{"get-issue", "ENG-1"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("get-issue failed: %v\nout: %s", err, buf.String())
+	}
+	if directAuth != "direct-key-wins" {
+		t.Errorf("Authorization = %q, want direct key", directAuth)
+	}
+}
+
+func TestLinearSessionEmptyFileFallsToWorkerToken(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		missing bool
+	}{
+		{"empty", false},
+		{"missing", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("LINEAR_API_KEY", "direct-key-ignored")
+			t.Setenv("LINEAR_ACCESS_TOKEN", "direct-token-ignored")
+			t.Setenv("WORKER_AUTH_TOKEN", "worker-token-abc")
+			if tc.missing {
+				t.Setenv("MCP_GATEWAY_TOKEN_FILE", t.TempDir()+"/missing")
+			} else {
+				t.Setenv("MCP_GATEWAY_TOKEN_FILE", writeSessionBearer(t, ""))
+			}
+			directHits, proxyHits, auth, _, out, err := runSessionGetIssue(t, "proxy")
+			if err != nil {
+				t.Fatalf("get-issue failed: %v\nout: %s", err, out)
+			}
+			if directHits.Load() != 0 {
+				t.Errorf("direct got %d requests, want 0", directHits.Load())
+			}
+			if proxyHits.Load() != 1 {
+				t.Errorf("proxy got %d requests, want 1", proxyHits.Load())
+			}
+			if auth != "Bearer worker-token-abc" {
+				t.Errorf("proxy Authorization = %q, want Bearer worker token", auth)
+			}
+		})
+	}
+}
+
+func TestLinearSessionMissingBearerFailsClosed(t *testing.T) {
+	envKey := "direct-key-must-not-leak-xyz"
+	t.Setenv("LINEAR_API_KEY", envKey)
+	t.Setenv("LINEAR_ACCESS_TOKEN", "")
+	t.Setenv("WORKER_AUTH_TOKEN", "")
+	t.Setenv("MCP_GATEWAY_TOKEN_FILE", writeSessionBearer(t, "   \n"))
+	directHits, proxyHits, _, _, _, err := runSessionGetIssue(t, "proxy")
+	if err == nil {
+		t.Fatal("expected bearer-unavailable error, got nil")
+	}
+	if !strings.Contains(err.Error(), "MCP_GATEWAY_TOKEN_FILE") {
+		t.Errorf("error should name MCP_GATEWAY_TOKEN_FILE, got: %v", err)
+	}
+	if strings.Contains(err.Error(), envKey) {
+		t.Errorf("error leaked the env key value: %v", err)
+	}
+	if directHits.Load() != 0 || proxyHits.Load() != 0 {
+		t.Errorf("direct=%d proxy=%d, want 0/0 (no request on missing bearer)", directHits.Load(), proxyHits.Load())
+	}
+}
+
+func TestLinearSessionProxyRefusalHasNoDirectRetry(t *testing.T) {
+	t.Setenv("LINEAR_API_KEY", "direct-key-ignored")
+	t.Setenv("LINEAR_ACCESS_TOKEN", "")
+	t.Setenv("WORKER_AUTH_TOKEN", "")
+	t.Setenv("MCP_GATEWAY_TOKEN_FILE", writeSessionBearer(t, "session-bearer-abc"))
+	directHits := &atomic.Int32{}
+	directSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		directHits.Add(1)
+		writeLinearGQLData(w, `{"issue":{"id":"id-1","identifier":"ENG-1","title":"X","state":{"name":"Backlog"},"team":{"name":"Engineering"},"project":null,"labels":{"nodes":[]}}}`)
+	}))
+	t.Cleanup(directSrv.Close)
+	proxyHits := &atomic.Int32{}
+	proxySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		proxyHits.Add(1)
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"errors":[{"message":"refused"}]}`))
+	}))
+	t.Cleanup(proxySrv.Close)
+	setTestBaseURL(directSrv.URL)
+	t.Cleanup(func() { setTestBaseURL("") })
+	t.Setenv("DONMAI_API_URL", proxySrv.URL)
+	root := New(nil, "donmai")
+	root.SilenceErrors = true
+	var buf bytes.Buffer
+	root.SetOut(&buf)
+	root.SetErr(&buf)
+	root.SetArgs([]string{"get-issue", "ENG-1"})
+	if err := root.Execute(); err == nil {
+		t.Fatalf("expected proxy 403 to fail, got nil\nout: %s", buf.String())
+	}
+	if directHits.Load() != 0 {
+		t.Errorf("direct got %d requests after proxy 403, want 0", directHits.Load())
+	}
+	if proxyHits.Load() != 1 {
+		t.Errorf("proxy got %d requests, want 1", proxyHits.Load())
+	}
+}
+
+func TestLinearSessionRejectsUserinfoOrigin(t *testing.T) {
+	bearer := "session-bearer-abc"
+	t.Setenv("LINEAR_API_KEY", "direct-key-ignored")
+	t.Setenv("LINEAR_ACCESS_TOKEN", "")
+	t.Setenv("WORKER_AUTH_TOKEN", "")
+	t.Setenv("MCP_GATEWAY_TOKEN_FILE", writeSessionBearer(t, bearer))
+	directHits := &atomic.Int32{}
+	directSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		directHits.Add(1)
+		writeLinearGQLData(w, `{}`)
+	}))
+	t.Cleanup(directSrv.Close)
+	setTestBaseURL(directSrv.URL)
+	t.Cleanup(func() { setTestBaseURL("") })
+	loopSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }))
+	t.Cleanup(loopSrv.Close)
+	tainted := strings.Replace(loopSrv.URL, "http://", "http://user:secret@", 1)
+	t.Setenv("DONMAI_API_URL", tainted)
+	root := New(nil, "donmai")
+	root.SilenceErrors = true
+	var buf bytes.Buffer
+	root.SetOut(&buf)
+	root.SetErr(&buf)
+	root.SetArgs([]string{"get-issue", "ENG-1"})
+	err := root.Execute()
+	if err == nil {
+		t.Fatalf("expected userinfo origin error, got nil\nout: %s", buf.String())
+	}
+	if !strings.Contains(err.Error(), "DONMAI_API_URL") {
+		t.Errorf("error should name DONMAI_API_URL, got: %v", err)
+	}
+	for _, leaked := range []string{bearer, "secret", tainted} {
+		if leaked != "" && strings.Contains(err.Error(), leaked) {
+			t.Errorf("error leaked a credential or origin value %q: %v", leaked, err)
+		}
+	}
+	if directHits.Load() != 0 {
+		t.Errorf("direct got %d requests, want 0", directHits.Load())
+	}
+}
+
+func TestLinearSessionBearerFileTrimmed(t *testing.T) {
+	t.Setenv("LINEAR_API_KEY", "")
+	t.Setenv("LINEAR_ACCESS_TOKEN", "")
+	t.Setenv("WORKER_AUTH_TOKEN", "")
+	t.Setenv("MCP_GATEWAY_TOKEN_FILE", writeSessionBearer(t, "session-bearer-abc\n"))
+	_, proxyHits, auth, _, out, err := runSessionGetIssue(t, "proxy")
+	if err != nil {
+		t.Fatalf("get-issue failed: %v\nout: %s", err, out)
+	}
+	if proxyHits.Load() != 1 {
+		t.Errorf("proxy got %d requests, want 1", proxyHits.Load())
+	}
+	if auth != "Bearer session-bearer-abc" {
+		t.Errorf("proxy Authorization = %q, want trimmed bearer", auth)
 	}
 }

@@ -83,6 +83,12 @@ type Provider struct {
 	// trustedExtensions is the immutable ordered same-process extension set
 	// supplied by the compiled embedder at provider construction.
 	trustedExtensions []TrustedExtensionIdentity
+	// interactiveBeforeChildStart is a deterministic test barrier after the
+	// interactive evidence-lease acquisition, before the PTY child starts.
+	// Observing the lease from the child cannot establish this ordering:
+	// the child may run before a post-spawn claim lands. Nil leaves the
+	// production spawn sequence unchanged.
+	interactiveBeforeChildStart func(root string)
 }
 
 // Options configures Provider construction. The empty value runs `pi` from
@@ -441,6 +447,13 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}
+	// Materialize + verify the session's native skills and render its
+	// repository-skill policy (skills.go). Like the extensions above this
+	// runs on every launch, so a resume rewrites and re-verifies them.
+	skills, err := skillMaterializer{}.MaterializeSkills(spec)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
+	}
 	// The boundary extension always loads first and is never displaced,
 	// reordered, or disabled by a delivery (D1).
 	extensionPaths := append([]string{layout.extension}, extraExtensionPaths...)
@@ -513,6 +526,21 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 		}
 	}
 
+	// Snapshot the shared state dir's existing transcripts BEFORE the child
+	// starts, so evidence reports only what this session writes. The state
+	// dir is shared across reuses of a workarea: without this, a reused
+	// workarea would attribute the previous session's transcript to this
+	// one. Taken after every parent write (extensions, credentials,
+	// tmp/cache dirs) and before the child can create its own transcript.
+	evidenceBaseline, evidenceIncomplete := snapshotPiTranscriptBaseline(layout.root)
+	evidenceClaim := acquirePiEvidenceClaim(layout.root)
+	spawned := false
+	defer func() {
+		if !spawned {
+			evidenceClaim.release()
+		}
+	}()
+
 	var (
 		cmd    *exec.Cmd
 		stdin  io.Writer
@@ -522,7 +550,7 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 		stdin = p.opts.stdinOverride
 		stdout = p.opts.stdoutOverride
 	} else {
-		c, in, out, serr := p.spawnChild(spec, layout, extensionPaths, childEnv, mode, sessionID, p.artifact, receipt, plan)
+		c, in, out, serr := p.spawnChild(spec, layout, extensionPaths, skills.Args, childEnv, mode, sessionID, p.artifact, receipt, plan)
 		if serr != nil {
 			releasePlan()
 			removeCredentials()
@@ -548,6 +576,9 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 		h.maxConsecutiveOutputLimitTurns = p.opts.MaxConsecutiveOutputLimitTurns
 	}
 	h.setConfinement(plan)
+	h.setStateRoot(layout.root)
+	h.setEvidenceBaseline(evidenceBaseline, evidenceIncomplete)
+	h.evidenceClaim = evidenceClaim
 	// The session credential files live in the session state root. Stop
 	// removes them so a finished session leaves no secret on disk; the
 	// worktree lifecycle that removes the state root is the backstop.
@@ -609,6 +640,7 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 	if spec.OnProcessSpawned != nil && cmd != nil && cmd.Process != nil {
 		spec.OnProcessSpawned(cmd.Process.Pid)
 	}
+	spawned = true
 	return h, nil
 }
 
@@ -649,6 +681,17 @@ func (p *Provider) launchNotices(spec agent.Spec) []agent.Event {
 	// its local tool gate answers a narrower channel — see the residual note
 	// on the RPC tool_call hook.
 	notices = append(notices, agent.ToolCallBoundsEvent(DefaultToolCallTimeoutSeconds))
+	// Applied effort from the final headless launch configuration: the level
+	// the adapter actually pinned via modelPinArgs (the same `--model
+	// <id>[:<level>]` the child exec'd with, and the same level the
+	// extension pin carries as DONMAI_PI_THINKING_LEVEL), on the new
+	// activity key. Only the headless RPC lane calls launchNotices, so the
+	// interactive PTY lane (interactiveArgs shares modelPinArgs but has no
+	// event seam) emits nothing here. Emitted only after a successful
+	// headless launch: the handle publishes notices behind the InitEvent,
+	// which never resolves when the handshake gate fails closed, and a
+	// prompt/resume command is never sent on that path.
+	notices = append(notices, appliedEffortEvent(spec))
 	return notices
 }
 
@@ -737,8 +780,8 @@ func newHeadlessChildCommand(argv []string, dir string, env []string) *exec.Cmd 
 // stdin/stdout/stderr pipes created below — and never a descriptor open on
 // an out-of-set file (ExtraFiles is never set: newHeadlessChildCommand).
 // spawnChild never releases the plan: on any error the caller does.
-func (p *Provider) spawnChild(spec agent.Spec, layout sessionLayout, extensionPaths []string, childEnv []string, mode launchMode, sessionID string, artifact *artifactLease, receipt *receiptAdmission, plan *confinement.Plan) (*exec.Cmd, io.WriteCloser, io.ReadCloser, error) {
-	argv, err := confinePiArgv(plan, append([]string{p.binary}, rpcArgs(layout, extensionPaths, mode, sessionID, spec)...))
+func (p *Provider) spawnChild(spec agent.Spec, layout sessionLayout, extensionPaths, skillArgs []string, childEnv []string, mode launchMode, sessionID string, artifact *artifactLease, receipt *receiptAdmission, plan *confinement.Plan) (*exec.Cmd, io.WriteCloser, io.ReadCloser, error) {
+	argv, err := confinePiArgv(plan, append([]string{p.binary}, rpcArgsWithSkills(layout, extensionPaths, mode, sessionID, spec, skillArgs)...))
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("pi confine command: %w", err)
 	}

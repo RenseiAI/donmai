@@ -64,6 +64,23 @@ func (d *Daemon) applyPendingMutations(_ context.Context, mutations []PendingMut
 	defer applyMutationsLock.Unlock()
 
 	for _, m := range mutations {
+		if m.Op == hostUpgradeOp {
+			appliedID, failure := d.handleHostUpgradeMutation(m)
+			switch {
+			case appliedID != "":
+				slog.Info("[daemon-sync] mutation applied",
+					"id", m.ID, "op", m.Op)
+				applied = append(applied, appliedID)
+			case failure != nil:
+				slog.Warn("[daemon-sync] mutation failed",
+					"id", m.ID, "op", m.Op, "err", failure.Error)
+				failures = append(failures, *failure)
+			default:
+				slog.Info("[daemon-sync] host upgrade pending",
+					"id", m.ID, "op", m.Op)
+			}
+			continue
+		}
 		if err := d.applyOneMutation(m); err != nil {
 			slog.Warn("[daemon-sync] mutation failed",
 				"id", m.ID, "op", m.Op, "err", err.Error())
@@ -81,6 +98,9 @@ func (d *Daemon) applyPendingMutations(_ context.Context, mutations []PendingMut
 }
 
 func (d *Daemon) applyOneMutation(m PendingMutation) error {
+	if m.Op == hostUpgradeOp {
+		return fmt.Errorf("host.upgrade is handled asynchronously via applyPendingMutations")
+	}
 	if isSessionMutationOp(m.Op) {
 		return d.applySessionMutation(m)
 	}

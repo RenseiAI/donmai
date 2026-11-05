@@ -2,6 +2,7 @@ package muse
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/RenseiAI/donmai/agent"
@@ -155,21 +156,24 @@ func TestMapItem_RevisionRuleDropsStale(t *testing.T) {
 	started := func(rev int) json.RawMessage {
 		return json.RawMessage(`{"sessionId":"s","viewCursor":"c","item":{"itemId":"i1","kind":"agentMessage","revision":` + itoa(rev) + `,"status":"inProgress","text":"hi"}}`)
 	}
-	// item/started at rev 1 carries no event for agentMessage (only
-	// completed emits), but it records the revision.
-	mapNotification("item/started", started(1), state, nil)
+	// item/started at rev 1 emits the single progress event for the item
+	// and records the revision.
+	if got := mapNotification("item/started", started(1), state, nil); len(got) != 1 {
+		t.Fatalf("started produced %v, want one progress event", kindsOf(got))
+	}
 	// A stale item/updated at rev 1 after rev 2 applied must drop.
 	mapNotification("item/updated", started(2), state, nil)
 	stale := mapNotification("item/updated", started(1), state, nil)
 	if len(stale) != 0 {
 		t.Errorf("stale revision produced %v", kindsOf(stale))
 	}
-	// Completion always applies, even at a stale revision.
-	done := mapNotification("item/completed", json.RawMessage(`{"sessionId":"s","viewCursor":"c","item":{"itemId":"i1","kind":"agentMessage","revision":1,"status":"completed","text":"hi"}}`), state, nil)
+	// Completion always applies, even at a stale revision and when it
+	// replaces already streamed text.
+	done := mapNotification("item/completed", json.RawMessage(`{"sessionId":"s","viewCursor":"c","item":{"itemId":"i1","kind":"agentMessage","revision":1,"status":"completed","text":"bye"}}`), state, nil)
 	if len(done) != 1 {
 		t.Fatalf("authoritative completion produced %v", kindsOf(done))
 	}
-	if text, ok := done[0].(agent.AssistantTextEvent); !ok || text.Text != "hi" {
+	if text, ok := done[0].(agent.AssistantTextEvent); !ok || text.Text != "bye" {
 		t.Errorf("completion event=%+v", done[0])
 	}
 }
@@ -236,7 +240,7 @@ func TestMapTokenUsage_AccumulatesCost(t *testing.T) {
 		t.Fatalf("tokenUsage produced %v, want one usage event", kindsOf(events))
 	}
 	call, ok := events[0].(agent.LlmCallEvent)
-	if !ok || call.InputTokens != 50 || call.OutputTokens != 20 || call.CachedInputTokens != 5 || call.ReasoningTokens != 2 || call.ObservedCostUsd == nil || *call.ObservedCostUsd != 0.5 || call.UsageSource != agent.LlmUsageProvider || call.TurnCompleted {
+	if !ok || call.InputTokens != 45 || call.OutputTokens != 20 || call.CachedInputTokens != 5 || call.ReasoningTokens != 2 || call.ObservedCostUsd == nil || *call.ObservedCostUsd != 0.5 || call.UsageSource != agent.LlmUsageProvider || call.TurnCompleted {
 		t.Fatalf("step usage=%+v", events[0])
 	}
 	if !state.hasCost || state.totalCostUSD != 0.5 {
@@ -257,7 +261,7 @@ func TestMapTokenUsage_AccumulatesCost(t *testing.T) {
 	if result == nil || result.ObservedCostUsd == nil || *result.ObservedCostUsd != 0.5 {
 		t.Errorf("result=%+v, want observed cost 0.5", result)
 	}
-	if result.Cost.InputTokens != 11 || result.Cost.OutputTokens != 7 {
+	if result.Cost.InputTokens != 10 || result.Cost.OutputTokens != 7 {
 		t.Errorf("cost=%+v, want the turn usage override (11 in, 7 out)", result.Cost)
 	}
 }
@@ -360,7 +364,7 @@ func TestMapTokenUsage_CumulativeFallback(t *testing.T) {
 			t.Fatalf("events=%v", kindsOf(events))
 		}
 		call := events[0].(agent.LlmCallEvent)
-		if call.InputTokens != 50 || call.OutputTokens != 20 || call.CachedInputTokens != 5 || call.CacheWriteTokens != 3 || call.ObservedCostUsd != nil {
+		if call.InputTokens != 45 || call.OutputTokens != 20 || call.CachedInputTokens != 5 || call.CacheWriteTokens != 3 || call.ObservedCostUsd != nil {
 			t.Fatalf("fallback=%+v", call)
 		}
 	}
@@ -373,4 +377,441 @@ func TestMapTokenUsage_CumulativeFallback(t *testing.T) {
 	if events := mapNotification("session/tokenUsage", json.RawMessage(`{`), state, nil); len(events) != 0 {
 		t.Fatalf("malformed usage=%v", events)
 	}
+}
+
+// TestFirstTurnShape_AllowlistsOnly pins the safe-shape contract: only
+// allowlisted names, validated tokens, counts and presence flags
+// survive. Raw prompt, paths, URLs, headers, environment and unknown
+// keys never enter the payload.
+func TestFirstTurnShape_AllowlistsOnly(t *testing.T) {
+	const promptSentinel = "PROMPT-SENTINEL-evt-9f8a7b6c5d4e"
+	sessionParams := map[string]any{
+		"sessionId":     "sid",
+		"commandId":     "cmd",
+		"workspaceRoot": "/sentinel/path/9f8a7b6c5d4e",
+		"modelId":       DefaultModel,
+		"providerId":    ProviderID,
+		"approvalMode":  string(ApprovalModePromptUnmatched),
+		"config": map[string]any{"mcpServers": map[string]SessionMCPServerConfig{
+			"sentinel-name": {Transport: "streamableHttp", URL: "https://sentinel.invalid/mcp", Headers: map[string]string{"Authorization": "sentinel-header"}},
+		}},
+		"unknownFutureKey": "sentinel-unknown",
+	}
+	turnParams := map[string]any{
+		"sessionId": "sid",
+		"commandId": "cmd",
+		"input": []map[string]any{
+			{"type": "text", "text": promptSentinel},
+			{"type": "image", "base64Data": "sentinel-b64"},
+			{"type": "teleport", "text": "sentinel-unknown-type"},
+		},
+		"ifBusy":          string(IfBusyQueue),
+		"displayText":     promptSentinel,
+		"workspaceRoots":  []string{"/sentinel/root"},
+		"reasoningEffort": string(ReasoningEffortLow),
+		"mysteryKey":      "sentinel-mystery",
+	}
+	shape := buildFirstTurnShape("session/start", sessionParams, turnParams)
+	payload := encodeFirstTurnDiagnostic(shape, nil)
+	for _, sentinel := range []string{promptSentinel, "sentinel-path", "sentinel.invalid", "sentinel-header", "sentinel-name", "sentinel-unknown", "sentinel-mystery", "sentinel-b64", "/sentinel/root"} {
+		if strings.Contains(payload, sentinel) {
+			t.Errorf("shape payload leaked %q; payload=%q", sentinel, payload)
+		}
+	}
+	if shape.ModelID != DefaultModel {
+		t.Errorf("ModelID=%q, want validated default", shape.ModelID)
+	}
+	if shape.ApprovalMode != string(ApprovalModePromptUnmatched) {
+		t.Errorf("ApprovalMode=%q", shape.ApprovalMode)
+	}
+	if shape.ReasoningEffort != string(ReasoningEffortLow) {
+		t.Errorf("ReasoningEffort=%q", shape.ReasoningEffort)
+	}
+	if shape.InputPartCount != 3 {
+		t.Errorf("InputPartCount=%d, want 3", shape.InputPartCount)
+	}
+	wantTypes := []string{"text", "image", "unknown"}
+	if len(shape.InputPartTypes) != len(wantTypes) {
+		t.Fatalf("InputPartTypes=%v, want %v", shape.InputPartTypes, wantTypes)
+	}
+	for i, w := range wantTypes {
+		if shape.InputPartTypes[i] != w {
+			t.Errorf("InputPartTypes[%d]=%q, want %q", i, shape.InputPartTypes[i], w)
+		}
+	}
+	if shape.MCPServerCount != 1 {
+		t.Errorf("MCPServerCount=%d, want 1 (count, never names)", shape.MCPServerCount)
+	}
+	if shape.WorkspaceRootsCount != 1 {
+		t.Errorf("WorkspaceRootsCount=%d, want 1", shape.WorkspaceRootsCount)
+	}
+	if !shape.HasDisplayText || !shape.HasWorkspaceRoot || !shape.HasConfig {
+		t.Errorf("presence flags lost: %+v", shape)
+	}
+	for _, k := range shape.SessionKeys {
+		if !allowedSessionStartKeys[k] {
+			t.Errorf("session key %q not allowlisted", k)
+		}
+	}
+	for _, k := range shape.TurnKeys {
+		if !allowedTurnStartKeys[k] {
+			t.Errorf("turn key %q not allowlisted", k)
+		}
+	}
+}
+
+// TestFirstTurnAsyncError_SanitizesFreeText pins the error side: known
+// kinds travel, unknown kinds and every message/reason stay out.
+func TestFirstTurnAsyncError_SanitizesFreeText(t *testing.T) {
+	const sentinel = "HOST-SENTINEL-evt-9f8a7b6c5d4e"
+	// Known kind survives with its flags; the sentinel message does not.
+	known := &TurnError{Kind: "overloaded", Message: sentinel, Retryable: true, Quota: json.RawMessage(`{"usd":1}`)}
+	classified := firstTurnAsyncError(TurnTerminalFailed, known, nil)
+	payload := encodeFirstTurnDiagnostic(firstTurnRequestShape{SessionMethod: "session/start"}, classified)
+	if classified.ErrorKind != "overloaded" {
+		t.Errorf("ErrorKind=%q, want overloaded", classified.ErrorKind)
+	}
+	if strings.Contains(payload, sentinel) {
+		t.Errorf("diagnostic copied host message; payload=%q", payload)
+	}
+	// Unknown kind collapses to unknown; the sentinel kind does not travel.
+	unknown := &TurnError{Kind: sentinel, Message: sentinel, Retryable: false}
+	classified = firstTurnAsyncError(TurnTerminalFailed, unknown, nil)
+	payload = encodeFirstTurnDiagnostic(firstTurnRequestShape{SessionMethod: "session/start"}, classified)
+	if classified.ErrorKind != "unknown" {
+		t.Errorf("ErrorKind=%q, want unknown for unlisted kind", classified.ErrorKind)
+	}
+	if strings.Contains(payload, sentinel) {
+		t.Errorf("diagnostic copied unknown kind/message; payload=%q", payload)
+	}
+	// Reason text never travels, only its presence.
+	reason := sentinel
+	classified = firstTurnAsyncError(TurnTerminalCancelled, nil, &reason)
+	payload = encodeFirstTurnDiagnostic(firstTurnRequestShape{SessionMethod: "session/start"}, classified)
+	if !classified.ErrorHasReason {
+		t.Error("ErrorHasReason=false, want presence flag")
+	}
+	if strings.Contains(payload, sentinel) {
+		t.Errorf("diagnostic copied reason text; payload=%q", payload)
+	}
+}
+
+// TestEncodeFirstTurnDiagnostic_CapsAtTwoKiB pins the 2 KiB ceiling.
+// The oversize half proves the truncation fires: it builds a payload
+// whose uncapped JSON exceeds the cap, so deleting the truncation
+// makes the length assertion fail.
+func TestEncodeFirstTurnDiagnostic_CapsAtTwoKiB(t *testing.T) {
+	shape := firstTurnRequestShape{
+		SessionMethod: "session/start",
+		SessionKeys:   []string{"approvalMode", "commandId", "config", "modelId", "providerId", "sessionId", "workspaceRoot"},
+		TurnKeys:      []string{"commandId", "displayText", "ifBusy", "input", "sessionId", "workspaceRoots"},
+	}
+	payload := encodeFirstTurnDiagnostic(shape, &firstTurnDiagnosticData{ErrorKind: "overloaded", ErrorMethod: "turn/start"})
+	if len(payload) > firstTurnDiagnosticMaxBytes {
+		t.Errorf("payload length=%d, want <= %d", len(payload), firstTurnDiagnosticMaxBytes)
+	}
+
+	// Oversize input proves the cap truncates: without the
+	// buf[:max] slice the payload stays over the ceiling.
+	largeKeys := make([]string, 400)
+	for i := range largeKeys {
+		largeKeys[i] = "overflow-key-" + strings.Repeat("x", 32) + itoa(i%10) + strings.Repeat("y", 8)
+	}
+	largeTypes := make([]string, 400)
+	for i := range largeTypes {
+		largeTypes[i] = strings.Repeat("z", 32) + itoa(i%10)
+	}
+	oversize := firstTurnRequestShape{
+		SessionMethod:   "session/start",
+		SessionKeys:     largeKeys,
+		TurnKeys:        largeKeys,
+		InputPartTypes:  largeTypes,
+		InputPartCount:  400,
+		MCPServerCount:  9999,
+		ModelID:         DefaultModel,
+		ApprovalMode:    string(ApprovalModePromptUnmatched),
+		ReasoningEffort: string(ReasoningEffortLow),
+	}
+	raw, err := json.Marshal(firstTurnDiagnosticData{Shape: oversize, ErrorKind: "overloaded", ErrorMethod: "turn/start"})
+	if err != nil {
+		t.Fatalf("marshal oversize: %v", err)
+	}
+	if len(raw) <= firstTurnDiagnosticMaxBytes {
+		t.Fatalf("oversize fixture is not oversize: raw=%d, want > %d", len(raw), firstTurnDiagnosticMaxBytes)
+	}
+	capped := encodeFirstTurnDiagnostic(oversize, &firstTurnDiagnosticData{ErrorKind: "overloaded", ErrorMethod: "turn/start"})
+	if len(capped) > firstTurnDiagnosticMaxBytes {
+		t.Errorf("oversize payload length=%d, want <= %d", len(capped), firstTurnDiagnosticMaxBytes)
+	}
+	if len(capped) != firstTurnDiagnosticMaxBytes {
+		t.Errorf("oversize payload length=%d, want exactly %d (truncated)", len(capped), firstTurnDiagnosticMaxBytes)
+	}
+}
+
+// TestMuseInputTokensExcludeCache pins the agent.CostData contract at the
+// harness boundary: Muse's inputTokens is the prompt total (cached tokens
+// included), so InputTokens must come out uncached on every emission path.
+func TestMuseInputTokensExcludeCache(t *testing.T) {
+	tests := []struct {
+		name       string
+		usage      string
+		wantIn     int64
+		wantCached int64
+	}{
+		{"cached below input", `{"inputTokens":100,"cachedTokens":0,"cacheReadTokens":30,"outputTokens":5,"reasoningTokens":0}`, 70, 30},
+		{"cached equals input", `{"inputTokens":100,"cachedTokens":0,"cacheReadTokens":100,"outputTokens":5,"reasoningTokens":0}`, 0, 100},
+		{"cached above input clamps to zero", `{"inputTokens":100,"cachedTokens":0,"cacheReadTokens":150,"outputTokens":5,"reasoningTokens":0}`, 0, 150},
+		{"nil cacheRead falls back to cachedTokens", `{"inputTokens":100,"cachedTokens":40,"outputTokens":5,"reasoningTokens":0}`, 60, 40},
+		{"cacheRead wins over cachedTokens", `{"inputTokens":100,"cachedTokens":99,"cacheReadTokens":10,"outputTokens":5,"reasoningTokens":0}`, 90, 10},
+		{"no cache", `{"inputTokens":100,"cachedTokens":0,"outputTokens":5,"reasoningTokens":0}`, 100, 0},
+	}
+	for _, tc := range tests {
+		t.Run("turnCompleted/"+tc.name, func(t *testing.T) {
+			state := newMapperState("m")
+			params := `{"sessionId":"s","terminal":"completed","turnId":"t","viewCursor":"c","usage":` + tc.usage + `}`
+			events := mapNotification("turn/completed", json.RawMessage(params), state, nil)
+			var llm *agent.LlmCallEvent
+			var res *agent.ResultEvent
+			for _, ev := range events {
+				switch e := ev.(type) {
+				case agent.LlmCallEvent:
+					llm = &e
+				case agent.ResultEvent:
+					res = &e
+				}
+			}
+			if llm == nil || res == nil || res.Cost == nil {
+				t.Fatalf("events=%v", kindsOf(events))
+			}
+			if llm.InputTokens != tc.wantIn || llm.CachedInputTokens != tc.wantCached {
+				t.Errorf("llm in=%d cached=%d, want %d/%d", llm.InputTokens, llm.CachedInputTokens, tc.wantIn, tc.wantCached)
+			}
+			if res.Cost.InputTokens != tc.wantIn || res.Cost.CachedInputTokens != tc.wantCached {
+				t.Errorf("cost in=%d cached=%d, want %d/%d", res.Cost.InputTokens, res.Cost.CachedInputTokens, tc.wantIn, tc.wantCached)
+			}
+		})
+		t.Run("tokenUsage/"+tc.name, func(t *testing.T) {
+			state := newMapperState("m")
+			params := `{"sessionId":"s","viewCursor":"c","usage":` + tc.usage + `,"cumulative":{"promptTokens":100,"outputTokens":5,"totalTokens":105}}`
+			events := mapNotification("session/tokenUsage", json.RawMessage(params), state, nil)
+			if len(events) != 1 {
+				t.Fatalf("events=%v", kindsOf(events))
+			}
+			call := events[0].(agent.LlmCallEvent)
+			if call.InputTokens != tc.wantIn || call.CachedInputTokens != tc.wantCached {
+				t.Errorf("in=%d cached=%d, want %d/%d", call.InputTokens, call.CachedInputTokens, tc.wantIn, tc.wantCached)
+			}
+		})
+	}
+
+	// Cumulative-only fallback (no per-step usage): deltas of the prompt
+	// total minus deltas of the cache-read total, then the terminal
+	// aggregate uses the session totals the same way.
+	t.Run("cumulative fallback", func(t *testing.T) {
+		steps := []struct {
+			prompt, read int64
+			wantIn       int64
+		}{
+			{100, 30, 70},
+			{250, 130, 50}, // prompt +150, read +100
+			{300, 400, 0},  // read delta (270) exceeds prompt delta (50): clamp
+			{300, 400, 0},  // no movement
+		}
+		state := newMapperState("m")
+		for i, st := range steps {
+			params, err := json.Marshal(map[string]any{"cumulative": map[string]any{
+				"promptTokens": st.prompt, "outputTokens": 1, "cacheReadTokens": st.read,
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			events := mapNotification("session/tokenUsage", params, state, nil)
+			call := events[0].(agent.LlmCallEvent)
+			if call.InputTokens != st.wantIn {
+				t.Errorf("step %d in=%d, want %d", i, call.InputTokens, st.wantIn)
+			}
+		}
+		res := mapNotification("turn/completed", json.RawMessage(`{"sessionId":"s","terminal":"completed","turnId":"t","viewCursor":"c"}`), state, nil)
+		for _, ev := range res {
+			if r, ok := ev.(agent.ResultEvent); ok {
+				// prompt 300, read 400: clamped, never negative.
+				if r.Cost.InputTokens != 0 || r.Cost.CachedInputTokens != 400 {
+					t.Errorf("aggregate in=%d cached=%d, want 0/400", r.Cost.InputTokens, r.Cost.CachedInputTokens)
+				}
+			}
+		}
+	})
+
+	t.Run("cumulative aggregate", func(t *testing.T) {
+		state := newMapperState("m")
+		mapNotification("session/tokenUsage", json.RawMessage(`{"cumulative":{"promptTokens":300,"outputTokens":9,"cacheReadTokens":120}}`), state, nil)
+		res := mapNotification("turn/completed", json.RawMessage(`{"sessionId":"s","terminal":"completed","turnId":"t","viewCursor":"c"}`), state, nil)
+		for _, ev := range res {
+			if r, ok := ev.(agent.ResultEvent); ok && (r.Cost.InputTokens != 180 || r.Cost.CachedInputTokens != 120) {
+				t.Errorf("aggregate in=%d cached=%d, want 180/120", r.Cost.InputTokens, r.Cost.CachedInputTokens)
+			}
+		}
+	})
+
+	// The context-window notice reports occupancy, not billing: it keeps
+	// the full prompt size, cached tokens included.
+	t.Run("contextUsage stays full size", func(t *testing.T) {
+		state := newMapperState("m")
+		events := mapNotification("session/contextUsage", json.RawMessage(`{"sessionId":"s","usedTokens":900,"windowTokens":1000,"pressure":"normal","viewCursor":"c"}`), state, nil)
+		n, ok := events[0].(agent.ContextUsageEvent)
+		if !ok || n.InputTokens == nil || *n.InputTokens != 900 {
+			t.Fatalf("notice=%+v", events[0])
+		}
+	})
+}
+
+// TestMapNotification_ApprovalReviewing pins the record-only reviewing
+// observation: the message names the tool and approval id, the
+// judgeEscalated/protectedWrite markers appear only when true, Raw is
+// retained, and neither RawArgs nor workspace paths leak into Message.
+func TestMapNotification_ApprovalReviewing(t *testing.T) {
+	params := func(judge, prot bool) json.RawMessage {
+		return json.RawMessage(`{"approvalId":"appr-9","sessionId":"s","toolName":"shell",` +
+			`"rawArgs":"RAWARGS-SENTINEL-map-9f8a","judgeEscalated":` + boolJSON(judge) +
+			`,"protectedWrite":` + boolJSON(prot) +
+			`,"subject":{"kind":"shell","workspaceRoot":"/sentinel/workspace/map-9f8a"}}`)
+	}
+	cases := []struct {
+		name          string
+		judge, prot   bool
+		wantJudgeMark bool
+		wantProtMark  bool
+	}{
+		{"neither", false, false, false, false},
+		{"judge only", true, false, true, false},
+		{"protected only", false, true, false, true},
+		{"both", true, true, true, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			state := newMapperState("m")
+			raw := map[string]any{"approvalId": "appr-9"}
+			events := mapNotification("approval/reviewing", params(tc.judge, tc.prot), state, raw)
+			if len(events) != 1 {
+				t.Fatalf("events=%v, want one approval_reviewing event", kindsOf(events))
+			}
+			sys, ok := events[0].(agent.SystemEvent)
+			if !ok || sys.Subtype != "approval_reviewing" {
+				t.Fatalf("event=%+v, want approval_reviewing SystemEvent", events[0])
+			}
+			if !strings.Contains(sys.Message, "shell") || !strings.Contains(sys.Message, "appr-9") {
+				t.Errorf("message=%q, want it to name the tool and approval id", sys.Message)
+			}
+			if has := strings.Contains(sys.Message, "[judgeEscalated]"); has != tc.wantJudgeMark {
+				t.Errorf("message=%q judge marker present=%v, want %v", sys.Message, has, tc.wantJudgeMark)
+			}
+			if has := strings.Contains(sys.Message, "[protectedWrite]"); has != tc.wantProtMark {
+				t.Errorf("message=%q protected marker present=%v, want %v", sys.Message, has, tc.wantProtMark)
+			}
+			for _, sentinel := range []string{"RAWARGS-SENTINEL-map-9f8a", "/sentinel/workspace/map-9f8a"} {
+				if strings.Contains(sys.Message, sentinel) {
+					t.Errorf("message=%q leaked %q", sys.Message, sentinel)
+				}
+			}
+			if sys.Raw == nil {
+				t.Error("Raw was dropped; the original object must be preserved")
+			}
+		})
+	}
+}
+
+// TestMapNotification_ApprovalReviewingMalformed pins the fail-soft
+// shape: empty or garbage params never panic and use unknown for the
+// missing display values.
+func TestMapNotification_ApprovalReviewingMalformed(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		params json.RawMessage
+		want   string
+	}{
+		{"empty object", json.RawMessage(`{}`), "Approval reviewing: unknown (unknown)"},
+		{"empty bytes", json.RawMessage(``), "Approval reviewing: unknown (unknown)"},
+		{"garbage", json.RawMessage(`{`), "Approval reviewing: unknown (unknown)"},
+		{"missing tool and id", json.RawMessage(`{"sessionId":"s","judgeEscalated":true}`), "Approval reviewing: unknown (unknown) [judgeEscalated]"},
+		{"tool missing id present", json.RawMessage(`{"approvalId":"appr-1","sessionId":"s"}`), "Approval reviewing: unknown (appr-1)"},
+		{"tool present id missing", json.RawMessage(`{"toolName":"shell","sessionId":"s"}`), "Approval reviewing: shell (unknown)"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			state := newMapperState("m")
+			events := mapNotification("approval/reviewing", tc.params, state, map[string]any{})
+			if len(events) != 1 {
+				t.Fatalf("events=%v, want one fail-soft approval_reviewing event", kindsOf(events))
+			}
+			sys, ok := events[0].(agent.SystemEvent)
+			if !ok || sys.Subtype != "approval_reviewing" {
+				t.Fatalf("event=%+v, want approval_reviewing SystemEvent", events[0])
+			}
+			if sys.Message != tc.want {
+				t.Errorf("message=%q, want %q", sys.Message, tc.want)
+			}
+		})
+	}
+}
+
+// TestMapNotification_BranchChanged pins the record-only branch
+// observation: the exact "branch: <branch>" message, Raw retention,
+// and no workspace path in Message.
+func TestMapNotification_BranchChanged(t *testing.T) {
+	state := newMapperState("m")
+	raw := map[string]any{"branch": "feature/x"}
+	events := mapNotification("session/branchChanged", json.RawMessage(`{"sessionId":"s","viewCursor":"c","branch":"feature/x","workspaceRoot":"/sentinel/workspace/map-9f8a"}`), state, raw)
+	if len(events) != 1 {
+		t.Fatalf("events=%v, want one branch_changed event", kindsOf(events))
+	}
+	sys, ok := events[0].(agent.SystemEvent)
+	if !ok || sys.Subtype != "branch_changed" {
+		t.Fatalf("event=%+v, want branch_changed SystemEvent", events[0])
+	}
+	if sys.Message != "branch: feature/x" {
+		t.Errorf("message=%q, want %q", sys.Message, "branch: feature/x")
+	}
+	if strings.Contains(sys.Message, "/sentinel/workspace/map-9f8a") {
+		t.Errorf("message=%q leaked the workspace path", sys.Message)
+	}
+	if sys.Raw == nil {
+		t.Error("Raw was dropped; the original object must be preserved")
+	}
+}
+
+// TestMapNotification_BranchChangedMalformed pins the fail-soft shape:
+// a null (detached HEAD), missing, or empty branch — or garbage
+// params — never panics and surfaces as unknown.
+func TestMapNotification_BranchChangedMalformed(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		params json.RawMessage
+	}{
+		{"null branch", json.RawMessage(`{"sessionId":"s","viewCursor":"c","branch":null,"workspaceRoot":"/w"}`)},
+		{"missing branch", json.RawMessage(`{"sessionId":"s","viewCursor":"c","workspaceRoot":"/w"}`)},
+		{"empty branch", json.RawMessage(`{"sessionId":"s","viewCursor":"c","branch":"","workspaceRoot":"/w"}`)},
+		{"empty object", json.RawMessage(`{}`)},
+		{"garbage", json.RawMessage(`{`)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			state := newMapperState("m")
+			events := mapNotification("session/branchChanged", tc.params, state, map[string]any{})
+			if len(events) != 1 {
+				t.Fatalf("events=%v, want one fail-soft branch_changed event", kindsOf(events))
+			}
+			sys, ok := events[0].(agent.SystemEvent)
+			if !ok || sys.Subtype != "branch_changed" {
+				t.Fatalf("event=%+v, want branch_changed SystemEvent", events[0])
+			}
+			if sys.Message != "branch: unknown" {
+				t.Errorf("message=%q, want %q", sys.Message, "branch: unknown")
+			}
+		})
+	}
+}
+
+func boolJSON(b bool) string {
+	if b {
+		return "true"
+	}
+	return "false"
 }

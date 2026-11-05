@@ -272,7 +272,8 @@ func workerStartRegisterRequest(flags *workerStartFlags, hostname string, pid in
 
 // batchHandlerMux fans a single worker.BatchHandler out to the per-work-type
 // executors. The worker poll loop hands EVERY batchWork[]/kgExtractWork[] item to
-// one handler; this mux inspects item.WorkType and dispatches to the matching
+// one handler; this mux inspects item.Kind() (batchKind, else the legacy
+// workType) and dispatches to the matching
 // executor's BatchHandler. An item whose work-type matches none of the wired
 // executors is logged + skipped (graceful degradation — a stale worker must
 // never crash the loop on a work-type a newer platform dispatched).
@@ -283,14 +284,14 @@ func workerStartRegisterRequest(flags *workerStartFlags, hostname string, pid in
 // (e.g.) a kg-extraction item to the codesurvival decoder.
 func batchHandlerMux(survival, kg worker.BatchHandler) worker.BatchHandler {
 	return func(ctx context.Context, item worker.BatchWorkItem) error {
-		switch item.WorkType {
+		switch item.Kind() {
 		case codesurvival.WorkTypeCodeSurvivalScan:
 			return survival(ctx, item)
 		case kgextract.WorkTypeKGExtraction:
 			return kg(ctx, item)
 		default:
 			slog.Info("worker start: unknown batch work-type; skipping",
-				"batchJobId", item.BatchJobID, "workType", item.WorkType)
+				"batchJobId", item.BatchJobID, "batchKind", item.Kind())
 			return nil
 		}
 	}

@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // SessionStatus matches the public API status union type.
@@ -63,20 +65,54 @@ type SessionTimeline struct {
 
 // SessionDetail is the inner session object in the detail response.
 type SessionDetail struct {
-	ID           string          `json:"id"`
-	Identifier   string          `json:"identifier"`
-	Status       SessionStatus   `json:"status"`
-	WorkType     string          `json:"workType"`
-	StartedAt    string          `json:"startedAt"`
-	Duration     int             `json:"duration"`
-	Timeline     SessionTimeline `json:"timeline"`
-	Provider     *string         `json:"provider,omitempty"`
-	Branch       *string         `json:"branch,omitempty"`
-	IssueTitle   *string         `json:"issueTitle,omitempty"`
-	ParkReason   *string         `json:"parkReason,omitempty"`
-	CostUsd      *float64        `json:"costUsd,omitempty"`
-	InputTokens  *int            `json:"inputTokens,omitempty"`
-	OutputTokens *int            `json:"outputTokens,omitempty"`
+	ID             string               `json:"id"`
+	Identifier     string               `json:"identifier"`
+	Status         SessionStatus        `json:"status"`
+	WorkType       string               `json:"workType"`
+	StartedAt      string               `json:"startedAt"`
+	Duration       int                  `json:"duration"`
+	Timeline       SessionTimeline      `json:"timeline"`
+	Provider       *string              `json:"provider,omitempty"`
+	Branch         *string              `json:"branch,omitempty"`
+	IssueTitle     *string              `json:"issueTitle,omitempty"`
+	ParkReason     *string              `json:"parkReason,omitempty"`
+	CostUsd        *float64             `json:"costUsd,omitempty"`
+	InputTokens    *int                 `json:"inputTokens,omitempty"`
+	OutputTokens   *int                 `json:"outputTokens,omitempty"`
+	TerminalReason *TerminalReason      `json:"terminalReason,omitempty"`
+	BudgetBreach   *SessionBudgetBreach `json:"budgetBreach,omitempty"`
+	PullRequestURL *string              `json:"pullRequestUrl,omitempty"`
+	PullRequest    *SessionPullRequest  `json:"pullRequest,omitempty"`
+	Summary        *string              `json:"summary,omitempty"`
+}
+
+// TerminalReason is the structured terminal failure reason carried on a
+// failed session detail response. It mirrors the server's diagnostic
+// shape: a stable machine code, a human message, the lifecycle phase
+// where the failure was decided, the deciding component, and the time
+// the reason was recorded.
+type TerminalReason struct {
+	Code      string `json:"code"`
+	Message   string `json:"message"`
+	Phase     string `json:"phase"`
+	DecidedBy string `json:"decidedBy"`
+	At        string `json:"at"`
+}
+
+// SessionBudgetBreach is the runner's budget report carried on a terminal
+// session detail response. Cap names the cap that fired; Detail is the
+// short human explanation.
+type SessionBudgetBreach struct {
+	Cap    string `json:"cap"`
+	Detail string `json:"detail"`
+}
+
+// SessionPullRequest is the structured pull-request artifact carried on a
+// terminal session detail response.
+type SessionPullRequest struct {
+	Number  *int    `json:"number,omitempty"`
+	URL     string  `json:"url,omitempty"`
+	HeadSHA *string `json:"headSha,omitempty"`
 }
 
 // SessionDetailResponse matches GET /api/public/sessions/:id.
@@ -827,4 +863,48 @@ type StatsResponseV2 struct {
 	// Providers is the per-provider cost and capacity breakdown.
 	// Empty when no provider cost data is available.
 	Providers []ProviderCost `json:"providers,omitempty"`
+}
+
+// ── Headless runner failure tail bounds ────────────────────────────────────
+//
+// Operator bounds for failed headless runs: every redacted failure tail
+// is capped to these byte and line limits before transport so
+// infrastructure failures cannot collapse into an unowned label.
+const (
+	// MaxHeadlessFailureTailBytes bounds one failure tail in bytes.
+	MaxHeadlessFailureTailBytes = 4096
+	// MaxHeadlessFailureTailLines bounds one failure tail in lines.
+	MaxHeadlessFailureTailLines = 50
+)
+
+// TruncateHeadlessFailureTail applies line then byte bounds to a redacted
+// tail, rune-safe. Empty stays empty. Invalid UTF-8 is sanitized first so
+// the Go-string bound is also the JSON-decoded wire bound: encoding/json
+// replaces each invalid byte with U+FFFD on marshal, which would otherwise
+// expand a 4096-byte invalid tail to 12288 bytes for the recipient.
+func TruncateHeadlessFailureTail(s string) string {
+	if s == "" {
+		return ""
+	}
+	// Sanitize before measuring: raw subprocess diagnostics can carry
+	// invalid UTF-8, and the JSON transport replaces each invalid byte
+	// with U+FFFD on decode. Bounding the raw bytes first would still
+	// deliver an expanded tail past the byte limit.
+	s = strings.ToValidUTF8(s, string(utf8.RuneError))
+	if s == "" {
+		return ""
+	}
+	if lines := strings.Split(s, "\n"); len(lines) > MaxHeadlessFailureTailLines {
+		s = strings.Join(lines[len(lines)-MaxHeadlessFailureTailLines:], "\n")
+	}
+	if len(s) <= MaxHeadlessFailureTailBytes {
+		return s
+	}
+	// Keep the longest rune-aligned suffix within the byte bound: slice
+	// from the end once, then trim a leading partial rune. O(n).
+	s = s[len(s)-MaxHeadlessFailureTailBytes:]
+	for len(s) > 0 && !utf8.RuneStart(s[0]) {
+		s = s[1:]
+	}
+	return s
 }

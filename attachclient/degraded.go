@@ -409,6 +409,9 @@ func (h *host) openHostSSE(ctx context.Context, sseURL string, tokH *tokenHolder
 		}
 		req.Header.Set("Authorization", "Bearer "+rejected)
 		req.Header.Set("Accept", "text/event-stream")
+		for name, values := range h.cfg.traceHeaders() {
+			req.Header[name] = values
+		}
 		resp, err := h.httpClient().Do(req)
 		if err != nil {
 			return nil, err
@@ -567,6 +570,9 @@ func (h *host) postHostBatch(ctx context.Context, url string, tokH *tokenHolder,
 		}
 		req.Header.Set("Authorization", "Bearer "+rejected)
 		req.Header.Set("Content-Type", "application/json")
+		for name, values := range h.cfg.traceHeaders() {
+			req.Header[name] = values
+		}
 
 		resp, derr := h.httpClient().Do(req)
 		if derr != nil {
@@ -667,9 +673,13 @@ func (h *host) upgradeProbe(ctx context.Context, tokH *tokenHolder, result chan 
 func (h *host) probeWSS(ctx context.Context, tok string) bool {
 	dctx, cancel := context.WithTimeout(ctx, h.cfg.DialTimeout)
 	defer cancel()
+	header := http.Header{"Authorization": {"Bearer " + tok}}
+	for name, values := range h.cfg.traceHeaders() {
+		header[name] = values
+	}
 	conn, _, err := websocket.Dial(dctx, h.cfg.AttachURL, &websocket.DialOptions{
 		HTTPClient:   h.cfg.HTTPClient,
-		HTTPHeader:   http.Header{"Authorization": {"Bearer " + tok}},
+		HTTPHeader:   header,
 		Subprotocols: []string{attachwire.SubprotocolVersion},
 	})
 	if err != nil {

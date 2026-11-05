@@ -25,7 +25,7 @@ import (
 //	handler := kgextract.BatchHandler(exec)
 func BatchHandler(exec *Executor) worker.BatchHandler {
 	return func(ctx context.Context, item worker.BatchWorkItem) error {
-		switch item.WorkType {
+		switch item.Kind() {
 		case WorkTypeKGExtraction:
 			var kgItem KgExtractWorkItem
 			if err := json.Unmarshal(item.Raw, &kgItem); err != nil {
@@ -36,7 +36,7 @@ func BatchHandler(exec *Executor) worker.BatchHandler {
 			// Graceful degradation: a stale worker may receive a work-type a
 			// newer platform dispatched. Log + skip; never crash the loop.
 			slog.Default().Info("kgextract: unknown batch work-type; skipping",
-				"batchJobId", item.BatchJobID, "workType", item.WorkType)
+				"batchJobId", item.BatchJobID, "batchKind", item.Kind())
 			return nil
 		}
 	}

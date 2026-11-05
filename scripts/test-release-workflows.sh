@@ -427,6 +427,8 @@ required_paths = %w[
   scripts/sign-and-notarize.sh
   scripts/test-sign-and-notarize.sh
   scripts/test-release-workflows.sh
+  scripts/verify-go-compiler.sh
+  scripts/verify-release-binaries.sh
   go.mod
 ]
 %w[pull_request push].each do |event|
@@ -564,7 +566,437 @@ scan = YAML.safe_load(File.read(File.join(root_dir, '.github/workflows/security-
 %w[secret-scan govulncheck semgrep].each do |job|
   abort "FAIL: security scan lost job #{job}" unless scan.fetch('jobs').key?(job)
 end
+# AC-1: the scheduled scanner blocks and retains the scanned SHA.
+scan_raw = File.read(File.join(root_dir, '.github/workflows/security-scan.yml'))
+govuln = scan.fetch('jobs').fetch('govulncheck')
+abort 'FAIL: govulncheck lost its blocking name' if govuln['name'].to_s.match?(/report-only/i)
+abort 'FAIL: govulncheck must keep the 10-minute timeout' unless govuln['timeout-minutes'] == 10
+abort 'FAIL: govulncheck must run the compiler guard' unless govuln.fetch('steps').any? { |step| step['run'].to_s.include?('verify-go-compiler.sh') }
+run_script = govuln.fetch('steps').select { |step| step['name'] == 'govulncheck' }.map { |step| step['run'].to_s }.join("\n")
+abort 'FAIL: govulncheck must fail closed' if run_script.match?(/::warning::govulncheck/)
+abort 'FAIL: govulncheck must run with pipefail' unless run_script.include?('pipefail')
+abort 'FAIL: govulncheck must run with errexit' unless run_script.include?('set -euo pipefail')
+abort 'FAIL: govulncheck must not swallow failures' if run_script.match?(/\|\|/)
+abort 'FAIL: govulncheck must not negate the scanner' if run_script.match?(/!\s*govulncheck/)
+abort 'FAIL: govulncheck must not disable errexit' if run_script.match?(/set \+e/)
+abort 'FAIL: govulncheck must not mask failures' if run_script.match?(/;\s*exit\s+0/)
+abort 'FAIL: govulncheck must scan all packages' unless run_script.include?('govulncheck ./...')
+abort 'FAIL: govulncheck must not continue-on-error' if govuln['continue-on-error'] == true || govuln.fetch('steps').any? { |step| step['continue-on-error'] == true }
+abort 'FAIL: govulncheck must retain the scanned SHA' unless govuln.to_s.match?(/github\.sha|GITHUB_SHA/)
+upload = govuln.fetch('steps').find { |step| step['uses'].to_s.start_with?('actions/upload-artifact@') }
+abort 'FAIL: govulncheck must upload its report' unless upload && upload.dig('with', 'if-no-files-found') == 'error'
+abort 'FAIL: govulncheck must retain its report' unless upload.dig('with', 'retention-days').is_a?(Integer)
+# The weekly schedule stays on the head branch.
+triggers = scan['on'] || scan[true]
+abort 'FAIL: security scan lost its weekly schedule' unless triggers.is_a?(Hash) && Array(triggers['schedule']).any? { |entry| entry['cron'].to_s.match?(/\*/) }
+# AC-2: CI and release validate the actual compiler.
+ci = YAML.safe_load(File.read(File.join(root_dir, '.github/workflows/ci.yml')), permitted_classes: [], permitted_symbols: [], aliases: false)
+contracts = ci.fetch('jobs').fetch('release-contracts')
+abort 'FAIL: release-contracts lost its compiler guard' unless contracts.fetch('steps').any? { |step| step['run'].to_s.include?('verify-go-compiler.sh') }
+release_steps = release.fetch('jobs').fetch('release').fetch('steps')
+guard_index = release_steps.index { |step| step['name'] == 'Verify Go compiler' && step['run'].to_s.include?('verify-go-compiler.sh') }
+goreleaser_index = release_steps.index { |step| step['uses'].to_s.start_with?('goreleaser/goreleaser-action@') }
+abort 'FAIL: release job lost its compiler guard' unless guard_index
+abort 'FAIL: release compiler guard must run before the build' unless guard_index < goreleaser_index
+abort 'FAIL: release compiler guard must use the staged script (manual retries)' unless release_steps[guard_index]['run'].to_s.include?('RUNNER_TEMP')
+# The build must upload to a non-public draft only: inspection gates
+# publicity. Pinned v2.17.1 has no publish-only command (no `continue`, no
+# build skip: its dist pipe fails on a non-empty dist without --clean, and
+# CleanPipe removes dist), so a second `release --clean` would rebuild and
+# discard the inspected bytes. The gated undraft below flips a flag on the
+# already-uploaded assets and never touches dist.
+build_args = release_steps[goreleaser_index].dig('with', 'args').to_s
+abort 'FAIL: release build must create a draft so nothing is public before inspection' unless build_args.include?('--draft')
+abort 'FAIL: release build must not skip publish (the draft must carry the inspected assets)' if build_args.include?('--skip=publish')
+release_runs = release_steps.select { |step| step.to_s.include?('release --clean') }
+abort 'FAIL: release must build exactly once (a second release rebuilds and discards inspection)' unless release_runs == [release_steps[goreleaser_index]]
+integration = YAML.safe_load(File.read(File.join(root_dir, '.github/workflows/release-signing-integration.yml')), permitted_classes: [], permitted_symbols: [], aliases: false)
+integration_steps = integration.fetch('jobs').fetch('signing-integration').fetch('steps')
+abort 'FAIL: signing integration lost its compiler guard' unless integration_steps.any? { |step| step['run'].to_s.include?('verify-go-compiler.sh') }
+# AC-3: every binary is inspected with go version -m before upload.
+verify_index = release_steps.index { |step| step['name'] == 'Verify release binaries' }
+attest_index = release_steps.index { |step| step['name'] == 'Attest build provenance' }
+publish_index = release_steps.index { |step| step['name'] == 'Publish release' }
+publish_run = release_steps.fetch(publish_index, {})['run'].to_s
+abort 'FAIL: publish must not rerun GoReleaser (it rebuilds and discards the inspected dist)' if publish_run.include?('goreleaser')
+abort 'FAIL: publish must not clean (it would discard the inspected dist)' if publish_run.include?('--clean')
+abort 'FAIL: publish must release the gated draft without rebuilding' unless publish_run.include?('gh release edit') && publish_run.include?('--draft=false')
+abort 'FAIL: publish must target the release tag on every path' unless publish_run.include?('RELEASE_TAG')
+abort 'FAIL: publish must confirm the release left draft status' unless publish_run.include?('isDraft')
+cleanup = release_steps.find { |step| step['name'].to_s.match?(/unverified draft/i) }
+abort 'FAIL: release job lost its unverified-draft cleanup' unless cleanup
+abort 'FAIL: draft cleanup must run on failure only' unless cleanup['if'].to_s.include?('failure()')
+abort 'FAIL: draft cleanup must never delete the signed tag' if cleanup['run'].to_s.include?('--cleanup-tag')
+abort 'FAIL: draft cleanup must only delete drafts' unless cleanup['run'].to_s.include?('isDraft')
+abort 'FAIL: draft cleanup must delete only drafts (== "true")' unless cleanup['run'].to_s.include?('== "true"')
+abort 'FAIL: draft cleanup must not match public releases' if cleanup['run'].to_s.match?(/==\s*"false"/)
+# B1: draft isolation — no public write before inspection.
+reject_index = release_steps.index { |step| step['name'] == 'Reject already-public release' }
+abort 'FAIL: release job lost its already-public guard' unless reject_index
+abort 'FAIL: already-public guard must run before the build' unless reject_index < goreleaser_index
+reject_run = release_steps[reject_index]['run'].to_s
+abort 'FAIL: already-public guard must read the live release' unless reject_run.include?('gh release view') && reject_run.include?('isDraft')
+abort 'FAIL: already-public guard must refuse a public release' unless reject_run.include?('already exists and is public') && reject_run.include?('exit 1')
+abort 'FAIL: already-public guard must allow a missing release' unless reject_run.include?('not found')
+abort 'FAIL: already-public guard must fail closed on unreadable status' unless reject_run.include?('cannot determine release status')
+abort 'FAIL: already-public guard must allow only an explicit draft' unless reject_run.include?('== "true"')
+abort 'FAIL: already-public guard must fail closed on unexpected values' unless reject_run.include?('unexpected isDraft')
+build_step = release_steps[goreleaser_index]
+abort 'FAIL: draft build must suppress the tap upload' unless build_step['env'].to_s.include?('GORELEASER_PUBLISH_HOMEBREW') && build_step['env'].to_s.include?('false')
+abort 'FAIL: draft build must not skip the cask file generation (the gated tap step needs dist/homebrew)' if build_args.include?('--skip=homebrew')
+cask_index = release_steps.index { |step| step['name'] == 'Publish Homebrew cask' }
+abort 'FAIL: release job lost its gated cask publish' unless cask_index
+abort 'FAIL: cask publish must run after the gated release publish' unless publish_index < cask_index
+abort 'FAIL: cask publish must run before provenance upload' unless cask_index < attest_index
+cask_step = release_steps[cask_index]
+abort 'FAIL: cask publish must run only for automatic stable' unless cask_step['if'].to_s.include?("env.GORELEASER_PUBLISH_HOMEBREW == 'true'")
+abort 'FAIL: cask publish must not rerun GoReleaser (it rebuilds)' if cask_step['run'].to_s.include?('goreleaser')
+abort 'FAIL: cask publish must reuse the inspected cask file' unless cask_step['run'].to_s.include?('dist/homebrew/Casks/donmai.rb')
+abort 'FAIL: cask publish must fail closed without inspected artifacts' unless cask_step['run'].to_s.include?('missing') && cask_step['run'].to_s.include?('exit 1')
+abort 'FAIL: cask publish must push the tap update' unless cask_step['run'].to_s.include?('push origin HEAD:main')
+# B2: Latest policy rides with the gated publish.
+abort 'FAIL: publish must carry the verified Latest policy' unless publish_run.include?('--latest=') && publish_run.include?('GORELEASER_MAKE_LATEST')
+# B3: publication scheduling — publish runs only on success, never after failure.
+if release_steps[publish_index].key?('if')
+  abort 'FAIL: publish must run only on success (no event condition; an always() would publish after failed inspection)'
+end
+abort 'FAIL: publish must not run on failure' if publish_run.include?('always()') || release_steps[publish_index]['if'].to_s.include?('always()')
+abort 'FAIL: release job lost its binary inspection' unless verify_index
+abort 'FAIL: release job lost its publish step' unless publish_index
+abort 'FAIL: binary inspection must run before provenance upload' unless verify_index < attest_index
+abort 'FAIL: binary inspection must run after the build' unless goreleaser_index < verify_index
+abort 'FAIL: binary inspection must gate publication' unless verify_index < publish_index
+abort 'FAIL: publication must run before provenance upload' unless publish_index < attest_index
+verify_run = release_steps[verify_index]['run'].to_s
+abort 'FAIL: binary inspection must use the staged config' unless verify_run.include?('RUNNER_TEMP') && verify_run.include?('goreleaser.yaml')
+abort 'FAIL: binary inspection must target the release tag on every path' unless verify_run.include?('RELEASE_TAG')
+abort 'FAIL: binary inspection must retain the scanned SHA' unless verify_run.include?('GITHUB_SHA')
+if release_steps[verify_index].key?('if')
+  abort 'FAIL: binary inspection must run on every path (no event condition)'
+end
+abort 'FAIL: binary inspection does not inspect with go version -m' unless File.read(File.join(root_dir, 'scripts/verify-release-binaries.sh')).include?('go version -m')
+# The expected artifact set comes from the GoReleaser config, never a copy.
+builds = YAML.safe_load(File.read(File.join(root_dir, '.goreleaser.yaml')), permitted_classes: [], permitted_symbols: [], aliases: false).fetch('builds')
+abort 'FAIL: GoReleaser config declares no builds' unless builds.is_a?(Array) && !builds.empty?
+combos = builds.flat_map { |build| Array(build['goos']).product(Array(build['goarch'])) }
+abort 'FAIL: GoReleaser config declares no platform matrix' if combos.empty?
+inspector = File.read(File.join(root_dir, 'scripts/verify-release-binaries.sh'))
+abort 'FAIL: binary inspector does not derive from the GoReleaser config' unless inspector.include?("goreleaser.yaml") && inspector.include?("builds")
+abort 'FAIL: binary inspector must discover via build id' unless inspector.include?("build['id']") || inspector.include?('build["id"]')
+abort 'FAIL: binary inspector must normalize the v tag' unless inspector.include?("#v") || inspector.include?("TrimPrefix") || inspector.include?("${tag#v}")
+abort 'FAIL: binary inspector must fail closed on producer errors' if inspector.match?(/done\s+<\s+<\(expected_binaries\)/)
+staged = release_steps.find { |step| step['name'] == 'Stage release automation' }['run'].to_s
+%w[verify-go-compiler.sh verify-release-binaries.sh].each do |script|
+  abort "FAIL: manual retries can fall back to an older #{script}" unless staged.include?(script)
+end
 RUBY
+
+# AC-2: the compiler guard pins its contract directly: floor and newer stable
+# pass; old, missing, malformed, and prerelease compilers fail.
+compiler_script="${root_dir}/scripts/verify-go-compiler.sh"
+[[ -x "${compiler_script}" ]] || fail 'Go compiler guard is missing or not executable'
+"${compiler_script}" --self-test
+floor=$(grep -E '^go [0-9]+\.[0-9]+\.[0-9]+$' "${root_dir}/go.mod" | head -1 | cut -d' ' -f2)
+[[ -n "${floor}" ]] || fail 'cannot read Go floor from go.mod'
+"${compiler_script}" --floor "${floor}" --version-output "go version go${floor} darwin/arm64" || fail 'floor compiler was rejected'
+"${compiler_script}" --floor "${floor}" --version-output 'go version go1.27.3 darwin/arm64' || fail 'newer stable compiler was rejected'
+if "${compiler_script}" --floor "${floor}" --version-output 'go version go1.0.0 darwin/arm64' >/dev/null 2>&1; then
+  fail 'old compiler was accepted'
+fi
+if "${compiler_script}" --floor "${floor}" --version-output '' >/dev/null 2>&1; then
+  fail 'missing compiler output was accepted'
+fi
+if "${compiler_script}" --floor "${floor}" --version-output 'go version go1.26 darwin/arm64' >/dev/null 2>&1; then
+  fail 'malformed compiler output was accepted'
+fi
+if "${compiler_script}" --floor "${floor}" --version-output 'go version go1.26.10rc1 darwin/arm64' >/dev/null 2>&1; then
+  fail 'prerelease compiler was accepted'
+fi
+if PATH="${temp_dir}" "${compiler_script}" >/dev/null 2>&1; then
+  fail 'missing go toolchain was accepted'
+fi
+
+# AC-3: real binary inspection refuses missing or stale metadata.
+binaries_script="${root_dir}/scripts/verify-release-binaries.sh"
+[[ -x "${binaries_script}" ]] || fail 'release binary inspector is missing or not executable'
+"${binaries_script}" --self-test
+
+# A dist of good binaries with no archives is not shippable. Probe the
+# empty-archive refusal directly so deleting the guard fails this contract
+# even if the self-test above is ever trimmed.
+no_archives_dir="${temp_dir}/no-archives"
+mkdir -p "${no_archives_dir}/dist/onlybin_linux_amd64_v1" "${no_archives_dir}/src"
+cat >"${no_archives_dir}/src/main.go" <<'GO'
+package main
+func main() {}
+GO
+cat >"${no_archives_dir}/src/go.mod" <<'GO'
+module example.com/noarchives
+
+go 1.26.10
+GO
+(cd "${no_archives_dir}/src" && GOWORK=off GOTOOLCHAIN=local go build -ldflags="-X main.version=1.2.3" -o "${no_archives_dir}/dist/onlybin_linux_amd64_v1/donmai" .)
+cat >"${no_archives_dir}/goreleaser.yaml" <<'YAML'
+version: 2
+builds:
+  - id: onlybin
+    main: ./src
+    binary: donmai
+    goos: [linux]
+    goarch: [amd64]
+YAML
+if (cd "${no_archives_dir}" && bash "${binaries_script}" --config goreleaser.yaml --dist dist --tag v1.2.3 --floor "${floor}" >/dev/null 2>&1); then
+  fail 'binary inspector accepted a dist with no archives'
+fi
+
+# B4: digest failures and malformed digests are refused, in both hash
+# branches. Probe the inspector directly with failing/malformed hashers so
+# deleting the digest validation fails this contract even if the self-test
+# cases above are ever trimmed.
+digest_probe_dir="${temp_dir}/digest-probe"
+mkdir -p "${digest_probe_dir}/dist/digestbin_linux_amd64_v1" "${digest_probe_dir}/src"
+cat >"${digest_probe_dir}/src/main.go" <<'GO'
+package main
+func main() {}
+GO
+cat >"${digest_probe_dir}/src/go.mod" <<'GO'
+module example.com/digestprobe
+
+go 1.26.10
+GO
+(cd "${digest_probe_dir}/src" && GOWORK=off GOTOOLCHAIN=local go build -ldflags="-X main.version=1.2.3" -o "${digest_probe_dir}/dist/digestbin_linux_amd64_v1/donmai" .)
+printf 'payload' >"${digest_probe_dir}/dist/donmai_1.2.3_linux_amd64.tar.gz"
+cat >"${digest_probe_dir}/goreleaser.yaml" <<'YAML'
+version: 2
+builds:
+  - id: digestbin
+    main: ./src
+    binary: donmai
+    goos: [linux]
+    goarch: [amd64]
+YAML
+mkdir -p "${digest_probe_dir}/fake-fail"
+printf '#!/bin/sh\nexit 1\n' >"${digest_probe_dir}/fake-fail/shasum"
+printf '#!/bin/sh\nexit 1\n' >"${digest_probe_dir}/fake-fail/sha256sum"
+chmod +x "${digest_probe_dir}/fake-fail/shasum" "${digest_probe_dir}/fake-fail/sha256sum"
+if (cd "${digest_probe_dir}" && PATH="${digest_probe_dir}/fake-fail:${PATH}" bash "${binaries_script}" --config goreleaser.yaml --dist dist --tag v1.2.3 --floor "${floor}" >/dev/null 2>&1); then
+  fail 'binary inspector accepted a failing digest'
+fi
+mkdir -p "${digest_probe_dir}/fake-malformed"
+printf '#!/bin/sh\necho "not-a-digest  x"\n' >"${digest_probe_dir}/fake-malformed/shasum"
+printf '#!/bin/sh\necho "not-a-digest  x"\n' >"${digest_probe_dir}/fake-malformed/sha256sum"
+chmod +x "${digest_probe_dir}/fake-malformed/shasum" "${digest_probe_dir}/fake-malformed/sha256sum"
+if (cd "${digest_probe_dir}" && PATH="${digest_probe_dir}/fake-malformed:${PATH}" bash "${binaries_script}" --config goreleaser.yaml --dist dist --tag v1.2.3 --floor "${floor}" >/dev/null 2>&1); then
+  fail 'binary inspector accepted a malformed digest'
+fi
+
+# B1/B2/B3: execute the gated workflow shells against mocked gh/git.
+# Every shell below is extracted from the production workflow file, not a
+# copy, so editing the workflow without updating the guard fails here.
+workflow_extract_dir="${temp_dir}/workflow-extract"
+mkdir -p "${workflow_extract_dir}"
+ruby -ryaml - "${root_dir}/.github/workflows/release.yml" "${workflow_extract_dir}" <<'RUBY'
+release_file, out_dir = ARGV
+workflow = YAML.safe_load(File.read(release_file), permitted_classes: [], permitted_symbols: [], aliases: false)
+steps = workflow.fetch('jobs').fetch('release').fetch('steps')
+{
+  'Reject already-public release' => 'reject.sh',
+  'Publish release' => 'publish.sh',
+  'Remove unverified draft' => 'cleanup.sh',
+  'Publish Homebrew cask' => 'cask.sh',
+}.each do |name, file|
+  step = steps.find { |s| s['name'] == name }
+  abort "FAIL: workflow lost step #{name}" unless step && step['run']
+  File.write(File.join(out_dir, file), step['run'])
+end
+RUBY
+# B1: the already-public guard refuses a public release, allows a draft or a
+# missing release, and fails closed on an unreadable status.
+for mock_state in true false missing error; do
+  mock_bin="${temp_dir}/mock-gh-${mock_state}"
+  mkdir -p "${mock_bin}"
+  cat >"${mock_bin}/gh" <<MOCK
+#!/bin/sh
+if [ "\$1" = "release" ] && [ "\$2" = "view" ]; then
+  case "${mock_state}" in
+    true) echo "true"; exit 0 ;;
+    false) echo "false"; exit 0 ;;
+    missing) echo "release not found" >&2; exit 1 ;;
+    error) echo "API rate limit" >&2; exit 1 ;;
+  esac
+fi
+echo "unexpected gh call: \$*" >&2
+exit 1
+MOCK
+  chmod +x "${mock_bin}/gh"
+done
+if ! PATH="${temp_dir}/mock-gh-true:${PATH}" RELEASE_TAG=v1.2.3 bash "${workflow_extract_dir}/reject.sh" >/dev/null 2>&1; then
+  fail 'already-public guard rejected a draft release'
+fi
+if PATH="${temp_dir}/mock-gh-false:${PATH}" RELEASE_TAG=v1.2.3 bash "${workflow_extract_dir}/reject.sh" >/dev/null 2>&1; then
+  fail 'already-public guard accepted a public release'
+fi
+if ! PATH="${temp_dir}/mock-gh-missing:${PATH}" RELEASE_TAG=v1.2.3 bash "${workflow_extract_dir}/reject.sh" >/dev/null 2>&1; then
+  fail 'already-public guard rejected a missing release'
+fi
+if PATH="${temp_dir}/mock-gh-error:${PATH}" RELEASE_TAG=v1.2.3 bash "${workflow_extract_dir}/reject.sh" >/dev/null 2>&1; then
+  fail 'already-public guard accepted an unreadable release status'
+fi
+# B1 fail-closed: empty, null, and garbage success responses must refuse,
+# and a public response with a stderr diagnostic must still refuse.
+for malformed in empty null garbage; do
+  mock_malformed_bin="${temp_dir}/mock-gh-${malformed}"
+  mkdir -p "${mock_malformed_bin}"
+  case "${malformed}" in
+    empty) malformed_output="" ;;
+    null) malformed_output="null" ;;
+    garbage) malformed_output="maybe" ;;
+  esac
+  cat >"${mock_malformed_bin}/gh" <<MOCK
+#!/bin/sh
+if [ "\$1" = "release" ] && [ "\$2" = "view" ]; then
+  echo "${malformed_output}"
+  exit 0
+fi
+echo "unexpected gh call: \$*" >&2
+exit 1
+MOCK
+  chmod +x "${mock_malformed_bin}/gh"
+  if PATH="${mock_malformed_bin}:${PATH}" RELEASE_TAG=v1.2.3 bash "${workflow_extract_dir}/reject.sh" >/dev/null 2>&1; then
+    fail "already-public guard accepted a ${malformed} release status"
+  fi
+done
+mock_warning_bin="${temp_dir}/mock-gh-public-warning"
+mkdir -p "${mock_warning_bin}"
+cat >"${mock_warning_bin}/gh" <<'MOCK'
+#!/bin/sh
+if [ "$1" = "release" ] && [ "$2" = "view" ]; then
+  echo "false"
+  echo "warning: rate limited" >&2
+  exit 0
+fi
+echo "unexpected gh call: $*" >&2
+exit 1
+MOCK
+chmod +x "${mock_warning_bin}/gh"
+if PATH="${mock_warning_bin}:${PATH}" RELEASE_TAG=v1.2.3 bash "${workflow_extract_dir}/reject.sh" >/dev/null 2>&1; then
+  fail 'already-public guard accepted a public release with a stderr diagnostic'
+fi
+# B2: the gated publish carries the verified Latest policy on both paths.
+for latest_value in true false; do
+  mock_publish_bin="${temp_dir}/mock-publish-${latest_value}"
+  mkdir -p "${mock_publish_bin}"
+  publish_log="${temp_dir}/publish-args-${latest_value}.log"
+  rm -f "${publish_log}"
+  cat >"${mock_publish_bin}/gh" <<MOCK
+#!/bin/sh
+if [ "\$1" = "release" ] && [ "\$2" = "edit" ]; then
+  printf '%s\n' "\$*" >>"${publish_log}"
+  exit 0
+fi
+if [ "\$1" = "release" ] && [ "\$2" = "view" ]; then
+  echo "false"
+  exit 0
+fi
+echo "unexpected gh call: \$*" >&2
+exit 1
+MOCK
+  chmod +x "${mock_publish_bin}/gh"
+  if ! PATH="${mock_publish_bin}:${PATH}" RELEASE_TAG=v1.2.3 GORELEASER_MAKE_LATEST="${latest_value}" bash "${workflow_extract_dir}/publish.sh" >/dev/null 2>&1; then
+    fail "gated publish failed for Latest=${latest_value}"
+  fi
+  grep -Fq -- "--draft=false" "${publish_log}" || fail "gated publish omits --draft=false for Latest=${latest_value}"
+  grep -Fq -- "--latest=${latest_value}" "${publish_log}" || fail "gated publish omits --latest=${latest_value}"
+done
+# B3: the unverified-draft cleanup deletes only drafts, never a public
+# release or an error response. Inverting the comparison would delete the
+# public release here and fail this contract.
+for cleanup_state in true false error; do
+  mock_cleanup_bin="${temp_dir}/mock-cleanup-${cleanup_state}"
+  mkdir -p "${mock_cleanup_bin}"
+  cleanup_log="${temp_dir}/cleanup-delete-${cleanup_state}.log"
+  rm -f "${cleanup_log}"
+  cat >"${mock_cleanup_bin}/gh" <<MOCK
+#!/bin/sh
+if [ "\$1" = "release" ] && [ "\$2" = "view" ]; then
+  case "${cleanup_state}" in
+    true) echo "true"; exit 0 ;;
+    false) echo "false"; exit 0 ;;
+    error) echo "API error" >&2; exit 1 ;;
+  esac
+fi
+if [ "\$1" = "release" ] && [ "\$2" = "delete" ]; then
+  printf '%s\n' "\$*" >>"${cleanup_log}"
+  exit 0
+fi
+echo "unexpected gh call: \$*" >&2
+exit 1
+MOCK
+  chmod +x "${mock_cleanup_bin}/gh"
+  PATH="${mock_cleanup_bin}:${PATH}" RELEASE_TAG=v1.2.3 bash "${workflow_extract_dir}/cleanup.sh" >/dev/null 2>&1 || true
+  if [ "${cleanup_state}" = "true" ]; then
+    grep -Fq -- "release delete" "${cleanup_log}" || fail 'cleanup did not delete an unverified draft'
+  else
+    if [ -f "${cleanup_log}" ]; then
+      fail "cleanup deleted on ${cleanup_state} response"
+    fi
+  fi
+done
+# B1: the gated cask step refuses without inspected artifacts instead of
+# pushing an empty tap update.
+cask_empty_dir="${temp_dir}/cask-empty"
+mkdir -p "${cask_empty_dir}"
+cp "${workflow_extract_dir}/cask.sh" "${cask_empty_dir}/cask.sh"
+mkdir -p "${temp_dir}/mock-git-empty"
+cat >"${temp_dir}/mock-git-empty/git" <<'MOCK'
+#!/bin/sh
+echo "unexpected git call: $*" >&2
+exit 1
+MOCK
+chmod +x "${temp_dir}/mock-git-empty/git"
+if (cd "${cask_empty_dir}" && PATH="${temp_dir}/mock-git-empty:${PATH}" RELEASE_TAG=v1.2.3 HOMEBREW_TAP_GITHUB_TOKEN=dummy bash ./cask.sh >/dev/null 2>&1); then
+  fail 'cask publish accepted a missing cask file'
+fi
+# B2: the gated cask step publishes the inspected cask file when it changes.
+# Extracted from the production workflow, so deleting the push fails here:
+# the mutated shell still exits 0, but no push is recorded.
+cask_changed_dir="${temp_dir}/cask-changed"
+mkdir -p "${cask_changed_dir}/dist/homebrew/Casks"
+printf 'cask "donmai" do\n  version "1.2.3"\nend\n' >"${cask_changed_dir}/dist/homebrew/Casks/donmai.rb"
+cp "${workflow_extract_dir}/cask.sh" "${cask_changed_dir}/cask.sh"
+mkdir -p "${temp_dir}/mock-git-changed"
+cask_push_log="${temp_dir}/cask-push.log"
+rm -f "${cask_push_log}"
+cat >"${temp_dir}/mock-git-changed/git" <<MOCK
+#!/bin/sh
+log="${cask_push_log}"
+printf '%s\n' "git \$*" >>"\${log}"
+if [ "\$1" = "clone" ]; then
+  dest=""
+  for arg in "\$@"; do dest="\$arg"; done
+  mkdir -p "\${dest}/Casks"
+  printf 'cask "donmai" do\n  version "old"\nend\n' >"\${dest}/Casks/donmai.rb"
+  exit 0
+fi
+if [ "\$1" = "-C" ]; then
+  shift; dir="\$1"; shift
+  sub="\$1"; shift
+  case "\${sub}" in
+    config) exit 0 ;;
+    add) exit 0 ;;
+    diff) exit 1 ;;
+    commit) printf '%s\n' "git commit \$*" >>"\${log}"; exit 0 ;;
+    push) printf '%s\n' "git push \$*" >>"\${log}"; exit 0 ;;
+    *) exit 0 ;;
+  esac
+fi
+exit 0
+MOCK
+chmod +x "${temp_dir}/mock-git-changed/git"
+if ! (cd "${cask_changed_dir}" && PATH="${temp_dir}/mock-git-changed:${PATH}" RELEASE_TAG=v1.2.3 HOMEBREW_TAP_GITHUB_TOKEN=dummy bash ./cask.sh >/dev/null 2>&1); then
+  fail 'cask publish failed on a changed cask file'
+fi
+grep -Fq -- "git push origin HEAD:main" "${cask_push_log}" || fail 'cask publish did not push the tap update'
 
 # The E2B build wrapper must pass the versioned target on every build and add
 # the rolling default only when requested by an automatic tag push.

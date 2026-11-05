@@ -364,3 +364,130 @@ func TestProcessor_SubagentLifecycleEmitsSubagentSpan(t *testing.T) {
 		t.Fatalf("completed span missing trace spine: %+v", subagents[0])
 	}
 }
+
+// TestValidTraceparentAcceptsAnyFlags pins that the consumer-wide
+// validator keeps every well-formed 1-byte flags value: dropping a valid
+// sampled context (for example flags 03) must fail here. Removing the
+// flags acceptance (restricting to 00/01) turns this test red.
+func TestValidTraceparentAcceptsAnyFlags(t *testing.T) {
+	t.Parallel()
+	const traceID = "0123456789abcdef0123456789abcdef"
+	const parentID = "0123456789abcdef"
+	for _, flags := range []string{"00", "01", "02", "03", "09", "ff", "FF"} {
+		tp := "00-" + traceID + "-" + parentID + "-" + flags
+		if !ValidTraceparent(tp) {
+			t.Errorf("ValidTraceparent(%q) = false, want true", tp)
+		}
+	}
+	for _, tp := range []string{
+		"",
+		"00-" + traceID + "-" + parentID + "-",
+		"00-" + traceID + "-" + parentID + "-0",
+		"00-" + traceID + "-" + parentID + "-000",
+		"00-" + traceID + "-" + parentID + "-0g",
+		"00-" + traceID + "-" + parentID + "-gg",
+		"00-00000000000000000000000000000000-" + parentID + "-01",
+		"00-" + traceID + "-0000000000000000-01",
+		"01-" + traceID + "-" + parentID + "-01",
+		"not-a-traceparent",
+	} {
+		if ValidTraceparent(tp) {
+			t.Errorf("ValidTraceparent(%q) = true, want false", tp)
+		}
+	}
+}
+
+// TestValidTracestateBoundaries pins the size and character guards: a
+// 512-byte value is accepted, 513 bytes are dropped, and control or
+// non-ASCII bytes are rejected. Deleting the length check or either
+// character bound leaves this test red.
+func TestValidTracestateBoundaries(t *testing.T) {
+	t.Parallel()
+	if !ValidTracestate("vendor=value") {
+		t.Error("ValidTracestate(vendor=value) = false, want true")
+	}
+	if ValidTracestate("") {
+		t.Error("ValidTracestate(empty) = true, want false")
+	}
+	atLimit := make([]byte, maxTracestateBytes)
+	for i := range atLimit {
+		atLimit[i] = 'a'
+	}
+	if !ValidTracestate(string(atLimit)) {
+		t.Errorf("ValidTracestate(%d bytes) = false, want true", maxTracestateBytes)
+	}
+	overLimit := string(atLimit) + "a"
+	if ValidTracestate(overLimit) {
+		t.Errorf("ValidTracestate(%d bytes) = true, want false", maxTracestateBytes+1)
+	}
+	for _, tc := range []struct {
+		name  string
+		state string
+	}{
+		{"newline", "bad\nstate"},
+		{"control", "a\x01b"},
+		{"del", "a\x7fb"},
+		{"high-byte", "vendor=\xff"},
+		{"multibyte", "vendor=\u00e9"},
+	} {
+		if ValidTracestate(tc.state) {
+			t.Errorf("ValidTracestate(%s) = true, want false", tc.name)
+		}
+	}
+}
+
+// TestProcessor_JoinIdentitiesFallbackAndOmission drives the production
+// processor: the session root carries the configured join identities
+// verbatim, an absent storage id falls back to the session id (the
+// legacy storage alias), and absent public/tracker ids stay omitted.
+// Deleting the fallback or emitting an empty placeholder turns this red.
+func TestProcessor_JoinIdentitiesFallbackAndOmission(t *testing.T) {
+	t.Parallel()
+	now := time.Unix(1_700_000_000, 0)
+	newRoot := func(cfg ProcessorConfig) agent.SessionSpan {
+		t.Helper()
+		recorder := &spanRecorder{}
+		if cfg.Sender == nil {
+			cfg.Sender = recorder
+		}
+		if cfg.Now == nil {
+			cfg.Now = func() time.Time { return now }
+		}
+		if cfg.IDGenerator == nil {
+			ids := &sequentialIDs{}
+			cfg.IDGenerator = ids.generate
+		}
+		p, err := NewProcessor(cfg)
+		if err != nil {
+			t.Fatalf("NewProcessor: %v", err)
+		}
+		p.Finish("completed", "")
+		for _, s := range recorder.snapshot() {
+			if root, ok := s.(agent.SessionSpan); ok {
+				return root
+			}
+		}
+		t.Fatal("no session root emitted")
+		return agent.SessionSpan{}
+	}
+	base := ProcessorConfig{
+		SessionID: "sess-1", OrgID: "org-1", WorkspaceID: "org-1",
+	}
+	absent := newRoot(base)
+	if absent.Donmai.SessionStorageID != "sess-1" {
+		t.Errorf("absent storage = %q, want session id fallback %q", absent.Donmai.SessionStorageID, "sess-1")
+	}
+	if absent.Donmai.SessionPublicID != "" {
+		t.Errorf("absent public = %q, want omitted", absent.Donmai.SessionPublicID)
+	}
+	if absent.Donmai.TrackerSessionID != "" {
+		t.Errorf("absent tracker = %q, want omitted", absent.Donmai.TrackerSessionID)
+	}
+	present := newRoot(ProcessorConfig{
+		SessionID: "sess-1", OrgID: "org-1", WorkspaceID: "org-1",
+		SessionStorageID: "sto-1", SessionPublicID: "pub-1", TrackerSessionID: "trk-1",
+	})
+	if present.Donmai.SessionStorageID != "sto-1" || present.Donmai.SessionPublicID != "pub-1" || present.Donmai.TrackerSessionID != "trk-1" {
+		t.Errorf("present join identities not preserved verbatim: %+v", present.Donmai)
+	}
+}

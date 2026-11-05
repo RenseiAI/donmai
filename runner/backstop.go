@@ -79,6 +79,10 @@ var excludePathPrefixes = []string{
 	"target/debug/",
 	"target/release/",
 	".donmai/code-index/",
+	// Skills a harness materializer wrote into the checkout for this
+	// session (.agents/skills/donmai-<id>/): session machinery, never
+	// project content. The project's own .agents/skills/ stays committable.
+	harnessstate.InTreeSkillPathPrefix,
 }
 
 // wipSecretBasenames are exact secret-bearing basenames that must never
@@ -326,16 +330,24 @@ func shouldExcludeFromBackstop(path string) bool {
 // because the daemon has already lost the right to push from this
 // worker.
 //
-// workType gates the chain on the completion contract's PR obligation.
-// Result sensitivity is independent: QA/review work needs a verdict to drive
-// its transition but legitimately owes no commit, branch, or PR.
+// workType gates the chain on the legacy name-keyed contract's PR
+// obligation; the session paths use shouldBackstopFor with the session's
+// resolved contract. Result sensitivity is independent: QA/review work needs
+// a verdict to drive its transition but legitimately owes no commit, branch,
+// or PR.
 func shouldBackstop(res *Result, workType string, role ...string) bool {
+	return shouldBackstopFor(res, RequiresPRURL(workType, role...))
+}
+
+// shouldBackstopFor is shouldBackstop for a session whose completion
+// contract is already resolved: requiresPR is that contract's PR obligation.
+func shouldBackstopFor(res *Result, requiresPR bool) bool {
 	if res == nil {
 		return false
 	}
 	// Contract gate: only work that explicitly owes a PR may enter the
 	// deterministic git backstop.
-	if !RequiresPRURL(workType, role...) {
+	if !requiresPR {
 		return false
 	}
 	switch res.FailureMode {
@@ -521,7 +533,7 @@ func (r *Runner) runBackstop(ctx context.Context, qw QueuedWork, branch string, 
 	// Keep the completion contract at the mutation boundary too. Normal callers
 	// use shouldBackstop, but a future direct caller must not turn verdict-only
 	// review output into a commit, push, or PR.
-	if !RequiresPRURL(qw.WorkType, qw.WorkTypeRole) {
+	if !qw.requiresPR() {
 		return agent.BackstopReport{}
 	}
 	report := agent.BackstopReport{Triggered: true}
@@ -799,7 +811,7 @@ func (r *Runner) runDeclaredBackstops(
 		if declaredSlug == "" {
 			declaredSlug = githubRepositorySlug(repository.Source.Repository)
 		}
-		if shouldBackstop(&repositoryResult, qw.WorkType, qw.WorkTypeRole) {
+		if shouldBackstopFor(&repositoryResult, qw.requiresPR()) {
 			report = runBackstopForRepository(ctx, r, qw, branch, &repositoryResult, allowedRepositories, declaredSlug)
 		} else if report.PRURL != "" {
 			report.PullRequest = lookupGitHubPullRequest(ctx, repositoryResult.WorktreePath, report.PRURL, allowedRepositories, declaredSlug)

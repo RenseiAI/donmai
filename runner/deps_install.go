@@ -40,28 +40,45 @@ const goDepsInstallCommand = "go mod download"
 // failure is logged and the run continues with whatever is on disk,
 // never failing the session.
 //
-//   - A pnpm-lock.yaml triggers the pnpm command above, skipped when
-//     node_modules/.bin already exists (the kit post_acquire hook or
-//     a previous run already installed).
-//   - A go.mod triggers the go command above.
-//   - pnpm runs before go when a worktree carries both.
-//   - readOnlyCheckout (the selected repository is read-only) skips
-//     the step: the runner may not write into that checkout.
-//   - Every command shares one timeout and runs in wpath via the
-//     Runner's DepsExecer (production: direct argv execution with a
-//     minimal environment and process-group cancellation).
-func (r *Runner) installSessionDependencies(ctx context.Context, qw QueuedWork, wpath string, readOnlyCheckout bool) {
+// A pnpm-lock.yaml triggers the pnpm command above; a go.mod triggers
+// the go command above. pnpm runs before go when a worktree carries
+// both. The pnpm command always runs for a detected lockfile, even when
+// node_modules/.bin already exists: a leftover .bin directory proves
+// nothing about the lockfile the session actually checked out, so a
+// stale or partial install must not read as ready. readOnlyCheckout
+// (the selected repository is read-only) skips the step: the runner may
+// not write into that checkout. Every command shares one timeout and
+// runs in wpath via the Runner's DepsExecer (production: direct argv
+// execution with a minimal environment and process-group cancellation).
+//
+// Recovery handoff (explicit, not automatic repair): the returned
+// *agent.DependencyPreparation is the bounded per-ecosystem outcome the
+// runner retains on the terminal result and, for failed/timed_out
+// outcomes, renders as a short runner-authored recovery instruction in
+// the delivered harness protocol (see injectDependencyPreparationPartial).
+// There is no second install attempt with weaker policy and no additional
+// outbound fetch: the handoff asks the model-driving harness to inspect
+// and repair with its own permitted tools, and to report blocked when
+// repair cannot finish. It reports attempted preparation, never a
+// guarantee of agent recovery. Cancellation never authorizes more work:
+// once the install context expires the step stops and reports timed_out
+// for every ecosystem that did not install cleanly.
+func (r *Runner) installSessionDependencies(ctx context.Context, qw QueuedWork, wpath string, readOnlyCheckout bool) *agent.DependencyPreparation {
+	ecosystems := detectedDependencyEcosystems(wpath)
+	if len(ecosystems) == 0 {
+		return nil
+	}
 	if readOnlyCheckout {
 		r.logger.Debug("dependency install skipped: selected repository is read-only",
 			"sessionId", qw.SessionID)
-		return
+		return skippedDependencyPreparation(ecosystems, agent.DependencyPreparationSkippedReadOnly)
 	}
 	if !depsInstallPermitted(qw) {
 		r.logger.Debug("dependency install skipped: execution security requires confinement", "sessionId", qw.SessionID)
-		return
+		return skippedDependencyPreparation(ecosystems, agent.DependencyPreparationSkippedSecurity)
 	}
 	if wpath == "" {
-		return
+		return nil
 	}
 	timeout := r.depsInstallTimeout
 	if timeout == 0 {
@@ -77,36 +94,168 @@ func (r *Runner) installSessionDependencies(ctx context.Context, qw QueuedWork, 
 	if execer == nil {
 		execer = depsInstallExecer{}
 	}
-	if _, err := os.Stat(filepath.Join(wpath, "pnpm-lock.yaml")); err == nil {
-		if _, err := os.Stat(filepath.Join(wpath, "node_modules", ".bin")); err != nil {
-			r.runDepsInstallCommand(installCtx, qw, execer, wpath, pnpmDepsInstallCommand)
-		} else {
-			r.logger.Info("dependency install skipped: node_modules already present",
-				"sessionId", qw.SessionID, "dir", wpath)
+	// Cancellation never authorizes more work: an already-expired
+	// install context reports timed_out for every detected ecosystem
+	// without running anything.
+	if installCtx.Err() != nil {
+		r.logger.Warn("repository dependency install timed out; continuing without installed dependencies",
+			"sessionId", qw.SessionID, "err", installCtx.Err())
+		return skippedDependencyPreparation(ecosystems, agent.DependencyPreparationTimedOut)
+	}
+	outcomes := make(map[string]string, len(ecosystems))
+	if hasDependencyEcosystem(ecosystems, "pnpm") {
+		pnpmTimedOut, pnpmFailed := r.runDepsInstallCommand(installCtx, qw, execer, wpath, pnpmDepsInstallCommand)
+		outcomes["pnpm"] = installOutcome(pnpmTimedOut, pnpmFailed)
+		// Re-evaluate after the first ecosystem so a cancellation
+		// mid-install never authorizes the second install: an expired
+		// shared context reports timed_out for the unattempted
+		// ecosystem below instead of starting go.
+	}
+	// Run go unless the shared context expired or the first command
+	// already consumed the shared deadline. A failed (non-timeout)
+	// pnpm install still attempts go — failure is per-ecosystem,
+	// best-effort — but a timed-out first command starts no more work.
+	if hasDependencyEcosystem(ecosystems, "go") && !outcomeTimedOut(outcomes["pnpm"]) && installCtx.Err() == nil {
+		goTimedOut, goFailed := r.runDepsInstallCommand(installCtx, qw, execer, wpath, goDepsInstallCommand)
+		outcomes["go"] = installOutcome(goTimedOut, goFailed)
+	}
+	// A context that expired between ecosystems authorizes no more
+	// work: every unattempted ecosystem reports timed_out. Completed
+	// outcomes keep their recorded value — a clean install stays ready
+	// even when a later ecosystem consumes the shared deadline.
+	if installCtx.Err() != nil {
+		for _, name := range ecosystems {
+			if outcomes[name] == "" {
+				outcomes[name] = agent.DependencyPreparationTimedOut
+			}
 		}
 	}
-	if _, err := os.Stat(filepath.Join(wpath, "go.mod")); err == nil {
-		r.runDepsInstallCommand(installCtx, qw, execer, wpath, goDepsInstallCommand)
+	// An ecosystem never attempted because an earlier one consumed the
+	// shared deadline reports timed_out: the install context expired
+	// before it could run.
+	for _, name := range ecosystems {
+		if outcomes[name] == "" {
+			outcomes[name] = agent.DependencyPreparationTimedOut
+		}
 	}
+	prep := &agent.DependencyPreparation{}
+	for _, name := range ecosystems {
+		prep.SetEcosystemOutcome(name, outcomes[name])
+	}
+	if !prep.NeedsRecovery() {
+		r.logger.Info("repository dependency preparation ready",
+			"sessionId", qw.SessionID, "dir", wpath)
+	}
+	return prep
+}
+
+// skippedDependencyPreparation reports one skipped outcome for every
+// detected ecosystem: no install was attempted, so every key shares the
+// same closed outcome.
+func skippedDependencyPreparation(ecosystems []string, outcome string) *agent.DependencyPreparation {
+	prep := &agent.DependencyPreparation{}
+	for _, name := range ecosystems {
+		prep.SetEcosystemOutcome(name, outcome)
+	}
+	return prep
+}
+
+// installOutcome folds one command's (timedOut, failed) pair into the
+// closed per-ecosystem vocabulary. An expired install context
+// (deadline or parent cancellation) is timed_out even when the execer
+// also reports an error, so cancellation never reads as a plain failure.
+func installOutcome(timedOut, failed bool) string {
+	switch {
+	case timedOut:
+		return agent.DependencyPreparationTimedOut
+	case failed:
+		return agent.DependencyPreparationFailed
+	default:
+		return agent.DependencyPreparationReady
+	}
+}
+
+func outcomeTimedOut(outcome string) bool { return outcome == agent.DependencyPreparationTimedOut }
+
+// detectedDependencyEcosystems names the installable ecosystems present
+// in wpath, in install order (pnpm before go). Bounded to the two
+// runner-authored commands; never derived from repository content beyond
+// the two manifest file probes below.
+func detectedDependencyEcosystems(wpath string) []string {
+	if wpath == "" {
+		return nil
+	}
+	var ecosystems []string
+	if _, err := os.Stat(filepath.Join(wpath, "pnpm-lock.yaml")); err == nil {
+		ecosystems = append(ecosystems, "pnpm")
+	}
+	if _, err := os.Stat(filepath.Join(wpath, "go.mod")); err == nil {
+		ecosystems = append(ecosystems, "go")
+	}
+	return ecosystems
+}
+
+func hasDependencyEcosystem(ecosystems []string, name string) bool {
+	for _, ecosystem := range ecosystems {
+		if ecosystem == name {
+			return true
+		}
+	}
+	return false
+}
+
+// dependencyPreparationNeedsRecovery reports whether a preparation
+// outcome must carry the runner-authored recovery handoff into the
+// delivered harness protocol: only failed and timed_out outcomes do.
+// Ready and both skipped outcomes add no instruction; nil (no detected
+// ecosystem) adds none either. Canonical logic lives in
+// agent.DependencyPreparation.NeedsRecovery; this stays as the runner's
+// call-site name.
+func dependencyPreparationNeedsRecovery(prep *agent.DependencyPreparation) bool {
+	return prep.NeedsRecovery()
+}
+
+// injectDependencyPreparationPartial appends the recovery handoff to the
+// harness protocol when prep needs it, preserving the existing protocol
+// text and the caller's original task. Ready, skipped, and nil outcomes
+// return the protocol unchanged so they add no instruction and no
+// bypass. Shell delivery never reaches this helper through the loop's
+// provider gate; autonomous shell remediation is out of scope. The prose
+// is canonical in agent.AppendDependencyPreparationRecovery.
+func injectDependencyPreparationPartial(existing string, prep *agent.DependencyPreparation) string {
+	return agent.AppendDependencyPreparationRecovery(existing, prep)
 }
 
 // runDepsInstallCommand runs one dependency install command and logs
 // the outcome. A non-zero exit or exec error is a warning, never a
-// session failure — the agent starts regardless.
-func (r *Runner) runDepsInstallCommand(ctx context.Context, qw QueuedWork, execer kit.Execer, dir, command string) {
+// session failure — the agent starts regardless. It reports the
+// per-command outcome as (timedOut, failed): an expired install context
+// (deadline or parent cancellation) is timed_out even when the execer
+// also reports an error, so cancellation never reads as a plain failure.
+// Raw command output and error text stay in the log; the returned pair
+// carries no output bytes.
+func (r *Runner) runDepsInstallCommand(ctx context.Context, qw QueuedWork, execer kit.Execer, dir, command string) (timedOut bool, failed bool) {
 	r.logger.Info("installing repository dependencies",
 		"sessionId", qw.SessionID, "dir", dir, "command", command)
 	code, err := execer.Exec(ctx, dir, command, depsInstallEnv(qw))
+	if ctx.Err() != nil {
+		r.logger.Warn("repository dependency install timed out; continuing without installed dependencies",
+			"sessionId", qw.SessionID, "command", command, "err", ctx.Err())
+		return true, false
+	}
 	switch {
 	case err != nil:
 		r.logger.Warn("repository dependency install failed; continuing without installed dependencies",
 			"sessionId", qw.SessionID, "command", command, "err", err)
+		return false, true
 	case code != 0:
 		r.logger.Warn("repository dependency install failed; continuing without installed dependencies",
 			"sessionId", qw.SessionID, "command", command, "exit", code)
+		return false, true
 	default:
 		r.logger.Info("repository dependency install complete",
 			"sessionId", qw.SessionID, "command", command)
+		return false, false
 	}
 }
 

@@ -7,11 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,6 +21,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/executioncell"
 	"github.com/RenseiAI/donmai/prompt"
 	"github.com/RenseiAI/donmai/provider/harness/pi"
 	"github.com/RenseiAI/donmai/provider/harness/stub"
@@ -26,6 +29,8 @@ import (
 	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 	"github.com/RenseiAI/donmai/runtime/workarea"
 	"github.com/RenseiAI/donmai/runtime/worktree"
+
+	"github.com/RenseiAI/donmai/runtime/heartbeat"
 )
 
 func TestWorktreeProvisionStrategyRepositoryFreeOnly(t *testing.T) {
@@ -552,45 +557,61 @@ func TestScanBlocked_DoesNotShadowWorkResult(t *testing.T) {
 }
 
 // TestClassifyBlocked_ForksOutcome exercises the classification fork: a
-// blocked observation with no PR becomes FailureAgentBlocked; a blocked
-// observation that nonetheless produced a PR is NOT blocked (the work
-// landed); a non-blocked observation is untouched.
+// blocked observation with no verified PR becomes FailureAgentBlocked; a
+// blocked observation with a VERIFIED PR is NOT blocked (the work landed);
+// a blocked observation with only an unverified scraped URL is still blocked
+// (a hallucinated link never suppresses the fork); a non-blocked observation
+// is untouched.
 func TestClassifyBlocked_ForksOutcome(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
-		name        string
-		obs         streamObservation
-		startPR     string
-		wantBlocked bool
-		wantMode    string
-		wantErrSub  string
+		name          string
+		obs           streamObservation
+		startPR       string
+		hasVerifiedPR bool
+		wantBlocked   bool
+		wantMode      string
+		wantErrSub    string
 	}{
 		{
-			name:        "blocked-no-pr-with-reason",
-			obs:         streamObservation{blocked: true, blockedReason: "spec ambiguous"},
-			wantBlocked: true,
-			wantMode:    FailureAgentBlocked,
-			wantErrSub:  "spec ambiguous",
+			name:          "blocked-no-pr-with-reason",
+			obs:           streamObservation{blocked: true, blockedReason: "spec ambiguous"},
+			hasVerifiedPR: false,
+			wantBlocked:   true,
+			wantMode:      FailureAgentBlocked,
+			wantErrSub:    "spec ambiguous",
 		},
 		{
-			name:        "blocked-no-pr-no-reason",
-			obs:         streamObservation{blocked: true},
-			wantBlocked: true,
-			wantMode:    FailureAgentBlocked,
-			wantErrSub:  "blocked",
+			name:          "blocked-no-pr-no-reason",
+			obs:           streamObservation{blocked: true},
+			hasVerifiedPR: false,
+			wantBlocked:   true,
+			wantMode:      FailureAgentBlocked,
+			wantErrSub:    "blocked",
 		},
 		{
-			name:        "blocked-but-pr-produced-not-blocked",
-			obs:         streamObservation{blocked: true, blockedReason: "x"},
-			startPR:     "https://github.com/o/r/pull/1",
-			wantBlocked: false,
-			wantMode:    "",
+			name:          "blocked-but-verified-pr-produced-not-blocked",
+			obs:           streamObservation{blocked: true, blockedReason: "x"},
+			startPR:       "https://github.com/o/r/pull/1",
+			hasVerifiedPR: true,
+			wantBlocked:   false,
+			wantMode:      "",
 		},
 		{
-			name:        "not-blocked-untouched",
-			obs:         streamObservation{blocked: false},
-			wantBlocked: false,
-			wantMode:    "",
+			name:          "blocked-with-unverified-scraped-url-still-blocked",
+			obs:           streamObservation{blocked: true, blockedReason: "x"},
+			startPR:       "https://github.com/o/r/pull/1",
+			hasVerifiedPR: false,
+			wantBlocked:   true,
+			wantMode:      FailureAgentBlocked,
+			wantErrSub:    "x",
+		},
+		{
+			name:          "not-blocked-untouched",
+			obs:           streamObservation{blocked: false},
+			hasVerifiedPR: false,
+			wantBlocked:   false,
+			wantMode:      "",
 		},
 	}
 	for _, tt := range tests {
@@ -599,7 +620,7 @@ func TestClassifyBlocked_ForksOutcome(t *testing.T) {
 			t.Parallel()
 			res := &Result{}
 			res.PullRequestURL = tt.startPR
-			got := classifyBlocked(res, tt.obs)
+			got := classifyBlocked(res, tt.obs, tt.hasVerifiedPR)
 			if got != tt.wantBlocked {
 				t.Fatalf("classifyBlocked = %v; want %v", got, tt.wantBlocked)
 			}
@@ -1008,6 +1029,270 @@ func TestScanPRURL_ExtractsURL(t *testing.T) {
 		if got != tc.want {
 			t.Errorf("scanPRURL(%q) = %q; want %q", tc.text, got, tc.want)
 		}
+	}
+}
+
+// TestObserveEvent_AssistantNarrativePRURLIsHintOnly pins the provenance
+// contract: a pull request URL in assistant free text never becomes the
+// session's authoritative URL — it is only a candidate for the remote
+// verifier. A hallucinated narrative link must not suppress the blocked
+// fork or mark the run complete before verification.
+func TestObserveEvent_AssistantNarrativePRURLIsHintOnly(t *testing.T) {
+	t.Parallel()
+	h := newRunnerHarness(t)
+	obs := &streamObservation{}
+	h.runner.observeEvent(
+		agent.AssistantTextEvent{Text: "Done! See https://github.com/o/r/pull/99 for the fix."},
+		obs, t.TempDir(), QueuedWork{}, nil,
+	)
+	if obs.pullRequestURL != "" {
+		t.Fatalf("assistant narrative set pullRequestURL = %q; want empty (hint only)", obs.pullRequestURL)
+	}
+	if len(obs.pullRequestCandidates) != 1 || obs.pullRequestCandidates[0] != "https://github.com/o/r/pull/99" {
+		t.Fatalf("pullRequestCandidates = %v; want the narrative URL as hint", obs.pullRequestCandidates)
+	}
+}
+
+// TestObserveEvent_ToolResultPRURLIsTrustedChannel pins that tool output is
+// the trusted channel: the first tool-result URL becomes the authoritative
+// observation (still subject to remote verification before it may suppress
+// the blocked fork). Later tool chatter must not displace it: a `gh pr list`
+// of unrelated pull requests after the session's own `gh pr create` leaves
+// the session's pull request in place so the verifier still checks it first.
+func TestObserveEvent_ToolResultPRURLIsTrustedChannel(t *testing.T) {
+	t.Parallel()
+	h := newRunnerHarness(t)
+	obs := &streamObservation{}
+	wt := t.TempDir()
+	h.runner.observeEvent(
+		agent.AssistantTextEvent{Text: "Working on it, see https://github.com/o/r/pull/99."},
+		obs, wt, QueuedWork{}, nil,
+	)
+	h.runner.observeEvent(
+		agent.ToolResultEvent{ToolName: "bash", ToolUseID: "1", Content: "opened https://github.com/o/r/pull/7"},
+		obs, wt, QueuedWork{}, nil,
+	)
+	if obs.pullRequestURL != "https://github.com/o/r/pull/7" {
+		t.Fatalf("pullRequestURL = %q; want the trusted tool-result URL", obs.pullRequestURL)
+	}
+	// Later tool chatter does not displace the first trusted URL.
+	h.runner.observeEvent(
+		agent.ToolResultEvent{ToolName: "bash", ToolUseID: "2", Content: "opened https://github.com/o/r/pull/8"},
+		obs, wt, QueuedWork{}, nil,
+	)
+	if obs.pullRequestURL != "https://github.com/o/r/pull/7" {
+		t.Fatalf("pullRequestURL = %q; want the first trusted tool-result URL (later chatter must not displace it)", obs.pullRequestURL)
+	}
+	if len(obs.pullRequestCandidates) != 3 {
+		t.Fatalf("pullRequestCandidates = %v; want all three URLs as candidates", obs.pullRequestCandidates)
+	}
+}
+
+// Verified PRs suppress the blocked fork at both callers (forcing either to false must fail).
+func TestRun_VerifiedPRSuppressesBlocked(t *testing.T) {
+	initial := runScripted(t, "development", true, "",
+		verdictScriptTurn{
+			events: []agent.Event{toolUse("pr", "gh pr create --fill"), toolResult("pr", followUpPR)},
+			text:   "Stuck.\nAGENT_BLOCKED: need a decision",
+		})
+	if initial.FailureMode == FailureAgentBlocked || initial.PullRequestURL != followUpPR {
+		t.Fatalf("initial: FailureMode=%q PR=%q; want verified exemption with %q", initial.FailureMode, initial.PullRequestURL, followUpPR)
+	}
+	followUp := runScripted(t, "development", false, "",
+		verdictScriptTurn{text: "Work in progress."},
+		verdictScriptTurn{
+			events: []agent.Event{toolUse("pr", "gh pr create --fill"), toolResult("pr", followUpPR)},
+			text:   "Need a decision.\nAGENT_BLOCKED: need a decision",
+		},
+	)
+	if followUp.FailureMode == FailureAgentBlocked || followUp.PullRequestURL != followUpPR {
+		t.Fatalf("follow-up: FailureMode=%q PR=%q; want verified exemption with %q", followUp.FailureMode, followUp.PullRequestURL, followUpPR)
+	}
+}
+
+// A decline never relabels a crash: PR URL plus AGENT_BLOCKED plus ErrorEvent
+// stays provider-error, for narrative and tool-result URLs.
+func TestRun_ProviderCrashKeepsProviderErrorOverBlocked(t *testing.T) {
+	for _, turn := range []verdictScriptTurn{
+		{text: "Opened " + followUpPR + "\nAGENT_BLOCKED: need a decision", crash: true},
+		{events: []agent.Event{toolUse("pr", "gh pr create --fill"), toolResult("pr", followUpPR)}, text: "AGENT_BLOCKED: need a decision", crash: true},
+	} {
+		res, _ := runScriptedSession(t, scriptedSession{
+			workType: WorkTypeQAStr, repository: followUpRepository,
+			pulls: map[int]string{7: pullAtSessionCommit}, turns: []verdictScriptTurn{turn},
+		})
+		if res.FailureMode != FailureProviderError || !strings.Contains(res.Error, "provider crashed mid turn") {
+			t.Fatalf("FailureMode=%q Error=%q; want provider-error with the crash", res.FailureMode, res.Error)
+		}
+	}
+}
+
+// Later chatter cannot displace the session PR: real URL first, then eight `gh pr list` URLs.
+func TestRun_LaterToolChatterKeepsSessionPR(t *testing.T) {
+	var events []agent.Event
+	events = append(events, toolUse("pr", "gh pr create --fill"), toolResult("pr", followUpPR))
+	pulls := map[int]string{7: pullAtSessionCommit}
+	for n := 101; n <= 108; n++ {
+		u := "https://github.com/example/repo/pull/" + fmt.Sprint(n)
+		events = append(events, toolUse("list", "gh pr list"), toolResult("list", "see "+u))
+		pulls[n] = pullAtOtherCommit
+	}
+	events = append(events, say("Still need a decision.\nAGENT_BLOCKED: need a decision"))
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType: "development", repository: followUpRepository, pulls: pulls,
+		turns: []verdictScriptTurn{{events: events}},
+	})
+	if res.PullRequestURL != followUpPR || res.FailureMode == FailureAgentBlocked {
+		t.Fatalf("PR=%q FailureMode=%q; want %q without agent-blocked", res.PullRequestURL, res.FailureMode, followUpPR)
+	}
+}
+
+// An earlier unrelated inject URL must not hide the session pull request a
+// later inject reports. Inject 1 reads unrelated PR #99; inject 2 creates
+// the session PR #7, then reports eight unrelated PRs and declines. The
+// merged observation keeps both, and the batched verifier still finds #7.
+// Eight is the old window size: with an eight-entry window the union evicted
+// #7 and the envelope kept #99, so settlement lost the session PR.
+func TestRun_EarlierUnrelatedInjectCannotHideLaterSessionPR(t *testing.T) {
+	platform := newRecordingPlatformServer(t)
+	platform.queueInject(heartbeat.InjectPayload{DeliveryID: "dlv-1", Text: "recall: first memory block"})
+	platform.queueInject(heartbeat.InjectPayload{DeliveryID: "dlv-2", Text: "recall: second memory block"})
+	secondBuffered := func() {
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			if acks, _ := platform.injectReports(); slices.Contains(acks, "dlv-2") {
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		t.Errorf("second inject was never buffered")
+	}
+	unrelated := "https://github.com/example/repo/pull/99"
+	var chatter []agent.Event
+	for _, n := range []int{101, 102, 103, 104, 105, 106, 107, 108} {
+		u := fmt.Sprintf("https://github.com/example/repo/pull/%d", n)
+		chatter = append(chatter, toolUse("list", "gh pr list"), toolResult("list", "see "+u))
+	}
+	pulls := map[int]string{7: pullAtSessionCommit, 99: pullAtOtherCommit, 101: pullAtOtherCommit, 102: pullAtOtherCommit, 103: pullAtOtherCommit, 104: pullAtOtherCommit, 105: pullAtOtherCommit, 106: pullAtOtherCommit, 107: pullAtOtherCommit, 108: pullAtOtherCommit}
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType: "development", repository: followUpRepository, pulls: pulls,
+		heartbeatInterval: 10 * time.Millisecond, platform: platform,
+		turns: []verdictScriptTurn{
+			{text: "Working."},
+			{before: secondBuffered, events: []agent.Event{toolUse("r", "gh pr view 99"), toolResult("r", "see "+unrelated)}, text: "noted 99"},
+			{events: append([]agent.Event{toolUse("pr", "gh pr create --fill"), toolResult("pr", followUpPR)}, chatter...), text: "Stuck.\nAGENT_BLOCKED: need decision"},
+		},
+	})
+	if res.PullRequestURL != followUpPR || res.FailureMode == FailureAgentBlocked {
+		t.Fatalf("PR=%q FailureMode=%q; want verified %q without agent-blocked", res.PullRequestURL, res.FailureMode, followUpPR)
+	}
+}
+
+// A genuine session PR reported in narrative before later tool chatter must
+// still verify. Narrative #7 is oldest, seventy unrelated tool URLs follow,
+// then the turn declines: the verifier checks every candidate in chunked batches.
+// Seventy exceeds the old 64-entry window, which evicted the narrative hint
+// and flipped this landed session to agent-blocked.
+func TestRun_NarrativeBeforeToolChatterKeepsSessionPR(t *testing.T) {
+	var events []agent.Event
+	pulls := map[int]string{7: pullAtSessionCommit}
+	events = append(events, say("Opened "+followUpPR+" for review."))
+	for n := 101; n <= 170; n++ {
+		u := fmt.Sprintf("https://github.com/example/repo/pull/%d", n)
+		events = append(events, toolUse("list", "gh pr list"), toolResult("list", "see "+u))
+		pulls[n] = pullAtOtherCommit
+	}
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType: "development", repository: followUpRepository, pulls: pulls,
+		turns: []verdictScriptTurn{{events: events, text: "Still stuck.\nAGENT_BLOCKED: need decision"}},
+	})
+	if res.PullRequestURL != followUpPR || res.FailureMode == FailureAgentBlocked {
+		t.Fatalf("PR=%q FailureMode=%q; want verified %q without agent-blocked", res.PullRequestURL, res.FailureMode, followUpPR)
+	}
+}
+
+// A flood of forty thousand unrelated URLs must not hide the session pull
+// request: the verifier reads refs in ~256-ref chunks sharing one deadline,
+// so one over-long ls-remote never marks every candidate unconfirmed. The
+// session pull request is oldest, so every chunk is read before it verifies.
+// Without chunking the single batched read fails with "argument list too
+// long" and the landed session flips to agent-blocked.
+func TestRun_FortyThousandCandidatesStillFindSessionPR(t *testing.T) {
+	var sb strings.Builder
+	sb.WriteString("Opened " + followUpPR + " for review. ")
+	for i := 0; i < 40000; i++ {
+		fmt.Fprintf(&sb, "https://github.com/example/repo/pull/%d ", 100000+i)
+	}
+	sb.WriteString("\nStill stuck.\nAGENT_BLOCKED: need decision")
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType: "development", repository: followUpRepository, pulls: map[int]string{7: pullAtSessionCommit},
+		turns: []verdictScriptTurn{{text: sb.String()}},
+	})
+	if res.PullRequestURL != followUpPR || res.FailureMode == FailureAgentBlocked {
+		t.Fatalf("PR=%q FailureMode=%q; want verified %q without agent-blocked", res.PullRequestURL, res.FailureMode, followUpPR)
+	}
+}
+
+// An unverified tool URL must not suppress the blocked fork on the initial
+// turn. QA owes no PR so no verifier is built: the envelope still carries
+// the scraped URL, but hasVerifiedPR is false and the decline stays blocked.
+func TestRun_UnverifiedToolURLStillBlocked(t *testing.T) {
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType: WorkTypeQAStr, repository: followUpRepository, pulls: map[int]string{7: pullAtOtherCommit},
+		turns: []verdictScriptTurn{{events: []agent.Event{toolUse("pr", "gh pr create --fill"), toolResult("pr", followUpPR)}, text: "Stuck.\nAGENT_BLOCKED: need decision"}},
+	})
+	if res.FailureMode != FailureAgentBlocked {
+		t.Fatalf("FailureMode=%q Status=%q PR=%q; want agent-blocked for unverified tool URL", res.FailureMode, res.Status, res.PullRequestURL)
+	}
+}
+
+// The follow-up blocked fork takes the same verified acceptance: a QA
+// follow-up turn that reports an unverified tool URL and declines stays
+// blocked. Forcing the second caller to envelope presence would complete it.
+func TestRun_UnverifiedToolURLStillBlockedAfterFollowUp(t *testing.T) {
+	res2, _ := runScriptedSession(t, scriptedSession{
+		workType: WorkTypeQAStr, repository: followUpRepository, pulls: map[int]string{7: pullAtOtherCommit},
+		turns: []verdictScriptTurn{
+			{text: "Work in progress."},
+			{events: []agent.Event{toolUse("pr", "gh pr create --fill"), toolResult("pr", followUpPR)}, text: "Need a decision.\nAGENT_BLOCKED: need decision"},
+		},
+	})
+	if res2.FailureMode != FailureAgentBlocked {
+		t.Fatalf("follow-up: FailureMode=%q Status=%q PR=%q; want agent-blocked for unverified tool URL", res2.FailureMode, res2.Status, res2.PullRequestURL)
+	}
+}
+
+// A pull request number with no ref on the session's remote is refused
+// through the production settlement path. The session branch was never
+// pushed either, so both refs read absent: without the missing-pull guard
+// the two empty strings compare equal and the phantom URL would verify.
+func TestRun_MissingPullRequestIsRefused(t *testing.T) {
+	missing := "https://github.com/example/repo/pull/404"
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType: "development", repository: followUpRepository, pulls: map[int]string{},
+		turns: []verdictScriptTurn{{events: []agent.Event{toolUse("pr", "gh pr create --fill"), toolResult("pr", missing)}, text: "Opened the pull request."}},
+	})
+	if res.PullRequestURL != "" {
+		t.Fatalf("PullRequestURL = %q; want none (no such pull request on the session's repository)", res.PullRequestURL)
+	}
+}
+
+// A same-number pull request on another repository never consumes the
+// session's batched ref. The foreign URL is reported first so it leads the
+// settlement order; the session's own PR follows. Production refuses the
+// foreign URL and accepts the session's; without the repository guard the
+// foreign URL would verify against the session's own pull head.
+func TestRun_ForeignRepositorySharingNumberIsRefused(t *testing.T) {
+	foreign := "https://github.com/other/repo/pull/7"
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType: "development", repository: followUpRepository, pulls: map[int]string{7: pullAtSessionCommit},
+		turns: []verdictScriptTurn{{events: []agent.Event{
+			toolUse("a", "gh pr view"), toolResult("a", "see "+foreign),
+			toolUse("b", "gh pr create --fill"), toolResult("b", "opened "+followUpPR),
+		}, text: "Opened the session pull request."}},
+	})
+	if res.PullRequestURL != followUpPR {
+		t.Fatalf("PullRequestURL = %q; want the session's own %q (foreign URL must not consume its ref)", res.PullRequestURL, followUpPR)
 	}
 }
 
@@ -2352,4 +2637,534 @@ func TestLoop_ExecutionSecurityReportWaitsForAcceptance(t *testing.T) {
 			t.Fatalf("spawns = %d, want one", spawns.Load())
 		}
 	})
+}
+
+// depsPromptCapturingProvider wraps the stub harness and records the
+// delivered Spec so Run-level dependency-preparation tests can assert on
+// the prompt plan the provider actually received.
+type depsPromptCapturingProvider struct {
+	agent.HarnessProvider
+	spec   agent.Spec
+	spawns int
+}
+
+func (p *depsPromptCapturingProvider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, error) {
+	p.spec = spec
+	p.spawns++
+	return p.HarnessProvider.Spawn(ctx, spec)
+}
+
+// shellDepsProvider reports the shell name so the runner takes the
+// bare-shell lane (no harness protocol), while still delegating to the
+// stub harness for manifest and spawn behavior.
+type shellDepsProvider struct {
+	agent.HarnessProvider
+	spec agent.Spec
+}
+
+func (p *shellDepsProvider) Name() agent.ProviderName { return agent.ProviderShell }
+
+func depsDiscardLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+func (p *shellDepsProvider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, error) {
+	p.spec = spec
+	return p.HarnessProvider.Spawn(ctx, spec)
+}
+
+// seedManifestsWithBin commits a pnpm lockfile, a go.mod, and a leftover
+// node_modules/.bin directory so the Run-level stale-.bin test proves the
+// installer still runs instead of reading the leftover as ready.
+func seedManifestsWithBin(t *testing.T, bareRepo string) {
+	t.Helper()
+	work := t.TempDir()
+	runGitFixture(t, "", "clone", "-q", bareRepo, work)
+	writeFile(t, work, "pnpm-lock.yaml", "lockfileVersion: 9.0\n")
+	writeFile(t, work, "go.mod", "module example.test/seed\n\ngo 1.24\n")
+	writeFile(t, work, filepath.Join("node_modules", ".bin", "keep"), "")
+	for _, args := range [][]string{
+		{"-C", work, "config", "user.email", "test@example.com"},
+		{"-C", work, "config", "user.name", "test"},
+		{"-C", work, "add", "pnpm-lock.yaml", "go.mod", filepath.Join("node_modules", ".bin", "keep")},
+		{"-C", work, "commit", "-q", "-m", "seed dependency manifests with stale bin"},
+		{"-C", work, "push", "-q", "origin", "HEAD:main"},
+	} {
+		runGitFixture(t, "", args...)
+	}
+}
+
+func depsCapturingHarness(t *testing.T, h *runnerHarness, provider *depsPromptCapturingProvider) {
+	t.Helper()
+	inner, err := stub.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider.HarnessProvider = inner.(agent.HarnessProvider)
+	reg := NewRegistry()
+	if err := reg.Register(provider); err != nil {
+		t.Fatal(err)
+	}
+	h.runner.registry = reg
+}
+
+// TestRun_DependencyPreparationReadyAddsNoRecovery drives the production
+// Run path with a lockfile plus a pre-existing empty/partial .bin: the
+// installer still runs before spawn, the terminal result reports ready,
+// and no recovery instruction is added. Restoring the .bin skip or
+// removing the Run call leaves zero install calls or no ready report and
+// fails it (AC-1 RED).
+func TestRun_DependencyPreparationReadyAddsNoRecovery(t *testing.T) {
+	h := newRunnerHarness(t)
+	h.runner.logger = depsDiscardLogger()
+	provider := &depsPromptCapturingProvider{}
+	depsCapturingHarness(t, h, provider)
+	execer := &recordingDepsExecer{}
+	h.runner.depsExecer = execer
+	seedManifestsWithBin(t, h.bareRepo)
+
+	qw := h.queuedWork("DEPS-READY-RUN")
+	qw.ExecutionSecurity = executionSecuritySection(nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := h.runner.Run(ctx, qw)
+	if err != nil || res.Status != "completed" {
+		t.Fatalf("Run status=%q err=%v (%s); want completed", res.Status, err, res.Error)
+	}
+	if calls := execer.recorded(); len(calls) != 2 {
+		t.Fatalf("install calls = %d; want pnpm then go despite .bin", len(calls))
+	}
+	if res.DependencyPreparation == nil || res.DependencyPreparation.Pnpm != agent.DependencyPreparationReady || res.DependencyPreparation.Go != agent.DependencyPreparationReady {
+		t.Fatalf("DependencyPreparation = %+v; want {pnpm:ready go:ready}", res.DependencyPreparation)
+	}
+	if provider.spec.PromptPlan == nil || provider.spec.PromptPlan.HarnessProtocol == nil {
+		t.Fatalf("prompt plan missing harness protocol: %+v", provider.spec.PromptPlan)
+	}
+	if strings.Contains(provider.spec.PromptPlan.HarnessProtocol.Text, "Dependency preparation did not complete") {
+		t.Fatalf("ready preparation must add no recovery instruction: %q", provider.spec.PromptPlan.HarnessProtocol.Text)
+	}
+	if provider.spec.PromptPlan.UserPrompt.Text == "" || !strings.Contains(provider.spec.PromptPlan.UserPrompt.Text, "This is a test issue body.") {
+		t.Fatalf("original user task lost in prompt plan: %+v", provider.spec.PromptPlan.UserPrompt)
+	}
+}
+
+// TestRun_DependencyPreparationFailureHandsRecovery drives Run with a
+// failing installer: best-effort spawn still completes, the terminal
+// result reports failed, and the delivered prompt plan carries the
+// recovery instruction while preserving the original task. Discarding
+// the outcome or omitting the protocol injection fails it (AC-2 RED).
+func TestRun_DependencyPreparationFailureHandsRecovery(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		execer   *recordingDepsExecer
+		wantStat string
+	}{
+		{name: "nonzero exit", execer: &recordingDepsExecer{exitCode: 1}, wantStat: agent.DependencyPreparationFailed},
+		{name: "start error", execer: &recordingDepsExecer{err: errors.New("SENTINEL-start-error")}, wantStat: agent.DependencyPreparationFailed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newRunnerHarness(t)
+			h.runner.logger = depsDiscardLogger()
+			provider := &depsPromptCapturingProvider{}
+			depsCapturingHarness(t, h, provider)
+			h.runner.depsExecer = tc.execer
+			seedManifestsInBareRepo(t, h.bareRepo)
+
+			qw := h.queuedWork("DEPS-FAIL-" + tc.name)
+			qw.ExecutionSecurity = executionSecuritySection(nil)
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			res, err := h.runner.Run(ctx, qw)
+			if err != nil || res.Status != "completed" {
+				t.Fatalf("Run status=%q err=%v (%s); want completed despite install failure", res.Status, err, res.Error)
+			}
+			if res.DependencyPreparation == nil || res.DependencyPreparation.Pnpm != tc.wantStat || res.DependencyPreparation.Go != tc.wantStat {
+				t.Fatalf("DependencyPreparation = %+v; want {pnpm:%s go:%s}", res.DependencyPreparation, tc.wantStat, tc.wantStat)
+			}
+			if provider.spec.PromptPlan == nil || provider.spec.PromptPlan.HarnessProtocol == nil {
+				t.Fatalf("prompt plan missing harness protocol: %+v", provider.spec.PromptPlan)
+			}
+			text := provider.spec.PromptPlan.HarnessProtocol.Text
+			for _, want := range []string{"Dependency preparation did not complete", "Dependencies are not ready.", "report blocked with the reason"} {
+				if !strings.Contains(text, want) {
+					t.Errorf("recovery instruction missing %q: %q", want, text)
+				}
+			}
+			if !strings.Contains(provider.spec.PromptPlan.UserPrompt.Text, "This is a test issue body.") {
+				t.Errorf("original user task lost in prompt plan: %+v", provider.spec.PromptPlan.UserPrompt)
+			}
+			if strings.Contains(text, "SENTINEL-start-error") {
+				t.Errorf("recovery prompt leaks raw installer error: %q", text)
+			}
+			if res.DependencyPreparation != nil {
+				raw, _ := json.Marshal(res.DependencyPreparation)
+				if strings.Contains(string(raw), "SENTINEL-start-error") {
+					t.Errorf("preparation report leaks raw installer error: %s", raw)
+				}
+			}
+		})
+	}
+}
+
+// TestRun_DependencyPreparationTimeoutHandsRecovery drives Run with a
+// wedged installer under a short step timeout: the bounded cancellation
+// still fires, best-effort spawn completes, and the handoff reports
+// timed_out with the recovery instruction.
+func TestRun_DependencyPreparationTimeoutHandsRecovery(t *testing.T) {
+	h := newRunnerHarness(t)
+	h.runner.logger = depsDiscardLogger()
+	provider := &depsPromptCapturingProvider{}
+	depsCapturingHarness(t, h, provider)
+	blocking := &contextBlockingExecer{}
+	h.runner.depsExecer = blocking
+	h.runner.depsInstallTimeout = 100 * time.Millisecond
+	seedManifestsInBareRepo(t, h.bareRepo)
+
+	qw := h.queuedWork("DEPS-TIMEOUT-RUN")
+	qw.ExecutionSecurity = executionSecuritySection(nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := h.runner.Run(ctx, qw)
+	if err != nil || res.Status != "completed" {
+		t.Fatalf("Run status=%q err=%v (%s); want completed despite timeout", res.Status, err, res.Error)
+	}
+	if res.DependencyPreparation == nil || res.DependencyPreparation.Pnpm != agent.DependencyPreparationTimedOut || res.DependencyPreparation.Go != agent.DependencyPreparationTimedOut {
+		t.Fatalf("DependencyPreparation = %+v; want {pnpm:timed_out go:timed_out}", res.DependencyPreparation)
+	}
+	if provider.spec.PromptPlan == nil || provider.spec.PromptPlan.HarnessProtocol == nil {
+		t.Fatalf("prompt plan missing harness protocol: %+v", provider.spec.PromptPlan)
+	}
+	if !strings.Contains(provider.spec.PromptPlan.HarnessProtocol.Text, "Dependency preparation did not complete") {
+		t.Fatalf("timed_out preparation must hand recovery: %q", provider.spec.PromptPlan.HarnessProtocol.Text)
+	}
+	if !strings.Contains(provider.spec.PromptPlan.HarnessProtocol.Text, agent.DependencyPreparationTimedOut) {
+		t.Errorf("recovery handoff missing bounded status timed_out: %q", provider.spec.PromptPlan.HarnessProtocol.Text)
+	}
+}
+
+// TestRun_DependencyPreparationSkipsAddNoBypass drives Run under a
+// restricted execution-security gate: no installer runs, the report is
+// the skipped outcome, and no bypass instruction is delivered.
+// Removing the authority guard fails it (AC-3 RED).
+func TestRun_DependencyPreparationSkipsAddNoBypass(t *testing.T) {
+	h := newRunnerHarness(t)
+	h.runner.logger = depsDiscardLogger()
+	inner, err := stub.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	capturing := &depsPromptCapturingProvider{HarnessProvider: inner.(agent.HarnessProvider)}
+	// The stub alone cannot render a restricted network level; wrap the
+	// capturing harness with the restricted-level manifest so the run
+	// reaches the install gate instead of refusing at pre-spawn.
+	gated := &depsSecurityProvider{HarnessProvider: capturing, dimension: agent.ExecutionSecurityNetwork, level: agent.NetworkLogged}
+	reg := NewRegistry()
+	if err := reg.Register(gated); err != nil {
+		t.Fatal(err)
+	}
+	h.runner.registry = reg
+	provider := capturing
+	execer := &recordingDepsExecer{}
+	h.runner.depsExecer = execer
+	seedManifestsInBareRepo(t, h.bareRepo)
+
+	qw := h.queuedWork("DEPS-SKIP-RUN")
+	qw.ExecutionSecurity = executionSecuritySection(nil)
+	qw.ExecutionSecurity.Levels.Network = agent.NetworkLogged
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := h.runner.Run(ctx, qw)
+	if err != nil || res.Status != "completed" {
+		t.Fatalf("Run status=%q err=%v (%s); want completed", res.Status, err, res.Error)
+	}
+	if calls := execer.recorded(); len(calls) != 0 {
+		t.Fatalf("install calls = %v; want none under restricted execution", calls)
+	}
+	if res.DependencyPreparation == nil || res.DependencyPreparation.Pnpm != agent.DependencyPreparationSkippedSecurity || res.DependencyPreparation.Go != agent.DependencyPreparationSkippedSecurity {
+		t.Fatalf("DependencyPreparation = %+v; want {pnpm:skipped_security go:skipped_security}", res.DependencyPreparation)
+	}
+	if provider.spec.PromptPlan != nil && provider.spec.PromptPlan.HarnessProtocol != nil &&
+		strings.Contains(provider.spec.PromptPlan.HarnessProtocol.Text, "Dependency preparation did not complete") {
+		t.Fatalf("skipped preparation must not hand recovery: %q", provider.spec.PromptPlan.HarnessProtocol.Text)
+	}
+}
+
+// TestRun_ShellGetsEvidenceOnly proves the shell lane carries the bounded
+// report as evidence but never executable recovery prose: a failing
+// install still completes, the result reports failed, and the shell spec
+// has no harness protocol to project instructions onto.
+func TestRun_ShellGetsEvidenceOnly(t *testing.T) {
+	h := newRunnerHarness(t)
+	h.runner.logger = depsDiscardLogger()
+	inner, err := stub.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	shell := &shellDepsProvider{HarnessProvider: inner.(agent.HarnessProvider)}
+	reg := NewRegistry()
+	if err := reg.Register(shell); err != nil {
+		t.Fatal(err)
+	}
+	h.runner.registry = reg
+	h.runner.depsExecer = &recordingDepsExecer{exitCode: 1}
+	seedManifestsInBareRepo(t, h.bareRepo)
+
+	qw := h.queuedWork("DEPS-SHELL-RUN")
+	qw.ExecutionSecurity = executionSecuritySection(nil)
+	qw.ResolvedProfile.Provider = agent.ProviderShell
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := h.runner.Run(ctx, qw)
+	if err != nil || res.Status != "completed" {
+		t.Fatalf("Run status=%q err=%v (%s); want completed", res.Status, err, res.Error)
+	}
+	if res.DependencyPreparation == nil || res.DependencyPreparation.Pnpm != agent.DependencyPreparationFailed || res.DependencyPreparation.Go != agent.DependencyPreparationFailed {
+		t.Fatalf("DependencyPreparation = %+v; want {pnpm:failed go:failed} evidence on shell run", res.DependencyPreparation)
+	}
+	if shell.spec.PromptPlan != nil && shell.spec.PromptPlan.HarnessProtocol != nil {
+		t.Fatalf("shell prompt plan must carry no harness protocol: %+v", shell.spec.PromptPlan.HarnessProtocol)
+	}
+}
+
+// TestRun_NoManifestOmitsPreparation pins the byte-compatible path: a
+// worktree with no manifests omits the report and leaves the protocol
+// unchanged.
+// TestRun_DependencyPreparationReadOnlySkipsAddsNoBypass drives Run with
+// a selected read-only repository: no installer runs, the bounded report
+// is skipped_read_only, and no recovery instruction reaches the delivered
+// prompt plan. Passing false for the read-only flag through the Run wiring
+// would install into the read-only checkout and fail it (AC-3 RED).
+func TestRun_DependencyPreparationReadOnlySkipsAddsNoBypass(t *testing.T) {
+	h := newRunnerHarness(t)
+	h.runner.logger = depsDiscardLogger()
+	provider := &workareaGateProvider{supportsReadOnlySelected: true}
+	reg := NewRegistry()
+	if err := reg.Register(provider); err != nil {
+		t.Fatal(err)
+	}
+	h.runner.registry = reg
+	execer := &recordingDepsExecer{}
+	h.runner.depsExecer = execer
+	contextRepo := makeBareRepo(t)
+	seedManifestsInBareRepo(t, contextRepo)
+
+	qw := h.queuedWork("DEPS-READONLY-RUN")
+	qw.WorkType = "acceptance"
+	qw.ExecutionSecurity = executionSecuritySection(nil)
+	qw.RepositoryDeclaration = &workarea.RepositoryDeclarationV1{
+		Protocol: workarea.ProtocolSessionRootV1,
+		Repositories: []workarea.DeclaredRepositoryV1{
+			{Source: workarea.RepositorySource{Repository: qw.Repository}, Name: "primary", Role: workarea.RepositoryRolePrimary, Authority: workarea.RepositoryMutable},
+			{Source: workarea.RepositorySource{Repository: contextRepo}, Name: "context", Role: workarea.RepositoryRoleContext, Authority: workarea.RepositoryReadOnly},
+		},
+		Select: &workarea.RepositoryFilter{Kind: workarea.RepositoryFilterNamed, Name: "context"},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := h.runner.Run(ctx, qw)
+	if err != nil || res.Status != "completed" {
+		t.Fatalf("Run status=%q err=%v (%s); want completed", res.Status, err, res.Error)
+	}
+	if calls := execer.recorded(); len(calls) != 0 {
+		t.Fatalf("install calls = %v; want none on a selected read-only checkout", calls)
+	}
+	if res.DependencyPreparation == nil || res.DependencyPreparation.Pnpm != agent.DependencyPreparationSkippedReadOnly || res.DependencyPreparation.Go != agent.DependencyPreparationSkippedReadOnly {
+		t.Fatalf("DependencyPreparation = %+v; want {pnpm:skipped_read_only go:skipped_read_only}", res.DependencyPreparation)
+	}
+	provider.mu.Lock()
+	observed := provider.observed
+	provider.mu.Unlock()
+	if observed.PromptPlan != nil && observed.PromptPlan.HarnessProtocol != nil &&
+		strings.Contains(observed.PromptPlan.HarnessProtocol.Text, "Dependency preparation did not complete") {
+		t.Fatalf("read-only preparation must not hand recovery: %q", observed.PromptPlan.HarnessProtocol.Text)
+	}
+}
+
+// preparedRecoveryProvider presents the codex harness manifest and
+// capabilities while running every spawn through the real
+// agent.PrepareHarness equality check, then delegates to the stub inner
+// for handle behavior. A receipt-bearing Run therefore exercises the
+// production admission path end to end: the runner's digest-exempt
+// recovery channel must survive the provider-side authority check, and
+// the captured spec is the adapted spec the provider would actually
+// deliver — not the pre-check input. A post-authority prompt mutation
+// (the reverted shape) fails here with an AuthorityDriftError instead
+// of a silent pass.
+type preparedRecoveryProvider struct {
+	inner    agent.HarnessProvider
+	manifest agent.HarnessManifest
+	caps     agent.Capabilities
+	spec     agent.Spec
+	spawns   int
+}
+
+func (p *preparedRecoveryProvider) Name() agent.ProviderName { return agent.ProviderCodex }
+
+func (p *preparedRecoveryProvider) Capabilities() agent.Capabilities { return p.caps }
+
+func (p *preparedRecoveryProvider) Manifest() agent.HarnessManifest { return p.manifest }
+
+func (p *preparedRecoveryProvider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, error) {
+	adapted, err := agent.PrepareHarness(spec, p.manifest)
+	if err != nil {
+		return nil, err
+	}
+	p.spec = adapted
+	p.spawns++
+	return p.inner.Spawn(ctx, adapted)
+}
+
+func (p *preparedRecoveryProvider) Resume(ctx context.Context, sessionID string, spec agent.Spec) (agent.Handle, error) {
+	return p.inner.Resume(ctx, sessionID, spec)
+}
+
+func (p *preparedRecoveryProvider) Shutdown(ctx context.Context) error { return p.inner.Shutdown(ctx) }
+
+func preparedDepsWork(t *testing.T, h *runnerHarness, provider *preparedRecoveryProvider, identifier string) QueuedWork {
+	t.Helper()
+	qw := h.queuedWork(identifier)
+	// Mint a session bearer like production dispatch does: the spawn lane
+	// mounts the per-session MCP gateway from the real bearer while the
+	// prepared source models it with a placeholder, and the authority
+	// normalization equalizes the two. A bearerless (degraded-mint)
+	// session omits the gateway at spawn and would drift on mcpServers
+	// for reasons unrelated to dependency preparation. The bearer is
+	// digest-exempt (json:"-"), so admission is unaffected.
+	qw.McpAuthToken = "sess_test_bearer"
+	base := exactReceiptQueuedWork(qw.SessionID)
+	qw.ResolvedProfile = base.ResolvedProfile
+	qw.ExecutionSecurity = executionSecuritySection(nil)
+	cell := exactReceiptCell(provider.manifest.ContractABI, qw.ResolvedProfile.Model, executioncell.SessionAutonomous, nil)
+	qw = attachAdmittedExecutionCell(t, qw, cell)
+	operational, err := CanonicalOperationalPayload(qw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	qw.OperationalPayload = operational
+	detail := rawJSONForRunner(t, map[string]any{
+		"sessionId":               qw.SessionID,
+		"workerId":                qw.WorkerID,
+		"admissionReceipt":        qw.AdmissionReceipt,
+		"effectiveCell":           qw.EffectiveCell,
+		"executionRuntimeBinding": qw.ExecutionRuntimeBinding,
+		"operationalPayload":      qw.OperationalPayload,
+	})
+	host, err := NewProviderView(h.runner.registry).PreflightExecution(detail)
+	if err != nil {
+		t.Fatalf("PreflightExecution: %v", err)
+	}
+	qw.HostAdaptationReceipt = host
+	return qw
+}
+
+// TestRun_PreparedDependencyRecoveryHandsRecovery drives the production Run
+// through the receipt-bearing prepared-harness lane: the host preflight
+// compiles the authority before installation, the installer fails or times
+// out, and the provider-side real agent.PrepareHarness check must still
+// pass (a post-authority prompt mutation fails here with an
+// AuthorityDriftError and the run never spawns) while the delivered
+// adapted spec carries the bounded recovery handoff with the original
+// task intact. Removing the digest-exempt runtime projection leaves a
+// successful spawn with no recovery text and fails it.
+func TestRun_PreparedDependencyRecoveryHandsRecovery(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		execer    DepsExecer
+		timeout   time.Duration
+		wantStat  string
+		wantRecov bool
+	}{
+		{name: "failed", execer: &recordingDepsExecer{exitCode: 1}, wantStat: agent.DependencyPreparationFailed, wantRecov: true},
+		{name: "timed_out", execer: &contextBlockingExecer{}, timeout: 100 * time.Millisecond, wantStat: agent.DependencyPreparationTimedOut, wantRecov: true},
+		{name: "ready_adds_nothing", execer: &recordingDepsExecer{}, wantStat: agent.DependencyPreparationReady},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newRunnerHarness(t)
+			h.runner.logger = depsDiscardLogger()
+			inner, err := stub.New()
+			if err != nil {
+				t.Fatal(err)
+			}
+			provider := &preparedRecoveryProvider{inner: inner.(agent.HarnessProvider), manifest: codexManifestForTest(), caps: codexCapabilitiesForTest()}
+			reg := NewRegistry()
+			if err := reg.Register(provider); err != nil {
+				t.Fatal(err)
+			}
+			h.runner.registry = reg
+			h.runner.depsExecer = tc.execer
+			if tc.timeout != 0 {
+				h.runner.depsInstallTimeout = tc.timeout
+			}
+			seedManifestsInBareRepo(t, h.bareRepo)
+			qw := preparedDepsWork(t, h, provider, "DEPS-PREPARED-"+tc.name)
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			res, err := h.runner.Run(ctx, qw)
+			if err != nil || res.Status != "completed" {
+				t.Fatalf("Run status=%q err=%v (%s); want completed despite preparation %q", res.Status, err, res.Error, tc.wantStat)
+			}
+			if provider.spawns != 1 {
+				t.Fatalf("spawnCalls = %d; want 1 (best-effort spawn preserved)", provider.spawns)
+			}
+			if res.DependencyPreparation == nil || res.DependencyPreparation.NeedsRecovery() != tc.wantRecov {
+				t.Fatalf("DependencyPreparation = %+v; want recovery=%v", res.DependencyPreparation, tc.wantRecov)
+			}
+			if tc.wantRecov && (res.DependencyPreparation.Pnpm != tc.wantStat && res.DependencyPreparation.Go != tc.wantStat) {
+				t.Fatalf("DependencyPreparation = %+v; want %q in a detected ecosystem", res.DependencyPreparation, tc.wantStat)
+			}
+			if provider.spec.PromptPlan == nil || provider.spec.PromptPlan.HarnessProtocol == nil {
+				if tc.wantRecov {
+					t.Fatalf("prompt plan missing harness protocol: %+v", provider.spec.PromptPlan)
+				}
+				return
+			}
+			text := provider.spec.PromptPlan.HarnessProtocol.Text
+			hasRecovery := strings.Contains(text, "Dependency preparation did not complete")
+			if tc.wantRecov && !hasRecovery {
+				t.Fatalf("prepared spawn lost %s recovery instruction: %q", tc.wantStat, text)
+			}
+			if !tc.wantRecov && hasRecovery {
+				t.Fatalf("ready preparation must add no recovery in prepared lane: %q", text)
+			}
+			if tc.wantRecov {
+				if !strings.Contains(text, res.DependencyPreparation.OutcomeSummary()) {
+					t.Errorf("prepared recovery missing bounded summary %q: %q", res.DependencyPreparation.OutcomeSummary(), text)
+				}
+				if !strings.Contains(provider.spec.PromptPlan.UserPrompt.Text, "This is a test issue body.") {
+					t.Errorf("original user task lost in prepared prompt plan: %+v", provider.spec.PromptPlan.UserPrompt)
+				}
+				if !strings.Contains(provider.spec.SystemPromptAppend, "Dependency preparation did not complete") {
+					t.Errorf("prepared SystemPromptAppend lost recovery instruction: %q", provider.spec.SystemPromptAppend)
+				}
+			}
+		})
+	}
+}
+
+func TestRun_NoManifestOmitsPreparation(t *testing.T) {
+	h := newRunnerHarness(t)
+	h.runner.logger = depsDiscardLogger()
+	provider := &depsPromptCapturingProvider{}
+	depsCapturingHarness(t, h, provider)
+	execer := &recordingDepsExecer{}
+	h.runner.depsExecer = execer
+	// No seedManifestsInBareRepo: the bare repo has no manifests.
+	qw := h.queuedWork("DEPS-NOMANIFEST-RUN")
+	qw.ExecutionSecurity = executionSecuritySection(nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := h.runner.Run(ctx, qw)
+	if err != nil || res.Status != "completed" {
+		t.Fatalf("Run status=%q err=%v (%s); want completed", res.Status, err, res.Error)
+	}
+	if calls := execer.recorded(); len(calls) != 0 {
+		t.Fatalf("install calls = %v; want none with no manifests", calls)
+	}
+	if res.DependencyPreparation != nil {
+		t.Fatalf("DependencyPreparation = %+v; want nil (omitted)", res.DependencyPreparation)
+	}
+	if provider.spec.PromptPlan != nil && provider.spec.PromptPlan.HarnessProtocol != nil &&
+		strings.Contains(provider.spec.PromptPlan.HarnessProtocol.Text, "Dependency preparation did not complete") {
+		t.Fatalf("no-manifest run must not hand recovery: %q", provider.spec.PromptPlan.HarnessProtocol.Text)
+	}
 }

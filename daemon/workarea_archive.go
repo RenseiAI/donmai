@@ -62,6 +62,21 @@ func defaultArchiveDir() string {
 	return statepath.Resolve("workareas", "/tmp/.donmai/workareas")
 }
 
+// ErrArchiveUnstableSource — the source mutated while the archive copy
+// was produced, so the staged capture is not one stable generation.
+// The source is retained (no commit, no disposal); callers return it
+// through the existing release-pending/failure path for a later pass.
+// Wrapped with %w so handlers can errors.Is() against it.
+// Co-owned writers are NOT expected to vanish here: an ordinary
+// in-session writer is quiesced by the caller before ArchiveRoot (see
+// the writer-quiescence boundary documented on WorkareaRootArchiveSpec
+// and RequireWriterQuiescence); an escaped or external writer that is
+// still mutating fails closed here instead of publishing a
+// mixed-generation archive. Same-user external cooperation remains a
+// trust policy — it is honoured by staying quiet — never a mixed pair
+// of files that never existed together in the source.
+var ErrArchiveUnstableSource = errors.New("workarea archive source changed during capture")
+
 // WorkareaArchiveErrCode is the sentinel set used by the registry for
 // programmatic error discrimination at the HTTP layer. Wrapped with %w
 // so handlers can errors.Is() against them.
@@ -148,6 +163,24 @@ type archiveManifest struct {
 	// tree digest and size cover the filtered tree only — SourceSizeBytes
 	// above still reports the unfiltered source so the saving is visible.
 	Excluded []string `json:"excluded,omitempty"`
+	// CaptureQuiesced records the caller-side no-writer evidence the
+	// producer carried on WorkareaRootArchiveSpec.Quiesced: true means
+	// the caller stopped the owning terminal/PTY generation and confirmed
+	// its reap before the capture ran. It is producer evidence, not a
+	// re-verified process fact — no live-host process inventory is taken
+	// at capture time — and it never overrides the stability witness:
+	// a mid-capture mutation still fails closed with source retained.
+	CaptureQuiesced bool `json:"captureQuiesced,omitempty"`
+	// CaptureStableGeneration records the writer-exclusion observation
+	// for this archive: the stable source-generation digest the capture
+	// verified before publishing. The witness is the post-copy source
+	// walk over the filtered (exclusion-guarded) tree — same filter,
+	// same digest function as the committed TreeDigest — compared
+	// against the staged copy after the copy completes, with matching
+	// pre-copy, pre-publish, and post-publish observations. Agreement
+	// across all observations is detection, not a snapshot proof, and
+	// any disagreement fails closed with the source retained.
+	CaptureStableGeneration string `json:"captureStableGeneration,omitempty"`
 	// Extra holds any fields not declared above so consumers can render
 	// them without the registry needing to evolve the manifest schema in
 	// lockstep with archive producers.
@@ -168,6 +201,47 @@ type archivePublicationIntent struct {
 // the terminal release authority. TerminalResultID is optional: when set, the
 // commit path also returns the separately versioned recovery reference that
 // binds the committed archive identity and digest to that terminal result.
+//
+// WRITER-QUIESCENCE BOUNDARY. ArchiveRoot does not — and cannot — stop
+// filesystem writers. Ordinary shutdown targets the owning PTY process group;
+// an escaped or daemonized descendant of that group, or any same-user
+// external writer, can still mutate the source while the capture runs.
+// The authorities therefore divide the lifecycle as follows, with one
+// existing manager/lease/provider authority at each step and no second
+// cleanup or archive system:
+//
+//  1. interactive terminal observation — the owning harness process group
+//     is stopped first; its exit only proves the group is gone, never that
+//     every writer is gone.
+//  2. publication disposition — the publication inspection records what the
+//     checkout proved (published / dirty / unpublished / uncertain); it is
+//     an observation, not a writer fence.
+//  3. lease settlement — acknowledgement or expiry moves the lease
+//     active -> release-pending, which makes provider release ELIGIBLE.
+//     Eligibility is not proof release succeeded: release failure retains
+//     release-pending for a bounded retry, and only durable released ends
+//     ownership. A restart after release-pending resumes provider release
+//     without asking the consumer to settle again.
+//  4. archive production — THIS call. For an archive-disposition release
+//     the manager invokes ArchiveRoot before source disposal, and disposal
+//     runs only after ArchiveRoot returns nil. See RequireWriterQuiescence
+//     for the caller-side no-writer gate and the capture-stability check
+//     that fails closed here while retaining the source.
+//  5. source disposal — the manager removes the source root only after a
+//     committed archive. No other disposition removes a root whose archive
+//     failed, and the reaper's bounded retry keeps the failure
+//     operator-visible instead of silently "released".
+//
+// Ordinary owned writers MUST be quiesced by the caller before invoking
+// ArchiveRoot (stop the owning terminal/PTY generation and confirm it
+// reaped; use RequireWriterQuiescence). Same-user external writers are a
+// cooperation trust policy: they are expected to stay quiet once the
+// owning generation is gone. That policy is NOT enforced here and MUST
+// NOT be confused with the stability guarantee: if any writer — owned,
+// escaped, or external — mutates the source mid-capture, ArchiveRoot
+// fails closed with ErrArchiveUnstableSource, publishes nothing, and
+// retains the source. It never publishes a mixed-generation archive and
+// never deletes the only complete copy.
 type WorkareaRootArchiveSpec struct {
 	AcquisitionID string
 	WorkareaID    string
@@ -177,6 +251,17 @@ type WorkareaRootArchiveSpec struct {
 	// TerminalResultID is the stable terminal result identity the committed
 	// archive retains. Empty preserves the legacy fire-and-forget commit.
 	TerminalResultID string
+	// Quiesced, when true, records that the caller stopped the owning
+	// terminal/PTY generation and confirmed its reap before invoking
+	// ArchiveRoot — the ordinary-writer half of the no-writer boundary
+	// above. ArchiveRoot does not re-verify process state (no live-host
+	// process inventory is taken here); the flag is durable producer
+	// evidence carried into the committed manifest alongside the
+	// stability witness, so operators can distinguish a quiesced capture
+	// from one whose caller could not prove the ordinary writers gone.
+	// Escaped or external writers that mutate mid-capture still fail
+	// closed via the stability check regardless of this flag.
+	Quiesced bool
 }
 
 // WorkareaArchiveRegistry is the on-disk archive index. Construct via
@@ -432,6 +517,15 @@ func (r *WorkareaArchiveRegistry) CommitArchiveRoot(ctx context.Context, spec Wo
 		// daemon that predates the field. A retry of that same release
 		// (same acquisition, workarea and session, re-verified bytes below)
 		// is idempotent; only a different non-empty binding collides.
+		// The witness rule matches restore exactly: a missing witness is
+		// a pre-witness archive (still idempotent), but a present
+		// witness that disagrees with the committed digest is
+		// corruption — the retry is refused instead of returning a
+		// reference restore would reject while the manager disposes
+		// the source.
+		if readErr == nil && !archiveWitnessConsistent(existing) {
+			return nil, fmt.Errorf("archive root: committed archive stability witness does not match committed generation: %w", ErrArchiveCorrupted)
+		}
 		if readErr == nil && existing.SchemaVersion == schemaVersion && existing.AcquisitionID == spec.AcquisitionID && existing.WorkareaID == spec.WorkareaID && existing.SessionID == spec.SessionID && (existing.TerminalResultID == "" || existing.TerminalResultID == spec.TerminalResultID) {
 			archivedRoot, openErr := archiveRoot.OpenRoot(filepath.Join(spec.WorkareaID, "tree"))
 			if openErr != nil {
@@ -439,11 +533,14 @@ func (r *WorkareaArchiveRegistry) CommitArchiveRoot(ctx context.Context, spec Wo
 			}
 			// The tree digest is the committed identity; physical allocation
 			// is accounting that the filesystem may revise after commit.
-			digest, digestErr := archiveTreeDigestRoot(archivedRoot)
+			// Either digest format matches: pre-witness archives stored
+			// the legacy (sizes included) digest, new captures store the
+			// zeroed-directory digest.
+			digestMatch, digestErr := archiveTreeDigestRootMatches(archivedRoot, existing.TreeDigest)
 			if existing.SchemaVersion == workareaArchiveLegacyFlatV1 && spec.AcquisitionID == "" && existing.SelectedLeaf == "" {
 				info, treeErr := archivedRoot.Stat(".")
 				_ = archivedRoot.Close()
-				if treeErr == nil && info.IsDir() && info.Mode()&os.ModeSymlink == 0 && digestErr == nil && digest == existing.TreeDigest {
+				if treeErr == nil && info.IsDir() && info.Mode()&os.ModeSymlink == 0 && digestErr == nil && digestMatch {
 					return r.committedArchiveReference(spec, existing)
 				}
 			} else {
@@ -453,8 +550,8 @@ func (r *WorkareaArchiveRegistry) CommitArchiveRoot(ctx context.Context, spec Wo
 					validErr = workarea.ValidateDeclaredRootHandle(archivedRoot, archivedDeclaration)
 				}
 				_ = archivedRoot.Close()
-				if declarationErr == nil && archivedDeclaration.AcquisitionID == spec.AcquisitionID && archivedDeclaration.WorkareaID == spec.WorkareaID && archivedDeclaration.SessionID == spec.SessionID && validErr == nil && digestErr == nil && digest == existing.TreeDigest && existing.StoreID == acquisition.StoreID && existing.RootIdentity == acquisition.RootIdentity {
-					if err := acquisitions.BindArchive(spec.AcquisitionID, spec.WorkareaID, spec.SessionID, spec.WorkareaID, digest); err != nil {
+				if declarationErr == nil && archivedDeclaration.AcquisitionID == spec.AcquisitionID && archivedDeclaration.WorkareaID == spec.WorkareaID && archivedDeclaration.SessionID == spec.SessionID && validErr == nil && digestErr == nil && digestMatch && existing.StoreID == acquisition.StoreID && existing.RootIdentity == acquisition.RootIdentity {
+					if err := acquisitions.BindArchive(spec.AcquisitionID, spec.WorkareaID, spec.SessionID, spec.WorkareaID, existing.TreeDigest); err != nil {
 						return nil, fmt.Errorf("archive root: bind existing immutable archive: %w", err)
 					}
 					return r.committedArchiveReference(spec, existing)
@@ -532,12 +629,67 @@ func (r *WorkareaArchiveRegistry) CommitArchiveRoot(ctx context.Context, spec Wo
 	// filtered tree, while SourceSizeBytes above still reports the
 	// unfiltered source. Anything the guard cannot prove regenerable
 	// — tracked source, uncommitted source, git metadata — is copied
-	// whole.
-	excluded, err := copyRootContentsExcluding(rootHandle, archiveHandle, root.String())
+	// whole. The single guard instance is shared by the pre-copy
+	// digest, the copy, and every witness walk (see
+	// archiveFilteredSourceDigest): the ignore/tracked inspection runs
+	// once per capture, so the walks cannot disagree over filter
+	// membership on a quiet source.
+	guard := newArchiveExclusionGuard(root.String())
+	// PRE-COPY GENERATION. Digest the live source BEFORE the copy under
+	// the same filter and digest function as the staged copy and the
+	// post-copy witness. Sequential walks cannot prove a dancing writer
+	// absent — a writer synchronized to the walk cursor can make any two
+	// walks agree on a pair that never existed — so the capture takes
+	// three source observations (pre, post, and a final re-walk before
+	// publication, plus a post-publication check with rollback below)
+	// and requires every one to equal the staged copy. Any observed
+	// disagreement fails closed: nothing is published and the source is
+	// retained. Writers that stay quiet (the caller-side quiescence
+	// gate plus the same-user cooperation policy) produce equality and
+	// commit. The pre-copy digest is also bounded and cancellable (see
+	// archiveFilteredSourceDigest): a continuously growing file cannot
+	// wedge the capture past the caller's deadline.
+	preGeneration, err := archiveFilteredSourceDigest(ctx, rootHandle, guard)
 	if err != nil {
+		return nil, fmt.Errorf("archive root: pre-copy source generation: %w", err)
+	}
+	excluded, err := copyRootContentsExcludingWithGuard(ctx, rootHandle, archiveHandle, guard)
+	if err != nil {
+		// A torn mid-copy read (writer grew a file under the open
+		// descriptor) is the same capture gap as a witness
+		// mismatch: fail closed with the stability sentinel so the
+		// release path retains the source through release-pending
+		// instead of publishing or disposing.
+		if isArchiveCopyChangedError(err) {
+			return nil, fmt.Errorf("archive root: source changed during capture: %w", ErrArchiveUnstableSource)
+		}
 		return nil, fmt.Errorf("archive root: copy complete tree: %w", err)
 	}
 	manifest.Excluded = excluded
+	// Deterministic crash/race seam between the copy and the
+	// post-copy witness: V16 tests plant a synchronous mutation here
+	// to prove the post-copy equality check fires (a racing writer
+	// cannot be scheduled deterministically, so the seam carries the
+	// exact-boundary proof while the racing tests carry the
+	// escaped-descendant shape). Ordinary production has no hook.
+	if r.archiveHook != nil {
+		if err := r.archiveHook("after-copy-archive-tree"); err != nil {
+			return nil, err
+		}
+	}
+	// POST-COPY WITNESS. Digest the live source AFTER the copy completes
+	// under the same exclusion filter and digest function as the staged
+	// copy. Together with the pre-copy generation above and the staged
+	// digest below, the capture requires a three-way equality
+	// (pre == staged == post): any writer that added, removed, or
+	// rewrote a captured byte between the walks leaves the three
+	// disagreeing, which fails closed with the source retained. The
+	// witness covers the filtered tree exactly like TreeDigest; the
+	// unfiltered SourceSizeBytes above is accounting, not evidence.
+	sourceGeneration, err := archiveFilteredSourceDigest(ctx, rootHandle, guard)
+	if err != nil {
+		return nil, fmt.Errorf("archive root: witness source generation: %w", err)
+	}
 	manifest.SizeBytes, err = workarea.PhysicalUsageRoot(archiveHandle)
 	if err != nil {
 		return nil, fmt.Errorf("archive root: account copied tree: %w", err)
@@ -546,6 +698,11 @@ func (r *WorkareaArchiveRegistry) CommitArchiveRoot(ctx context.Context, spec Wo
 	if err != nil {
 		return nil, fmt.Errorf("archive root: digest copied tree: %w", err)
 	}
+	if preGeneration != manifest.TreeDigest || sourceGeneration != manifest.TreeDigest {
+		return nil, fmt.Errorf("archive root: source changed during capture (staged generation does not match source): %w", ErrArchiveUnstableSource)
+	}
+	manifest.CaptureStableGeneration = manifest.TreeDigest
+	manifest.CaptureQuiesced = spec.Quiesced
 	body, err := json.Marshal(&manifest)
 	if err != nil {
 		return nil, fmt.Errorf("archive root: encode manifest: %w", err)
@@ -591,6 +748,21 @@ func (r *WorkareaArchiveRegistry) CommitArchiveRoot(ctx context.Context, spec Wo
 			return nil, err
 		}
 	}
+	// FINAL PRE-PUBLISH RE-WALK. A writer that mutates after the
+	// post-copy witness but before publication would otherwise leave a
+	// staged tree that was stable at witness time but stale at publish
+	// time — and disposal would then delete the newer live bytes. The
+	// re-walk runs AFTER the before-publish seam so seam-driven
+	// mutations are observed, not hidden. Mismatch fails closed: the
+	// stage is cleaned up by the committed=false defer, nothing is
+	// published, and the source is retained.
+	finalGeneration, err := archiveFilteredSourceDigest(ctx, rootHandle, guard)
+	if err != nil {
+		return nil, fmt.Errorf("archive root: pre-publish source generation: %w", err)
+	}
+	if finalGeneration != manifest.TreeDigest {
+		return nil, fmt.Errorf("archive root: source changed before publication (staged generation is stale): %w", ErrArchiveUnstableSource)
+	}
 	if err := archiveRootRenameNoReplace(archiveRoot, stage, final); err != nil {
 		return nil, fmt.Errorf("archive root: publish archive: %w", err)
 	}
@@ -598,6 +770,23 @@ func (r *WorkareaArchiveRegistry) CommitArchiveRoot(ctx context.Context, spec Wo
 		if err := r.archiveHook("after-publish-archive"); err != nil {
 			return nil, err
 		}
+	}
+	// POST-PUBLICATION CHECK WITH ROLLBACK. A writer that mutates after
+	// publication but before the manager's disposal would otherwise see
+	// its newer live bytes deleted with the source. The re-walk runs
+	// AFTER the after-publish seam so seam-driven mutations are
+	// observed. Mismatch rolls back the just-published archive and
+	// fails closed with the source retained, so a later pass can
+	// capture the newer generation fresh — the retry never observes a
+	// stale committed archive for a live source that moved on.
+	publishedGeneration, err := archiveFilteredSourceDigest(ctx, rootHandle, guard)
+	if err != nil {
+		_ = archiveRoot.RemoveAll(final)
+		return nil, fmt.Errorf("archive root: post-publish source generation: %w", err)
+	}
+	if publishedGeneration != manifest.TreeDigest {
+		_ = archiveRoot.RemoveAll(final)
+		return nil, fmt.Errorf("archive root: source changed after publication (published generation is stale): %w", ErrArchiveUnstableSource)
 	}
 	if err := syncArchiveDirectory(archiveRoot); err != nil {
 		return nil, err
@@ -631,6 +820,9 @@ func (r *WorkareaArchiveRegistry) CommitArchiveRoot(ctx context.Context, spec Wo
 func (r *WorkareaArchiveRegistry) committedArchiveReference(spec WorkareaRootArchiveSpec, existing *archiveManifest) (*workarea.TerminalArchiveReference, error) {
 	if existing == nil || existing.TreeDigest == "" || existing.WorkareaID == "" || existing.SessionID == "" {
 		return nil, fmt.Errorf("archive root: committed archive identity is incomplete: %w", ErrArchiveCorrupted)
+	}
+	if !archiveWitnessConsistent(existing) {
+		return nil, fmt.Errorf("archive root: committed archive stability witness does not match committed generation: %w", ErrArchiveCorrupted)
 	}
 	if spec.WorkareaID != "" && existing.WorkareaID != spec.WorkareaID {
 		return nil, fmt.Errorf("archive root: committed archive identity conflict: %w", ErrArchiveCorrupted)
@@ -694,6 +886,9 @@ func (r *WorkareaArchiveRegistry) readCommittedArchiveReference(archiveRoot *os.
 	if err != nil {
 		return nil, err
 	}
+	if !archiveWitnessConsistent(manifest) {
+		return nil, fmt.Errorf("archive root: committed archive stability witness does not match committed generation: %w", ErrArchiveCorrupted)
+	}
 	if manifest.SchemaVersion != workareaArchiveSchemaV1 && manifest.SchemaVersion != workareaArchiveLegacyFlatV1 {
 		return nil, fmt.Errorf("archive root: committed archive schema is unknown: %w", ErrArchiveCorrupted)
 	}
@@ -704,12 +899,14 @@ func (r *WorkareaArchiveRegistry) readCommittedArchiveReference(archiveRoot *os.
 	if err != nil {
 		return nil, fmt.Errorf("archive root: open committed archive tree: %w", err)
 	}
-	digest, err := archiveTreeDigestRoot(archivedRoot)
+	// Either digest format matches: pre-witness archives stored the
+	// legacy (sizes included) digest.
+	digestMatch, err := archiveTreeDigestRootMatches(archivedRoot, manifest.TreeDigest)
 	_ = archivedRoot.Close()
 	if err != nil {
 		return nil, fmt.Errorf("archive root: digest committed archive tree: %w", err)
 	}
-	if digest != manifest.TreeDigest {
+	if !digestMatch {
 		return nil, fmt.Errorf("archive root: committed archive digest mismatch: %w", ErrArchiveCorrupted)
 	}
 	return r.committedArchiveReference(spec, manifest)
@@ -1507,6 +1704,16 @@ func (r *WorkareaArchiveRegistry) RestoreV1(
 	if err != nil {
 		return nil, 0, err
 	}
+	// The capture-stability witness is verified on read as well as at
+	// write, on every restore path: a committed archive whose staged
+	// generation does not match its own witness is not one stable
+	// source generation and must not restore. A missing witness is an
+	// archive written before the witness existed — still restorable —
+	// but a present witness that disagrees with the committed digest
+	// is corruption.
+	if manifest.CaptureStableGeneration != "" && manifest.CaptureStableGeneration != manifest.TreeDigest {
+		return nil, 0, fmt.Errorf("restore: archive stability witness does not match committed generation: %w", ErrArchiveCorrupted)
+	}
 
 	if r.poolGuard != nil {
 		retryAfter, gerr := r.poolGuard.CheckCapacity()
@@ -1625,6 +1832,8 @@ func (r *WorkareaArchiveRegistry) restoreSessionRootArchive(archiveID string, ma
 	if manifest.AcquisitionID == "" || manifest.WorkareaID == "" || manifest.SessionID == "" || manifest.StoreID == "" || manifest.TreeDigest == "" {
 		return nil, fmt.Errorf("restore: incomplete session-root archive identity: %w", ErrArchiveCorrupted)
 	}
+	// Witness-vs-digest agreement is enforced centrally in RestoreV1
+	// before dispatch; see the capture-stability gate there.
 	acquisitions, err := r.acquisitionAuthority()
 	if err != nil {
 		return nil, fmt.Errorf("restore: session-root archive has no acquisition authority: %w", ErrArchiveCorrupted)
@@ -1665,8 +1874,10 @@ func (r *WorkareaArchiveRegistry) restoreSessionRootArchive(archiveID string, ma
 		if err := syncArchiveTree(restore.StagingRoot.String()); err != nil {
 			return err
 		}
-		digest, err := archiveTreeDigest(restore.StagingRoot.String())
-		if err != nil || digest != manifest.TreeDigest {
+		// Either digest format matches: pre-witness archives stored the
+		// legacy (sizes included) digest.
+		digestMatch, err := archiveTreeDigestPathMatches(restore.StagingRoot.String(), manifest.TreeDigest)
+		if err != nil || !digestMatch {
 			return fmt.Errorf("restore: copied archive digest mismatch: %w", ErrArchiveCorrupted)
 		}
 		selectedLeaf, repositories, err := restoredDeclarationMetadata(restore.StagingRoot)
@@ -2376,14 +2587,6 @@ func diffWalkers(idA, idB string, a, b []archiveEntry) (
 	return entries, summary
 }
 
-func archiveTreeDigest(root string) (string, error) {
-	entries, err := walkArchiveTreeMode(root, false)
-	if err != nil {
-		return "", err
-	}
-	return archiveTreeDigestEntries(entries)
-}
-
 func archiveTreeDigestRoot(root *os.Root) (string, error) {
 	entries, err := walkArchiveRoot(root)
 	if err != nil {
@@ -2392,7 +2595,193 @@ func archiveTreeDigestRoot(root *os.Root) (string, error) {
 	return archiveTreeDigestEntries(entries)
 }
 
+// archiveFilteredSourceDigest walks the live source root through the same
+// exclusion filter the capture copy applies and digests the result with
+// the same digest function as the staged copy. It is one observation of
+// the writer-exclusion check for this capture: the caller compares each
+// observation (pre-copy, post-copy, pre-publish, post-publish) against
+// the staged copy's digest after the copy completes, and any
+// disagreement fails closed with the source retained. Sequential walks
+// over a changing tree are detection, not a snapshot proof — a writer
+// synchronized to the walk cursor can in principle make any finite
+// number of walks agree — so the capture takes four observations around
+// the copy and publication, requires all of them to equal the staged
+// digest, and the authoritative no-writer guarantee comes from the
+// caller-side quiescence gate (ordinary writers stopped and reaped
+// before lease settlement) plus the same-user cooperation policy. Like
+// the copy and the committed digest, this witness covers the filtered
+// tree only: regenerable excluded directories the guard proves ignored
+// and tracked-free are skipped by the same rule, while tracked source,
+// uncommitted source, and git metadata are always walked. A same-file
+// identity change mid-walk (directory or file replaced under the open
+// descriptor) is an error, never a skipped entry.
+//
+// The walk is bounded and cancellable: ctx is checked before every
+// entry and before every file hash, and each file hash reads at most
+// one byte past the Lstat size (see hashRootFile), so a continuously
+// growing file surfaces as a size mismatch within one entry instead of
+// wedging the reader at EOF past the caller's deadline. Cancellation
+// aborts the capture promptly and releases the registry mutex through
+// the caller's defer, so a bounded reaper attempt completes instead of
+// hanging behind an unbounded live-source read.
+//
+// The guard instance is shared with the copy walk (see
+// copyRootContentsExcludingWithGuard): the ignore/tracked inspection
+// runs once per capture, so the witness cannot disagree with the copy
+// over filter membership on a quiet source. A per-call guard would
+// re-run git between the walks and could observe a concurrent
+// .gitignore or index change as a phantom instability.
+func archiveFilteredSourceDigest(ctx context.Context, source *os.Root, guard *archiveExclusionGuard) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if guard == nil {
+		guard = newArchiveExclusionGuard("")
+	}
+	entries := make([]archiveEntry, 0, 64)
+	hardlinks := make(map[workarea.FileIdentity]string)
+	if err := walkFilteredSourceRoot(ctx, source, "", &entries, hardlinks, guard); err != nil {
+		return "", err
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Path < entries[j].Path })
+	return archiveTreeDigestEntries(entries)
+}
+
+// walkFilteredSourceRoot mirrors walkArchiveRootDirectory's digest walk
+// with the capture exclusion filter applied: real directories the guard
+// proves regenerable are recorded as excluded and skipped, everything
+// else is hashed exactly as the copy path would capture it.
+func walkFilteredSourceRoot(ctx context.Context, source *os.Root, prefix string, out *[]archiveEntry, hardlinks map[workarea.FileIdentity]string, guard *archiveExclusionGuard) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	directory, err := source.Open(".")
+	if err != nil {
+		return err
+	}
+	entries, err := directory.ReadDir(-1)
+	closeErr := directory.Close()
+	if err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return err
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		name := entry.Name()
+		info, err := source.Lstat(name)
+		if err != nil {
+			return err
+		}
+		relative := name
+		if prefix != "" {
+			relative = filepath.Join(prefix, name)
+		}
+		relative = filepath.ToSlash(relative)
+		archiveEntry := archiveEntry{Path: relative, IsDir: info.IsDir(), Size: info.Size(), ModeStr: info.Mode().String()}
+		switch {
+		case info.Mode()&os.ModeSymlink != 0:
+			target, err := source.Readlink(name)
+			if err != nil {
+				return err
+			}
+			archiveEntry.IsSymlink = true
+			archiveEntry.SymlinkTo = target
+		case info.IsDir():
+			if isArchiveExcludedDir(entry.Name()) {
+				candidate := relative
+				if !isArchiveGitMetadataPath(candidate) && guard.skippable(candidate) {
+					continue
+				}
+			}
+			child, err := source.OpenRoot(name)
+			if err != nil {
+				return err
+			}
+			opened, openErr := child.Stat(".")
+			if openErr != nil || !os.SameFile(info, opened) {
+				_ = child.Close()
+				return fmt.Errorf("archive witness directory identity changed")
+			}
+			walkErr := walkFilteredSourceRoot(ctx, child, relative, out, hardlinks, guard)
+			_ = child.Close()
+			if walkErr != nil {
+				return walkErr
+			}
+		case info.Mode().IsRegular():
+			identity, err := workarea.IdentityOf(info)
+			if err != nil {
+				return err
+			}
+			if first := hardlinks[identity]; first != "" {
+				archiveEntry.HardlinkTo = first
+			} else {
+				hardlinks[identity] = relative
+			}
+			hash, err := hashRootFile(ctx, source, name, info)
+			if err != nil {
+				// A torn witness hash (writer grew or truncated
+				// the file mid-hash) is itself instability
+				// evidence: surface it as the stability sentinel
+				// so the capture fails closed instead of
+				// returning a digest error the caller could
+				// mistake for a transient I/O fault.
+				if isArchiveDigestChangedError(err) {
+					return fmt.Errorf("archive witness: source changed during capture: %w", ErrArchiveUnstableSource)
+				}
+				return err
+			}
+			archiveEntry.Hash = hash
+		default:
+			return fmt.Errorf("archive witness refuses special file %q", relative)
+		}
+		*out = append(*out, archiveEntry)
+	}
+	return nil
+}
+
 func archiveTreeDigestEntries(entries []archiveEntry) (string, error) {
+	hash := sha256.New()
+	encoder := json.NewEncoder(hash)
+	encoder.SetEscapeHTML(false)
+	for _, entry := range entries {
+		// Directory sizes are filesystem-allocated metadata, not
+		// capture evidence: link counts and dentry layout shift as
+		// files are added or removed, so two identical content
+		// trees can report different directory sizes. Only regular
+		// files (byte length) and symlinks (target string length
+		// is not hashed — the target itself is) contribute sizes.
+		size := entry.Size
+		if entry.IsDir && !entry.IsSymlink {
+			size = 0
+		}
+		if err := encoder.Encode(struct {
+			Path          string `json:"path"`
+			Mode          string `json:"mode"`
+			Size          int64  `json:"size"`
+			Hash          string `json:"hash"`
+			SymlinkTarget string `json:"symlinkTarget"`
+			HardlinkTo    string `json:"hardlinkTo"`
+		}{
+			Path: entry.Path, Mode: entry.ModeStr, Size: size, Hash: entry.Hash,
+			SymlinkTarget: entry.SymlinkTo, HardlinkTo: entry.HardlinkTo,
+		}); err != nil {
+			return "", err
+		}
+	}
+	return "sha256:" + hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+// archiveTreeDigestEntriesLegacy encodes the pre-quiescence digest format
+// that included directory sizes. Archives committed before the witness
+// carry this format; verification accepts either format so a pre-witness
+// archive stays restorable and idempotent after the format change.
+// New captures always use archiveTreeDigestEntries (sizes zeroed).
+func archiveTreeDigestEntriesLegacy(entries []archiveEntry) (string, error) {
 	hash := sha256.New()
 	encoder := json.NewEncoder(hash)
 	encoder.SetEscapeHTML(false)
@@ -2412,6 +2801,58 @@ func archiveTreeDigestEntries(entries []archiveEntry) (string, error) {
 		}
 	}
 	return "sha256:" + hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+// archiveDigestMatchesEntries reports whether want equals either the
+// current (directory sizes zeroed) or the legacy (sizes included)
+// digest of entries. Either match proves the same captured bytes:
+// directory sizes are allocation metadata the filesystem may revise
+// without changing a byte, so the legacy value can only differ in
+// that metadata.
+func archiveDigestMatchesEntries(entries []archiveEntry, want string) (bool, error) {
+	current, err := archiveTreeDigestEntries(entries)
+	if err != nil {
+		return false, err
+	}
+	if current == want {
+		return true, nil
+	}
+	legacy, err := archiveTreeDigestEntriesLegacy(entries)
+	if err != nil {
+		return false, err
+	}
+	return legacy == want, nil
+}
+
+// archiveTreeDigestRootMatches walks the rooted tree once and reports
+// whether its digest — current or legacy format — equals want.
+func archiveTreeDigestRootMatches(root *os.Root, want string) (bool, error) {
+	entries, err := walkArchiveRoot(root)
+	if err != nil {
+		return false, err
+	}
+	return archiveDigestMatchesEntries(entries, want)
+}
+
+// archiveTreeDigestPathMatches walks the path tree once and reports
+// whether its digest — current or legacy format — equals want.
+func archiveTreeDigestPathMatches(path, want string) (bool, error) {
+	entries, err := walkArchiveTreeMode(path, false)
+	if err != nil {
+		return false, err
+	}
+	return archiveDigestMatchesEntries(entries, want)
+}
+
+// archiveTreeDigestLegacyPath computes the legacy (sizes included)
+// digest of the path tree. Tests forge pre-witness manifests with it;
+// production verification never commits it.
+func archiveTreeDigestLegacyPath(path string) (string, error) {
+	entries, err := walkArchiveTreeMode(path, false)
+	if err != nil {
+		return "", err
+	}
+	return archiveTreeDigestEntriesLegacy(entries)
 }
 
 func walkArchiveRoot(root *os.Root) ([]archiveEntry, error) {
@@ -2483,7 +2924,7 @@ func walkArchiveRootDirectory(root *os.Root, prefix string, out *[]archiveEntry,
 			} else {
 				hardlinks[identity] = relative
 			}
-			hash, err := hashRootFile(root, name, info)
+			hash, err := hashRootFile(context.Background(), root, name, info)
 			if err != nil {
 				return err
 			}
@@ -2496,7 +2937,41 @@ func walkArchiveRootDirectory(root *os.Root, prefix string, out *[]archiveEntry,
 	return nil
 }
 
-func hashRootFile(root *os.Root, name string, expected os.FileInfo) (string, error) {
+// archiveWitnessConsistent reports whether a committed manifest's
+// capture-stability witness agrees with its committed digest. A missing
+// witness is an archive written before the witness existed — still
+// restorable and idempotent. A present witness that disagrees with the
+// committed digest is corruption: the staged tree is not the generation
+// the capture verified, so it must neither restore nor satisfy
+// idempotent retry. Every commit path (fresh, idempotent retry, and
+// committed-reference re-read) and every restore path enforces the same
+// rule, so a retry can never accept an archive that restore refuses
+// and then dispose the source.
+func archiveWitnessConsistent(manifest *archiveManifest) bool {
+	if manifest == nil {
+		return false
+	}
+	return manifest.CaptureStableGeneration == "" || manifest.CaptureStableGeneration == manifest.TreeDigest
+}
+
+// errArchiveDigestChanged marks a torn witness hash: the source file grew
+// (or shrank) under its open descriptor while the witness hashed it.
+// Matched by string like errArchiveCopyChanged; walkFilteredSourceRoot
+// maps it to ErrArchiveUnstableSource.
+const errArchiveDigestChanged = "archive digest source file changed during hash"
+
+// isArchiveDigestChangedError reports whether err is a torn witness hash.
+func isArchiveDigestChangedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), errArchiveDigestChanged)
+}
+
+func hashRootFile(ctx context.Context, root *os.Root, name string, expected os.FileInfo) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	file, err := root.Open(name)
 	if err != nil {
 		return "", err
@@ -2506,9 +2981,33 @@ func hashRootFile(root *os.Root, name string, expected os.FileInfo) (string, err
 	if err != nil || !os.SameFile(expected, opened) {
 		return "", fmt.Errorf("archive digest file identity changed")
 	}
+	// A writer that grows (or truncates) the file between the walk's
+	// Lstat and this hash stages bytes the witness cannot distinguish
+	// from a stable generation when the writer then goes quiet. Refuse
+	// the torn read here — same fail-closed family as the copy path's
+	// size checks — instead of hashing a prefix that never existed as
+	// one generation.
+	if opened.Size() != expected.Size() {
+		return "", fmt.Errorf("archive digest source file changed during hash")
+	}
 	hash := sha256.New()
-	if _, err := io.Copy(hash, bufio.NewReader(file)); err != nil {
+	// Bound the read to one byte past the Lstat size: a writer that
+	// grows the file mid-hash then surfaces as a byte-count mismatch
+	// within one entry instead of wedging this reader at EOF while the
+	// writer keeps appending. A stable file reads exactly its Lstat
+	// size and hits EOF there; the post-read stat below confirms it.
+	hashed, err := io.Copy(hash, io.LimitReader(bufio.NewReader(file), expected.Size()+1))
+	if err != nil {
 		return "", err
+	}
+	if hashed != expected.Size() {
+		return "", fmt.Errorf("archive digest source file changed during hash")
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if current, statErr := file.Stat(); statErr != nil || current.Size() != expected.Size() {
+		return "", fmt.Errorf("archive digest source file changed during hash")
 	}
 	return hex.EncodeToString(hash.Sum(nil)), nil
 }
@@ -2706,7 +3205,7 @@ func copyTreeRoot(sourceRoot *os.Root, dst string) error {
 }
 
 func copyRootContents(source, destination *os.Root) error {
-	return copyRootDirectory(source, destination, ".", make(map[workarea.FileIdentity]string), nil)
+	return copyRootDirectory(context.Background(), source, destination, ".", make(map[workarea.FileIdentity]string), nil)
 }
 
 // archiveExcludedDirNames are regenerable dependency and build-output
@@ -3017,23 +3516,29 @@ func archiveFirstLine(s string) string {
 	return s
 }
 
-// copyRootContentsExcluding copies like copyRootContents but skips
-// regenerable dependency and build-output directories (see
-// archiveExcludedDirNames) at any depth. It returns the skipped
-// directories as slash-separated paths relative to the copied root,
-// sorted, for the archive manifest's excluded list. A candidate is
-// skipped only when the guard proves it regenerable — ignored by the
-// enclosing checkout and holding no tracked files — so tracked source,
-// uncommitted source and git metadata are always copied. Roots that are
-// not git checkouts copy whole: sourceRootName carries the absolute
-// source path the guard inspects (empty keeps every candidate).
-// Restore paths keep using copyRootContents so an already-committed
-// archive always reproduces byte for byte, including archives written
-// before the exclusion existed.
-func copyRootContentsExcluding(source, destination *os.Root, sourceRootName string) ([]string, error) {
-	guard := newArchiveExclusionGuard(sourceRootName)
+// copyRootContentsExcludingWithGuard copies like the filtered capture
+// and additionally returns the guard that decided the exclusions, so the
+// capture-stability witness can reuse the same inspection instead of
+// re-running git between the copy and witness walks (see
+// archiveFilteredSourceDigest).
+// copyRootContentsExcludingWithGuard copies like the filtered capture
+// copy and reuses the caller's guard for exclusion decisions, so the
+// capture-stability witness (see archiveFilteredSourceDigest) observes
+// the same filter membership as the copy walk on a quiet source. The
+// copy is bounded and cancellable: ctx is checked before every entry
+// and every file copy reads at most its Lstat size plus one byte (see
+// copyRootFile), so a continuously growing file surfaces as a size
+// mismatch within one entry instead of wedging the copier at EOF past
+// the caller's deadline.
+func copyRootContentsExcludingWithGuard(ctx context.Context, source, destination *os.Root, guard *archiveExclusionGuard) ([]string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if guard == nil {
+		guard = newArchiveExclusionGuard("")
+	}
 	exclusion := &copyExclusion{guard: guard}
-	if err := copyRootDirectory(source, destination, ".", make(map[workarea.FileIdentity]string), exclusion); err != nil {
+	if err := copyRootDirectory(ctx, source, destination, ".", make(map[workarea.FileIdentity]string), exclusion); err != nil {
 		return nil, err
 	}
 	excluded := exclusion.skipped
@@ -3049,7 +3554,10 @@ type copyExclusion struct {
 	skipped []string
 }
 
-func copyRootDirectory(source, destination *os.Root, relativeDir string, hardlinks map[workarea.FileIdentity]string, exclusion *copyExclusion) error {
+func copyRootDirectory(ctx context.Context, source, destination *os.Root, relativeDir string, hardlinks map[workarea.FileIdentity]string, exclusion *copyExclusion) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	directory, err := source.Open(relativeDir)
 	if err != nil {
 		return err
@@ -3063,11 +3571,22 @@ func copyRootDirectory(source, destination *os.Root, relativeDir string, hardlin
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
 	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		name := filepath.Join(relativeDir, entry.Name())
 		info, err := source.Lstat(name)
 		if err != nil {
 			return err
 		}
+		// A writer that replaces a path between the directory
+		// listing and this Lstat changes what the copy stages
+		// versus what the witness walk observes. The Lstat
+		// identity is recorded into the per-file size checks in
+		// copyRootFile; directory replacement across the two
+		// walks surfaces as a digest mismatch in the witness.
+		// Entry disappearance (unlink/rename mid-copy) errors
+		// here and fails closed, never silently skipped.
 		switch {
 		case info.Mode()&os.ModeSymlink != 0:
 			target, err := source.Readlink(name)
@@ -3107,7 +3626,7 @@ func copyRootDirectory(source, destination *os.Root, relativeDir string, hardlin
 				_ = sourceChild.Close()
 				return fmt.Errorf("archive copy source directory identity changed")
 			}
-			copyErr := copyRootDirectory(source, destination, name, hardlinks, exclusion)
+			copyErr := copyRootDirectory(ctx, source, destination, name, hardlinks, exclusion)
 			_ = sourceChild.Close()
 			if copyErr != nil {
 				return copyErr
@@ -3126,7 +3645,7 @@ func copyRootDirectory(source, destination *os.Root, relativeDir string, hardlin
 				}
 				continue
 			}
-			if err := copyRootFile(source, destination, name, info); err != nil {
+			if err := copyRootFile(ctx, source, destination, name, info); err != nil {
 				return err
 			}
 			hardlinks[identity] = name
@@ -3137,7 +3656,25 @@ func copyRootDirectory(source, destination *os.Root, relativeDir string, hardlin
 	return nil
 }
 
-func copyRootFile(source, destination *os.Root, name string, expected os.FileInfo) error {
+// errArchiveCopyChanged marks a torn mid-copy read: a source file grew
+// (or shrank) under its open descriptor while the copy staged it. It is
+// matched by string because the copy walk returns plain fmt.Errorf
+// values, not sentinels, and the registry maps it to
+// ErrArchiveUnstableSource at the capture boundary.
+const errArchiveCopyChanged = "archive copy source file changed during copy"
+
+// isArchiveCopyChangedError reports whether err is a torn mid-copy read.
+func isArchiveCopyChangedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), errArchiveCopyChanged)
+}
+
+func copyRootFile(ctx context.Context, source, destination *os.Root, name string, expected os.FileInfo) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	in, err := source.Open(name)
 	if err != nil {
 		return err
@@ -3151,9 +3688,37 @@ func copyRootFile(source, destination *os.Root, name string, expected os.FileInf
 	if err != nil {
 		return err
 	}
-	if err := copySparseData(in, out, expected.Size()); err != nil {
+	// A writer that appends between the walk's Lstat and this read
+	// changes the size under the open descriptor: refuse the torn
+	// read rather than staging a prefix the witness cannot
+	// distinguish from a stable generation. (SameFile alone does not
+	// catch appends — the inode is unchanged — but the size growth
+	// is observable here and in the witness walk.)
+	if current, statErr := in.Stat(); statErr != nil || current.Size() != expected.Size() {
+		_ = out.Close()
+		_ = destination.Remove(name)
+		return errors.New(errArchiveCopyChanged)
+	}
+	if err := copySparseData(ctx, in, out, expected.Size()); err != nil {
 		_ = out.Close()
 		return err
+	}
+	// Re-check after the byte copy: an append that landed mid-read
+	// leaves the staged prefix shorter than the live source, which
+	// the witness walk would catch by size — but only if the source
+	// is still growing at witness time. A writer that stops between
+	// the copy and the witness could otherwise stage a torn prefix
+	// that matches nothing yet digests as self-consistent. Fail
+	// closed here instead.
+	if err := ctx.Err(); err != nil {
+		_ = out.Close()
+		_ = destination.Remove(name)
+		return err
+	}
+	if current, statErr := in.Stat(); statErr != nil || current.Size() != expected.Size() {
+		_ = out.Close()
+		_ = destination.Remove(name)
+		return errors.New(errArchiveCopyChanged)
 	}
 	if err := out.Sync(); err != nil {
 		_ = out.Close()

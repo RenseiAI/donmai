@@ -694,6 +694,23 @@ type Daemon struct {
 	// terminal and rung 2 cannot precede rung 1. See mutation_session_wake.go.
 	wakeLedger       wakeLedger
 	preflightConfigs *preflightConfigRegistry
+
+	// hostUpgradeMu guards the consented host-upgrade request state below.
+	// It is never held across lifecycle waits, config writes, preflight or
+	// update execution: the heartbeat path only records intent here and hands
+	// bounded execution to a background goroutine, so a delayed update
+	// cannot block the next beat.
+	hostUpgradeMu       sync.Mutex
+	hostUpgradeInFlight map[string]struct{}
+	hostUpgradeCancels  map[string]context.CancelFunc
+	hostUpgradeDone     map[string]hostUpgradeOutcome
+	hostUpgradeLoaded   bool
+	// hostUpgradeDurableBroken is set when the durable outcome file cannot
+	// be read (corrupt/unreadable) or cannot be written. While set, new
+	// swaps refuse without running: a lost durable record must never cause
+	// a restart plus redelivery to run a second swap.
+	hostUpgradeDurableBroken bool
+	hostUpgradeDurableError  string
 }
 
 // New constructs a Daemon. Call Start() to bring it online.
@@ -2655,6 +2672,12 @@ func (d *Daemon) Stop(ctx context.Context) error {
 	}
 	d.lifecycleMu.Unlock()
 
+	// Bound a hosted upgrade attempt: cancel its execution context before
+	// waiting on the lifecycle lease so Shutdown never waits past the
+	// attempt's own bound. The attempt records a failure outcome and
+	// releases the lease; Stop then proceeds.
+	d.cancelHostUpgrades()
+
 	lease, err := d.claimLifecycle(ctx, lifecycleStop)
 	if err != nil {
 		// Prefer a terminal result that raced the caller's wait over its now-stale
@@ -4009,6 +4032,7 @@ func (a *updateAttempt) run(ctx context.Context) (*UpdateResult, error) {
 	updater := NewUpdater(UpdaterOptions{
 		CurrentVersion: d.EffectiveVersion(),
 		Config:         cfg.AutoUpdate,
+		CDNBase:        effectiveUpdateCDNBase(cfg.AutoUpdate),
 		SkipExit:       true, // HTTP-driven update: caller decides to exit.
 	})
 	return updater.RunUpdate(ctx)

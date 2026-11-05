@@ -20,6 +20,8 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -168,6 +170,12 @@ type Handle struct {
 	// delegation tool calls with their results to emit the typed
 	// sub-agent lifecycle alongside the plain tool events.
 	mapper LineMapper
+
+	// cleanups run once at Stop (AddCleanup); cleanupDone records that
+	// they have, so a late registration runs at once.
+	cleanupMu   sync.Mutex
+	cleanups    []func() error
+	cleanupDone bool
 }
 
 // sendEvent multiplexes one event onto the public events channel.
@@ -676,6 +684,7 @@ func (h *Handle) doStop(ctx context.Context) error {
 	// before returning, even if subprocess teardown errored.
 	defer h.closeEvents()
 	defer func() { _ = removeMCPConfig(h.mcpConfigPath) }()
+	defer h.runCleanups()
 
 	// If the parent subprocess has already exited, the events
 	// channel has nothing more to receive — skip signaling.
@@ -914,26 +923,86 @@ func resumeArgv(sessionID, prompt string, resumeExtraArgs []string) (argv []stri
 	return argv, prompt
 }
 
-// filterRoutingPinArgs admits only a well-formed routing pin pair:
-// a `--settings` flag immediately followed by a JSON envelope whose env
-// names are exactly the session's own routing destinations and whose
-// values are non-empty. Anything else — a dangling flag, a non-pin flag,
-// a second value, unparseable JSON — vetoes the whole thing rather than
+// filterRoutingPinArgs admits only well-formed harness pairs, each at most
+// once: a `--settings` flag immediately followed by a JSON envelope whose env
+// names are exactly the session's own routing destinations and whose values
+// are non-empty, and a `--plugin-dir` flag followed by the session's own
+// skill plugin directory (isSkillPluginDir). Anything else — a dangling flag,
+// a foreign flag, a second pair of either kind, unparseable JSON, a plugin
+// directory the harness did not create — vetoes the whole thing rather than
 // passing anything through. The whitelist is syntactic (shape + known
-// destination names); the harness renders the values from its own
-// post-projection spec, never from callee input.
+// destination names + the plugin directory's reserved name); the harness
+// renders the values from its own post-projection spec, never from callee
+// input. The pin is emitted first, then the plugin directory.
 func filterRoutingPinArgs(extra []string) []string {
-	// The extras must be EXACTLY the pin pair: a foreign fragment
+	// The extras must be EXACTLY these pairs: a foreign fragment
 	// anywhere in the slice vetoes the whole thing rather than being
 	// skipped, so a smuggled tool, model, or second settings layer can
 	// never ride alongside the pin.
-	if len(extra) != 2 || extra[0] != "--settings" {
+	if len(extra) == 0 || len(extra)%2 != 0 {
 		return nil
 	}
-	if !isRoutingPinJSON(extra[1]) {
-		return nil
+	var pin, pluginDir []string
+	for i := 0; i < len(extra); i += 2 {
+		flag, value := extra[i], extra[i+1]
+		switch {
+		case flag == "--settings" && pin == nil && isRoutingPinJSON(value):
+			pin = []string{"--settings", value}
+		case flag == "--plugin-dir" && pluginDir == nil && isSkillPluginDir(value):
+			pluginDir = []string{"--plugin-dir", value}
+		default:
+			return nil
+		}
 	}
-	return []string{"--settings", extra[1]}
+	return append(pin, pluginDir...)
+}
+
+// skillPluginDirPrefix mirrors the claude harness's per-session skill plugin
+// directory name prefix (provider/harness/claude skills.go). The driver
+// cannot import a harness package, so the literal is repeated here, exactly
+// as resumePinEnvNames mirrors the routing pin's names.
+const skillPluginDirPrefix = "donmai-skills-"
+
+// isSkillPluginDir reports whether dir is a skill plugin directory the
+// harness created for this session: an absolute, clean path whose last
+// element carries the reserved prefix.
+func isSkillPluginDir(dir string) bool {
+	return filepath.IsAbs(dir) && filepath.Clean(dir) == dir &&
+		strings.HasPrefix(filepath.Base(dir), skillPluginDirPrefix)
+}
+
+// AddCleanup registers fn to run when the handle stops, after the
+// subprocess is torn down: the harness hands the handle what it
+// materialized for the session (a skill plugin directory) so the resume
+// turns Inject starts can keep using it until the session ends. When the
+// handle has already stopped, fn runs at once.
+func (h *Handle) AddCleanup(fn func() error) {
+	if fn == nil {
+		return
+	}
+	h.cleanupMu.Lock()
+	if !h.cleanupDone {
+		h.cleanups = append(h.cleanups, fn)
+		h.cleanupMu.Unlock()
+		return
+	}
+	h.cleanupMu.Unlock()
+	if err := fn(); err != nil && h.logger != nil {
+		h.logger.Warn("handle cleanup failed", "err", err)
+	}
+}
+
+// runCleanups runs every registered cleanup exactly once.
+func (h *Handle) runCleanups() {
+	h.cleanupMu.Lock()
+	fns := h.cleanups
+	h.cleanups, h.cleanupDone = nil, true
+	h.cleanupMu.Unlock()
+	for _, fn := range fns {
+		if err := fn(); err != nil && h.logger != nil {
+			h.logger.Warn("handle cleanup failed", "err", err)
+		}
+	}
 }
 
 // composeEnv builds the child process environment by merging parentEnv

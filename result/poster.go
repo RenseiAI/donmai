@@ -334,6 +334,16 @@ type statusRequest struct {
 	// result recorded none — old platforms ignore it.
 	PreparationSeconds int64 `json:"preparationSeconds,omitempty"`
 
+	// DependencyPreparation is the bounded per-ecosystem dependency-install
+	// outcome retained from the runner's preparation phase. It is a closed
+	// per-ecosystem object ({"pnpm": <outcome>, "go": <outcome>}, keys
+	// only for detected ecosystems) with the closed outcome vocabulary
+	// ready, failed, timed_out, skipped_read_only, skipped_security.
+	// Additive; omitted when the result recorded none (no detected
+	// ecosystem or a result that predates the report) — old platforms
+	// ignore it.
+	DependencyPreparation *agent.DependencyPreparation `json:"dependencyPreparation,omitempty"`
+
 	// BudgetBreach names the session budget cap the runner stopped the
 	// session at: the failure reason on a failed session, and on a completed
 	// one the flag that the delivered work ran over its budget. Additive;
@@ -383,6 +393,26 @@ type statusRequest struct {
 	// in-session retries. Always serialized (no omitempty) so a zero
 	// reads as "did nothing" rather than unknown.
 	ToolCalls int `json:"toolCalls"`
+
+	// ExitCode is the headless process exit when one existed. Nil when no
+	// process existed or the harness reported none. Additive; omitted
+	// when nil — old platforms ignore it.
+	ExitCode *int `json:"exitCode,omitempty"`
+
+	// OutputTail is the redacted, bounded diagnostic tail of a failed
+	// headless run. Additive; omitted when empty — old platforms
+	// ignore it.
+	OutputTail string `json:"outputTail,omitempty"`
+
+	// FailurePhase names where a failure was decided (for example
+	// "spawn", "provision" or "stream"). Additive; omitted when
+	// empty — old platforms ignore it.
+	FailurePhase string `json:"failurePhase,omitempty"`
+
+	// FailureDecidedBy names who decided a failure (for example
+	// "runner"). Additive; omitted when empty — old platforms ignore
+	// it.
+	FailureDecidedBy string `json:"failureDecidedBy,omitempty"`
 
 	// SeatState is the seat's final three-axis report: session presence,
 	// activity with its decided-by rung, resumability, plus the
@@ -746,13 +776,15 @@ func buildStatusRequest(creds RuntimeCredentials, r agent.Result, projection *wo
 		TerminalWorkareaLease:    projection,
 		TerminalArchiveReference: archiveReference,
 		ExecutionSecurityRefusal: r.ExecutionSecurityRefusal, TurnContinuations: r.TurnContinuations,
-		PreparationSeconds: r.PreparationSeconds,
-		BudgetBreach:       r.BudgetBreach, Resumable: r.Resumable, ResumeCheckpoint: r.ResumeCheckpoint, WIPRef: r.WIPRef,
+		PreparationSeconds: r.PreparationSeconds, DependencyPreparation: r.DependencyPreparation,
+		BudgetBreach: r.BudgetBreach, Resumable: r.Resumable, ResumeCheckpoint: r.ResumeCheckpoint, WIPRef: r.WIPRef,
 		PostSessionWarnings: r.PostSessionWarnings,
 		UpstreamError:       agent.CanonicalUpstreamError(r.Upstream), ToolCalls: r.ToolCalls,
 		FinalProvider: r.FinalProvider, FinalModel: r.FinalModel, ProviderAttempts: r.ProviderAttempts,
 		SeatState: summarizeSeatState(r), SeatSummary: summarizeSeatSummary(r),
 		GenerationIDs: r.GenerationIDs,
+		ExitCode:      r.ExitCode, OutputTail: r.OutputTail,
+		FailurePhase: r.FailurePhase, FailureDecidedBy: r.FailureDecidedBy,
 	}
 	if r.Cost != nil {
 		body.TotalCostUsd = r.Cost.TotalCostUsd

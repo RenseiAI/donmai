@@ -309,6 +309,56 @@ func (b *codexConfigBoundary) appendGatewayProviderBlock(baseURL, key string, sp
 	return projectGatewayKey(specEnv, key), b.validate()
 }
 
+// appendUntrustedProjects records each dir as an untrusted project in the
+// boundary's private config.toml, in the table form codex itself writes when
+// a project's trust is decided:
+//
+//	[projects."<dir>"]
+//	trust_level = "untrusted"
+//
+// A dir that already has a table keeps it, so a Resume on the same working
+// directory writes nothing. Codex reads the user config again for each
+// request, and its own config/batchWrite keeps these tables (both measured
+// against codex-cli 0.164.0). The tables go at the end of the file, after the
+// one top-level-key block this boundary appends (the gateway provider
+// block, written earlier in the same spawn).
+func (b *codexConfigBoundary) appendUntrustedProjects(dirs []string) error {
+	if b == nil {
+		return errors.New("isolated Codex config boundary is missing")
+	}
+	body, err := os.ReadFile(b.configPath) //nolint:gosec // provider-owned isolated config path
+	if err != nil {
+		return fmt.Errorf("read isolated Codex config: %w", err)
+	}
+	present := string(body)
+	var block strings.Builder
+	for _, dir := range dirs {
+		header := "[projects." + tomlBasicString(dir) + "]\n"
+		if strings.Contains(present, header) || strings.Contains(block.String(), header) {
+			continue
+		}
+		block.WriteString("\n" + header + "trust_level = " + tomlBasicString(codexTrustLevelUntrusted) + "\n")
+	}
+	if block.Len() == 0 {
+		return b.validate()
+	}
+	f, err := os.OpenFile(b.configPath, os.O_WRONLY|os.O_APPEND, codexConfigMode)
+	if err != nil {
+		return fmt.Errorf("record untrusted project: %w", err)
+	}
+	if _, err := f.WriteString(block.String()); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("record untrusted project: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close isolated Codex config: %w", err)
+	}
+	if err := os.Chmod(b.configPath, codexConfigMode); err != nil {
+		return fmt.Errorf("secure isolated Codex config: %w", err)
+	}
+	return b.validate()
+}
+
 // projectGatewayKey returns the session env with the binding-selected key
 // projected onto the gateway env name, so the child authenticates to the
 // routed endpoint with the cell's own credential even when the session

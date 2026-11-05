@@ -30,6 +30,7 @@ import (
 	"github.com/RenseiAI/donmai/runner/access"
 	"github.com/RenseiAI/donmai/runtime/workarea"
 	"github.com/RenseiAI/donmai/sessionshim"
+	"github.com/RenseiAI/donmai/stagewire"
 )
 
 // Version is the daemon binary version reported in DaemonStatus and in
@@ -353,6 +354,12 @@ type SessionHandle struct {
 	// Mirrors SessionSpec.WorkType.
 	WorkType     string `json:"workType,omitempty"`
 	WorkTypeRole string `json:"workTypeRole,omitempty"`
+
+	// Stage and Card are the 1.0 wire's stage (key, name, roles) and
+	// dispatched card (id, handle, contract), projected from the session's
+	// stored detail when the list is served. Nil for legacy work items.
+	Stage *stagewire.Stage `json:"stage,omitempty"`
+	Card  *stagewire.Card  `json:"card,omitempty"`
 
 	// IssueIdentifier is the work item's human-readable identifier,
 	// projected from the session's stored detail when the list is served,

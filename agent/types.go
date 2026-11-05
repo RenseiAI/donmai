@@ -653,6 +653,20 @@ type Spec struct {
 	// credential delivery or process spawn. Returning an error fails closed.
 	OnToolLifecycleAdapted func(ToolLifecycleReceipt) error `json:"-"`
 
+	// DependencyPreparation is the bounded post-acquire dependency-install
+	// outcome the runner carries into spawn. It is a runtime-only channel
+	// on the prepared-harness lane: deliberately ABSENT from
+	// harnessAuthorityProjection (agent/prepared_harness.go), because the
+	// install runs after admission compiles the host authority and no
+	// post-admission prompt mutation may disturb the authority digest
+	// ApplyPreparedHarness verifies. ApplyPreparedHarness projects the
+	// failed/timed_out recovery handoff from this field AFTER the
+	// equality check passes; ready, skipped, and nil outcomes are
+	// no-ops. The legacy (non-receipted) lane never sets it — it injects
+	// the same handoff at composition time, where no digest exists to
+	// disturb. Never serialized: process-only, like the receipts.
+	DependencyPreparation *DependencyPreparation `json:"-"`
+
 	// AdditionalExtensions is an ORDERED list of additional extensions
 	// delivered to a harness whose spawn surface loads host-side extensions
 	// (currently pi; provider/harness/pi). Per
@@ -673,6 +687,16 @@ type Spec struct {
 	// D5.5 there is still no cross-harness "supports extensions" boolean;
 	// only the exact profile's ToolPluginDelivery answers the question.
 	AdditionalExtensions []ExtensionDelivery `json:"additionalExtensions,omitempty"`
+
+	// Skills is the session's skill delivery (skill_delivery.go): the pure
+	// per-skill plan PlanSkillDelivery computed for this exact harness, and
+	// the content of every skill it delivers natively. Skills the plan left
+	// on the prompt are already folded into SystemPromptAppend; the exact
+	// adapter's SkillMaterializer writes and verifies the native ones before
+	// the child starts. The plan is part of the harness authority digest
+	// ("skills"). Nil — no skills and no repository policy on the work item —
+	// is inert for every harness.
+	Skills *SkillDelivery `json:"skills,omitempty"`
 }
 
 // WithToolLifecycleProfile returns a copy selecting one manifest-declared
@@ -703,6 +727,32 @@ type CostData struct {
 	TotalCostUsd      float64 `json:"totalCostUsd,omitempty"`
 	NumTurns          int     `json:"numTurns,omitempty"`
 }
+
+// DependencyPreparation is the bounded outcome of post-acquire
+// dependency preparation. It is a closed per-ecosystem object: each key
+// names a detected ecosystem ("pnpm", "go", in install order) and each
+// value is one of the closed outcome vocabulary below. Only detected
+// ecosystems appear as keys; undetected ecosystems are omitted, never
+// empty or null. It carries no command output and no error text by
+// construction.
+type DependencyPreparation struct {
+	Pnpm string `json:"pnpm,omitempty"`
+	Go   string `json:"go,omitempty"`
+}
+
+// Closed dependency-preparation outcome vocabulary. ready means the
+// ecosystem's install exited zero; failed means a non-zero exit or start
+// error; timed_out means the install context expired (including parent
+// cancellation mid-install); the skipped pair means no install was
+// attempted for a detected ecosystem. A nil *DependencyPreparation
+// (omitted on the wire) means no ecosystem was detected.
+const (
+	DependencyPreparationReady           = "ready"
+	DependencyPreparationFailed          = "failed"
+	DependencyPreparationTimedOut        = "timed_out"
+	DependencyPreparationSkippedReadOnly = "skipped_read_only"
+	DependencyPreparationSkippedSecurity = "skipped_security"
+)
 
 // Result is the runner's final session-result shape, distinct from the
 // per-provider terminal ResultEvent.
@@ -908,6 +958,40 @@ type Result struct {
 	// never recorded the phase stays byte-identical. Additive — old
 	// platforms ignore it.
 	PreparationSeconds int64 `json:"preparationSeconds,omitempty"`
+
+	// DependencyPreparation is the bounded outcome of post-acquire
+	// dependency preparation (runner dependency install step). It names
+	// the per-ecosystem install outcome for every detected ecosystem:
+	// ready when the install exited zero, failed on a non-zero exit or
+	// start error, timed_out when the install context expired,
+	// skipped_read_only when the selected repository forbids writes,
+	// skipped_security when the execution-security gate forbids host
+	// installs. Nil when no ecosystem was detected (nothing to prepare)
+	// so old results stay byte-identical. Bounded by construction:
+	// per-ecosystem outcomes only, never raw tool output or error text.
+	// Additive — old platforms ignore it.
+	DependencyPreparation *DependencyPreparation `json:"dependencyPreparation,omitempty"`
+
+	// ExitCode is the headless process exit when one existed. Nil when no
+	// process existed (a spawn failure) or the harness reported none:
+	// never zero for a spawn failure and never an invented agent verdict.
+	// Additive — old platforms ignore it.
+	ExitCode *int `json:"exitCode,omitempty"`
+
+	// OutputTail is the redacted, bounded diagnostic tail of a failed
+	// headless run. Empty on every other run. Bounded by the
+	// operator-facing byte/line limits and redacted before transport.
+	// Additive — old platforms ignore it.
+	OutputTail string `json:"outputTail,omitempty"`
+
+	// FailurePhase names where a failure was decided (for example
+	// "spawn", "provision" or "stream"). Empty on success.
+	// Additive — old platforms ignore it.
+	FailurePhase string `json:"failurePhase,omitempty"`
+
+	// FailureDecidedBy names who decided a failure (for example
+	// "runner"). Empty on success. Additive — old platforms ignore it.
+	FailureDecidedBy string `json:"failureDecidedBy,omitempty"`
 }
 
 // WIPRef identifies a reserved remote ref preserving a failed session.

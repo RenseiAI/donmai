@@ -1,6 +1,7 @@
 package hostwatch
 
 import (
+	"slices"
 	"strconv"
 	"time"
 
@@ -68,6 +69,7 @@ func detailFields(c SessionCard, now time.Time) []detailField {
 		{"Accepted", safeIdentityText(c.AcceptedAt)},
 		{"Worktree", safeIdentityText(c.WorktreePath)},
 	}
+	fields = withStageFields(fields, c)
 	if c.isHeld() {
 		// A held row has no process, workarea or live observations yet.
 		kept := fields[:0]
@@ -79,6 +81,28 @@ func detailFields(c SessionCard, now time.Time) []detailField {
 			kept = append(kept, f)
 		}
 		fields = kept
+	}
+	return fields
+}
+
+// withStageFields places the wire stage and the role the run executes under
+// right after the work type. A session whose work item carries no stage gains
+// no rows, so a legacy session's detail is unchanged.
+func withStageFields(fields []detailField, c SessionCard) []detailField {
+	var stage []detailField
+	if label := c.stageLabel(); label != "" {
+		stage = append(stage, detailField{"Stage", label})
+	}
+	if runRole := displayLabel(c.StageRunRole, maxStageRoleRunes); runRole != "" {
+		stage = append(stage, detailField{"Run role", runRole})
+	}
+	if len(stage) == 0 {
+		return fields
+	}
+	for i, f := range fields {
+		if f.label == "Work type" {
+			return slices.Insert(fields, i+1, stage...)
+		}
 	}
 	return fields
 }

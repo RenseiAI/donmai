@@ -404,6 +404,17 @@ type Result struct {
 	// caller can correlate dashboard signals to runner logs.
 	LinearStatusTransition *LinearStatusTransition `json:"linearStatusTransition,omitempty"`
 
+	// WorkClose is the run's `WORK_RESULT: close` request, when the agent
+	// asked to close its work item. The session itself classifies as
+	// FailureAgentBlocked (a deliberate decline) on every legacy path.
+	WorkClose *WorkClose `json:"workClose,omitempty"`
+
+	// StageStart and StageTransition record the stage transitions applied
+	// for a work item that carries transitions (see stage_outcome.go): the
+	// start transition, and the end-of-run outcome's. Nil otherwise.
+	StageStart      *StageTransitionRecord `json:"stageStart,omitempty"`
+	StageTransition *StageTransitionRecord `json:"stageTransition,omitempty"`
+
 	// BudgetReport captures the per-stage budget enforcement record.
 	// Non-nil
 	// for every Run; the .Enforced flag distinguishes
