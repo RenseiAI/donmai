@@ -68,24 +68,27 @@ function readPinnedPiVersion(repoRoot) {
 
 // Node-pg template check list. THE single artifact the verifier executes for
 // the node-pg template: `pnpm --version` proves the pinned package manager
-// resolves, `pg-start` proves the local Postgres 17 cluster comes up, and
-// the probe proves the pgvector extension enables in a scratch database.
-// The verifier runs exactly these commands in order (see
-// assertNodePgCheckOutput); removing an entry here removes it from
+// resolves, `pg-start` proves the local Postgres 17 cluster comes up as the
+// unprivileged sandbox account, and the probe proves the pgvector extension
+// enables in a scratch database. The socket lives in /tmp (the Dockerfile
+// moves unix_socket_directories and stats_temp_directory there so the
+// unprivileged account always has a writable socket directory), so every
+// client passes -h /tmp. The verifier runs exactly these commands in order
+// (see assertNodePgCheckOutput); removing an entry here removes it from
 // verification, and the node-pg check-list test fails.
 const PNPM_VERSION_COMMAND = 'pnpm --version'
 const PG_START_COMMAND = 'pg-start'
 const PGVECTOR_PROBE_COMMAND =
-  "psql -U postgres -d postgres -c 'DROP DATABASE IF EXISTS pgvector_probe' " +
-  '&& createdb -U postgres pgvector_probe ' +
-  "&& psql -U postgres -d pgvector_probe -c 'CREATE EXTENSION vector'"
+  "psql -h /tmp -U postgres -d postgres -c 'DROP DATABASE IF EXISTS pgvector_probe' " +
+  '&& createdb -h /tmp -U postgres pgvector_probe ' +
+  "&& psql -h /tmp -U postgres -d pgvector_probe -c 'CREATE EXTENSION vector'"
 // POSTGRES_VERSION_COMMAND queries the running server for its version so the
 // verifier compares the actual major against the Dockerfile pin instead of
 // trusting pg-start's ready message. No backslashes: the E2B build SDK
 // strips single backslashes from RUN bodies, and the same rule keeps
 // verifier commands free of escapes.
 const POSTGRES_VERSION_COMMAND =
-  "psql -U postgres -d postgres -tAc 'SHOW server_version'"
+  "psql -h /tmp -U postgres -d postgres -tAc 'SHOW server_version'"
 
 function nodePgCheckCommands() {
   return [PNPM_VERSION_COMMAND, PG_START_COMMAND, PGVECTOR_PROBE_COMMAND]
@@ -275,6 +278,56 @@ function hasBuildTimeVectorSmoke(dockerfileSource) {
 function hasTrustLocalAuth(dockerfileSource) {
   const executable = executableDockerfileText(dockerfileSource)
   return executable.includes('pg_hba.conf') && executable.includes('trust')
+}
+
+// hasSandboxUser reports whether the node-pg Dockerfile provisions the
+// unprivileged sandbox account the E2B SDK runs commands as. Without it the
+// chown below has no target and the runtime USER user owns nothing.
+function hasSandboxUser(dockerfileSource) {
+  const executable = executableDockerfileText(dockerfileSource)
+  return (
+    /useradd\s+[^&;\n]*\buser\b/.test(executable) ||
+    /adduser\s+[^&;\n]*\buser\b/.test(executable)
+  )
+}
+
+// hasClusterOwnedBySandboxUser reports whether the node-pg Dockerfile
+// transfers the Postgres cluster to the sandbox account. pg_ctlcluster
+// permits only the cluster owner or root, so a postgres-owned cluster
+// leaves pg-start failing as the unprivileged SDK user even with trust
+// authentication. Comment-only mentions do not count.
+function hasClusterOwnedBySandboxUser(dockerfileSource) {
+  const executable = executableDockerfileText(dockerfileSource)
+  return (
+    /chown\s+-R\s+user[:\s]/.test(executable) &&
+    executable.includes('/var/lib/postgresql') &&
+    executable.includes('/etc/postgresql')
+  )
+}
+
+// hasTmpSocketConfig reports whether the node-pg Dockerfile and its pg-start
+// helper use /tmp for the socket and readiness probe. /var/run is a fresh
+// tmpfs at sandbox boot, so a socket there is unwritable for the
+// unprivileged account even after the chown; /tmp is always writable.
+function hasTmpSocketConfig(dockerfileSource) {
+  const executable = executableDockerfileText(dockerfileSource)
+  return (
+    executable.includes("unix_socket_directories = '/tmp'") &&
+    executable.includes('/tmp/pg_stat_tmp') &&
+    executable.includes('pg_isready -h /tmp')
+  )
+}
+
+// hasUnprivilegedPgStart is the blocking-finding guard: pg-start plus the
+// ownership transfer plus the /tmp socket. Any one missing leaves the
+// advertised helper failing as the SDK user.
+function hasUnprivilegedPgStart(dockerfileSource) {
+  return (
+    hasPgStartScript(dockerfileSource) &&
+    hasSandboxUser(dockerfileSource) &&
+    hasClusterOwnedBySandboxUser(dockerfileSource) &&
+    hasTmpSocketConfig(dockerfileSource)
+  )
 }
 
 function hasNodePgTemplate(repoRoot) {
@@ -765,12 +818,16 @@ module.exports = {
   formatFailure,
   hasBuildTimeVectorSmoke,
   hasCToolchainForRace,
+  hasClusterOwnedBySandboxUser,
   hasE2bCompatibleGoPath,
   hasGoTemplate,
   hasNodePgTemplate,
   hasPgStartScript,
   hasPgvectorPackage,
+  hasSandboxUser,
+  hasTmpSocketConfig,
   hasTrustLocalAuth,
+  hasUnprivilegedPgStart,
   isGoTemplateRef,
   isNodePgTemplateRef,
   main,

@@ -24,12 +24,16 @@ const {
   executableDockerfileText,
   hasBuildTimeVectorSmoke,
   hasCToolchainForRace,
+  hasClusterOwnedBySandboxUser,
   hasE2bCompatibleGoPath,
   hasGoTemplate,
   hasNodePgTemplate,
   hasPgStartScript,
   hasPgvectorPackage,
+  hasSandboxUser,
+  hasTmpSocketConfig,
   hasTrustLocalAuth,
+  hasUnprivilegedPgStart,
   isGoTemplateRef,
   isNodePgTemplateRef,
   main,
@@ -2207,4 +2211,85 @@ test('e2b.node-pg.Dockerfile installs pnpm with --force over corepack shims', ()
     executableDockerfileText(dockerfile),
     /npm i -g pnpm@\$\{PNPM_VERSION\} --force/
   )
+})
+
+test('node-pg verifier clients target the /tmp socket', () => {
+  // The Dockerfile moves unix_socket_directories to /tmp so the
+  // unprivileged account always has a writable socket directory. Every
+  // verifier client must pass -h /tmp or it probes the old default socket
+  // and fails against the fixed image.
+  assert.ok(
+    PGVECTOR_PROBE_COMMAND.includes('-h /tmp'),
+    `vector probe must target /tmp, got ${JSON.stringify(PGVECTOR_PROBE_COMMAND)}`
+  )
+  assert.ok(
+    POSTGRES_VERSION_COMMAND.includes('-h /tmp'),
+    `version query must target /tmp, got ${JSON.stringify(POSTGRES_VERSION_COMMAND)}`
+  )
+})
+
+test('e2b.node-pg.Dockerfile grants the sandbox account OS permission to start Postgres', () => {
+  // Blocking-finding guard: pg_ctlcluster permits only the cluster owner
+  // or root, so a postgres-owned cluster leaves pg-start failing as the
+  // SDK user even with trust auth. The Dockerfile must create user, chown
+  // the cluster to it, and keep the socket in /tmp.
+  const repoRoot = testRepoRoot()
+  const dockerfile = fs.readFileSync(
+    path.join(repoRoot, 'worker', 'e2b', 'e2b.node-pg.Dockerfile'),
+    'utf8'
+  )
+  assert.equal(hasSandboxUser(dockerfile), true)
+  assert.equal(hasClusterOwnedBySandboxUser(dockerfile), true)
+  assert.equal(hasTmpSocketConfig(dockerfile), true)
+  assert.equal(hasUnprivilegedPgStart(dockerfile), true)
+})
+
+test('unprivileged-start guard fails when the ownership transfer is reverted', () => {
+  // Revert simulation: the pre-fix Dockerfile provisioned pg-start and
+  // trust auth but left the cluster postgres-owned with the socket in
+  // /var/run/postgresql. The guard must go RED on that layout.
+  const reverted = [
+    'FROM debian:bookworm-slim',
+    'RUN apt-get update && apt-get install -y postgresql-17 postgresql-17-pgvector',
+    "RUN sed -i -e 's/peer/trust/' /etc/postgresql/17/main/pg_hba.conf",
+    'RUN echo \'#!/bin/sh\' > /usr/local/bin/pg-start',
+    'RUN echo \'pg_ctlcluster 17 main start\' >> /usr/local/bin/pg-start',
+    'RUN echo \'if pg_isready -h /var/run/postgresql -U postgres >/dev/null 2>&1; then\' >> /usr/local/bin/pg-start',
+    'RUN chmod +x /usr/local/bin/pg-start',
+    'RUN pg-start && psql -U postgres -d postgres -c \'CREATE EXTENSION vector\' && pg_ctlcluster 17 main stop',
+  ].join('\n')
+  assert.equal(hasPgStartScript(reverted), true)
+  assert.equal(hasTrustLocalAuth(reverted), true)
+  assert.equal(hasSandboxUser(reverted), false)
+  assert.equal(hasClusterOwnedBySandboxUser(reverted), false)
+  assert.equal(hasTmpSocketConfig(reverted), false)
+  assert.equal(hasUnprivilegedPgStart(reverted), false)
+})
+
+test('unprivileged-start guard ignores comment-only ownership mentions', () => {
+  const commentOnly = [
+    '# useradd -m -s /bin/bash user',
+    '# chown -R user:user /var/lib/postgresql /etc/postgresql',
+    "# unix_socket_directories = '/tmp'",
+    '# pg_isready -h /tmp',
+    'FROM debian:bookworm-slim',
+  ].join('\n')
+  assert.equal(hasSandboxUser(commentOnly), false)
+  assert.equal(hasClusterOwnedBySandboxUser(commentOnly), false)
+  assert.equal(hasTmpSocketConfig(commentOnly), false)
+  assert.equal(hasUnprivilegedPgStart(commentOnly), false)
+})
+
+test('e2b.node-pg.Dockerfile proves an unprivileged start at build time', () => {
+  // The build-time smoke must repeat the start and the vector probe as
+  // user: a postgres-owned cluster passes the root half and fails here,
+  // exactly the release failure this guards.
+  const repoRoot = testRepoRoot()
+  const dockerfile = fs.readFileSync(
+    path.join(repoRoot, 'worker', 'e2b', 'e2b.node-pg.Dockerfile'),
+    'utf8'
+  )
+  const executable = executableDockerfileText(dockerfile)
+  assert.match(executable, /su user -s \/bin\/sh -c 'pg-start'/)
+  assert.match(executable, /su user -s \/bin\/sh -c "[^"]*CREATE EXTENSION vector/)
 })

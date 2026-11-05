@@ -25,10 +25,15 @@
 #   is created at build time with trust authentication for local socket and
 #   loopback TCP connections, so in-box test suites can connect without a
 #   password: this template is an ephemeral single-tenant sandbox, and no
-#   credential is baked in (there is no password to bake). `pg-start`
+#   credential is baked in (there is no password to bake). The cluster data,
+#   config, log, and run directories are transferred to the unprivileged
+#   sandbox account (see below), and the socket plus stats temp directories
+#   live under /tmp, so the unprivileged account holds OS permission to
+#   start the server and always has a writable socket directory, even when
+#   the runtime tmpfs hides the build-time /var/run/postgresql. `pg-start`
 #   (in /usr/local/bin, on the login default PATH) brings the cluster up on
 #   first use; the build-time smoke below proves the whole path before the
-#   template ships.
+#   template ships, including an unprivileged start as the sandbox account.
 #
 # Seats running tsc on large repositories should export
 # NODE_OPTIONS=--max-old-space-size=12288 (12 GiB of the 16 GiB box). It is
@@ -46,6 +51,16 @@
 # TypeScript repository. The base `donmai-worker` template keeps E2B's
 # defaults; the Go template builds at 4 vCPU / 8 GiB.
 FROM debian:bookworm-slim
+
+# Unprivileged sandbox account. The E2B build SDK appends USER user when the
+# Dockerfile names no explicit USER, so sandbox commands (including the
+# release verifier) run as user, not root. PostgreSQL-common only lets the
+# cluster owner or root run pg_ctlcluster: a postgres-owned cluster leaves
+# the advertised pg-start failing as user. Creating user here and
+# transferring the cluster to it below gives the runtime account OS
+# permission to start its own database with no credential or privilege
+# escalation. The id check keeps rebuilds idempotent.
+RUN id -u user 2>/dev/null || useradd -m -s /bin/bash user
 
 # Base tools + GitHub CLI (`gh`) + gnupg for the PGDG keyring. Same as
 # e2b.Dockerfile: `gh` is not in Debian's default repos, so the official
@@ -79,13 +94,18 @@ RUN curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
          postgresql-17 postgresql-17-pgvector \
     && rm -rf /var/lib/apt/lists/*
 
-# Trust authentication for local connections. The PGDG postinst creates the
-# `main` cluster with peer/scram-sha-256 auth, which rejects passwordless
-# `psql -U postgres` from any uid but the postgres user. This template is an
-# ephemeral single-tenant sandbox with no password anywhere, so local socket
-# and loopback TCP connections trust: in-box `*.pg.test.ts` suites connect
-# with no credential setup. Remote TCP is untouched (no listen_addresses
-# change here; the default is localhost-only).
+# Trust authentication for local connections, plus ownership and socket
+# placement so the unprivileged sandbox account can start the cluster. The
+# PGDG postinst creates the `main` cluster with peer/scram-sha-256 auth,
+# which rejects passwordless `psql -U postgres` from any uid but the
+# postgres user. This template is an ephemeral single-tenant sandbox with
+# no password anywhere, so local socket and loopback TCP connections trust:
+# in-box `*.pg.test.ts` suites connect with no credential setup. Remote TCP
+# is untouched (no listen_addresses change here; the default is
+# localhost-only). The chown below transfers the cluster to user so
+# pg_ctlcluster accepts the runtime account; the socket overrides move the
+# socket and stats temp files to /tmp, which the runtime account can always
+# write even when /var/run is a fresh tmpfs at sandbox boot.
 # NOTE: no backslashes in any RUN command body. The E2B template build SDK
 # parses the Dockerfile with dockerfile-ast and re-emits each RUN joined by
 # single spaces, which strips every single backslash before the builder
@@ -96,27 +116,34 @@ RUN sed -i \
       -e 's/peer/trust/' \
       -e 's/scram-sha-256/trust/' \
       /etc/postgresql/17/main/pg_hba.conf \
-    && grep -E '^(local|host)' /etc/postgresql/17/main/pg_hba.conf
+    && grep -E '^(local|host)' /etc/postgresql/17/main/pg_hba.conf \
+    && echo "unix_socket_directories = '/tmp'" >> /etc/postgresql/17/main/postgresql.conf \
+    && echo "stats_temp_directory = '/tmp/pg_stat_tmp'" >> /etc/postgresql/17/main/postgresql.conf \
+    && chown -R user:user /var/lib/postgresql /etc/postgresql /var/log/postgresql /var/run/postgresql \
+    && ls -ld /var/lib/postgresql/17/main
 
 # pg-start: bring the local Postgres 17 cluster up on first use. Idempotent
 # (a second call is a no-op) so seats and the template verifier can call it
 # unconditionally, and it waits for readiness instead of returning while the
 # server is still starting. Lives in /usr/local/bin so it resolves under
 # `bash -l -c`, the shell E2B uses for build steps and SDK version checks.
-# Written with echo (no heredoc): the SDK joins each RUN into one line, so a
-# shell heredoc terminator would never stand alone and the whole remainder of
-# the Dockerfile would be swallowed into this RUN. Every echo body is
-# single-quoted with no backslashes for the same reason.
+# Runs unprivileged: the cluster is owned by user (see above) and the
+# socket lives in /tmp, so pg_ctlcluster accepts the sandbox account with
+# no sudo. Written with echo (no heredoc): the SDK joins each RUN into one
+# line, so a shell heredoc terminator would never stand alone and the whole
+# remainder of the Dockerfile would be swallowed into this RUN. Every echo
+# body is single-quoted with no backslashes for the same reason.
 RUN echo '#!/bin/sh' > /usr/local/bin/pg-start \
     && echo '# Bring up the template local Postgres 17 cluster on first use.' >> /usr/local/bin/pg-start \
     && echo 'set -eu' >> /usr/local/bin/pg-start \
     && echo 'if pg_lsclusters 17 main 2>/dev/null | grep -q " online"; then' >> /usr/local/bin/pg-start \
     && echo 'echo "postgres 17/main already online"' >> /usr/local/bin/pg-start \
     && echo 'else' >> /usr/local/bin/pg-start \
+    && echo 'mkdir -p /tmp/pg_stat_tmp' >> /usr/local/bin/pg-start \
     && echo 'pg_ctlcluster 17 main start' >> /usr/local/bin/pg-start \
     && echo 'fi' >> /usr/local/bin/pg-start \
     && echo 'for _ in $(seq 1 30); do' >> /usr/local/bin/pg-start \
-    && echo 'if pg_isready -h /var/run/postgresql -U postgres >/dev/null 2>&1; then' >> /usr/local/bin/pg-start \
+    && echo 'if pg_isready -h /tmp -U postgres >/dev/null 2>&1; then' >> /usr/local/bin/pg-start \
     && echo 'echo "postgres 17/main ready"' >> /usr/local/bin/pg-start \
     && echo 'exit 0' >> /usr/local/bin/pg-start \
     && echo 'fi' >> /usr/local/bin/pg-start \
@@ -190,12 +217,22 @@ RUN if [ "${PNPM_WARM_STORE}" = "1" ]; then \
 # Build-time smoke: prove the whole Postgres path before the template ships.
 # Starts the cluster via pg-start, creates a scratch database, enables the
 # vector extension in it, then cleans up and stops the cluster so the first
-# in-box pg-start exercises the start path. Any failure here fails the
-# template build rather than shipping a template whose verify step fails at
-# its first `CREATE EXTENSION vector`.
+# in-box pg-start exercises the start path. The socket lives in /tmp (see
+# above), so every client passes -h /tmp. The second half repeats the start
+# and probe as the unprivileged sandbox account: a postgres-owned cluster
+# would pass the root half and fail here, exactly the release failure this
+# guards. Any failure here fails the template build rather than shipping a
+# template whose verify step fails at its first `CREATE EXTENSION vector`.
 RUN pg-start \
-    && psql -U postgres -d postgres -c "DROP DATABASE IF EXISTS build_probe" \
-    && createdb -U postgres build_probe \
-    && psql -U postgres -d build_probe -c 'CREATE EXTENSION vector' \
-    && psql -U postgres -d postgres -c 'DROP DATABASE build_probe' \
+    && psql -h /tmp -U postgres -d postgres -c "DROP DATABASE IF EXISTS build_probe" \
+    && createdb -h /tmp -U postgres build_probe \
+    && psql -h /tmp -U postgres -d build_probe -c 'CREATE EXTENSION vector' \
+    && psql -h /tmp -U postgres -d postgres -c 'DROP DATABASE build_probe' \
+    && pg_ctlcluster 17 main stop \
+    && su user -s /bin/sh -c 'pg-start' \
+    && su user -s /bin/sh -c "psql -h /tmp -U postgres -d postgres -tAc 'SHOW server_version'" \
+    && su user -s /bin/sh -c "psql -h /tmp -U postgres -d postgres -c 'DROP DATABASE IF EXISTS build_probe_user'" \
+    && su user -s /bin/sh -c 'createdb -h /tmp -U postgres build_probe_user' \
+    && su user -s /bin/sh -c "psql -h /tmp -U postgres -d build_probe_user -c 'CREATE EXTENSION vector'" \
+    && su user -s /bin/sh -c "psql -h /tmp -U postgres -d postgres -c 'DROP DATABASE build_probe_user'" \
     && pg_ctlcluster 17 main stop
