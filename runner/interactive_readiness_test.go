@@ -41,56 +41,56 @@ func TestInteractiveReadiness_Contract(t *testing.T) {
 		wantPull     bool
 	}{
 		{
-			name: "hook idle is live and queued",
+			name:    "hook idle is live and queued",
 			channel: agent.NoticeDeliveryHook, nch: liveHook,
 			wantState: agent.ChatStateIdle, wantLive: true, wantQueue: true,
 			wantDeclared: true, wantDriven: true, wantExposed: true, wantPull: true,
 		},
 		{
-			name: "hook busy stays live and queued",
+			name:    "hook busy stays live and queued",
 			channel: agent.NoticeDeliveryHook, nch: liveHook, busy: true,
 			wantState: agent.ChatStateBusy, wantLive: true, wantQueue: true,
 			wantDeclared: true, wantDriven: true, wantExposed: true, wantPull: true,
 		},
 		{
-			name: "hook ignores the alternate screen: pull never touches the terminal",
+			name:    "hook ignores the alternate screen: pull never touches the terminal",
 			channel: agent.NoticeDeliveryHook, nch: liveHook, alt: true,
 			wantState: agent.ChatStateIdle, wantLive: true, wantQueue: true,
 			wantDeclared: true, wantDriven: true, wantExposed: true, wantPull: true,
 		},
 		{
-			name: "hook ended takes nothing",
+			name:    "hook ended takes nothing",
 			channel: agent.NoticeDeliveryHook, nch: liveHook, ended: true,
 			wantState: agent.ChatStateEnded, wantLive: false, wantQueue: false,
-			wantReason: agent.ChatReasonSessionEnded,
+			wantReason:   agent.ChatReasonSessionEnded,
 			wantDeclared: true, wantDriven: true, wantExposed: true, wantPull: true,
 		},
 		{
-			name: "hook declared but absent is queue-only with the absent reason",
+			name:    "hook declared but absent is queue-only with the absent reason",
 			channel: agent.NoticeDeliveryHook, nch: nil,
 			wantState: agent.ChatStateIdle, wantLive: false, wantQueue: true,
-			wantReason: agent.ChatReasonChannelAbsent,
+			wantReason:   agent.ChatReasonChannelAbsent,
 			wantDeclared: true, wantDriven: true, wantPull: true,
 		},
 		{
-			name: "pty-notice is not semantic chat even when push would succeed",
+			name:    "pty-notice is not semantic chat even when push would succeed",
 			channel: agent.NoticeDeliveryPTYNotice, nch: nil,
 			wantState: agent.ChatStateIdle, wantLive: false, wantQueue: false,
-			wantReason: agent.ChatReasonPTYNoticeNotChat,
+			wantReason:   agent.ChatReasonPTYNoticeNotChat,
 			wantDeclared: true, wantDriven: true, wantExposed: true,
 		},
 		{
-			name: "pty-notice on the alternate screen stays not-chat with the modal state",
+			name:    "pty-notice on the alternate screen stays not-chat with the modal state",
 			channel: agent.NoticeDeliveryPTYNotice, nch: nil, alt: true,
 			wantState: agent.ChatStateModal, wantLive: false, wantQueue: false,
-			wantReason: agent.ChatReasonModalAlternateScreen,
+			wantReason:   agent.ChatReasonModalAlternateScreen,
 			wantDeclared: true, wantDriven: true, wantExposed: true,
 		},
 		{
-			name: "pty-notice ended takes nothing",
+			name:    "pty-notice ended takes nothing",
 			channel: agent.NoticeDeliveryPTYNotice, nch: nil, ended: true,
 			wantState: agent.ChatStateEnded, wantLive: false, wantQueue: false,
-			wantReason: agent.ChatReasonSessionEnded,
+			wantReason:   agent.ChatReasonSessionEnded,
 			wantDeclared: true, wantDriven: true, wantExposed: true,
 		},
 	}
@@ -438,5 +438,3 @@ func TestInteractiveReadiness_QueueReadinessMirrorsTheSlot(t *testing.T) {
 		t.Fatalf("absent-channel readiness = %+v; want queue-only with %q", got, agent.ChatReasonChannelAbsent)
 	}
 }
-
-
