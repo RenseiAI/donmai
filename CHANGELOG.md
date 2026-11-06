@@ -10,6 +10,14 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 No unreleased changes.
 
+## v0.73.3 — 2026-11-06
+
+### Chores
+
+- Report applied reasoning effort after successful turn admission
+- Add node-pg E2B worker template with pnpm, Postgres 17 and pgvector
+- Archive bounded redacted failed-session transcript tails
+
 ## v0.73.2 — 2026-11-05
 
 ### Fixes
