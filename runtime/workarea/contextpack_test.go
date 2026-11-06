@@ -497,3 +497,44 @@ func TestMaterializeContextPackUppercaseDigestRedeliverySucceeds(t *testing.T) {
 		t.Fatalf("redelivered bytes = %q, err=%v", rebody, err)
 	}
 }
+
+// TestMaterializeContextPackLegacyUppercaseMarkerRedeliverySucceeds pins the
+// case-insensitive digest comparison as load-bearing: a marker written by an
+// older publisher with uppercase hexadecimal digests must still match the
+// identical carrier on redelivery. Reverting sameIncludedDigests to a
+// case-sensitive comparison refuses this redelivery with a false conflict.
+func TestMaterializeContextPackLegacyUppercaseMarkerRedeliverySucceeds(t *testing.T) {
+	root := RootPath(t.TempDir())
+	doc := testPackDoc(t, "doc.md", "negotiated bytes")
+	pack := ContextPackV1{Version: ContextPackProtocol, PackID: "pack1", Documents: []ContextDocumentV1{doc}}
+	first, err := MaterializeContextPack(root, pack)
+	if err != nil {
+		t.Fatalf("first delivery: %v", err)
+	}
+	markerPath := filepath.Join(string(root), filepath.FromSlash(first.Dir), ContextPackMarkerName)
+	raw, err := os.ReadFile(markerPath)
+	if err != nil {
+		t.Fatalf("read marker: %v", err)
+	}
+	var report ContextPackReport
+	if err := json.Unmarshal(raw, &report); err != nil {
+		t.Fatalf("decode marker: %v", err)
+	}
+	for i := range report.Included {
+		report.Included[i].Digest = "sha256:" + strings.ToUpper(strings.TrimPrefix(report.Included[i].Digest, "sha256:"))
+	}
+	upper, err := json.Marshal(report)
+	if err != nil {
+		t.Fatalf("encode marker: %v", err)
+	}
+	if err := os.WriteFile(markerPath, upper, 0o600); err != nil {
+		t.Fatalf("seed legacy marker: %v", err)
+	}
+	again, err := MaterializeContextPack(root, pack)
+	if err != nil {
+		t.Fatalf("legacy uppercase marker refused on redelivery: %v", err)
+	}
+	if len(again.Included) != 1 || again.Included[0].Path != "doc.md" {
+		t.Fatalf("redelivery included = %+v", again.Included)
+	}
+}

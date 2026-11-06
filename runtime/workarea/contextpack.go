@@ -410,6 +410,11 @@ func MaterializeContextPack(root RootPath, pack ContextPackV1) (ContextPackRepor
 	return report, nil
 }
 
+// sameIncludedDigests compares two inclusion receipts case-insensitively on
+// digests: markers written before digest canonicalization may carry
+// uppercase hexadecimal, and an identical redelivery must still match.
+// TestMaterializeContextPackLegacyUppercaseMarkerRedeliverySucceeds pins this:
+// reverting EqualFold to == refuses that redelivery as a false conflict.
 func sameIncludedDigests(a, b []ContextPackIncluded) bool {
 	if len(a) != len(b) {
 		return false
