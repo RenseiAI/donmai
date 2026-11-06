@@ -423,3 +423,77 @@ func TestMaterializeContextPackMarkerFIFORefusesWithoutBlocking(t *testing.T) {
 		t.Fatal("materialization blocked opening FIFO")
 	}
 }
+
+// TestMaterializeContextPackRefusesSymlinkedAncestors pins the dedicated
+// directory fix: a symlinked metadata ancestor must refuse before any
+// document is published, and the link target must stay untouched.
+func TestMaterializeContextPackRefusesSymlinkedAncestors(t *testing.T) {
+	for _, linkRel := range []string{DeclarationDirName, DeclarationDirName + "/" + ContextPackDirName} {
+		t.Run(filepath.FromSlash(linkRel), func(t *testing.T) {
+			root := RootPath(t.TempDir())
+			parent := filepath.Dir(filepath.Join(string(root), filepath.FromSlash(linkRel)))
+			if err := os.MkdirAll(parent, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			target := t.TempDir()
+			if err := os.WriteFile(filepath.Join(target, "sentinel.md"), []byte("repository bytes"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(target, filepath.Join(string(root), filepath.FromSlash(linkRel))); err != nil {
+				t.Fatal(err)
+			}
+			pack := ContextPackV1{Version: ContextPackProtocol, PackID: "pack1", Documents: []ContextDocumentV1{testPackDoc(t, "guide.md", "negotiated bytes")}}
+			if _, err := MaterializeContextPack(root, pack); err == nil {
+				t.Fatal("symlinked ancestor accepted")
+			}
+			var packErr *ContextPackError
+			if _, err := MaterializeContextPack(root, pack); !errors.As(err, &packErr) || packErr.Reason != ReasonContextPackUnsafe {
+				t.Fatalf("ancestor refusal reason = %v, want %q", err, ReasonContextPackUnsafe)
+			}
+			entries, err := os.ReadDir(target)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(entries) != 1 || entries[0].Name() != "sentinel.md" {
+				t.Fatalf("link target changed: %v", entries)
+			}
+			body, err := os.ReadFile(filepath.Join(target, "sentinel.md"))
+			if err != nil || string(body) != "repository bytes" {
+				t.Fatalf("link target overwritten: %q, err=%v", body, err)
+			}
+		})
+	}
+}
+
+// TestMaterializeContextPackUppercaseDigestRedeliverySucceeds pins digest
+// normalization: an uppercase hexadecimal digest is accepted once and the
+// identical carrier redelivers byte-identical documents instead of
+// refusing with a false digest mismatch.
+func TestMaterializeContextPackUppercaseDigestRedeliverySucceeds(t *testing.T) {
+	root := RootPath(t.TempDir())
+	doc := testPackDoc(t, "doc.md", "negotiated bytes")
+	doc.Digest = "sha256:" + strings.ToUpper(strings.TrimPrefix(doc.Digest, "sha256:"))
+	pack := ContextPackV1{Version: ContextPackProtocol, PackID: "pack1", Documents: []ContextDocumentV1{doc}}
+	first, err := MaterializeContextPack(root, pack)
+	if err != nil {
+		t.Fatalf("uppercase digest refused on first delivery: %v", err)
+	}
+	if len(first.Included) != 1 {
+		t.Fatalf("included = %+v", first.Included)
+	}
+	body, err := os.ReadFile(filepath.Join(string(root), filepath.FromSlash(first.Dir), "doc.md"))
+	if err != nil || string(body) != "negotiated bytes" {
+		t.Fatalf("published bytes = %q, err=%v", body, err)
+	}
+	again, err := MaterializeContextPack(root, pack)
+	if err != nil {
+		t.Fatalf("identical uppercase carrier refused on redelivery: %v", err)
+	}
+	if len(again.Included) != 1 || again.Included[0].Path != "doc.md" {
+		t.Fatalf("redelivery included = %+v", again.Included)
+	}
+	rebody, err := os.ReadFile(filepath.Join(string(root), filepath.FromSlash(again.Dir), "doc.md"))
+	if err != nil || string(rebody) != "negotiated bytes" {
+		t.Fatalf("redelivered bytes = %q, err=%v", rebody, err)
+	}
+}

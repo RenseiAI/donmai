@@ -220,6 +220,47 @@ func ContextPackDir(_ RootPath, packID string) string {
 	return DeclarationDirName + "/" + ContextPackDirName + "/" + packID
 }
 
+func ensureContextPackParent(root *os.Root) (os.FileInfo, error) {
+	// The session-owned context directory must stay an independent
+	// metadata directory: an operator-planted symlink at either
+	// metadata ancestor would redirect publication into a repository
+	// checkout (including a declared read-only repository). MkdirAll
+	// follows such links, so each ancestor is created level by level
+	// and proved to be a real directory before use.
+	if _, err := root.Lstat(DeclarationDirName); err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+		if err := root.Mkdir(DeclarationDirName, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+			return nil, err
+		}
+	}
+	declaredIdent, err := root.Lstat(DeclarationDirName)
+	if err != nil {
+		return nil, err
+	}
+	if declaredIdent.Mode()&os.ModeSymlink != 0 || !declaredIdent.IsDir() {
+		return nil, &ContextPackError{Reason: ReasonContextPackUnsafe, Path: DeclarationDirName, Detail: "metadata directory is not a real directory"}
+	}
+	contextRel := DeclarationDirName + "/" + ContextPackDirName
+	if _, err := root.Lstat(contextRel); err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+		if err := root.Mkdir(contextRel, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+			return nil, err
+		}
+	}
+	contextIdent, err := root.Lstat(contextRel)
+	if err != nil {
+		return nil, err
+	}
+	if contextIdent.Mode()&os.ModeSymlink != 0 || !contextIdent.IsDir() {
+		return nil, &ContextPackError{Reason: ReasonContextPackUnsafe, Path: contextRel, Detail: "context directory is not a real directory"}
+	}
+	return contextIdent, nil
+}
+
 // MaterializeContextPack publishes the pack atomically under the session-owned directory.
 func MaterializeContextPack(root RootPath, pack ContextPackV1) (ContextPackReport, error) {
 	if err := ValidateContextPack(pack); err != nil {
@@ -253,14 +294,23 @@ func MaterializeContextPack(root RootPath, pack ContextPackV1) (ContextPackRepor
 		if !bytes.Equal(sum[:], want) {
 			return ContextPackReport{}, &ContextPackError{Reason: ReasonContextPackDigest, Path: doc.Path, Detail: "digest mismatch"}
 		}
+		canonical := "sha256:" + hex.EncodeToString(sum[:])
 		stagedDocs = append(stagedDocs, staged{rel: clean, content: content})
-		included = append(included, ContextPackIncluded{Path: clean, Bytes: len(content), Digest: doc.Digest})
+		included = append(included, ContextPackIncluded{Path: clean, Bytes: len(content), Digest: canonical})
 	}
 	rootHandle, err := openDeclarationRoot(root)
 	if err != nil {
 		return ContextPackReport{}, err
 	}
 	defer func() { _ = rootHandle.Close() }()
+	contextIdent, err := ensureContextPackParent(rootHandle)
+	if err != nil {
+		var packErr *ContextPackError
+		if errors.As(err, &packErr) {
+			return ContextPackReport{}, err
+		}
+		return ContextPackReport{}, fmt.Errorf("runtime/workarea: create context directory: %w", err)
+	}
 	finalRel := ContextPackDir(root, pack.PackID)
 	if existing, readErr := readContextPackMarker(rootHandle, finalRel); readErr == nil {
 		// Redelivery trusts nothing it has not re-proved: the marker
@@ -288,16 +338,13 @@ func MaterializeContextPack(root RootPath, pack ContextPackV1) (ContextPackRepor
 		return ContextPackReport{}, err
 	}
 	stagingRel := DeclarationDirName + "/" + ContextPackDirName + "/" + stagingName
-	if err := rootHandle.MkdirAll(DeclarationDirName+"/"+ContextPackDirName, 0o700); err != nil {
-		return ContextPackReport{}, fmt.Errorf("runtime/workarea: create context directory: %w", err)
-	}
 	committed := false
 	defer func() {
 		if !committed {
 			_ = rootHandle.RemoveAll(stagingRel)
 		}
 	}()
-	if err := rootHandle.MkdirAll(stagingRel, 0o700); err != nil {
+	if err := rootHandle.Mkdir(stagingRel, 0o700); err != nil {
 		return ContextPackReport{}, fmt.Errorf("runtime/workarea: create staging: %w", err)
 	}
 	stagingRoot, err := rootHandle.OpenRoot(stagingRel)
@@ -341,6 +388,16 @@ func MaterializeContextPack(root RootPath, pack ContextPackV1) (ContextPackRepor
 	}
 	_ = markerFile.Close()
 	_ = stagingRoot.Close()
+	// Re-prove the context parent did not change while staging: an
+	// ancestor swapped for a symlink after validation must not carry
+	// the atomic rename into a repository checkout.
+	currentIdent, err := rootHandle.Lstat(DeclarationDirName + "/" + ContextPackDirName)
+	if err != nil {
+		return ContextPackReport{}, fmt.Errorf("runtime/workarea: recheck context directory: %w", err)
+	}
+	if currentIdent.Mode()&os.ModeSymlink != 0 || !currentIdent.IsDir() || !os.SameFile(contextIdent, currentIdent) {
+		return ContextPackReport{}, &ContextPackError{Reason: ReasonContextPackUnsafe, Path: DeclarationDirName + "/" + ContextPackDirName, Detail: "context directory changed during publication"}
+	}
 	stagingAbs := filepath.Join(string(root), filepath.FromSlash(stagingRel))
 	finalAbs := filepath.Join(string(root), filepath.FromSlash(finalRel))
 	if err := RenameNoReplace(stagingAbs, finalAbs); err != nil {
@@ -358,7 +415,7 @@ func sameIncludedDigests(a, b []ContextPackIncluded) bool {
 		return false
 	}
 	for i := range a {
-		if a[i] != b[i] {
+		if a[i].Path != b[i].Path || a[i].Bytes != b[i].Bytes || !strings.EqualFold(a[i].Digest, b[i].Digest) {
 			return false
 		}
 	}
@@ -459,7 +516,7 @@ func verifyContextPackDocuments(root *os.Root, finalRel string, included []Conte
 			return &ContextPackError{Reason: ReasonContextPackDigest, Path: inc.Path, Detail: "published document changed"}
 		}
 		sum := sha256.Sum256(body)
-		if "sha256:"+hex.EncodeToString(sum[:]) != inc.Digest {
+		if !strings.EqualFold("sha256:"+hex.EncodeToString(sum[:]), inc.Digest) {
 			return &ContextPackError{Reason: ReasonContextPackDigest, Path: inc.Path, Detail: "published document digest mismatch"}
 		}
 	}
