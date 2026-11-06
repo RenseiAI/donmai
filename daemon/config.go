@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -509,6 +510,15 @@ type AutoUpdateConfig struct {
 	Channel             UpdateChannel  `yaml:"channel"             json:"channel"`
 	Schedule            UpdateSchedule `yaml:"schedule"            json:"schedule"`
 	DrainTimeoutSeconds int            `yaml:"drainTimeoutSeconds" json:"drainTimeoutSeconds"`
+
+	// Scheduled opts the host into scheduled pull checks owned by
+	// Start/Stop (nightly at 03:00 local time, or hourly for on-release).
+	// Off by default: configuring a cdnBase alone (needed for consented
+	// push upgrades) never starts background self-updates. The scheduled
+	// loop runs only when scheduled is true plus a nightly/on-release
+	// schedule, a configured cdnBase origin (or link-time default), and
+	// at least one signers entry.
+	Scheduled bool `yaml:"scheduled,omitempty" json:"scheduled,omitempty"`
 
 	// Signers is the allowlist of identities trusted to sign release
 	// binaries. Auto-update is fail-closed: when this list is empty the
@@ -1211,6 +1221,12 @@ func validateConfig(c *Config) error {
 	case "", ScheduleNightly, ScheduleOnRelease, ScheduleManual:
 	default:
 		return fmt.Errorf("autoUpdate.schedule invalid: %q", c.AutoUpdate.Schedule)
+	}
+	if src := strings.TrimSpace(c.AutoUpdate.CDNBase); src != "" {
+		u, err := url.Parse(src)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return fmt.Errorf("autoUpdate.cdnBase must be an http(s) URL with a host: %q", c.AutoUpdate.CDNBase)
+		}
 	}
 	for i, s := range c.AutoUpdate.Signers {
 		if strings.TrimSpace(s.SAN) == "" && strings.TrimSpace(s.SANRegex) == "" {
