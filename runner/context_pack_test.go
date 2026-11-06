@@ -487,3 +487,143 @@ func TestRunContextPackRefusesSymlinkedContextParent(t *testing.T) {
 		t.Fatalf("repository file overwritten: %q", body)
 	}
 }
+
+// TestRunContextPackStaysOutOfRepositoryCommits pins the flat-layout
+// publication boundary through the production Run entry: with an executor
+// attesting the negotiated-document protocol and no repository declaration,
+// the checkout IS the workarea root, so the published documents land inside
+// the Git checkout. They must stay session machinery there — invisible to
+// `git status`, unstaged by the backstop, and absent from both the backstop
+// commit and any WIP checkpoint — even when force-staged into the index.
+//
+// RED (with the `.workarea` row removed from the shared harness-state
+// table): `git status` reports `?? .workarea/`, `git add -A` stages the
+// documents, the backstop commits them, and the WIP scratch index keeps
+// them, so every assertion below fails.
+func TestRunContextPackStaysOutOfRepositoryCommits(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	platform := newRecordingPlatformServer(t)
+	wtm, err := worktree.NewManager(worktree.Options{ParentDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("worktree.NewManager: %v", err)
+	}
+	poster, err := result.NewPoster(result.Options{
+		PlatformURL: platform.URL,
+		WorkerID:    "worker-1",
+		AuthToken:   "tok",
+		HTTPClient:  platform.Client(),
+		BaseDelay:   1,
+	})
+	if err != nil {
+		t.Fatalf("result.NewPoster: %v", err)
+	}
+	provider := &contextPackGateProvider{attests: true}
+	reg := NewRegistry()
+	if err := reg.Register(provider); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	r, err := New(Options{
+		Registry: reg, WorktreeManager: wtm, Poster: poster,
+		HTTPClient: platform.Client(), SkipBackstop: true, SkipSteering: true,
+		SkipPostSession: true, PreserveWorktreeAlways: true,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	bare := makeBareRepo(t)
+	qw := QueuedWork{
+		QueuedWork:      queuedWorkBase("CTX-FLAT-PUBLISH"),
+		WorkerID:        "worker-1",
+		AuthToken:       "tok",
+		PlatformURL:     platform.URL,
+		ResolvedProfile: ResolvedProfile{Provider: agent.ProviderStub},
+	}
+	qw.Repository = bare
+	_, raw := testContextPack(t, map[string]string{"brief.md": "negotiated brief bytes", "session-notes.md": "negotiated notes bytes"})
+	qw.ContextPack = raw
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	res, err := r.Run(ctx, qw)
+	if err != nil || res.Status != "completed" {
+		t.Fatalf("Run = %+v, err=%v", res, err)
+	}
+	if res.ContextPack == nil || len(res.ContextPack.Included) != 2 {
+		t.Fatalf("diagnostics = %+v", res.ContextPack)
+	}
+	// Flat layout: the checkout is the workarea root, so the published
+	// documents sit inside the Git checkout by construction.
+	if filepath.Clean(res.WorkareaRoot) != filepath.Clean(res.WorktreePath) {
+		t.Fatalf("WorkareaRoot %q != WorktreePath %q; want the flat layout", res.WorkareaRoot, res.WorktreePath)
+	}
+	checkout := res.WorktreePath
+	for _, inc := range res.ContextPack.Included {
+		if _, err := os.Stat(filepath.Join(checkout, ".workarea", "context", "pack1", filepath.FromSlash(inc.Path))); err != nil {
+			t.Fatalf("published document %s missing: %v", inc.Path, err)
+		}
+	}
+
+	// Provision-time exclusion: the session documents are invisible to
+	// `git status` and `git add -A` stages none of them.
+	for _, line := range strings.Split(gitRun(t, checkout, "status", "--porcelain"), "\n") {
+		if strings.Contains(line, ".workarea") {
+			t.Fatalf("session document visible to git status: %q", line)
+		}
+	}
+	gitRun(t, checkout, "add", "-A")
+	for _, line := range strings.Split(gitRun(t, checkout, "-c", "core.quotePath=false", "diff", "--cached", "--name-only"), "\n") {
+		if path := strings.TrimSpace(line); path != "" {
+			if strings.HasPrefix(path, ".workarea/") {
+				t.Fatalf("session document staged by git add -A: %q", path)
+			}
+			t.Fatalf("unexpected staged path %q; the executor made no repository edits", path)
+		}
+	}
+
+	// Backstop worst case: even force-staged session documents are dropped
+	// by the production filter, so the commit carries the real work only
+	// and the pushed session branch never exposes them.
+	gitRun(t, checkout, "add", "-f",
+		".workarea/context/pack1/brief.md",
+		".workarea/context/pack1/session-notes.md",
+		".workarea/context/pack1/pack.json")
+	writeFile(t, checkout, "feature.txt", "real work\n")
+	before := gitRun(t, checkout, "rev-parse", "HEAD")
+	branch := "agent/" + qw.SessionID
+	stubGhRecordingArgs(t, "https://github.com/example-o/test-r/pull/7")
+	report := r.runBackstop(ctx, qw, branch, res, nil)
+	if report.Diagnostics != "" {
+		t.Fatalf("backstop diagnostics = %q", report.Diagnostics)
+	}
+	if !report.Pushed {
+		t.Fatal("backstop did not push the session branch")
+	}
+	committed := gitRun(t, checkout, "diff", "--name-only", before, "HEAD")
+	for _, line := range strings.Split(committed, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), ".workarea/") {
+			t.Fatalf("session document entered the backstop commit:\n%s", committed)
+		}
+	}
+	if !strings.Contains(committed, "feature.txt") {
+		t.Fatalf("real work missing from the backstop commit:\n%s", committed)
+	}
+	tree := gitRun(t, checkout, "ls-tree", "-r", "--name-only", "HEAD")
+	for _, line := range strings.Split(tree, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), ".workarea/") {
+			t.Fatalf("session document reachable from the pushed head:\n%s", tree)
+		}
+	}
+	gitRun(t, checkout, "reset", "-q", "HEAD")
+
+	// WIP production path: with no work beyond the excluded documents,
+	// no checkpoint is created, so no reserved ref can carry them.
+	head := gitRun(t, checkout, "rev-parse", "HEAD")
+	checkpoint, warnings, err := createWIPCheckpoint(ctx, qw, rescueTarget{path: checkout, base: head}, "refs/wip/"+qw.SessionID+"/1")
+	if err != nil {
+		t.Fatalf("createWIPCheckpoint: %v (warnings %v)", err, warnings)
+	}
+	if checkpoint != nil {
+		t.Fatalf("WIP checkpoint %v created for session machinery alone", checkpoint)
+	}
+}
