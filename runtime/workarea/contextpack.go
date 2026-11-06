@@ -162,6 +162,10 @@ func ValidateContextPack(pack ContextPackV1) error {
 		if err != nil {
 			return err
 		}
+		// Fold case before comparing: on case-insensitive checkouts
+		// A.md and a.md name the same file, so they collide even though
+		// they are distinct strings. Pinned by
+		// TestValidateContextPackRefusesCaseVariantCollision.
 		key := strings.ToLower(clean)
 		if _, dup := seen[key]; dup {
 			return &ContextPackError{Reason: ReasonContextPackCollision, Path: doc.Path, Detail: "duplicate destination"}

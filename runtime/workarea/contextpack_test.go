@@ -99,6 +99,30 @@ func TestDecodeContextPackRefusesBadPackIdentity(t *testing.T) {
 	}
 }
 
+// TestValidateContextPackRefusesCaseVariantCollision pins the case-folded
+// duplicate-destination check as load-bearing: destinations that differ only
+// by letter case collide, so a pack carrying both must refuse with
+// context_pack_collision. The check runs before any filesystem write, which
+// keeps case-insensitive checkouts from silently overlaying one document on
+// another. Reverting the fold to an exact comparison accepts this pack.
+func TestValidateContextPackRefusesCaseVariantCollision(t *testing.T) {
+	pack := ContextPackV1{Version: ContextPackProtocol, PackID: "pack1", Documents: []ContextDocumentV1{
+		testPackDoc(t, "notes/Guide.md", "first"),
+		testPackDoc(t, "notes/guide.md", "second"),
+	}}
+	err := ValidateContextPack(pack)
+	var packErr *ContextPackError
+	if !errors.As(err, &packErr) {
+		t.Fatalf("case-variant destinations accepted: err=%v", err)
+	}
+	if packErr.Reason != ReasonContextPackCollision {
+		t.Fatalf("reason = %q, want %q (err=%v)", packErr.Reason, ReasonContextPackCollision, err)
+	}
+	if _, err := DecodeContextPack(encodePack(t, pack)); err == nil {
+		t.Fatal("case-variant carrier accepted by Decode")
+	}
+}
+
 func TestMaterializeContextPackRefusesBadPackIdentity(t *testing.T) {
 	for _, packID := range []string{"../evil", "", ".hidden"} {
 		t.Run("packId="+strconv.Quote(packID), func(t *testing.T) {
