@@ -85,6 +85,17 @@ var dirs = []Dir{
 		Owner: "the runner's seat scratch writer",
 		Why:   "ephemeral seat scratch files such as copied review text and gate notes; they are session machinery, not project content",
 	},
+	{
+		// The session-owned metadata leaf (runtime/workarea
+		// DeclarationDirName). Negotiated-document materialization
+		// publishes under .workarea/context; the retained flat layout
+		// keeps that directory inside the checkout, so without this row a
+		// backstop or WIP checkpoint commits session documents as
+		// project changes.
+		Name:  ".workarea",
+		Owner: "the runner's negotiated-document materialization (runtime/workarea)",
+		Why:   "published session documents under the session-owned context directory; session machinery, not project content",
+	},
 }
 
 // Dirs returns the state-directory names, sorted, as a fresh slice the caller

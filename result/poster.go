@@ -316,6 +316,13 @@ type statusRequest struct {
 	// the receiver predates the contract — old platforms ignore it.
 	TerminalArchiveReference *workarea.TerminalArchiveReference `json:"terminalArchiveReference,omitempty"`
 
+	// ContextPack is the sanitized negotiated-document diagnostic for the
+	// pack materialized before the first executor turn: included paths,
+	// byte counts and digests plus excluded paths with sanitized reasons.
+	// Document bytes never appear here. Additive; omitted when no carrier
+	// was materialized — old platforms ignore it.
+	ContextPack *workarea.ContextPackReport `json:"contextPack,omitempty"`
+
 	// ExecutionSecurityRefusal is the typed pre-spawn refusal of a session
 	// refused for its stamped execution-security levels (closed code plus
 	// the dimensions it names), paired with failureMode
@@ -461,6 +468,10 @@ type PostOptions struct {
 	// emitted only after the archive bytes and manifest commit. Nil omits
 	// the key so a run without a committed archive stays byte-identical.
 	TerminalArchiveReference *workarea.TerminalArchiveReference
+	// ContextPack is the sanitized negotiated-document diagnostic for the
+	// pack materialized before the first executor turn. Nil omits the key
+	// so a run without a pack stays byte-identical.
+	ContextPack *workarea.ContextPackReport
 	// SeatState is the seat's final three-axis report (session presence,
 	// activity with its decided-by rung, resumability, plus the
 	// orthogonal needs-input signal). Nil omits the receipt keys so a
@@ -544,7 +555,7 @@ func (p *Poster) PrepareTerminalStatusBodyWithOptions(ctx context.Context, sessi
 	if r.Status == "" {
 		return nil, errors.New("result: agent.Result.Status is required")
 	}
-	body := buildStatusRequest(p.credentials(ctx), r, opts.TerminalWorkareaLease, opts.TerminalArchiveReference)
+	body := buildStatusRequest(p.credentials(ctx), r, opts)
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return nil, fmt.Errorf("marshal terminal status body: %w", err)
@@ -576,7 +587,7 @@ func (p *Poster) PrepareWorkerExitedWithoutResultBody(sessionID, workerID string
 	body := buildStatusRequest(RuntimeCredentials{WorkerID: workerID}, agent.Result{
 		Status: "failed", FailureMode: WorkerExitedWithoutResultFailureMode,
 		Summary: "Worker exited without posting a terminal result.",
-	}, projection, nil)
+	}, PostOptions{TerminalWorkareaLease: projection})
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return nil, fmt.Errorf("marshal fallback terminal status body: %w", err)
@@ -710,7 +721,7 @@ func completionOutcome(status string) string {
 func (p *Poster) postStatus(ctx context.Context, sessionID string, r agent.Result, opts PostOptions) error {
 	path := fmt.Sprintf("/api/sessions/%s/status", sessionID)
 	return p.doRetried(ctx, path, func(creds RuntimeCredentials) any {
-		return buildStatusRequest(creds, r, opts.TerminalWorkareaLease, opts.TerminalArchiveReference)
+		return buildStatusRequest(creds, r, opts)
 	})
 }
 
@@ -759,7 +770,9 @@ func summarizeSeatSummary(r agent.Result) *SeatStateSummary {
 	return out
 }
 
-func buildStatusRequest(creds RuntimeCredentials, r agent.Result, projection *workarea.TerminalLeaseProjection, archiveReference *workarea.TerminalArchiveReference) statusRequest {
+func buildStatusRequest(creds RuntimeCredentials, r agent.Result, opts PostOptions) statusRequest {
+	projection := opts.TerminalWorkareaLease
+	archiveReference := opts.TerminalArchiveReference
 	worktreePath := r.WorktreePath
 	if projection != nil {
 		// The terminal lease projection is the only externally visible workarea
@@ -775,6 +788,7 @@ func buildStatusRequest(creds RuntimeCredentials, r agent.Result, projection *wo
 		ContinuationOutcome:      r.ContinuationOutcome,
 		TerminalWorkareaLease:    projection,
 		TerminalArchiveReference: archiveReference,
+		ContextPack:              opts.ContextPack,
 		ExecutionSecurityRefusal: r.ExecutionSecurityRefusal, TurnContinuations: r.TurnContinuations,
 		PreparationSeconds: r.PreparationSeconds, DependencyPreparation: r.DependencyPreparation,
 		BudgetBreach: r.BudgetBreach, Resumable: r.Resumable, ResumeCheckpoint: r.ResumeCheckpoint, WIPRef: r.WIPRef,
