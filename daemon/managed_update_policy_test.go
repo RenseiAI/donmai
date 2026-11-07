@@ -273,6 +273,22 @@ func TestManagedUpdatePolicyRejectsBadInputs(t *testing.T) {
 			wantSub: "wildcards",
 		},
 		{
+			name: "uppercase scheme issuer",
+			mutate: func(t *testing.T) ([]byte, string) {
+				raw := buildManagedPolicyJSON(t, []managedSignerWire{{Issuer: "HTTPS://i.example", Subject: "s"}}, []string{})
+				return raw, DigestManagedUpdatePolicy(raw)
+			},
+			wantSub: "invalid issuer",
+		},
+		{
+			name: "empty host issuer",
+			mutate: func(t *testing.T) ([]byte, string) {
+				raw := buildManagedPolicyJSON(t, []managedSignerWire{{Issuer: "https://", Subject: "s"}}, []string{})
+				return raw, DigestManagedUpdatePolicy(raw)
+			},
+			wantSub: "invalid issuer",
+		},
+		{
 			name: "non-https issuer",
 			mutate: func(t *testing.T) ([]byte, string) {
 				raw := buildManagedPolicyJSON(t, []managedSignerWire{{Issuer: "http://i.example", Subject: "s"}}, []string{})
