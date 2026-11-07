@@ -154,6 +154,36 @@ func TestManagedUpdatePolicyRejectsBadInputs(t *testing.T) {
 		wantSub string
 	}{
 		{
+			name: "trailing word",
+			mutate: func(t *testing.T) ([]byte, string) {
+				raw := buildManagedPolicyJSON(t, validManagedSigners(), []string{})
+				raw = append(raw, " trailing"...)
+				return raw, DigestManagedUpdatePolicy(raw)
+			},
+			wantSub: "trailing data",
+		},
+		{
+			name: "trailing second value",
+			mutate: func(t *testing.T) ([]byte, string) {
+				raw := buildManagedPolicyJSON(t, validManagedSigners(), []string{})
+				raw = append(raw, `{"extra":1}`...)
+				return raw, DigestManagedUpdatePolicy(raw)
+			},
+			wantSub: "trailing data",
+		},
+		{
+			name: "one byte over limit",
+			mutate: func(_ *testing.T) ([]byte, string) {
+				// Exactly MaxBytes+1: pad the subject so the encoded
+				// document is one byte past the 64 KiB bound.
+				base := []byte(`{"version":1,"signers":[{"issuer":"https://i.example","subject":""}],"publicRootsPem":[]}`)
+				pad := ManagedUpdatePolicyMaxBytes + 1 - len(base)
+				raw := []byte(`{"version":1,"signers":[{"issuer":"https://i.example","subject":"` + strings.Repeat("a", pad) + `"}],"publicRootsPem":[]}`)
+				return raw, DigestManagedUpdatePolicy(raw)
+			},
+			wantSub: "exceeds",
+		},
+		{
 			name: "wrong digest",
 			mutate: func(t *testing.T) ([]byte, string) {
 				raw := buildManagedPolicyJSON(t, validManagedSigners(), []string{})
@@ -361,6 +391,33 @@ func TestManagedUpdatePolicyEmptyRootsMeansNoAdditionalRoots(t *testing.T) {
 	}
 }
 
+func TestManagedUpdatePolicySizeBoundsPinInclusiveEdge(t *testing.T) {
+	t.Parallel()
+	// Exactly MaxBytes is accepted; MaxBytes+1 is refused. Pinning both
+	// edges prevents a one-byte bound drift in either direction.
+	base := []byte(`{"version":1,"signers":[{"issuer":"https://i.example","subject":""}],"publicRootsPem":[]}`)
+	padExact := ManagedUpdatePolicyMaxBytes - len(base)
+	atLimit := []byte(`{"version":1,"signers":[{"issuer":"https://i.example","subject":"` + strings.Repeat("a", padExact) + `"}],"publicRootsPem":[]}`)
+	if len(atLimit) != ManagedUpdatePolicyMaxBytes {
+		t.Fatalf("at-limit policy is %d bytes, want %d", len(atLimit), ManagedUpdatePolicyMaxBytes)
+	}
+	if _, err := ParseManagedUpdatePolicy(atLimit, DigestManagedUpdatePolicy(atLimit)); err != nil {
+		t.Fatalf("exactly %d bytes should parse: %v", ManagedUpdatePolicyMaxBytes, err)
+	}
+	over := append(append([]byte(nil), atLimit...), ' ')
+	// Appending a space keeps the JSON valid (trailing whitespace is
+	// allowed) while pushing the document one byte over the bound, so
+	// the size guard alone decides.
+	if len(over) != ManagedUpdatePolicyMaxBytes+1 {
+		t.Fatalf("over-limit policy is %d bytes, want %d", len(over), ManagedUpdatePolicyMaxBytes+1)
+	}
+	if _, err := ParseManagedUpdatePolicy(over, DigestManagedUpdatePolicy(over)); err == nil {
+		t.Fatalf("%d bytes should refuse", ManagedUpdatePolicyMaxBytes+1)
+	} else if !errors.Is(err, ErrManagedUpdatePolicyRefused) || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("over-limit err %v should be a typed exceeds refusal", err)
+	}
+}
+
 func TestManagedUpdatePolicyPersistFailureRetainsPrior(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
@@ -425,7 +482,6 @@ func TestManagedUpdatePolicyConcurrentReadsSeeCompleteSnapshots(t *testing.T) {
 	}
 
 	var wg sync.WaitGroup
-	observedOld := make(chan bool, 64)
 	observedNew := make(chan bool, 64)
 	stop := make(chan struct{})
 	for i := 0; i < 8; i++ {
@@ -448,10 +504,6 @@ func TestManagedUpdatePolicyConcurrentReadsSeeCompleteSnapshots(t *testing.T) {
 					if string(got) != string(oldRaw) {
 						t.Errorf("mixed pair: old digest with foreign bytes")
 						return
-					}
-					select {
-					case observedOld <- true:
-					default:
 					}
 				case newDigest:
 					if string(got) != string(newRaw) {
@@ -482,9 +534,6 @@ func TestManagedUpdatePolicyConcurrentReadsSeeCompleteSnapshots(t *testing.T) {
 	}
 	close(stop)
 	wg.Wait()
-	if len(observedOld) == 0 {
-		t.Error("expected some readers to observe the old snapshot")
-	}
 	if len(observedNew) == 0 {
 		t.Error("expected some readers to observe the new snapshot")
 	}

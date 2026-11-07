@@ -50,6 +50,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -177,14 +178,17 @@ func ParseManagedUpdatePolicy(policyJSON []byte, digestHex string) (ManagedUpdat
 	if err := dec.Decode(&wire); err != nil {
 		return ManagedUpdatePolicy{}, managedPolicyRefusedCause("malformed policy JSON", err)
 	}
-	// No trailing document after the single JSON object.
+	// No trailing document after the single JSON object. Either guard
+	// alone refuses every trailing shape: More covers a trailing word
+	// (which the second Decode reports as a syntax error, not io.EOF),
+	// and the EOF check covers a second JSON value (for which More may
+	// already be false on some inputs). Matches the sibling strict
+	// decoders (kit_package requireJSONEOF, session shim acceptance).
 	if dec.More() {
 		return ManagedUpdatePolicy{}, managedPolicyRefused("malformed policy JSON: trailing data")
 	}
 	var extra json.RawMessage
-	if err := dec.Decode(&extra); err == nil {
-		// A second value decoded successfully: trailing data.
-		_ = extra
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
 		return ManagedUpdatePolicy{}, managedPolicyRefused("malformed policy JSON: trailing data")
 	}
 
