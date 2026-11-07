@@ -142,6 +142,64 @@ func TestUpdateDefaults_SystemReachesEffectiveAfterHeartbeat(t *testing.T) {
 	}
 }
 
+func TestUpdateDefaults_LocalOriginWinsOverSystem(t *testing.T) {
+	// Explicit host-local origin masks the system snapshot: swapping the
+	// precedence would surface the system value here.
+	plat := &updateDefaultsPlatform{}
+	srv := httptest.NewServer(plat.handler(t))
+	t.Cleanup(srv.Close)
+	d := updateDefaultsTestDaemon(t, AutoUpdateConfig{Channel: ChannelStable, Schedule: ScheduleManual, CDNBase: "https://local.test"})
+	plat.put(json.RawMessage(`{"cdnBase":"https://sys.example.test"}`))
+	if err := driveHeartbeat(t, d, srv); err != nil {
+		t.Fatalf("beat: %v", err)
+	}
+	if base, origin := d.EffectiveUpdateCDNBase(); base != "https://local.test" || origin != UpdateOriginLocal {
+		t.Fatalf("cdnBase = %q/%q, want https://local.test/local", base, origin)
+	}
+	if eff := d.EffectiveAutoUpdateConfig(); eff.CDNBase != "https://local.test" {
+		t.Fatalf("effective cdnBase = %q, want local", eff.CDNBase)
+	}
+}
+
+func TestUpdateDefaults_OmittedChannelSurvivesWrite(t *testing.T) {
+	// An omitted channel must survive an unrelated write plus reload:
+	// WriteConfig must not materialize the default-filled stable into an
+	// explicit local override that would mask the system layer.
+	d := newRestartTestDaemon(t, nil)
+	dir := t.TempDir()
+	d.opts.ConfigPath = filepath.Join(dir, "daemon.yaml")
+	raw := []byte("apiVersion: v1\nkind: DaemonConfig\nmachine:\n  id: test-machine\ncapacity:\n  maxConcurrentSessions: 2\norchestrator:\n  url: https://example.test\nautoUpdate:\n  schedule: manual\n")
+	if err := os.WriteFile(d.opts.ConfigPath, raw, 0o600); err != nil {
+		t.Fatalf("write raw config: %v", err)
+	}
+	loaded, err := LoadConfig(d.opts.ConfigPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if loaded == nil {
+		t.Fatal("load config returned nil")
+	}
+	// Simulate an unrelated mutation write then a daemon restart reload.
+	if err := WriteConfig(d.opts.ConfigPath, loaded); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	reloaded, err := LoadConfig(d.opts.ConfigPath)
+	if err != nil {
+		t.Fatalf("reload config: %v", err)
+	}
+	d.config = reloaded
+	plat := &updateDefaultsPlatform{}
+	srv := httptest.NewServer(plat.handler(t))
+	t.Cleanup(srv.Close)
+	plat.put(json.RawMessage(`{"channel":"beta"}`))
+	if err := driveHeartbeat(t, d, srv); err != nil {
+		t.Fatalf("beat: %v", err)
+	}
+	if ch, o := d.EffectiveUpdateChannel(); ch != ChannelBeta || o != UpdateOriginSystem {
+		t.Fatalf("after write+reload+system beta: ch=%q/%q, want beta/system", ch, o)
+	}
+}
+
 func TestUpdateDefaults_ChannelIndependentClearAndPreserve(t *testing.T) {
 	plat := &updateDefaultsPlatform{}
 	srv := httptest.NewServer(plat.handler(t))
@@ -171,6 +229,9 @@ func TestUpdateDefaults_ChannelIndependentClearAndPreserve(t *testing.T) {
 	if err := driveHeartbeat(t, d, srv); err != nil {
 		t.Fatalf("restore: %v", err)
 	}
+	if diag := d.SystemUpdateDiagnostic(); diag != "" {
+		t.Fatalf("restore left stale diagnostic: %q, want empty", diag)
+	}
 	plat.mu.Lock()
 	plat.omit = true
 	plat.stored = nil
@@ -193,6 +254,21 @@ func TestUpdateDefaults_ChannelIndependentClearAndPreserve(t *testing.T) {
 	}
 	if d.SystemUpdateDiagnostic() == "" {
 		t.Fatal("malformed left no typed diagnostic")
+	}
+	// Recovery with a valid snapshot clears the typed diagnostic.
+	plat.mu.Lock()
+	plat.beatErr = 0
+	plat.omit = false
+	plat.stored = json.RawMessage(`{"channel":"beta"}`)
+	plat.mu.Unlock()
+	if err := driveHeartbeat(t, d, srv); err != nil {
+		t.Fatalf("recovery beat: %v", err)
+	}
+	if diag := d.SystemUpdateDiagnostic(); diag != "" {
+		t.Fatalf("recovery left stale diagnostic: %q, want empty", diag)
+	}
+	if ch, _ := d.EffectiveUpdateChannel(); ch != ChannelBeta {
+		t.Fatalf("recovery cleared channel = %q, want beta preserved", ch)
 	}
 	plat.mu.Lock()
 	plat.beatErr = http.StatusInternalServerError

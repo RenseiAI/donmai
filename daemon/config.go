@@ -514,7 +514,7 @@ type OrchestratorConfig struct {
 
 // AutoUpdateConfig is the auto-update preferences block.
 type AutoUpdateConfig struct {
-	Channel             UpdateChannel  `yaml:"channel"             json:"channel"`
+	Channel             UpdateChannel  `yaml:"channel,omitempty"       json:"channel,omitempty"`
 	Schedule            UpdateSchedule `yaml:"schedule"            json:"schedule"`
 	DrainTimeoutSeconds int            `yaml:"drainTimeoutSeconds" json:"drainTimeoutSeconds"`
 
@@ -713,6 +713,13 @@ func WriteConfig(path string, cfg *Config) error {
 	}
 	normalized := *cfg
 	normalizeProjectContract(&normalized)
+	// A default-filled channel is not an explicit host-local override:
+	// omitting it preserves the authored-false distinction so a later
+	// reload still lets the system snapshot win. Without this, any write
+	// would materialize "stable" and mask the system layer.
+	if !normalized.autoUpdateChannelAuthored {
+		normalized.AutoUpdate.Channel = ""
+	}
 	if normalized.ProjectAdmissionVersion == 0 {
 		// Keep a legacy write legacy. The enabled set is an in-memory
 		// projection until the first successful v2 mutation.

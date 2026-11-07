@@ -157,6 +157,7 @@ func (d *Daemon) applySystemUpdateDefaults(raw json.RawMessage) {
 	}
 	d.systemUpdateMu.Lock()
 	defer d.systemUpdateMu.Unlock()
+	hadError := false
 	if channelRaw, ok := obj["channel"]; ok {
 		if strings.TrimSpace(string(channelRaw)) == "null" {
 			d.systemUpdate.Channel = nil
@@ -164,12 +165,14 @@ func (d *Daemon) applySystemUpdateDefaults(raw json.RawMessage) {
 			var s string
 			if err := json.Unmarshal(channelRaw, &s); err != nil {
 				d.systemUpdateDiag = (&UpdateDefaultsError{Field: "channel", Reason: fmt.Sprintf("malformed: %v", err)}).Error()
+				hadError = true
 			} else {
 				switch {
 				case strings.TrimSpace(s) == "":
 					d.systemUpdate.Channel = nil
 				case !isValidUpdateChannel(strings.TrimSpace(s)):
 					d.systemUpdateDiag = (&UpdateDefaultsError{Field: "channel", Reason: fmt.Sprintf("unknown channel %q", s)}).Error()
+					hadError = true
 				default:
 					v := strings.TrimSpace(s)
 					d.systemUpdate.Channel = &v
@@ -184,18 +187,23 @@ func (d *Daemon) applySystemUpdateDefaults(raw json.RawMessage) {
 			var s string
 			if err := json.Unmarshal(baseRaw, &s); err != nil {
 				d.systemUpdateDiag = (&UpdateDefaultsError{Field: "cdnBase", Reason: fmt.Sprintf("malformed: %v", err)}).Error()
+				hadError = true
 			} else {
 				switch {
 				case strings.TrimSpace(s) == "":
 					d.systemUpdate.CDNBase = nil
 				case !isValidUpdateCDNBase(s):
 					d.systemUpdateDiag = (&UpdateDefaultsError{Field: "cdnBase", Reason: fmt.Sprintf("malformed origin %q", s)}).Error()
+					hadError = true
 				default:
 					v := strings.TrimSpace(s)
 					d.systemUpdate.CDNBase = &v
 				}
 			}
 		}
+	}
+	if !hadError {
+		d.systemUpdateDiag = ""
 	}
 }
 
