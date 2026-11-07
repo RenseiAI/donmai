@@ -160,6 +160,15 @@ type HeartbeatOptions struct {
 	// Optional — leave nil to ignore. Phase 2e.
 	OnHostStatus func(detail HostStatusDetail)
 
+	// OnUpdateDefaults consumes the heartbeat reply's update-defaults
+	// member. The argument is the raw member: nil when the server omitted
+	// it (older server), JSON null for an explicit whole-snapshot clear,
+	// or an object for per-field updates. Malformed members preserve the
+	// last-known-good snapshot with a typed diagnostic and never fail
+	// the beat. Optional — leave nil to ignore platform-provided
+	// defaults and keep serving from local configuration only.
+	OnUpdateDefaults func(raw json.RawMessage)
+
 	// GetSeatStates returns one three-axis report per in-flight seat for
 	// this beat (session presence, activity with its decided-by rung,
 	// resumability, plus the orthogonal needs-input count). Called once
@@ -888,6 +897,12 @@ type heartbeatResponseBody struct {
 	HostStatus       *HostStatusDetail               `json:"hostStatus,omitempty"`
 	PendingMutations []PendingMutation               `json:"pendingMutations,omitempty"`
 	SessionShim      *SessionShimHeartbeatProjection `json:"sessionShim,omitempty"`
+	// UpdateDefaults carries the platform-provided system snapshot for
+	// update configuration. Raw so absence (nil, older server) stays
+	// distinct from an explicit null (clear) and from malformed data.
+	// Additive: older servers omit it and newer daemons ignore unknown
+	// members inside it.
+	UpdateDefaults json.RawMessage `json:"updateDefaults,omitempty"`
 }
 
 func (h *HeartbeatService) callEndpoint(
@@ -1026,6 +1041,14 @@ func (h *HeartbeatService) dropConfirmedAcks(applied []string, failures []Heartb
 func (h *HeartbeatService) handleHeartbeatResponse(ctx context.Context, resp *heartbeatResponseBody) {
 	if resp == nil {
 		return
+	}
+	// The production consumer for platform-provided update defaults.
+	// Runs on every successful beat, including beats from older servers
+	// whose reply omits the member (raw == nil, a no-op preserve) and
+	// beats that carry an explicit clear or malformed data (preserve
+	// last-good with a typed diagnostic, never fail the beat).
+	if h.opts.OnUpdateDefaults != nil && resp.UpdateDefaults != nil {
+		h.opts.OnUpdateDefaults(resp.UpdateDefaults)
 	}
 	if resp.HostStatus != nil && h.opts.OnHostStatus != nil {
 		h.opts.OnHostStatus(*resp.HostStatus)
