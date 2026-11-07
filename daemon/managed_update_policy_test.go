@@ -251,6 +251,26 @@ func TestManagedUpdatePolicyRejectsBadInputs(t *testing.T) {
 			wantSub: "invalid issuer",
 		},
 		{
+			name: "too many signers",
+			mutate: func(t *testing.T) ([]byte, string) {
+				signers := make([]managedSignerWire, ManagedUpdatePolicyMaxSigners+1)
+				for i := range signers {
+					signers[i] = managedSignerWire{Issuer: "https://i.example", Subject: "s"}
+				}
+				raw := buildManagedPolicyJSON(t, signers, []string{})
+				return raw, DigestManagedUpdatePolicy(raw)
+			},
+			wantSub: "signers must hold",
+		},
+		{
+			name: "missing publicRootsPem",
+			mutate: func(_ *testing.T) ([]byte, string) {
+				raw := []byte(`{"version":1,"signers":[{"issuer":"https://i.example","subject":"s"}]}`)
+				return raw, DigestManagedUpdatePolicy(raw)
+			},
+			wantSub: "publicRootsPem is required",
+		},
+		{
 			name: "too many roots",
 			mutate: func(t *testing.T) ([]byte, string) {
 				roots := make([]string, ManagedUpdatePolicyMaxRoots+1)
