@@ -160,6 +160,16 @@ type HeartbeatOptions struct {
 	// Optional — leave nil to ignore. Phase 2e.
 	OnHostStatus func(detail HostStatusDetail)
 
+	// OnManagedUpdateTrust is invoked when the heartbeat response carries
+	// a managedUpdateTrust projection. Nil (absent) projections never
+	// reach this callback: unconfigured leaves local policy unchanged.
+	// Non-nil projections (valid, invalid, or explicit unavailable) are
+	// applied atomically by the daemon when opted-in and ignored when
+	// opted-out.
+	//
+	// Optional — leave nil to ignore remote trust rotations.
+	OnManagedUpdateTrust func(projection *ManagedUpdateTrustProjection)
+
 	// GetSeatStates returns one three-axis report per in-flight seat for
 	// this beat (session presence, activity with its decided-by rung,
 	// resumability, plus the orthogonal needs-input count). Called once
@@ -882,12 +892,13 @@ func (h *HostStatusDetail) SuspendsClaiming() bool {
 // and pendingMutations. Both are optional — a daemon talking to a
 // pre-Phase-2 platform unmarshals the missing fields to zero values.
 type heartbeatResponseBody struct {
-	Acknowledged     bool                            `json:"acknowledged"`
-	ServerTime       string                          `json:"serverTime"`
-	PendingWorkCount int                             `json:"pendingWorkCount"`
-	HostStatus       *HostStatusDetail               `json:"hostStatus,omitempty"`
-	PendingMutations []PendingMutation               `json:"pendingMutations,omitempty"`
-	SessionShim      *SessionShimHeartbeatProjection `json:"sessionShim,omitempty"`
+	Acknowledged       bool                            `json:"acknowledged"`
+	ServerTime         string                          `json:"serverTime"`
+	PendingWorkCount   int                             `json:"pendingWorkCount"`
+	HostStatus         *HostStatusDetail               `json:"hostStatus,omitempty"`
+	PendingMutations   []PendingMutation               `json:"pendingMutations,omitempty"`
+	SessionShim        *SessionShimHeartbeatProjection `json:"sessionShim,omitempty"`
+	ManagedUpdateTrust *ManagedUpdateTrustProjection `json:"managedUpdateTrust,omitempty"`
 }
 
 func (h *HeartbeatService) callEndpoint(
@@ -1029,6 +1040,9 @@ func (h *HeartbeatService) handleHeartbeatResponse(ctx context.Context, resp *he
 	}
 	if resp.HostStatus != nil && h.opts.OnHostStatus != nil {
 		h.opts.OnHostStatus(*resp.HostStatus)
+	}
+	if resp.ManagedUpdateTrust != nil && h.opts.OnManagedUpdateTrust != nil {
+		h.opts.OnManagedUpdateTrust(resp.ManagedUpdateTrust)
 	}
 	if len(resp.PendingMutations) > 0 && h.opts.OnPendingMutations != nil {
 		applied, failures := h.opts.OnPendingMutations(ctx, resp.PendingMutations)
