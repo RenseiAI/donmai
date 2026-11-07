@@ -13,6 +13,7 @@ import (
 // must report it back.
 func TestPublicChannelRoundTrip(t *testing.T) {
 	cfg := DefaultConfig()
+	cfg.Orchestrator.URL = "https://example.test"
 	cfg.AutoUpdate.Channel = ChannelBeta
 	path := filepath.Join(t.TempDir(), "daemon.yaml")
 	if err := WriteConfig(path, cfg); err != nil {
@@ -34,6 +35,7 @@ func TestPublicChannelRoundTrip(t *testing.T) {
 func TestExplicitStableSetterRoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "daemon.yaml")
 	cfg := DefaultConfig()
+	cfg.Orchestrator.URL = "https://example.test"
 	cfg.SetAutoUpdateChannel(ChannelStable)
 	if err := WriteConfig(path, cfg); err != nil {
 		t.Fatalf("WriteConfig: %v", err)
@@ -54,6 +56,7 @@ func TestExplicitStableSetterRoundTrip(t *testing.T) {
 	}
 
 	fresh := DefaultConfig()
+	fresh.Orchestrator.URL = "https://example.test"
 	freshPath := filepath.Join(t.TempDir(), "fresh.yaml")
 	if err := WriteConfig(freshPath, fresh); err != nil {
 		t.Fatalf("WriteConfig(fresh): %v", err)
