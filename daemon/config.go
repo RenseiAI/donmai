@@ -125,6 +125,14 @@ type Config struct {
 	// losing their own settings on the next write. Declared fields
 	// always win: keys also present in the marshaled Config are skipped.
 	unknownFields map[string]*yaml.Node
+	// autoUpdateChannelAuthored records whether daemon.yaml explicitly
+	// set autoUpdate.channel. LoadConfig populates it from the raw
+	// document so the effective update-channel resolver can distinguish
+	// an explicit "stable" from the compiled default filled by
+	// applyDefaults when the key is omitted. Unmarshaled configs that
+	// bypass LoadConfig leave it false; callers that construct an
+	// explicit local override in memory must set it alongside Channel.
+	autoUpdateChannelAuthored bool
 }
 
 // LocalRuntimeConfig is non-secret operator policy. Credentials remain in
@@ -670,10 +678,14 @@ func LoadConfig(path string) (*Config, error) {
 		Capacity struct {
 			MaxConcurrentSessions *int `yaml:"maxConcurrentSessions"`
 		} `yaml:"capacity"`
+		AutoUpdate struct {
+			Channel *string `yaml:"channel"`
+		} `yaml:"autoUpdate"`
 	}
 	if err := yaml.Unmarshal(data, &authored); err != nil {
 		return nil, fmt.Errorf("parse daemon capacity %q: %w", path, err)
 	}
+	cfg.autoUpdateChannelAuthored = authored.AutoUpdate.Channel != nil && strings.TrimSpace(*authored.AutoUpdate.Channel) != ""
 
 	// Apply env-var substitution on authToken.
 	if cfg.Orchestrator.AuthToken != "" {

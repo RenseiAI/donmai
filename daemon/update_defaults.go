@@ -90,14 +90,17 @@ func isValidUpdateCDNBase(s string) bool {
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return false
 	}
-	return strings.TrimSpace(u.Host) != ""
+	return strings.TrimSpace(u.Hostname()) != ""
 }
 
 // resolveEffectiveChannel implements the per-field precedence for the
 // release channel: explicit host-local, then system snapshot, then the
-// compiled default.
-func resolveEffectiveChannel(local UpdateChannel, system *string) (UpdateChannel, UpdateOrigin) {
-	if strings.TrimSpace(string(local)) != "" {
+// compiled default. localExplicit distinguishes an explicitly authored
+// host-local value from the compiled default filled when daemon.yaml
+// omits autoUpdate.channel: only an explicit value masks the system
+// layer.
+func resolveEffectiveChannel(local UpdateChannel, localExplicit bool, system *string) (UpdateChannel, UpdateOrigin) {
+	if localExplicit && strings.TrimSpace(string(local)) != "" {
 		return local, UpdateOriginLocal
 	}
 	if system != nil && strings.TrimSpace(*system) != "" {
@@ -233,11 +236,13 @@ func (d *Daemon) SystemUpdateDiagnostic() string {
 // the compiled default. It also reports which layer supplied the value.
 func (d *Daemon) EffectiveUpdateChannel() (UpdateChannel, UpdateOrigin) {
 	var local UpdateChannel
+	localExplicit := false
 	if cfg := d.Config(); cfg != nil {
 		local = cfg.AutoUpdate.Channel
+		localExplicit = cfg.autoUpdateChannelAuthored
 	}
 	snap := d.SystemUpdateSnapshot()
-	return resolveEffectiveChannel(local, snap.Channel)
+	return resolveEffectiveChannel(local, localExplicit, snap.Channel)
 }
 
 // EffectiveUpdateCDNBase resolves the update origin through the production
@@ -258,11 +263,13 @@ func (d *Daemon) EffectiveUpdateCDNBase() (string, UpdateOrigin) {
 // the system layer can never change verification behavior.
 func (d *Daemon) EffectiveAutoUpdateConfig() AutoUpdateConfig {
 	var local AutoUpdateConfig
+	localExplicit := false
 	if cfg := d.Config(); cfg != nil {
 		local = cfg.AutoUpdate
+		localExplicit = cfg.autoUpdateChannelAuthored
 	}
 	snap := d.SystemUpdateSnapshot()
-	channel, _ := resolveEffectiveChannel(local.Channel, snap.Channel)
+	channel, _ := resolveEffectiveChannel(local.Channel, localExplicit, snap.Channel)
 	base, _ := resolveEffectiveCDNBase(local.CDNBase, snap.CDNBase)
 	local.Channel = channel
 	local.CDNBase = base

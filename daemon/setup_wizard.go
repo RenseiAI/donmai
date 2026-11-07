@@ -472,6 +472,9 @@ func RunSetupWizard(opts WizardOptions) (*Config, error) {
 		},
 		UsagePing: usagePing,
 	}
+	// The wizard always prompts for the channel, so its result is an
+	// explicit host-local override even when the operator accepts stable.
+	cfg.autoUpdateChannelAuthored = strings.TrimSpace(string(channel)) != ""
 	if choice == 2 {
 		cfg.APIVersion = LocalRuntimeConfigAPIVersion
 		cfg.LocalRuntime = localRuntime

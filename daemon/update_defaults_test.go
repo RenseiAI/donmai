@@ -31,8 +31,19 @@ func updateDefaultsTestDaemon(t *testing.T, local AutoUpdateConfig) *Daemon {
 		Orchestrator: OrchestratorConfig{URL: "https://example.test"},
 		AutoUpdate:   local,
 	}
+	// Mark an explicitly supplied non-empty channel as authored so the
+	// in-memory construction matches what LoadConfig would record for a
+	// file that contains the key. Omitted (empty) stays non-authored.
+	d.config.autoUpdateChannelAuthored = strings.TrimSpace(string(local.Channel)) != ""
 	if err := WriteConfig(d.opts.ConfigPath, d.config); err != nil {
 		t.Fatalf("write config: %v", err)
+	}
+	// Reload through the production loader so defaulting and authored
+	// presence match a normally loaded configuration.
+	if loaded, err := LoadConfig(d.opts.ConfigPath); err != nil {
+		t.Fatalf("reload config: %v", err)
+	} else if loaded != nil {
+		d.config = loaded
 	}
 	return d
 }
@@ -122,6 +133,7 @@ func TestUpdateDefaults_SystemReachesEffectiveAfterHeartbeat(t *testing.T) {
 	}
 	// Clearing the local channel override exposes the system value.
 	d.config.AutoUpdate.Channel = ""
+	d.config.autoUpdateChannelAuthored = false
 	if err := driveHeartbeat(t, d, srv); err != nil {
 		t.Fatalf("beat2: %v", err)
 	}
@@ -253,5 +265,68 @@ func TestUpdateDefaults_OldServerAndIdempotent(t *testing.T) {
 	fresh := updateDefaultsTestDaemon(t, AutoUpdateConfig{Schedule: ScheduleManual})
 	if ch, o := fresh.EffectiveUpdateChannel(); ch != ChannelStable || o != UpdateOriginDefault {
 		t.Fatalf("fresh channel = %q/%q, want stable/default", ch, o)
+	}
+}
+
+func TestUpdateDefaults_OmittedChannelLetsSystemWin(t *testing.T) {
+	// B1: a normally loaded configuration that omits autoUpdate.channel
+	// fills the compiled default (stable) but must not mask the system
+	// layer. Production path: file without the key -> LoadConfig.
+	d := newRestartTestDaemon(t, nil)
+	dir := t.TempDir()
+	d.opts.ConfigPath = filepath.Join(dir, "daemon.yaml")
+	raw := []byte("apiVersion: v1\nkind: DaemonConfig\nmachine:\n  id: test-machine\ncapacity:\n  maxConcurrentSessions: 2\norchestrator:\n  url: https://example.test\nautoUpdate:\n  schedule: manual\n")
+	if err := os.WriteFile(d.opts.ConfigPath, raw, 0o600); err != nil {
+		t.Fatalf("write raw config: %v", err)
+	}
+	loaded, err := LoadConfig(d.opts.ConfigPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if loaded == nil {
+		t.Fatal("load config returned nil")
+	}
+	if loaded.AutoUpdate.Channel != ChannelStable {
+		t.Fatalf("loaded channel = %q, want stable default fill", loaded.AutoUpdate.Channel)
+	}
+	d.config = loaded
+	plat := &updateDefaultsPlatform{}
+	srv := httptest.NewServer(plat.handler(t))
+	t.Cleanup(srv.Close)
+	plat.put(json.RawMessage(`{"channel":"beta"}`))
+	if err := driveHeartbeat(t, d, srv); err != nil {
+		t.Fatalf("beat: %v", err)
+	}
+	if ch, o := d.EffectiveUpdateChannel(); ch != ChannelBeta || o != UpdateOriginSystem {
+		t.Fatalf("omitted local channel: got %s/%s; want beta/system", ch, o)
+	}
+	if eff := d.EffectiveAutoUpdateConfig(); eff.Channel != ChannelBeta {
+		t.Fatalf("effective config channel = %q, want beta", eff.Channel)
+	}
+}
+
+func TestUpdateDefaults_MissingHostnamePreserves(t *testing.T) {
+	// B2: a system origin with its hostname omitted (port-only authority)
+	// must preserve the last-good CDN and record a typed diagnostic.
+	plat := &updateDefaultsPlatform{}
+	srv := httptest.NewServer(plat.handler(t))
+	t.Cleanup(srv.Close)
+	d := updateDefaultsTestDaemon(t, AutoUpdateConfig{Schedule: ScheduleManual})
+	plat.put(json.RawMessage(`{"cdnBase":"https://sys.example.test"}`))
+	if err := driveHeartbeat(t, d, srv); err != nil {
+		t.Fatalf("seed beat: %v", err)
+	}
+	if base, _ := d.EffectiveUpdateCDNBase(); base != "https://sys.example.test" {
+		t.Fatalf("seed cdnBase = %q, want system value", base)
+	}
+	plat.put(json.RawMessage(`{"cdnBase":"https://:443"}`))
+	if err := driveHeartbeat(t, d, srv); err != nil {
+		t.Fatalf("bad beat: %v", err)
+	}
+	if base, _ := d.EffectiveUpdateCDNBase(); base != "https://sys.example.test" {
+		t.Fatalf("missing hostname overwrote last-good: base=%q", base)
+	}
+	if diag := d.SystemUpdateDiagnostic(); diag == "" {
+		t.Fatal("missing hostname left no typed diagnostic")
 	}
 }
