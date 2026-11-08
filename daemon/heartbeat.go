@@ -898,7 +898,7 @@ type heartbeatResponseBody struct {
 	HostStatus         *HostStatusDetail               `json:"hostStatus,omitempty"`
 	PendingMutations   []PendingMutation               `json:"pendingMutations,omitempty"`
 	SessionShim        *SessionShimHeartbeatProjection `json:"sessionShim,omitempty"`
-	ManagedUpdateTrust *ManagedUpdateTrustProjection `json:"managedUpdateTrust,omitempty"`
+	ManagedUpdateTrust *ManagedUpdateTrustProjection   `json:"managedUpdateTrust,omitempty"`
 }
 
 func (h *HeartbeatService) callEndpoint(

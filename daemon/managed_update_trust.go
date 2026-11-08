@@ -25,12 +25,13 @@
 // restarter reloads the persisted file before verifying.
 //
 // States (see PR body transition table):
-//   unmanaged (opt-out) ignores projections, keeps local behavior;
-//   opted-in + valid -> active policy;
-//   same digest -> unchanged (no-op);
-//   invalid/unavailable/write failure -> updates refused (fail-closed)
-//     with the prior persisted policy retained;
-//   next valid policy -> active.
+//
+//	unmanaged (opt-out) ignores projections, keeps local behavior;
+//	opted-in + valid -> active policy;
+//	same digest -> unchanged (no-op);
+//	invalid/unavailable/write failure -> updates refused (fail-closed)
+//	  with the prior persisted policy retained;
+//	next valid policy -> active.
 package daemon
 
 import (
@@ -301,13 +302,12 @@ func (d *Daemon) applyManagedUpdateTrustProjection(proj *ManagedUpdateTrustProje
 	d.ensureManagedTrustLoaded()
 	d.managedTrustMu.Lock()
 	defer d.managedTrustMu.Unlock()
-	if d.managedTrustActive != nil && strings.EqualFold(strings.TrimSpace(d.managedTrustActive.Digest), strings.TrimSpace(proj.Digest)) {
-		// Repeated digest is a no-op: duplicate delivery is harmless and
-		// must not rewrite or re-block.
-		return
-	}
-	rootBytes, err := validateManagedUpdateTrustProjection(proj)
-	if err != nil {
+	// Validate before the digest comparison: only a valid projection
+	// whose digest matches the active pair while unblocked is a no-op.
+	// Invalid/unavailable always fail closed (file untouched); a valid
+	// projection always persists, activates, and clears the block, so a
+	// retry after any block recovers even when the digest is unchanged.
+	if _, err := validateManagedUpdateTrustProjection(proj); err != nil {
 		// Malformed/unavailable: block new managed updates until a valid
 		// projection arrives, preserve the prior persisted policy, never
 		// enable built-in fallback. The file is untouched; only the
@@ -316,13 +316,17 @@ func (d *Daemon) applyManagedUpdateTrustProjection(proj *ManagedUpdateTrustProje
 		d.managedTrustBlockedReason = err.Error()
 		return
 	}
+	if d.managedTrustActive != nil && !d.managedTrustBlocked && strings.EqualFold(strings.TrimSpace(d.managedTrustActive.Digest), strings.TrimSpace(proj.Digest)) {
+		// Repeated digest is a no-op: duplicate delivery is harmless and
+		// must not rewrite or re-block.
+		return
+	}
 	policy := managedUpdateTrustPolicy{
 		Digest:    strings.TrimSpace(proj.Digest),
 		Signers:   append([]UpdateSigner(nil), proj.Signers...),
 		TrustRoot: strings.TrimSpace(proj.TrustRoot),
 		UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano),
 	}
-	_ = rootBytes
 	if err := persistManagedUpdateTrustPolicy(managedUpdateTrustPath(d.opts.ConfigPath), policy); err != nil {
 		d.managedTrustBlocked = true
 		d.managedTrustBlockedReason = err.Error()
@@ -395,19 +399,3 @@ func (d *Daemon) orchestratorURLForManagedOptIn() string {
 	}
 	return cfg.Orchestrator.URL
 }
-
-// newManagedSigstoreVerifierForTest builds a verifier from explicit managed
-// bytes for tests that exercise the managed pair without a Daemon. It uses
-// the production parser and identity builder.
-func newManagedSigstoreVerifierForTest(signers []UpdateSigner, rootBytes []byte) (*sigstoreBinaryVerifier, error) {
-	material, err := root.NewTrustedRootFromJSON(rootBytes)
-	if err != nil {
-		return nil, err
-	}
-	identities, err := buildUpdateIdentityPolicies(signers)
-	if err != nil {
-		return nil, err
-	}
-	return &sigstoreBinaryVerifier{material: material, identities: identities, rootSource: "managed"}, nil
-}
-

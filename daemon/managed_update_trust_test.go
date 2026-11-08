@@ -106,7 +106,7 @@ func newManagedTestDaemon(t *testing.T, configPath string, enabled bool, localSi
 func driveManagedProjectionThroughHeartbeat(t *testing.T, d *Daemon, proj *ManagedUpdateTrustProjection) {
 	t.Helper()
 	t.Setenv("DONMAI_DAEMON_REAL_REGISTRATION", "1")
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"acknowledged":       true,
 			"managedUpdateTrust": proj,
@@ -143,11 +143,16 @@ func TestManagedUpdateTrust_HeartbeatRestartCustomerPassesVendorFails(t *testing
 
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "daemon.yaml")
-	// Local signers pin the vendor identity so a union mutant (managed OR
-	// local/built-in) would accept the vendor bundle. Replacement must
-	// reject it.
+	// Local trust pins the vendor root and vendor identity, so the vendor
+	// bundle verifies under a local construction: a union mutant (managed
+	// OR local) would accept it. Replacement must still reject it.
 	localVendor := []UpdateSigner{{SAN: managedTestVendorSAN, Issuer: managedTestVendorIssuer}}
+	vendorRootPath := filepath.Join(dir, "vendor-root.json")
+	if err := os.WriteFile(vendorRootPath, virtualSigstoreRootJSON(t, vendorVS), 0o600); err != nil {
+		t.Fatalf("write vendor root: %v", err)
+	}
 	d := newManagedTestDaemon(t, configPath, true, localVendor)
+	d.config.AutoUpdate.TrustRootPath = vendorRootPath
 
 	driveManagedProjectionThroughHeartbeat(t, d, proj)
 
@@ -168,6 +173,7 @@ func TestManagedUpdateTrust_HeartbeatRestartCustomerPassesVendorFails(t *testing
 	// Restart: a fresh Daemon on the same config dir reloads the persisted
 	// pair before verifying.
 	second := newManagedTestDaemon(t, configPath, true, localVendor)
+	second.config.AutoUpdate.TrustRootPath = vendorRootPath
 	second.ensureManagedTrustLoaded()
 	second.managedTrustMu.RLock()
 	restarted := second.managedTrustActive
@@ -198,8 +204,32 @@ func TestManagedUpdateTrust_HeartbeatRestartCustomerPassesVendorFails(t *testing
 	if err != nil {
 		t.Fatalf("vendor sign: %v", err)
 	}
+	// The fixture verifies under the local vendor construction, so the
+	// managed rejection below pins replacement rather than a broken
+	// fixture: a union of managed and local trust would accept it.
+	if lv := newAutoUpdateVerifier(second.Config().AutoUpdate); true {
+		localSig, ok := lv.(*sigstoreBinaryVerifier)
+		if !ok {
+			t.Fatalf("local verifier type = %T, want *sigstoreBinaryVerifier", lv)
+		}
+		if ok, reason := localSig.verifyEntity(vendorEntity, hexSHA256(binary)); !ok {
+			t.Fatalf("vendor bundle must verify under local trust: %s", reason)
+		}
+	}
 	if ok, reason := sv.verifyEntity(vendorEntity, hexSHA256(binary)); ok {
 		t.Errorf("vendor-only binary: want invalid (replacement, not union), got valid (%s)", reason)
+	}
+	// Same customer root, vendor identity: the managed pair pins the
+	// customer identity, so this must fail. A union mutant that appends
+	// the local (vendor) identities to the managed identities would
+	// accept it, so this assertion kills that mutant independently of
+	// roots (the root already matches the managed pair).
+	crossEntity, err := customerVS.Sign(managedTestVendorSAN, managedTestVendorIssuer, binary)
+	if err != nil {
+		t.Fatalf("cross sign: %v", err)
+	}
+	if ok, reason := sv.verifyEntity(crossEntity, hexSHA256(binary)); ok {
+		t.Errorf("vendor identity under customer root: want invalid (replacement, not union), got valid (%s)", reason)
 	}
 	if ok, reason := sv.verifyEntity(customerEntity, hexSHA256([]byte("tampered-binary"))); ok {
 		t.Errorf("tampered binary: want invalid, got valid (%s)", reason)
@@ -304,7 +334,7 @@ func TestManagedUpdateTrust_InvalidDigestRootOversizedUnavailableBlock(t *testin
 	_ = validRootBytes
 
 	cases := []struct {
-		name  string
+		name   string
 		mutate func(*ManagedUpdateTrustProjection)
 	}{
 		{"invalid root not base64", func(p *ManagedUpdateTrustProjection) { p.TrustRoot = "!!!not-base64!!!" }},
@@ -424,7 +454,7 @@ func TestManagedUpdateTrust_PersistenceFailureBlocksAndRecovers(t *testing.T) {
 	dir := t.TempDir()
 	// Make the managed path a directory so persistence fails.
 	configPath := filepath.Join(dir, "daemon.yaml")
-	if err := os.MkdirAll(managedUpdateTrustPath(configPath), 0o755); err != nil {
+	if err := os.MkdirAll(managedUpdateTrustPath(configPath), 0o700); err != nil {
 		t.Fatalf("mkdir blocking path: %v", err)
 	}
 	d := newManagedTestDaemon(t, configPath, true, []UpdateSigner{{SAN: managedTestCustomerSAN, Issuer: managedTestCustomerIssuer}})
