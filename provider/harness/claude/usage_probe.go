@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/tempown"
 )
 
 // ProbeUsage runs one claude usage read: a short-lived CLI session in
@@ -157,7 +158,7 @@ func (b *boundedProbeOutput) Write(data []byte) (int, error) {
 // produced one — a missing binary, a timeout, an unreadable reply —
 // which is never a login verdict by itself.
 func readUsageControl(ctx context.Context, binary string) (json.RawMessage, bool) {
-	probeDir, err := os.MkdirTemp("", "donmai-claude-usage-")
+	probeDir, err := tempown.MkdirTemp("", tempown.PrefixClaudeUsage)
 	if err != nil {
 		return nil, false
 	}

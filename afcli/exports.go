@@ -82,6 +82,17 @@ func NewHostCmd(ds func() afclient.DataSource, cfg Config) *cobra.Command {
 	return newHostCmd(ds, cfg)
 }
 
+// NewDoctorTempCmd returns a fresh `temp` Cobra command — the `host doctor
+// temp` leaf: a report of the user temp folder by producer, and --fix to
+// remove donmai's own dead artefacts (plus, on a confirmed request with no
+// seat running, the shared tool caches). NewHostCmd already carries it under
+// `doctor`; the export lets a composing binary mount the same leaf under its
+// own doctor command. The work behind it is the tempdoctor package (Scan,
+// Report.WriteText, Fix), for a binary that wants its own command shape.
+func NewDoctorTempCmd(cfg Config) *cobra.Command {
+	return newDaemonDoctorTempCmd(defaultDaemonFactory, binaryName(cfg))
+}
+
 // NewProviderCmd returns a fresh `provider` Cobra command tree
 // (list, show) targeting the local daemon. See provider.go for
 // per-subcommand documentation.

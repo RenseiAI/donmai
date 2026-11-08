@@ -1741,3 +1741,218 @@ func TestSweepOrphans_ProtectsAdoptedHomeThroughSymlinkedRoot(t *testing.T) {
 		t.Fatalf("protected adopted home reached through a symlinked root was reclaimed: %v", err)
 	}
 }
+
+// neverUsedHome builds the shape a provider leaves when it is constructed and
+// its owner exits without a Shutdown before any spawn: the owner manifest, the
+// private config.toml and a seeded plugin cache, nothing codex itself writes.
+// extra names additional top-level files to create.
+func neverUsedHome(t *testing.T, root, name string, manifest donmaiOwnerManifest, age time.Duration, extra ...string) string {
+	t.Helper()
+	home := filepath.Join(root, codexHomePrefix+name)
+	if err := os.Mkdir(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, codexConfigFileName), []byte(codexConfigBaseline), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(home, codexPluginCacheSubdir, "plugins"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, codexPluginCacheSubdir, "plugins", "catalog.json"), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range extra {
+		if err := os.WriteFile(filepath.Join(home, name), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	persistDonmaiOwnerManifest(home, manifest)
+	ageTree(t, home, time.Now(), age)
+	return home
+}
+
+// TestSweepOrphans_ReclaimsNeverUsedHomesOfADeadOwnerOnTheShortFloor pins the
+// fix for the population that kept a real host's sweep at reclaimed=0: homes
+// a provider created but never handed to codex, whose owner (an agent-run
+// worker or a test binary) is gone. They sat behind the 24-hour unverified
+// floor although nothing could be using them.
+//
+// RED proof: remove the never-used branch in sweepManifested and these homes
+// fall through to the UnverifiedMinAge path and count as SkippedYoung.
+func TestSweepOrphans_ReclaimsNeverUsedHomesOfADeadOwnerOnTheShortFloor(t *testing.T) {
+	requireManifestVerification(t)
+	root := t.TempDir()
+	owner := fakeDeadIdentity(t)
+	var homes []string
+	for i := range 3 {
+		homes = append(homes, neverUsedHome(t, root, "never-used-"+strconv.Itoa(i),
+			donmaiOwnerManifest{OwnerIdentity: owner, StartedAt: time.Now()}, 2*time.Hour))
+	}
+
+	report := SweepOrphans(context.Background(), SweepOptions{Root: root, PluginCacheDir: t.TempDir()})
+
+	if report.Reclaimed != 3 || report.NeverUsed != 3 || report.SkippedYoung != 0 {
+		t.Fatalf("report = %+v, want 3 reclaimed as never-used and none skipped young", report)
+	}
+	for _, home := range homes {
+		if _, err := os.Stat(home); !os.IsNotExist(err) {
+			t.Fatalf("never-used home of a dead owner survived: %s err=%v", home, err)
+		}
+	}
+}
+
+// TestSweepOrphans_NeverUsedShortFloorRequiresEveryProof pins each condition
+// of the never-used path: without any one of them the home stays on the
+// 24-hour floor (SkippedYoung at 2 hours) and loses nothing.
+func TestSweepOrphans_NeverUsedShortFloorRequiresEveryProof(t *testing.T) {
+	requireManifestVerification(t)
+	cases := map[string]struct {
+		manifest func(t *testing.T) donmaiOwnerManifest
+		age      time.Duration
+		extra    []string
+		want     func(r SweepReport) bool
+	}{
+		"bare-PID owner is not a proven-dead identity": {
+			manifest: func(t *testing.T) donmaiOwnerManifest {
+				return donmaiOwnerManifest{OwnerPID: fakeDeadPID(t), StartedAt: time.Now()}
+			},
+			age:  2 * time.Hour,
+			want: func(r SweepReport) bool { return r.SkippedYoung == 1 },
+		},
+		"codex-written state means codex ran here": {
+			manifest: func(t *testing.T) donmaiOwnerManifest {
+				return donmaiOwnerManifest{OwnerIdentity: fakeDeadIdentity(t), StartedAt: time.Now()}
+			},
+			age:   2 * time.Hour,
+			extra: []string{"installation_id"},
+			want:  func(r SweepReport) bool { return r.SkippedYoung == 1 },
+		},
+		"an auth link is placed only on the spawn path": {
+			manifest: func(t *testing.T) donmaiOwnerManifest {
+				return donmaiOwnerManifest{OwnerIdentity: fakeDeadIdentity(t), StartedAt: time.Now()}
+			},
+			age:   2 * time.Hour,
+			extra: []string{codexAuthFileName},
+			want:  func(r SweepReport) bool { return r.SkippedYoung == 1 },
+		},
+		"younger than MinAge": {
+			manifest: func(t *testing.T) donmaiOwnerManifest {
+				return donmaiOwnerManifest{OwnerIdentity: fakeDeadIdentity(t), StartedAt: time.Now()}
+			},
+			age:  10 * time.Minute,
+			want: func(r SweepReport) bool { return r.SkippedYoung == 1 },
+		},
+		"live owner identity": {
+			manifest: func(t *testing.T) donmaiOwnerManifest {
+				return donmaiOwnerManifest{OwnerIdentity: mustProcessIdentity(t, os.Getpid()), StartedAt: time.Now()}
+			},
+			age:  2 * time.Hour,
+			want: func(r SweepReport) bool { return r.SkippedLive == 1 },
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			home := neverUsedHome(t, root, "guarded", tc.manifest(t), tc.age, tc.extra...)
+
+			report := SweepOrphans(context.Background(), SweepOptions{Root: root, PluginCacheDir: t.TempDir()})
+
+			if report.Reclaimed != 0 || report.NeverUsed != 0 || !tc.want(report) {
+				t.Fatalf("report = %+v", report)
+			}
+			for _, keep := range []string{codexConfigFileName, donmaiOwnerManifestName} {
+				if _, err := os.Stat(filepath.Join(home, keep)); err != nil {
+					t.Fatalf("guarded home lost %s: %v", keep, err)
+				}
+			}
+		})
+	}
+}
+
+// TestSweepOrphans_NeverUsedOnlyActsOnNothingElse pins the operator-CLI mode:
+// it reclaims a never-used home and leaves every entry the full sweep would
+// act on alone — a home whose live, identity-matched child the full sweep
+// would terminate, a dead-child home it would reclaim, and a manifest-less
+// legacy home past the unverified floor. It never signals a process.
+func TestSweepOrphans_NeverUsedOnlyActsOnNothingElse(t *testing.T) {
+	requireManifestVerification(t)
+	root := t.TempDir()
+	deadOwner := fakeDeadIdentity(t)
+
+	neverUsed := neverUsedHome(t, root, "operator-never-used",
+		donmaiOwnerManifest{OwnerIdentity: deadOwner, StartedAt: time.Now()}, 2*time.Hour)
+
+	child := spawnSweepFixtureProcess(t)
+	liveChild := filepath.Join(root, codexHomePrefix+"operator-live-child")
+	if err := os.Mkdir(liveChild, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	persistDonmaiOwnerManifest(liveChild, donmaiOwnerManifest{
+		OwnerIdentity: deadOwner,
+		ChildIdentity: mustProcessIdentity(t, child.Process.Pid),
+		StartedAt:     time.Now(),
+	})
+	ageTree(t, liveChild, time.Now(), 24*time.Hour)
+
+	deadChild := filepath.Join(root, codexHomePrefix+"operator-dead-child")
+	if err := os.Mkdir(deadChild, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	persistDonmaiOwnerManifest(deadChild, donmaiOwnerManifest{
+		OwnerIdentity: deadOwner,
+		ChildIdentity: fakeDeadIdentity(t),
+		StartedAt:     time.Now(),
+	})
+	ageTree(t, deadChild, time.Now(), 24*time.Hour)
+
+	legacy := legacyHome(t, root, "operator-legacy", 48*time.Hour)
+
+	report := SweepOrphans(context.Background(), SweepOptions{
+		Root: root, NeverUsedOnly: true, BinaryHint: "sleep",
+		TerminationGrace: 200 * time.Millisecond, PluginCacheDir: t.TempDir(),
+	})
+
+	if report.NeverUsed != 1 || report.Reclaimed != 1 || report.Terminated != 0 || report.SkippedOutOfScope != 3 {
+		t.Fatalf("report = %+v, want 1 never-used reclaimed, 3 out of scope, nothing terminated", report)
+	}
+	if _, err := os.Stat(neverUsed); !os.IsNotExist(err) {
+		t.Fatalf("never-used home survived: %v", err)
+	}
+	for _, keep := range []string{
+		filepath.Join(liveChild, donmaiOwnerManifestName),
+		filepath.Join(deadChild, donmaiOwnerManifestName),
+		filepath.Join(legacy, codexConfigFileName),
+		filepath.Join(legacy, codexAuthFileName),
+	} {
+		if _, err := os.Stat(keep); err != nil {
+			t.Fatalf("out-of-scope entry %s was touched: %v", keep, err)
+		}
+	}
+	if !processAliveOS(child.Process.Pid) {
+		t.Fatal("NeverUsedOnly signalled a live child")
+	}
+}
+
+func TestClassifyHomeShapes(t *testing.T) {
+	requireManifestVerification(t)
+	root := t.TempDir()
+	never := neverUsedHome(t, root, "shape-never", donmaiOwnerManifest{OwnerPID: 1, StartedAt: time.Now()}, time.Hour)
+	used := neverUsedHome(t, root, "shape-used", donmaiOwnerManifest{OwnerPID: 1, StartedAt: time.Now()}, time.Hour, "installation_id")
+	retained := neverUsedHome(t, root, "shape-retained", donmaiOwnerManifest{OwnerPID: 1, StartedAt: time.Now()}, time.Hour, "state_5.sqlite")
+	if err := os.MkdirAll(filepath.Join(retained, codexSessionStateSubdir, "2026"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for path, want := range map[string]HomeShape{
+		never:                         HomeShapeNeverUsed,
+		used:                          HomeShapeUsed,
+		retained:                      HomeShapeRetained,
+		filepath.Join(root, "absent"): HomeShapeUnreadable,
+	} {
+		if got := ClassifyHome(path); got != want {
+			t.Errorf("ClassifyHome(%s) = %q, want %q", filepath.Base(path), got, want)
+		}
+	}
+	if !IsArtifactName(codexHomePrefix+"x") || !IsArtifactName(codexAppSocketPrefix+"x") || IsArtifactName("tsx-501") {
+		t.Fatal("IsArtifactName fence is wrong")
+	}
+}

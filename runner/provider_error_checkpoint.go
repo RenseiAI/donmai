@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/tempown"
 )
 
 // providerErrorCheckpointTimeout bounds the whole checkpoint. A variable so a
@@ -197,7 +198,7 @@ func sessionCommitted(ctx context.Context, target rescueTarget, head string) (bo
 }
 
 func checkpointDirtyWorktree(ctx context.Context, worktreePath, head string, qw QueuedWork) (string, []string, bool, error) {
-	indexDir, err := os.MkdirTemp("", "provider-error-checkpoint-")
+	indexDir, err := tempown.MkdirTemp("", tempown.PrefixCheckpointIndex)
 	if err != nil {
 		return "", nil, false, fmt.Errorf("create scratch index dir: %w", err)
 	}

@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/RenseiAI/donmai/tempown"
 )
 
 // mcpGatewayTokenFileEnv is the generic live-bearer rail shared by harness
@@ -63,7 +65,7 @@ func prepareSessionMCPBearerEnv(
 		return sessionMCPBearerFile{}, fmt.Errorf("prepare session MCP bearer env: nil destination")
 	}
 
-	dir, err := os.MkdirTemp("", "donmai-mcp-bearer-")
+	dir, err := tempown.MkdirTemp("", tempown.PrefixMCPBearer)
 	if err != nil {
 		return sessionMCPBearerFile{}, fmt.Errorf("prepare session MCP bearer env: create private directory: %w", err)
 	}

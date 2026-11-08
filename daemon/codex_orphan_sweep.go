@@ -80,6 +80,7 @@ func (d *Daemon) sweepCodexOrphans(ctx context.Context) providercodex.SweepRepor
 		merged.SkippedIrreducible += report.SkippedIrreducible
 		merged.ExpiredRetained += report.ExpiredRetained
 		merged.SkippedProtected += report.SkippedProtected
+		merged.NeverUsed += report.NeverUsed
 		merged.Terminated += report.Terminated
 		merged.SkippedYoung += report.SkippedYoung
 		merged.SkippedLive += report.SkippedLive
@@ -95,6 +96,9 @@ func (d *Daemon) sweepCodexOrphans(ctx context.Context) providercodex.SweepRepor
 		"terminated", report.Terminated,
 		"skippedProtected", report.SkippedProtected,
 		"skippedIrreducible", report.SkippedIrreducible,
+		"neverUsed", report.NeverUsed,
+		"skippedYoung", report.SkippedYoung,
+		"skippedLive", report.SkippedLive,
 		"errors", report.Errors,
 	)
 	return report

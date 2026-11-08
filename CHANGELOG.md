@@ -8,7 +8,14 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
-No unreleased changes.
+### Features
+
+- Add `host doctor temp`: reports the user temp folder by producer (donmai artefacts, codex homes, donmai caches, shared tool caches) with sampled counts and sizes, flat-directory warnings and a boot-cleanup estimate; `--fix` removes donmai artefacts whose owner is gone, and `--fix --include-tool-caches` removes shared tool caches after confirmation with no seat running. The report and fix are a Go API (`tempdoctor`) an embedding product can wrap.
+- Record the owning process in the name of every temp artefact probes, harness sessions and the runner create, and reclaim them at daemon start and hourly once the owner is gone.
+
+### Fixes
+
+- Reclaim codex homes that no codex process ever used once their owner is confirmed dead, instead of holding them for the 24-hour unverified floor.
 
 ## v0.73.3 — 2026-11-06
 

@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/RenseiAI/donmai/tempown"
 )
 
 //go:embed signalguard/signal-guard.sh
@@ -76,7 +78,7 @@ type signalGuardLayout struct {
 // binary (go:embed), so it survives upgrades with no hand-installed step.
 // The caller removes layout.dir when the session ends.
 func installSignalGuard() (signalGuardLayout, error) {
-	dir, err := os.MkdirTemp("", "donmai-signal-guard-*")
+	dir, err := tempown.MkdirTemp("", tempown.PrefixSignalGuard)
 	if err != nil {
 		return signalGuardLayout{}, fmt.Errorf("runner: create signal guard dir: %w", err)
 	}

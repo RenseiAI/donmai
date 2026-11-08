@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/tempown"
 )
 
 const (
@@ -60,7 +61,7 @@ func CheckModelBinaryVersion(ctx context.Context, binary, model string) error {
 	// An empty, private cwd and home keep repository config and ambient
 	// credentials out of this read-only --version probe. PATH is retained for
 	// installed script wrappers that resolve their interpreter through env.
-	probeDir, err := os.MkdirTemp("", "donmai-claude-version-")
+	probeDir, err := tempown.MkdirTemp("", tempown.PrefixClaudeVersion)
 	if err != nil {
 		return fmt.Errorf("%w: create isolated Claude Code probe directory: %w", agent.ErrProviderUnavailable, err)
 	}

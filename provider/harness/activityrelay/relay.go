@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/tempown"
 )
 
 // Relay event names, in the snake_case vocabulary the CLIs themselves use
@@ -88,7 +89,7 @@ type Relay struct {
 
 // New creates the relay directory and writes the relay script into it.
 func New() (*Relay, error) {
-	dir, err := os.MkdirTemp("", "donmai-activity-relay-")
+	dir, err := tempown.MkdirTemp("", tempown.PrefixActivityRelay)
 	if err != nil {
 		return nil, fmt.Errorf("activity relay: create dir: %w", err)
 	}
