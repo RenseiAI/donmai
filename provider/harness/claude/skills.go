@@ -9,6 +9,7 @@ import (
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/runtime/skillfs"
+	"github.com/RenseiAI/donmai/tempown"
 )
 
 // Native skill delivery for Claude Code: a per-session plugin directory.
@@ -60,7 +61,7 @@ func (m skillMaterializer) MaterializeSkills(spec agent.Spec) (agent.Materialize
 	if layout := spec.Skills.Plan.Layout; layout != agent.SkillLayoutPluginDir {
 		return agent.MaterializedSkills{}, fmt.Errorf("provider/claude: skill plan layout %q is not this harness's", layout)
 	}
-	dir, err := os.MkdirTemp(m.tempDir, skillPluginDirPrefix+"*")
+	dir, err := tempown.MkdirTemp(m.tempDir, skillPluginDirPrefix)
 	if err != nil {
 		return agent.MaterializedSkills{}, fmt.Errorf("provider/claude: create skill plugin dir: %w", err)
 	}

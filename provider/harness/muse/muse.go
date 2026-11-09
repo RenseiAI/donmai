@@ -17,6 +17,7 @@ import (
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/runtime/confinement"
 	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
+	"github.com/RenseiAI/donmai/tempown"
 	"github.com/google/uuid"
 )
 
@@ -300,7 +301,7 @@ func (p *Provider) spawnHandle(ctx context.Context, spec agent.Spec, resumeSessi
 	var sessionDir string
 	if confiner != nil {
 		var derr error
-		sessionDir, derr = os.MkdirTemp("", "muse-session-")
+		sessionDir, derr = tempown.MkdirTemp("", tempown.PrefixMuseSession)
 		if derr != nil {
 			return nil, fmt.Errorf("%w: muse session scratch: %v", agent.ErrSpawnFailed, derr)
 		}

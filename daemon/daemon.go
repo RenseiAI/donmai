@@ -168,6 +168,13 @@ type Options struct {
 	// mentions it — never does.
 	CodexOrphanSweeper CodexOrphanSweepFunc
 
+	// TempJanitor reclaims the temp artefacts probes, harness sessions and
+	// the runner record under the system temp folder (tempown owner-tagged
+	// names) once their owner process is gone — once per Start beside the
+	// codex sweep, then hourly. Nil makes it a no-op; only the production
+	// entry point (afcli/daemon_run.go) sets it, to tempown.Sweep.
+	TempJanitor TempJanitorFunc
+
 	// TrustLedgerSweeper undoes seeded workspace-trust entries whose owning
 	// session is no longer live, once per Start, after shim adoption and
 	// before registration — see sweepSeededTrustLedger. Nil (the default
@@ -1715,6 +1722,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 	// reach again. Runs after adoption so live sessions' resume-keyed homes
 	// are protected, and never fails startup — see sweepCodexOrphans.
 	d.sweepCodexOrphans(ctx)
+	d.sweepTempArtifacts(ctx)
 	// Undo seeded workspace trust whose owning session died before its
 	// cleanup ran. Runs after adoption so live sessions' ledger rows are
 	// protected, and never fails startup — see sweepSeededTrustLedger.
@@ -2169,6 +2177,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 		// entry point runs (see afcli/daemon_run.go), which likewise
 		// end with their parent context rather than with Stop.
 		d.startCodexOrphanSweepLoop(ctx)
+		d.startTempJanitorLoop(ctx)
 
 		// Poll loop — the binding constraint that makes the daemon actually
 		// receive work. Without this the platform's heartbeat-only sidecar

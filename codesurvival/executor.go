@@ -12,6 +12,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/RenseiAI/donmai/tempown"
 )
 
 // resultPostTimeout bounds the result POST. Mirrors the detached-timeout
@@ -31,13 +33,13 @@ type Workarea struct {
 }
 
 // WorkareaProvider acquires an isolated workarea for a scan. The default
-// provider uses os.MkdirTemp + os.RemoveAll; tests inject a stub.
+// provider uses tempown.MkdirTemp + os.RemoveAll; tests inject a stub.
 type WorkareaProvider func() (Workarea, error)
 
 // defaultWorkareaProvider creates a fresh temp dir under the OS temp root and
 // returns a Release that removes it.
 func defaultWorkareaProvider() (Workarea, error) {
-	dir, err := os.MkdirTemp("", "code-survival-*")
+	dir, err := tempown.MkdirTemp("", tempown.PrefixCodeSurvival)
 	if err != nil {
 		return Workarea{}, fmt.Errorf("codesurvival: acquire workarea: %w", err)
 	}

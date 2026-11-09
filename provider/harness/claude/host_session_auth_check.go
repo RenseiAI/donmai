@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/tempown"
 )
 
 const (
@@ -63,7 +64,7 @@ func CheckHostSessionLogin(ctx context.Context, binary string) error {
 			env = append(env, name+"="+value)
 		}
 	}
-	probeDir, err := os.MkdirTemp("", "donmai-claude-login-")
+	probeDir, err := tempown.MkdirTemp("", tempown.PrefixClaudeLogin)
 	if err != nil {
 		return fmt.Errorf("%w: create private Claude login probe: %w", agent.ErrProviderUnavailable, err)
 	}

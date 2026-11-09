@@ -10,10 +10,11 @@ import (
 	"sync"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/tempown"
 )
 
 const (
-	openCodeConfigPrefix = "donmai-opencode-config-"
+	openCodeConfigPrefix = tempown.PrefixOpenCodeConfig
 	openCodeConfigMode   = 0o600
 	openCodeHomeMode     = 0o700
 )
@@ -60,7 +61,7 @@ func newOpenCodeConfigBoundary(tempDir string, spec agent.Spec) (_ *openCodeConf
 		return nil, errors.New("provider/opencode: config parent must be a non-symlink directory")
 	}
 
-	home, err := os.MkdirTemp(parent, openCodeConfigPrefix)
+	home, err := tempown.MkdirTemp(parent, openCodeConfigPrefix)
 	if err != nil {
 		return nil, fmt.Errorf("provider/opencode: create config boundary: %w", err)
 	}

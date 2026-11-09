@@ -29,6 +29,7 @@ import (
 	"github.com/RenseiAI/donmai/runtime/statehome"
 	"github.com/RenseiAI/donmai/runtime/workarea"
 	"github.com/RenseiAI/donmai/runtime/worktree"
+	"github.com/RenseiAI/donmai/tempown"
 )
 
 // applyDaemonControlAuth arms the host control-API gate on opts. The host
@@ -443,6 +444,9 @@ func newDaemonRunCmd(cfg Config) *cobra.Command {
 				// only the production entry point configures this seam; see
 				// Options.CodexOrphanSweeper's doc comment.
 				CodexOrphanSweeper: providercodex.SweepOrphans,
+				// The real temp janitor for owner-tagged probe, session and
+				// runner leftovers; see Options.TempJanitor's doc comment.
+				TempJanitor: tempown.Sweep,
 				// The real seeded-trust crash sweep — only the production
 				// entry point configures this seam; see
 				// Options.TrustLedgerSweeper's doc comment.

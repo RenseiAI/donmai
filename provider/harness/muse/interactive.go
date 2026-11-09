@@ -14,6 +14,7 @@ import (
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/provider/harness/ptycli"
 	"github.com/RenseiAI/donmai/runtime/confinement"
+	"github.com/RenseiAI/donmai/tempown"
 )
 
 // museAuthPathEnv overrides the credential-file location the host login
@@ -162,7 +163,7 @@ func probeHostSessionLogin(ctx context.Context, binary string) error {
 // environment injected, so the credential-resolution leg is table-testable
 // without mutating process state.
 func probeHostSessionLoginWithEnv(ctx context.Context, binary string, env []string) error {
-	probeDir, err := os.MkdirTemp("", "donmai-muse-login-")
+	probeDir, err := tempown.MkdirTemp("", tempown.PrefixMuseLogin)
 	if err != nil {
 		return errHostSessionLogin
 	}
@@ -334,7 +335,7 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 	var sessionDir string
 	if confiner != nil {
 		var derr error
-		sessionDir, derr = os.MkdirTemp("", "muse-interactive-")
+		sessionDir, derr = tempown.MkdirTemp("", tempown.PrefixMuseInteractive)
 		if derr != nil {
 			return nil, fmt.Errorf("%w: muse interactive session scratch: %v", agent.ErrSpawnFailed, derr)
 		}
