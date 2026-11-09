@@ -235,7 +235,10 @@ jobs:
           E2B_ADDITIONAL_TAGS: ${{ steps.release.outputs.e2b_additional_tags }}
           E2B_DOCKERFILE: e2b.node-pg.Dockerfile
           E2B_CPU_COUNT: 8
-          E2B_MEMORY_MB: 16384
+          # E2B refuses templates above 8192 MiB on the current plan
+          # ("Memory can't be higher than 8192 MiB"); raising it needs a
+          # plan change on the E2B side, not a config change here.
+          E2B_MEMORY_MB: 8192
         run: node "${RUNNER_TEMP}/build-e2b-template.cjs"
 
       - name: Assert published E2B node-pg template toolchain
