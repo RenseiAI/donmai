@@ -407,7 +407,9 @@ func sessionTmpOwnerMatches(dir string, claim sessionTmpClaim) bool {
 // DONMAI_SESSION_TMPDIR just as a declared one does.
 func applySessionTmpBindings(env []string, dir string) []string {
 	keys := append(append([]string(nil), sessionTmpBindingKeys...), SessionTmpDirEnv)
-	out := make([]string, 0, len(env)+len(keys))
+	// Capacity from env alone: the four bound keys append past it at most
+	// once, and an added length would read as an allocation-size overflow.
+	out := make([]string, 0, len(env))
 dropped:
 	for _, kv := range env {
 		key := kv
