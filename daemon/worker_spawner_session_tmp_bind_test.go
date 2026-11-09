@@ -91,11 +91,16 @@ func waitForSeatFile(t *testing.T, path string) {
 }
 
 // heldSeatEnv waits for a held worker's recorded bindings and parses them.
+// It registers the guarded cleanup for the TMPDIR the worker saw before any
+// caller asserts on it, so a failing assertion never leaks a derived
+// directory whose session outlives the test binary.
 func heldSeatEnv(t *testing.T, root, sessionID string) map[string]string {
 	t.Helper()
 	path := filepath.Join(root, sessionID, "env.txt")
 	waitForSeatFile(t, path)
-	return envToMapSessionTmpTest(strings.Split(strings.TrimSpace(readSeatFile(t, path)), "\n"))
+	env := envToMapSessionTmpTest(strings.Split(strings.TrimSpace(readSeatFile(t, path)), "\n"))
+	cleanupReportedScratch(t, env["TMPDIR"])
+	return env
 }
 
 func releaseHeldSeat(t *testing.T, root, sessionID, exitCode string) {
@@ -363,11 +368,16 @@ func TestSpawner_SessionTmp_DerivedWhenUndeclared(t *testing.T) {
 			t.Fatalf("accept: %v", err)
 		}
 	}
+	// Read every seat's bindings before asserting on any, so each observed
+	// directory has its cleanup registered even when an assertion fails.
+	envs := map[string]map[string]string{}
+	for _, id := range ids {
+		envs[id] = heldSeatEnv(t, root, id)
+	}
 	dirs := map[string]string{}
 	for _, id := range ids {
-		env := heldSeatEnv(t, root, id)
+		env := envs[id]
 		dir := env["TMPDIR"]
-		cleanupReportedScratch(t, dir)
 		if !derivedSessionTmpPattern.MatchString(dir) {
 			t.Fatalf("%s TMPDIR = %q, want a derived %s", id, dir, derivedSessionTmpPattern)
 		}
@@ -419,7 +429,6 @@ func TestSpawner_SessionTmp_InheritedAdvisoryIgnoredAtLaunch(t *testing.T) {
 	}
 	env := heldSeatEnv(t, root, sessionID)
 	dir := env["TMPDIR"]
-	cleanupReportedScratch(t, dir)
 	if !derivedSessionTmpPattern.MatchString(dir) {
 		t.Fatalf("worker TMPDIR = %q, want its own derived directory, not the daemon's inherited %q", dir, outer)
 	}
