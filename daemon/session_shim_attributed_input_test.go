@@ -133,29 +133,63 @@ func TestSessionShimAttributedInputSystemPacedHumanImmediate(t *testing.T) {
 		return time.Time{}
 	}
 
-	if err := d.WriteAdoptedSessionShimInputAttributed(id.OrgID, id.SessionID, humanUserID, []byte("human-token")); err != nil {
-		t.Fatalf("WriteAdoptedSessionShimInputAttributed(human text): %v", err)
+	// Warm the harness before measuring anything. AcceptWork returns once the
+	// shim is adopted, which does not wait for the echo harness the shim
+	// spawned under its PTY (a re-exec of this race-instrumented test binary)
+	// to reach its first stdin read. Input written earlier is buffered by the
+	// line discipline and answered only once that child finishes starting, so
+	// whichever round trip runs first absorbs the child's cold start: hundreds
+	// of milliseconds on a loaded -race runner, which is more than the pacing
+	// gap. Unwarmed, that cost always landed on the human trip, because it is
+	// measured first. One unmeasured round trip proves the harness is reading,
+	// so every measured trip below shares the same warm path.
+	if err := d.WriteAdoptedSessionShimInputAttributed(id.OrgID, id.SessionID, humanUserID, []byte("warmup-token\r")); err != nil {
+		t.Fatalf("WriteAdoptedSessionShimInputAttributed(warm-up): %v", err)
 	}
-	humanStart := time.Now()
-	if err := d.WriteAdoptedSessionShimInputAttributed(id.OrgID, id.SessionID, humanUserID, []byte("\r")); err != nil {
-		t.Fatalf("WriteAdoptedSessionShimInputAttributed(human CR): %v", err)
-	}
-	humanElapsed := waitForAck("ack:human-token").Sub(humanStart)
+	waitForAck("ack:warmup-token")
 
-	if err := d.WriteAdoptedSessionShimInputAttributed(id.OrgID, id.SessionID, attachwire.SystemNudgeUserID, []byte("system-token")); err != nil {
-		t.Fatalf("WriteAdoptedSessionShimInputAttributed(system text): %v", err)
+	// roundTrip writes token and then a bare CR, both attributed to userID,
+	// and returns the time from the CR write to the harness's answer. Only
+	// the bare CR is ever paced (ptyhost/systeminput.go).
+	roundTrip := func(userID, token string) time.Duration {
+		t.Helper()
+		if err := d.WriteAdoptedSessionShimInputAttributed(id.OrgID, id.SessionID, userID, []byte(token)); err != nil {
+			t.Fatalf("WriteAdoptedSessionShimInputAttributed(%s text): %v", userID, err)
+		}
+		start := time.Now()
+		if err := d.WriteAdoptedSessionShimInputAttributed(id.OrgID, id.SessionID, userID, []byte("\r")); err != nil {
+			t.Fatalf("WriteAdoptedSessionShimInputAttributed(%s CR): %v", userID, err)
+		}
+		return waitForAck("ack:" + token).Sub(start)
 	}
-	systemStart := time.Now()
-	if err := d.WriteAdoptedSessionShimInputAttributed(id.OrgID, id.SessionID, attachwire.SystemNudgeUserID, []byte("\r")); err != nil {
-		t.Fatalf("WriteAdoptedSessionShimInputAttributed(system CR): %v", err)
-	}
-	systemElapsed := waitForAck("ack:system-token").Sub(systemStart)
 
-	if systemElapsed < sanityFloor {
-		t.Errorf("system-attributed round trip took only %v, want >= %v (the last-hop pacing gap)", systemElapsed, sanityFloor)
+	// Interleaved pairs, compared by their minimums. Load only ever ADDS
+	// latency to a round trip, so the fastest of a few trips is the best
+	// estimate of each kind's fixed cost, and the pacing gap is a fixed lower
+	// bound on every system trip. A single pair let one scheduler stall on the
+	// human trip (measured 330ms against a 280ms system trip on a host loaded
+	// to 8 concurrent suites) outweigh the whole gap. The floor is asserted on
+	// EVERY system trip. Comparing minimums is no weaker against a paced human
+	// trip: with every input paced it failed 8 of 40 runs, where the
+	// single-sample comparison failed none.
+	const rounds = 3
+	var humanBest, systemBest time.Duration
+	for round := range rounds {
+		human := roundTrip(humanUserID, fmt.Sprintf("human-token-%d", round))
+		system := roundTrip(attachwire.SystemNudgeUserID, fmt.Sprintf("system-token-%d", round))
+		t.Logf("round %d: human %v, system %v", round, human, system)
+		if system < sanityFloor {
+			t.Errorf("system-attributed round trip %d took only %v, want >= %v (the last-hop pacing gap)", round, system, sanityFloor)
+		}
+		if round == 0 || human < humanBest {
+			humanBest = human
+		}
+		if round == 0 || system < systemBest {
+			systemBest = system
+		}
 	}
-	if humanElapsed >= systemElapsed {
-		t.Errorf("human round trip (%v) was not clearly faster than the paced system round trip (%v); human input must never be delayed", humanElapsed, systemElapsed)
+	if humanBest >= systemBest {
+		t.Errorf("fastest human round trip (%v) was not clearly faster than the fastest paced system round trip (%v); human input must never be delayed", humanBest, systemBest)
 	}
 }
 
