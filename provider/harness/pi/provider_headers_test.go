@@ -2,9 +2,12 @@ package pi
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
+	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -15,32 +18,77 @@ import (
 	"github.com/RenseiAI/donmai/internal/testexec"
 )
 
-func TestProviderHeadersPinEnv(t *testing.T) {
+func TestProviderHeadersPin(t *testing.T) {
 	t.Parallel()
 	injected := &agent.EndpointBinding{BaseURL: "https://gateway.example/v1", Protocol: agent.ProtoOpenAIChat, Host: agent.HostDirect}
 	declared := map[string]string{agent.ProviderHTTPHeadersEnv: "x-title: Example App\nx-cost: $HOME\nx-note: !echo hi"}
-	const wantJSON = piHeadersEnvVar + `={"x-cost":"$$HOME","x-note":"$!echo hi","x-title":"Example App"}`
+	escaped := map[string]string{"x-cost": "$$HOME", "x-note": "$!echo hi", "x-title": "Example App"}
 	tests := []struct {
-		name string
-		spec agent.Spec
-		want []string
+		name       string
+		spec       agent.Spec
+		want       *sessionProviderHeaders
+		wantMarker []string
 	}{
 		{name: "absent exports nothing", spec: agent.Spec{Model: "m", Endpoint: injected, Env: map[string]string{"OTHER": "v"}}},
-		{name: "injected provider", spec: agent.Spec{Model: "m", Endpoint: injected, Env: declared}, want: []string{wantJSON}},
 		{
-			name: "native route names the built-in provider",
-			spec: agent.Spec{Model: "openrouter/some-model", Env: declared},
-			want: []string{wantJSON, piHeadersProviderEnvVar + "=openrouter"},
+			name: "injected provider", spec: agent.Spec{Model: "m", Endpoint: injected, Env: declared},
+			want: &sessionProviderHeaders{Headers: escaped}, wantMarker: []string{piHeadersDeclaredEnvVar + "=1"},
+		},
+		{
+			name: "native route names the built-in provider", spec: agent.Spec{Model: "openrouter/some-model", Env: declared},
+			want: &sessionProviderHeaders{Headers: escaped, NativeProvider: "openrouter"}, wantMarker: []string{piHeadersDeclaredEnvVar + "=1"},
 		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			got := slices.DeleteFunc(providerPinEnv(tc.spec), func(kv string) bool { return !strings.HasPrefix(kv, piHeadersEnvVar) })
-			if !slices.Equal(got, tc.want) {
-				t.Fatalf("providerPinEnv header entries = %q; want %q", got, tc.want)
+			if got := providerHeadersPin(tc.spec); !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("providerHeadersPin = %+v; want %+v", got, tc.want)
+			}
+			got := slices.DeleteFunc(providerPinEnv(tc.spec), func(kv string) bool { return !strings.HasPrefix(kv, "DONMAI_PI_HEADERS") })
+			if !slices.Equal(got, tc.wantMarker) {
+				t.Fatalf("providerPinEnv header entries = %q; want %q", got, tc.wantMarker)
 			}
 		})
+	}
+}
+
+// TestProviderHeadersNeverInExecEnv pins where a declared header value
+// travels: never into the headless or the interactive exec environment, which
+// a same-user process listing renders, and only into the owner-only session
+// credential file the extension reads.
+func TestProviderHeadersNeverInExecEnv(t *testing.T) {
+	t.Parallel()
+	const secret = "sentinel-gw-secret"
+	spec := realBinarySpec(t.TempDir(), "x", "https://gateway.example/v1")
+	spec.Env = map[string]string{agent.ProviderHTTPHeadersEnv: "cf-aig-authorization: Bearer " + secret}
+	layout := sessionLayout{root: filepath.Join(t.TempDir(), ".pi-x")}
+	parts := partitionChildEnv(nil, spec)
+	interactive := []string{}
+	for k, v := range interactiveExecEnvWithTrust(parts.exec, spec, layout, false) {
+		interactive = append(interactive, k+"="+v)
+	}
+	for lane, env := range map[string][]string{"headless": headlessChildEnv(parts.exec, spec, layout, "tok"), "interactive": interactive} {
+		if sessionCredentialValuePresent(env, secret) {
+			t.Errorf("%s exec env carries the declared header value: %q", lane, env)
+		}
+	}
+
+	if err := os.MkdirAll(layout.root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path, err := writeSessionCredentialFile(layout, sessionCredentialEntries(spec), parts.deferred, providerHeadersPin(spec))
+	if err != nil {
+		t.Fatalf("write credential file: %v", err)
+	}
+	raw, err := os.ReadFile(path) //nolint:gosec // test-owned credential file
+	if err != nil {
+		t.Fatal(err)
+	}
+	var file sessionCredentialFile
+	if err := json.Unmarshal(raw, &file); err != nil || file.ProviderHeaders == nil ||
+		file.ProviderHeaders.Headers["cf-aig-authorization"] != "Bearer "+secret {
+		t.Fatalf("credential file providerHeaders = %+v (%v); want the declared header", file.ProviderHeaders, err)
 	}
 }
 

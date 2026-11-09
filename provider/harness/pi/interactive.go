@@ -106,7 +106,7 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 	// halves of the same composition. Any write failure denies spawn closed,
 	// before the child starts; the files are removed by the PTY cleanup below.
 	childEnvParts := interactiveChildEnvParts(spec)
-	credentialPath, err := writeSessionCredentialFile(layout, sessionCredentialEntries(spec), childEnvParts.deferred)
+	credentialPath, err := writeSessionCredentialFile(layout, sessionCredentialEntries(spec), childEnvParts.deferred, providerHeadersPin(spec))
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}

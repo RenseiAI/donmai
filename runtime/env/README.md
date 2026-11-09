@@ -113,8 +113,13 @@ headers are never silently dropped. Absent or blank changes nothing.
 |---|---|
 | claude | merged into `ANTHROPIC_CUSTOM_HEADERS`: existing lines kept, names not already present appended |
 | codex | `http_headers` on the gateway `model_providers` block (sessions with an endpoint base URL) |
-| pi | `headers` on the injected provider, and a header-only override on a natively pinned built-in provider; values escaped so pi's `$NAME` and `!command` syntax stays literal |
+| pi | `headers` on the injected provider, and a header-only override on a natively pinned built-in provider; values escaped so pi's `$NAME` and `!command` syntax stays literal. The values ride the owner-only session credential file, never the exec environment |
 | opencode | `options.headers` on the injected provider; values holding `{env:` or `{file:` are refused |
+
+On claude the declared values reach the CLI child's exec environment through
+`ANTHROPIC_CUSTOM_HEADERS`, because that child receives `Spec.Env` there, so a
+same-user process listing can read them: header values are not secret-safe on
+claude.
 
 ## Heuristic helpers
 
