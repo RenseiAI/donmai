@@ -117,6 +117,14 @@ const (
 	piRoutingOrderEnvVar = "DONMAI_PI_ROUTING_ORDER"
 	piRoutingOnlyEnvVar  = "DONMAI_PI_ROUTING_ONLY"
 
+	// piHeadersDeclaredEnvVar marks, with "1", a session whose credential
+	// file carries declared provider headers (providerHeadersPin), so the
+	// extension fails its load instead of running without them. It carries
+	// no header value. Exported only when headers are declared: no clearing
+	// entry is needed, as both lanes build an exact child env refusing every
+	// inherited DONMAI_PI_* name.
+	piHeadersDeclaredEnvVar = "DONMAI_PI_HEADERS_DECLARED"
+
 	// injectedExtensionsDir holds materialized agent.ExtensionDelivery
 	// (Kind == ExtensionDeliveryInline) artifacts, one level under piStateDir
 	// (ADR-2026-08-12 D1). Kept out of piStateDir's root so it never collides
@@ -588,7 +596,45 @@ func providerPinEnv(spec agent.Spec) []string {
 	out = append(out, piThinkingLevelEnvVar+"="+thinkingLevelForEffort(spec.Effort))
 	out = append(out, unitPricePinEnv(spec)...)
 	out = append(out, routingPreferencePinEnv(spec)...)
+	if providerHeadersPin(spec) != nil {
+		out = append(out, piHeadersDeclaredEnvVar+"=1")
+	}
 	return out
+}
+
+// providerHeadersPin builds the credential file's provider-headers section
+// from the declared headers (agent.ProviderHTTPHeadersEnv), or nil when none
+// are declared. The extension sets them as pi's documented
+// ProviderConfig.headers (Record<string, string>) on the injected provider.
+// pi resolves those values like apiKey, so each one is escaped
+// (piConfigLiteral) to reach the wire as written. A native pin
+// (nativeProviderPin) also names its built-in provider, which the extension
+// gives the same headers as a header-only override that keeps pi's models.
+// prepare refuses a malformed declaration before this runs.
+func providerHeadersPin(spec agent.Spec) *sessionProviderHeaders {
+	headers, err := agent.ProviderHTTPHeadersFromEnv(spec.Env)
+	if err != nil || len(headers) == 0 {
+		return nil
+	}
+	pin := &sessionProviderHeaders{Headers: make(map[string]string, len(headers))}
+	for _, h := range headers {
+		pin.Headers[h.Name] = piConfigLiteral(h.Value)
+	}
+	if provider, _, native := nativeProviderPin(spec.Model, spec.Endpoint); native {
+		pin.NativeProvider = provider
+	}
+	return pin
+}
+
+// piConfigLiteral escapes value for pi's config-value resolution, which runs
+// a leading "!" as a shell command and reads "$NAME" from the environment:
+// "$$" is a literal "$" and "$!" a literal "!" (pi docs/models.md).
+func piConfigLiteral(value string) string {
+	escaped := strings.ReplaceAll(value, "$", "$$")
+	if strings.HasPrefix(escaped, "!") {
+		escaped = "$" + escaped
+	}
+	return escaped
 }
 
 // unitPricePinEnv exports the endpoint binding's optional per-token prices

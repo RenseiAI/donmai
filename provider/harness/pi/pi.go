@@ -312,6 +312,11 @@ func (p *Provider) prepare(ctx context.Context, spec agent.Spec) (agent.Spec, er
 	if err != nil {
 		return spec, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}
+	// A malformed provider-header declaration refuses the session before any
+	// child spawns (providerHeadersPin renders a valid one).
+	if _, err := agent.ProviderHTTPHeadersFromEnv(spec.Env); err != nil {
+		return spec, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
+	}
 	// Requirement 2: fail fast, before any child spawns, when the resolved
 	// pin routes NATIVELY through one of pi's built-in providers (see
 	// nativeProviderPin) but that exact (provider, model) pair is not in
@@ -478,7 +483,7 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 	// denies spawn closed, before any child starts. The files are removed at
 	// session end (Stop) and, on spawn-failure paths below, here.
 	childEnvParts := sessionChildEnv(spec)
-	credentialPath, err := writeSessionCredentialFile(layout, sessionCredentialEntries(spec), childEnvParts.deferred)
+	credentialPath, err := writeSessionCredentialFile(layout, sessionCredentialEntries(spec), childEnvParts.deferred, providerHeadersPin(spec))
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}

@@ -324,6 +324,30 @@ function parseRoutingSlugs(raw: string | undefined): string[] {
   return out;
 }
 
+// readProviderHeaders returns the providerHeaders section of the session
+// credential file (credential_file.go sessionProviderHeaders): header name to
+// value, each value already escaped for pi's config-value syntax, set as
+// ProviderConfig.headers, plus the natively pinned built-in provider, if any.
+// A header value can be a credential, so it rides the owner-only file and
+// never the exec environment. DONMAI_PI_HEADERS_DECLARED marks a session
+// that declared headers: a file that does not carry them in the expected
+// shape fails the load rather than running the session without them.
+function readProviderHeaders(envelope: any) {
+  const declared = process.env.DONMAI_PI_HEADERS_DECLARED === "1";
+  const pin = envelope?.providerHeaders;
+  if (!declared && (pin === undefined || pin === null)) return undefined;
+  const headers = pin?.headers;
+  if (
+    headers === null ||
+    typeof headers !== "object" ||
+    Array.isArray(headers) ||
+    !Object.values(headers).every((value) => typeof value === "string")
+  ) {
+    throw new Error("donmai: declared provider headers are missing from the session credential file");
+  }
+  return { headers, nativeProvider: typeof pin.nativeProvider === "string" ? pin.nativeProvider : "" };
+}
+
 // routingPinValid reports whether one routing pin value is usable: absent
 // (the harness exports clearing entries for cells without a preference)
 // or a well-formed JSON array of non-empty strings. A present-but-mangled
@@ -848,6 +872,8 @@ export default async function activate(pi: ExtensionAPI) {
         }
       : undefined;
   const modelCompat = mergeRoutingCompat(compat, routingCompat);
+  const providerHeaderPin = readProviderHeaders(sessionCredentials);
+  const providerHeaders = providerHeaderPin?.headers;
   // Per-token price pin: the runner exports the endpoint binding's
   // optional per-token prices (USD per million tokens) on
   // DONMAI_PI_PRICE_{INPUT,OUTPUT,CACHE_READ,CACHE_WRITE} plus the
@@ -919,6 +945,7 @@ export default async function activate(pi: ExtensionAPI) {
         baseUrl,
         apiKey,
         api: api as never,
+        ...(providerHeaders === undefined ? {} : { headers: providerHeaders }),
         models: [
           {
             id: model,
@@ -938,6 +965,13 @@ export default async function activate(pi: ExtensionAPI) {
       // the Go side still gates on the handshake, and tool calls stay blocked
       // until verified.
     }
+  }
+  // Native route: the built-in provider the harness pins with --provider gets
+  // the same headers as a header-only override, which keeps pi's own models
+  // for it (docs/custom-provider.md, "Override Existing Provider").
+  const headersProvider = providerHeaderPin?.nativeProvider ?? "";
+  if (providerHeaders !== undefined && headersProvider !== "" && headersProvider !== "donmai") {
+    pi.registerProvider(headersProvider, { headers: providerHeaders });
   }
 
   // Interactive PTY mode: no handshake, no RPC-backed blocking adjudication

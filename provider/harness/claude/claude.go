@@ -149,6 +149,9 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}
+	if spec.Env, err = withProviderHTTPHeaders(spec.Env); err != nil {
+		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
+	}
 	// Reasoning effort is fixed through the environment only for stamped
 	// headless sessions (effort.go): the configured level, or the model's
 	// own default when none is configured — never a level saved in the
@@ -265,6 +268,9 @@ func (p *Provider) Resume(ctx context.Context, sessionID string, spec agent.Spec
 	spec, err = applyEndpoint(spec)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
+	}
+	if spec.Env, err = withProviderHTTPHeaders(spec.Env); err != nil {
+		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
 	}
 	if forceEffortEnv(spec) {
 		spec.Env = withEffortEnv(spec.Env, spec.Effort)
