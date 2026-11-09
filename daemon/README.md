@@ -192,9 +192,24 @@ is where an embedding product delivers its per-session values.
 
 | Case | Directory | Notes |
 |---|---|---|
-| Declared | The value of `DONMAI_SESSION_TMPDIR` | It can come from the work item's env, `SpawnerOptions.BaseEnv` or `OnPreSpawn`. The hook runs last, so its value wins. A declared value always wins over the derived default. |
-| Not declared | `/tmp/<prefix><12 random hex digits>`, for example `/tmp/donmai-9f86d081884c` | `<prefix>` is `SpawnerOptions.SessionTmpDerivedPrefix`. The daemon sets it to `donmai-` unless an embedder sets its own. The worker is told the path through `DONMAI_SESSION_TMPDIR`, so a session always sees which directory it was given. |
-| Derivation off | None | Only a spawner built without the daemon (an empty prefix) has this case. The worker inherits the daemon's own `TMPDIR`, `TMP` and `TEMP`. |
+| Declared | The value of `DONMAI_SESSION_TMPDIR` | It can come from the work item's env or `OnPreSpawn`. The hook runs last, so its value wins. A declared value always wins over the derived default. |
+| Not declared, `sessionScratch.derive` on (the default) | `/tmp/<prefix><12 random hex digits>`, for example `/tmp/donmai-9f86d081884c` | `<prefix>` is `donmai-`, or the prefix an embedder pins in `SpawnerOptions.SessionTmpDerivedPrefix`. The worker is told the path through `DONMAI_SESSION_TMPDIR`, so a session always sees which directory it was given. |
+| Not declared, `sessionScratch.derive` off | None | The worker inherits the daemon's own `TMPDIR`, `TMP` and `TEMP`, exactly as before derivation existed. This also covers a spawner built without the daemon and an empty prefix. |
+
+**The setting.** Derivation is the daemon setting `sessionScratch.derive`
+in `daemon.yaml`:
+
+```yaml
+sessionScratch:
+  derive: false   # absent or true: derive; false: leave undeclared sessions on the daemon's TMPDIR
+```
+
+Set it with `donmai host set sessionScratch.derive 0` (or `1`). The
+command writes the value explicitly and leaves every other key in the
+file alone. Like `repoKeeper.*`, the setting is read once at daemon start,
+so it takes effect after a restart with drained work. Off wins over an
+embedder-pinned prefix. At every start the daemon logs the effective
+value as `daemon: per-session scratch directories setting=sessionScratch.derive derive=<bool> prefix=<prefix>`.
 
 The derived name is random, not taken from the session id. That way
 nothing can create the path before the launch does, and two daemons
@@ -205,9 +220,17 @@ names the session, the directory and its source (`declared` or
 `derived`).
 
 If the daemon was itself started inside another session, it inherits
-that session's `DONMAI_SESSION_TMPDIR`. The daemon never passes that copy
-on, because it names the other session's directory, not one of its own
-sessions'.
+that session's `DONMAI_SESSION_TMPDIR`. That copy never counts as a
+declaration, on any layer: the daemon drops it from its own inherited
+environment and from `SpawnerOptions.BaseEnv`, because it names the other
+session's directory, not one of its own sessions'. (A standalone embedder
+seeds `BaseEnv` from a snapshot of its process environment, and `BaseEnv`
+is one map for every session, so it can never declare a per-session
+directory anyway.)
+
+**Known limitation.** Derived directories always live directly under
+`/tmp`; the root is not configurable. A declared value is held to the same
+rule.
 
 **Rules a directory must meet.** A declared value must be:
 

@@ -25,6 +25,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -33,6 +34,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/RenseiAI/donmai/afclient"
 )
 
 // derivedSessionTmpPattern is the documented shape of a derived directory
@@ -762,26 +765,40 @@ func TestSpawner_SessionTmp_SweepReclaimsAfterDaemonDies(t *testing.T) {
 	}
 }
 
-// TestDaemonStart_DerivesSessionScratchByDefault pins the daemon contract
-// for undeclared sessions: a started daemon configures its spawner to
-// derive a per-session scratch directory under DefaultSessionTmpDerivedPrefix,
-// and an embedder-pinned prefix keeps priority.
+// TestDaemonStart_SessionScratchDeriveSetting pins the daemon's declared
+// sessionScratch.derive setting end to end: a daemon started from a
+// daemon.yaml fixture launches an undeclared session through its own
+// spawner, and the env reaching the exec seam is what the setting says.
+// Absent or true derives a directory (under an embedder-pinned prefix when
+// one is set); false derives nothing whatever the embedder pinned, and
+// TMPDIR, TMP and TEMP reach the worker exactly as the daemon inherited
+// them, with no advisory key.
 //
-// RED: drop the daemon's default and the spawner derives nothing, so an
-// undeclared session inherits the shared host temp.
-func TestDaemonStart_DerivesSessionScratchByDefault(t *testing.T) {
+// RED: ignore the setting in Daemon.Start and the "off" rows derive; drop
+// the default and the "on" rows inherit the shared host temp.
+func TestDaemonStart_SessionScratchDeriveSetting(t *testing.T) {
+	parent := map[string][]string{}
+	for _, kv := range os.Environ() {
+		if key, _, ok := strings.Cut(kv, "="); ok {
+			parent[key] = append(parent[key], kv)
+		}
+	}
 	for _, tc := range []struct {
-		name   string
-		pinned string
-		want   string
+		name       string
+		setting    string
+		pinned     string
+		wantPrefix string
 	}{
-		{name: "default", want: DefaultSessionTmpDerivedPrefix},
-		{name: "embedder pinned", pinned: "embedder-", want: "embedder-"},
+		{name: "absent derives", wantPrefix: DefaultSessionTmpDerivedPrefix},
+		{name: "true derives", setting: "sessionScratch:\n  derive: true\n", wantPrefix: DefaultSessionTmpDerivedPrefix},
+		{name: "absent keeps an embedder prefix", pinned: "embedder-", wantPrefix: "embedder-"},
+		{name: "false derives nothing", setting: "sessionScratch:\n  derive: false\n"},
+		{name: "false overrides an embedder prefix", setting: "sessionScratch:\n  derive: false\n", pinned: "embedder-"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
 			path := filepath.Join(dir, "daemon.yaml")
-			body := "machine:\n  id: isolated-fixture\norchestrator:\n  url: file:///" + dir + "/queue\n"
+			body := "machine:\n  id: isolated-fixture\norchestrator:\n  url: file:///" + dir + "/queue\n" + tc.setting
 			if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 				t.Fatal(err)
 			}
@@ -807,9 +824,171 @@ func TestDaemonStart_DerivesSessionScratchByDefault(t *testing.T) {
 			d.spawner.mu.Lock()
 			got := d.spawner.opts.SessionTmpDerivedPrefix
 			d.spawner.mu.Unlock()
-			if got != tc.want {
-				t.Fatalf("spawner derived prefix = %q, want %q", got, tc.want)
+			if got != tc.wantPrefix {
+				t.Errorf("spawner derived prefix = %q, want %q", got, tc.wantPrefix)
+			}
+
+			d.spawner.AddProjects([]ProjectConfig{{ID: "x", Repository: "github.com/a/b"}})
+			var captured []string
+			d.spawner.startCommand = func(cmd *exec.Cmd) error {
+				captured = append([]string(nil), cmd.Env...)
+				return errors.New("controlled capture: never start a real worker")
+			}
+			if _, err := d.spawner.AcceptWork(seatTmpSpec("seat-derive-setting", "")); err == nil || !strings.Contains(err.Error(), "controlled capture") {
+				t.Fatalf("accept = %v, want the controlled capture failure", err)
+			}
+			if captured == nil {
+				t.Fatal("the launch never reached the exec seam")
+			}
+			byKey := map[string][]string{}
+			for _, kv := range captured {
+				if key, _, ok := strings.Cut(kv, "="); ok {
+					byKey[key] = append(byKey[key], kv)
+				}
+			}
+			if tc.wantPrefix == "" {
+				for _, key := range sessionTmpBindingKeys {
+					if fmt.Sprint(byKey[key]) != fmt.Sprint(parent[key]) {
+						t.Fatalf("derivation off: worker %s entries = %v, want the inherited %v untouched", key, byKey[key], parent[key])
+					}
+				}
+				if entries := byKey[SessionTmpDirEnv]; len(entries) != 0 {
+					t.Fatalf("derivation off: worker env carries %v", entries)
+				}
+				return
+			}
+			want := regexp.MustCompile("^/tmp/" + regexp.QuoteMeta(tc.wantPrefix) + "[0-9a-f]{12}$")
+			bound := envToMapSessionTmpTest(captured)
+			if !want.MatchString(bound["TMPDIR"]) {
+				t.Fatalf("derivation on: worker TMPDIR = %q, want %s", bound["TMPDIR"], want)
+			}
+			for _, key := range append([]string{SessionTmpDirEnv}, sessionTmpBindingKeys...) {
+				if len(byKey[key]) != 1 || bound[key] != bound["TMPDIR"] {
+					t.Fatalf("derivation on: worker %s entries = %v, want exactly one on %q", key, byKey[key], bound["TMPDIR"])
+				}
+			}
+			if _, err := os.Lstat(bound["TMPDIR"]); !os.IsNotExist(err) {
+				_ = os.RemoveAll(bound["TMPDIR"])
+				t.Fatalf("a launch refused at exec left its derived directory behind: %v", err)
 			}
 		})
+	}
+}
+
+// TestSpawner_SessionTmp_BaseEnvInheritedKeyIgnored pins that BaseEnv never
+// declares a session's scratch directory. A standalone embedder seeds
+// BaseEnv from a snapshot of its own process env; nested inside another
+// seat, that snapshot carries the outer seat's DONMAI_SESSION_TMPDIR, whose
+// directory is live and marked for the outer session. The inner launch must
+// start cleanly — with derivation on in its own derived directory, with
+// derivation off on the inherited TMPDIR and no advisory key — and the
+// outer seat's directory is never touched.
+//
+// RED: let BaseEnv's copy count as a declaration and every inner launch is
+// refused: "already owned by session \"outer-sess\"".
+func TestSpawner_SessionTmp_BaseEnvInheritedKeyIgnored(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name   string
+		prefix string
+	}{
+		{name: "derivation-on", prefix: DefaultSessionTmpDerivedPrefix},
+		{name: "derivation-off", prefix: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			outerDir := fmt.Sprintf("/tmp/seat-outer-baseenv-%d-%s", os.Getpid(), tc.name)
+			_ = os.RemoveAll(outerDir)
+			t.Cleanup(func() { _ = os.RemoveAll(outerDir) })
+			outer := NewWorkerSpawner(SpawnerOptions{SessionTmpRecordDir: t.TempDir()})
+			outerClaim, err := outer.prepareSessionTmpDir("outer-sess", outerDir)
+			if err != nil {
+				t.Fatalf("prepare the outer seat's directory: %v", err)
+			}
+			t.Cleanup(func() { outer.cleanupSessionTmpClaim("outer-sess", outerClaim) })
+			sentinel := filepath.Join(outerDir, "outer.txt")
+			if err := os.WriteFile(sentinel, []byte("outer bytes"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			root, recordDir := t.TempDir(), t.TempDir()
+			s := NewWorkerSpawner(SpawnerOptions{
+				Projects:                []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+				WorkerCommand:           heldSeatWorker(root),
+				SessionTmpRecordDir:     recordDir,
+				SessionTmpDerivedPrefix: tc.prefix,
+				BaseEnv:                 map[string]string{SessionTmpDirEnv: outerDir},
+			})
+			ended := sessionEnds(s)
+			const sessionID = "inner-sess"
+			if _, err := s.AcceptWork(seatTmpSpec(sessionID, "")); err != nil {
+				t.Fatalf("inner launch refused over the BaseEnv copy of the outer seat's key: %v", err)
+			}
+			env := heldSeatEnv(t, root, sessionID)
+			dir := env["TMPDIR"]
+			if tc.prefix == "" {
+				if dir != os.Getenv("TMPDIR") || env["ADVISORY"] != "" {
+					t.Fatalf("derivation off: worker TMPDIR = %q ADVISORY = %q, want the inherited TMPDIR %q and no advisory key", dir, env["ADVISORY"], os.Getenv("TMPDIR"))
+				}
+				if claim, ok := s.sessionTmpClaimFor(sessionID); ok {
+					t.Fatalf("derivation off: inner session claimed %+v", claim)
+				}
+			} else {
+				if !derivedSessionTmpPattern.MatchString(dir) {
+					t.Fatalf("worker TMPDIR = %q, want its own derived directory, not the outer seat's %q", dir, outerDir)
+				}
+				assertSeatBound(t, env, dir)
+				assertLiveScratch(t, s, recordDir, sessionID, dir)
+			}
+			if owner, ok, err := readSessionTmpOwnerRecord(outerDir); err != nil || !ok || owner.SessionID != "outer-sess" {
+				t.Fatalf("outer seat's marker = %+v, %v, %v; want it still owned by outer-sess", owner, ok, err)
+			}
+			releaseHeldSeat(t, root, sessionID, "0")
+			waitSessionEnd(t, ended)
+			waitForActiveCount(t, s, 0)
+			if raw, err := os.ReadFile(sentinel); err != nil || string(raw) != "outer bytes" { //nolint:gosec // G304: the path is a fixture under /tmp.
+				t.Fatalf("outer seat's files disturbed by the inner session: %v %q", err, raw)
+			}
+			if tc.prefix != "" {
+				assertScratchGone(t, s, recordDir, sessionID, dir)
+			}
+		})
+	}
+}
+
+// TestServer_SessionScratchDeriveSet pins the running daemon's half of
+// `host set sessionScratch.derive`: POST /api/daemon/capacity mirrors 0 and
+// 1 into the in-memory config — so a later daemon-side config write keeps
+// the operator's choice — says a restart is needed, and refuses anything
+// else without touching the setting.
+//
+// RED: drop the in-memory mirror and the setting reads as the default.
+func TestServer_SessionScratchDeriveSet(t *testing.T) {
+	d, srv, cleanup := mustStartDaemon(t)
+	defer cleanup()
+	for _, tc := range []struct {
+		value      string
+		wantStatus int
+		wantDerive bool
+	}{
+		{value: "0", wantStatus: http.StatusOK, wantDerive: false},
+		{value: "2", wantStatus: http.StatusBadRequest, wantDerive: false},
+		{value: "1", wantStatus: http.StatusOK, wantDerive: true},
+	} {
+		var resp afclient.SetCapacityResponse
+		status := requirePost(t, srv.Addr(), "/api/daemon/capacity", map[string]string{"key": SessionScratchDeriveKey, "value": tc.value}, &resp)
+		if status != tc.wantStatus {
+			t.Fatalf("POST %s=%s -> %d (%+v), want %d", SessionScratchDeriveKey, tc.value, status, resp, tc.wantStatus)
+		}
+		if status == http.StatusOK && !strings.Contains(resp.Message, "restart") {
+			t.Errorf("%s=%s message %q does not say a restart is needed", SessionScratchDeriveKey, tc.value, resp.Message)
+		}
+		d.mu.Lock()
+		got := d.config.SessionScratch.DeriveEnabled()
+		explicit := d.config.SessionScratch.Derive != nil
+		d.mu.Unlock()
+		if got != tc.wantDerive || !explicit {
+			t.Fatalf("after POST %s=%s the in-memory setting is derive=%v (explicit %v), want derive=%v stated explicitly", SessionScratchDeriveKey, tc.value, got, explicit, tc.wantDerive)
+		}
 	}
 }

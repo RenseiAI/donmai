@@ -185,8 +185,10 @@ type SpawnerOptions struct {
 	// bound and removed exactly like a declared one, and stated to the
 	// worker as DONMAI_SESSION_TMPDIR. A declared value always wins. Empty
 	// disables derivation: an undeclared session inherits the daemon's own
-	// TMPDIR, TMP and TEMP. The daemon sets DefaultSessionTmpDerivedPrefix
-	// when an embedder leaves it empty. The prefix must keep the name inside
+	// TMPDIR, TMP and TEMP. The daemon sets it from its sessionScratch.derive
+	// setting (SessionScratchConfig): off clears it whatever an embedder
+	// pinned; on keeps an embedder-pinned prefix and otherwise sets
+	// DefaultSessionTmpDerivedPrefix. The prefix must keep the name inside
 	// [A-Za-z0-9._-] and the path within the socket-path budget (see
 	// session_tmpdir.go); a prefix that does not refuses every undeclared
 	// launch with an error naming the rule it broke.
@@ -2156,8 +2158,30 @@ func (s *WorkerSpawner) daemonOwnedEnv(spec SessionSpec, project *ProjectConfig)
 // DONMAI_PI_CONFINEMENT=required into an unconfined pi seat. The host's
 // value comes from the daemon's inherited environment or BaseEnv, both of
 // which the host controls.
+//
+// BaseEnv also loses DONMAI_SESSION_TMPDIR. BaseEnv is one map for every
+// session, so it can never declare a per-session scratch directory — and a
+// standalone embedder seeds it from a snapshot of its own process env,
+// which inside another seat carries that seat's directory. Counted as a
+// declaration, that copy would bind (and so refuse) every session to the
+// outer seat's directory.
 func (s *WorkerSpawner) sessionEnv(spec SessionSpec, project *ProjectConfig) []string {
-	return composeEnv(s.opts.BaseEnv, runtimeenv.FilterHostOwnedMap(spec.Env), s.daemonOwnedEnv(spec, project))
+	return composeEnv(withoutSessionTmpDirKey(s.opts.BaseEnv), runtimeenv.FilterHostOwnedMap(spec.Env), s.daemonOwnedEnv(spec, project))
+}
+
+// withoutSessionTmpDirKey returns base without DONMAI_SESSION_TMPDIR. base
+// is returned as is when it does not carry the key, and never mutated.
+func withoutSessionTmpDirKey(base map[string]string) map[string]string {
+	if _, ok := base[SessionTmpDirEnv]; !ok {
+		return base
+	}
+	out := make(map[string]string, len(base)-1)
+	for k, v := range base {
+		if k != SessionTmpDirEnv {
+			out[k] = v
+		}
+	}
+	return out
 }
 
 // composeEnv flattens the merged env into the os.Environ() form expected by

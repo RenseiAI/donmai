@@ -15,14 +15,16 @@ package daemon
 // delivers its per-session scope env:
 //
 //  1. Declared: DONMAI_SESSION_TMPDIR=<absolute path> in that final env.
-//     It may come from the work item's env, from BaseEnv, or from
-//     OnPreSpawn; the hook runs last, so its value wins. A declared value
-//     always wins over the derived default below. The daemon's own
-//     inherited copy of the key never counts: it names whatever session
-//     the daemon itself was started inside, not this one, so the parent
-//     env filter drops it.
+//     It may come from the work item's env or from OnPreSpawn; the hook
+//     runs last, so its value wins. A declared value always wins over the
+//     derived default below. An inherited copy of the key never counts,
+//     on any layer: the daemon's own process env and BaseEnv (one map for
+//     every session, which a standalone embedder seeds from a snapshot of
+//     its process env) both drop it, because it names whatever session
+//     the daemon itself was started inside, not this one.
 //  2. Derived: with nothing declared and SpawnerOptions.SessionTmpDerivedPrefix
-//     set (the daemon sets DefaultSessionTmpDerivedPrefix), the launch
+//     set (the daemon sets DefaultSessionTmpDerivedPrefix unless its
+//     sessionScratch.derive setting is off), the launch
 //     derives /tmp/<prefix><12 random hex digits> and states it to the
 //     worker as DONMAI_SESSION_TMPDIR, so the session sees what it was
 //     given. The name is random rather than session-derived: it cannot
