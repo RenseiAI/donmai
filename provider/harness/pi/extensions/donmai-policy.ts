@@ -324,6 +324,26 @@ function parseRoutingSlugs(raw: string | undefined): string[] {
   return out;
 }
 
+// parseHeaderPin decodes DONMAI_PI_HEADERS (extension.go
+// providerHeadersPinEnv): a JSON object of header name to value, each value
+// already escaped for pi's config-value syntax, set as ProviderConfig.headers.
+// Absent means no headers. The harness is the only author (it refuses every
+// inherited DONMAI_PI_* name), so a value that does not decode fails the load
+// rather than running the session without its declared headers.
+function parseHeaderPin(raw: string | undefined) {
+  if (!raw) return undefined;
+  const parsed = JSON.parse(raw);
+  if (
+    parsed === null ||
+    typeof parsed !== "object" ||
+    Array.isArray(parsed) ||
+    !Object.values(parsed).every((value) => typeof value === "string")
+  ) {
+    throw new Error("donmai: DONMAI_PI_HEADERS is not a JSON object of strings");
+  }
+  return parsed;
+}
+
 // routingPinValid reports whether one routing pin value is usable: absent
 // (the harness exports clearing entries for cells without a preference)
 // or a well-formed JSON array of non-empty strings. A present-but-mangled
@@ -848,6 +868,7 @@ export default async function activate(pi: ExtensionAPI) {
         }
       : undefined;
   const modelCompat = mergeRoutingCompat(compat, routingCompat);
+  const providerHeaders = parseHeaderPin(process.env.DONMAI_PI_HEADERS);
   // Per-token price pin: the runner exports the endpoint binding's
   // optional per-token prices (USD per million tokens) on
   // DONMAI_PI_PRICE_{INPUT,OUTPUT,CACHE_READ,CACHE_WRITE} plus the
@@ -919,6 +940,7 @@ export default async function activate(pi: ExtensionAPI) {
         baseUrl,
         apiKey,
         api: api as never,
+        ...(providerHeaders === undefined ? {} : { headers: providerHeaders }),
         models: [
           {
             id: model,
@@ -938,6 +960,13 @@ export default async function activate(pi: ExtensionAPI) {
       // the Go side still gates on the handshake, and tool calls stay blocked
       // until verified.
     }
+  }
+  // Native route: the built-in provider the harness pins with --provider gets
+  // the same headers as a header-only override, which keeps pi's own models
+  // for it (docs/custom-provider.md, "Override Existing Provider").
+  const headersProvider = process.env.DONMAI_PI_HEADERS_PROVIDER ?? "";
+  if (providerHeaders !== undefined && headersProvider !== "" && headersProvider !== "donmai") {
+    pi.registerProvider(headersProvider, { headers: providerHeaders });
   }
 
   // Interactive PTY mode: no handshake, no RPC-backed blocking adjudication

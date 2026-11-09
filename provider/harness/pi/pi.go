@@ -312,6 +312,11 @@ func (p *Provider) prepare(ctx context.Context, spec agent.Spec) (agent.Spec, er
 	if err != nil {
 		return spec, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}
+	// A malformed provider-header declaration refuses the session before any
+	// child spawns (providerHeadersPinEnv renders a valid one).
+	if _, err := agent.ProviderHTTPHeadersFromEnv(spec.Env); err != nil {
+		return spec, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
+	}
 	// Requirement 2: fail fast, before any child spawns, when the resolved
 	// pin routes NATIVELY through one of pi's built-in providers (see
 	// nativeProviderPin) but that exact (provider, model) pair is not in

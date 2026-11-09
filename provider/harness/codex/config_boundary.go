@@ -242,7 +242,13 @@ func removeAuthLink(path string) error {
 // silently spawning against the default endpoint. The model still travels
 // through thread/start (resolveModel); the provider id here only names the
 // block.
+//
+// A malformed provider-header declaration (agent.ProviderHTTPHeadersEnv)
+// refuses every session here, routed or not, before any side effect.
 func gatewayBinding(spec agent.Spec) (baseURL, key string, ok bool, err error) {
+	if _, err := agent.ProviderHTTPHeadersFromEnv(spec.Env); err != nil {
+		return "", "", false, fmt.Errorf("codex: %w", err)
+	}
 	ep := spec.Endpoint
 	if ep == nil || strings.TrimSpace(ep.BaseURL) == "" {
 		return "", "", false, nil
@@ -286,12 +292,16 @@ func (b *codexConfigBoundary) appendGatewayProviderBlock(baseURL, key string, sp
 	if strings.Contains(string(body), codexGatewayProviderID) {
 		return projectGatewayKey(specEnv, key), b.validate()
 	}
+	headers, err := gatewayHTTPHeadersLine(specEnv)
+	if err != nil {
+		return nil, err
+	}
 	block := "model_provider = " + tomlBasicString(codexGatewayProviderID) + "\n" +
 		"[model_providers." + codexGatewayProviderID + "]\n" +
 		"name = " + tomlBasicString(codexGatewayProviderID) + "\n" +
 		"base_url = " + tomlBasicString(baseURL) + "\n" +
 		"env_key = " + tomlBasicString(codexGatewayEnvKey) + "\n" +
-		"wire_api = \"responses\"\n"
+		"wire_api = \"responses\"\n" + headers
 	f, err := os.OpenFile(b.configPath, os.O_WRONLY|os.O_APPEND, codexConfigMode)
 	if err != nil {
 		return nil, fmt.Errorf("append gateway provider block: %w", err)
@@ -307,6 +317,22 @@ func (b *codexConfigBoundary) appendGatewayProviderBlock(baseURL, key string, sp
 		return nil, fmt.Errorf("secure isolated Codex config: %w", err)
 	}
 	return projectGatewayKey(specEnv, key), b.validate()
+}
+
+// gatewayHTTPHeadersLine renders the session's declared provider headers
+// (agent.ProviderHTTPHeadersEnv) as the provider block's http_headers inline
+// table: codex sends those literal values on every request to the provider.
+// No declaration renders nothing, so the block stays byte-identical.
+func gatewayHTTPHeadersLine(specEnv map[string]string) (string, error) {
+	headers, err := agent.ProviderHTTPHeadersFromEnv(specEnv)
+	if err != nil || len(headers) == 0 {
+		return "", err
+	}
+	pairs := make([]string, 0, len(headers))
+	for _, h := range headers {
+		pairs = append(pairs, tomlBasicString(h.Name)+" = "+tomlBasicString(h.Value))
+	}
+	return "http_headers = { " + strings.Join(pairs, ", ") + " }\n", nil
 }
 
 // appendUntrustedProjects records each dir as an untrusted project in the
