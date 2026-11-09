@@ -110,8 +110,10 @@ type SpawnerOptions struct {
 	// OnSpawnAborted is the optional rollback partner for OnPreSpawn. It is
 	// invoked synchronously exactly once when OnPreSpawn returned nil (and
 	// therefore transferred ownership of any resources it acquired) but the
-	// subsequent cmd.Start failed. The error is the same wrapped
-	// "start worker" error AcceptWork returns.
+	// launch then failed before a worker ran: the session's scratch
+	// directory could not be prepared from the env the hook returned, the
+	// shim launcher failed, or cmd.Start failed. The error is the same
+	// error AcceptWork returns.
 	//
 	// It is deliberately NOT invoked when OnPreSpawn itself fails: the hook
 	// never transferred ownership, so it remains responsible for releasing
@@ -176,6 +178,19 @@ type SpawnerOptions struct {
 	// disables persistence: claims are tracked in memory only, and the
 	// startup sweep is a no-op.
 	SessionTmpRecordDir string
+
+	// SessionTmpDerivedPrefix, when non-empty, gives every session whose
+	// final spawn env declares no DONMAI_SESSION_TMPDIR a scratch directory
+	// of the spawner's own: /tmp/<prefix><12 random hex digits>, created,
+	// bound and removed exactly like a declared one, and stated to the
+	// worker as DONMAI_SESSION_TMPDIR. A declared value always wins. Empty
+	// disables derivation: an undeclared session inherits the daemon's own
+	// TMPDIR, TMP and TEMP. The daemon sets DefaultSessionTmpDerivedPrefix
+	// when an embedder leaves it empty. The prefix must keep the name inside
+	// [A-Za-z0-9._-] and the path within the socket-path budget (see
+	// session_tmpdir.go); a prefix that does not refuses every undeclared
+	// launch with an error naming the rule it broke.
+	SessionTmpDerivedPrefix string
 
 	// WorktreeParentDir is the directory under which the spawned worker
 	// creates each per-session worktree (<WorktreeParentDir>/<sessionID>).
@@ -1031,9 +1046,13 @@ func (s *WorkerSpawner) externalSessionOccupancyLocked() int {
 // spawner keeps NO process bookkeeping for it — no exec.Cmd, no pipes, no
 // reaper entry — because every one of those would be a second owner of a session
 // whose whole point is having exactly one (§D1).
-func (s *WorkerSpawner) spawnThroughShim(spec SessionSpec, project *ProjectConfig, sessionTmp sessionTmpClaim) (*SessionHandle, bool, error) {
+//
+// The returned claim is the session's scratch directory, prepared from the
+// env the hook made final; the caller owns its cleanup until the launch
+// commits, and must release it on a legacy (nil, nil) decline.
+func (s *WorkerSpawner) spawnThroughShim(spec SessionSpec, project *ProjectConfig) (*SessionHandle, sessionTmpClaim, bool, error) {
 	if s.opts.ShimSpawn == nil {
-		return nil, false, nil
+		return nil, sessionTmpClaim{}, false, nil
 	}
 	env := s.sessionEnv(spec, project)
 	if seatBudget, seatBudgetOK := s.seatBudgetForSpawn(); seatBudgetOK {
@@ -1046,29 +1065,33 @@ func (s *WorkerSpawner) spawnThroughShim(spec SessionSpec, project *ProjectConfi
 	if s.opts.OnPreSpawn != nil {
 		next, hookErr := s.opts.OnPreSpawn(spec, env)
 		if hookErr != nil {
-			return nil, true, fmt.Errorf("pre-spawn hook: %w", hookErr)
+			return nil, sessionTmpClaim{}, true, fmt.Errorf("pre-spawn hook: %w", hookErr)
 		}
 		if next != nil {
 			env = next
 		}
 	}
-	// The executor's scratch binding wins over the hook, exactly as on the
-	// direct path: isolation of the session's temp files is not the hook's
-	// to relax.
-	if sessionTmp.owned() {
-		env = applySessionTmpBindings(env, sessionTmp.Dir)
+	// The scratch directory is resolved from the env the hook made final,
+	// exactly as on the direct path, and its binding wins over the hook:
+	// isolation of the session's temp files is not the hook's to relax.
+	sessionTmp, env, err := s.bindSessionTmpDir(spec, env)
+	if err != nil {
+		if s.opts.OnSpawnAborted != nil && s.opts.OnPreSpawn != nil {
+			s.opts.OnSpawnAborted(spec, err)
+		}
+		return nil, sessionTmpClaim{}, true, err
 	}
 	handle, err := s.opts.ShimSpawn(spec, *project, env)
 	if err != nil {
 		if s.opts.OnSpawnAborted != nil && s.opts.OnPreSpawn != nil {
 			s.opts.OnSpawnAborted(spec, err)
 		}
-		return nil, true, err
+		return nil, sessionTmp, true, err
 	}
 	if handle == nil {
-		return nil, false, nil
+		return nil, sessionTmp, false, nil
 	}
-	return handle, true, nil
+	return handle, sessionTmp, true, nil
 }
 
 // resolveProjectForSpecLocked admits a spec against the machine's project
@@ -1287,17 +1310,22 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 		return nil, err
 	}
 
-	// The executor-owned per-session scratch directory is validated and
-	// created before any worker process starts, on both spawn paths. A
-	// failure fails the launch closed: the session never runs against the
-	// shared host temp.
-	sessionTmp, err := s.prepareSessionTmpDir(spec)
-	if err != nil {
-		return nil, err
+	// The executor-owned per-session scratch directory is resolved from the
+	// env the worker will exec with, so it is prepared after OnPreSpawn on
+	// both spawn paths (bindSessionTmpDir): that hook is where an embedder
+	// delivers a declared value. A value the work item itself declares is
+	// checked here first, so a malformed one refuses the launch before the
+	// hook acquires anything for it. Any failure fails the launch closed:
+	// the session never runs against the shared host temp.
+	if raw := workItemSessionTmpDir(spec); raw != "" {
+		if _, err := validateSessionTmpLaunchValue(raw); err != nil {
+			return nil, fmt.Errorf("declared scratch directory for session %q: %w", spec.SessionID, err)
+		}
 	}
 	// Until ownership transfers to the reaper (direct path) or to the
-	// session-end listener (shim path), an aborted spawn removes what was
-	// just created.
+	// session-end listener (shim path), an aborted spawn removes what it
+	// created.
+	var sessionTmp sessionTmpClaim
 	sessionTmpCommitted := false
 	defer func() {
 		if !sessionTmpCommitted {
@@ -1320,7 +1348,8 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 		shimSelected = s.opts.ShimSpawn != nil
 	}
 	if shimSelected {
-		handle, handled, err := s.spawnThroughShim(spec, project, sessionTmp)
+		handle, claim, handled, err := s.spawnThroughShim(spec, project)
+		sessionTmp = claim
 		if s.opts.ShimOwns != nil && !handled && err == nil {
 			err = errors.New("session shim selector chose ownership but launcher returned no handle")
 			if s.opts.OnSpawnAborted != nil && s.opts.OnPreSpawn != nil {
@@ -1337,8 +1366,11 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 			sessionTmpCommitted = true
 			return handle, nil
 		}
-		// Legacy combined-decision callback declined ownership. Continue to
-		// the direct path exactly as before.
+		// Legacy combined-decision callback declined ownership. Release the
+		// scratch directory the offer prepared — the direct path runs the
+		// hook again and binds its own — and continue exactly as before.
+		s.cleanupSessionTmpClaim(spec.SessionID, sessionTmp)
+		sessionTmp = sessionTmpClaim{}
 	}
 
 	command := s.opts.WorkerCommand
@@ -1423,10 +1455,19 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 			cmd.Env = next
 		}
 	}
-	// The executor's scratch binding wins over the hook: isolation of the
-	// session's temp files is not the hook's to relax.
-	if sessionTmp.owned() {
-		cmd.Env = applySessionTmpBindings(cmd.Env, sessionTmp.Dir)
+	// The scratch directory is resolved from the env the hook made final,
+	// and its binding wins over the hook: isolation of the session's temp
+	// files is not the hook's to relax. The hook already transferred
+	// ownership of what it acquired, so a refusal here rolls it back.
+	var bindErr error
+	sessionTmp, cmd.Env, bindErr = s.bindSessionTmpDir(spec, cmd.Env)
+	if bindErr != nil {
+		closeWorkerPipes()
+		cancel()
+		if preSpawnOwnsCleanup && s.opts.OnSpawnAborted != nil {
+			s.opts.OnSpawnAborted(spec, bindErr)
+		}
+		return nil, bindErr
 	}
 
 	if err := s.startCommand(cmd); err != nil {
@@ -2184,23 +2225,31 @@ func composeEnv(parts ...map[string]string) []string {
 
 // filterSpawnerParentEnv is the daemon spawn path's inherited-environment
 // filter: the runner-only controls, the engine re-exec controls, plus the
-// per-session read credential.
+// two per-session values a daemon may itself have inherited from a session
+// it runs inside.
 // A stale read credential in the daemon's own environment names some other
 // session's detail read; it must not ride into a worker beside that
-// worker's own explicitly stated credential. Kept beside composeEnv (not
-// in runtime/env) because the explicit-map half of that composition must
-// keep stating the credential.
+// worker's own explicitly stated credential. A stale DONMAI_SESSION_TMPDIR
+// names some other session's scratch directory; carried along, it would
+// read as this session's declaration and bind every session the daemon
+// launches to that one directory. Kept beside composeEnv (not in
+// runtime/env) because the explicit-map half of that composition must keep
+// stating both.
 func filterSpawnerParentEnv(entries []string) []string {
 	out := runtimeenv.FilterEngineControlEnv(runtimeenv.FilterRunnerOnly(entries))
 	kept := out[:0]
-	prefix := runtimeenv.SessionReadTokenEnv + "="
 	for _, entry := range out {
-		if entry == runtimeenv.SessionReadTokenEnv || strings.HasPrefix(entry, prefix) {
+		if isEnvEntryFor(entry, runtimeenv.SessionReadTokenEnv) || isEnvEntryFor(entry, SessionTmpDirEnv) {
 			continue
 		}
 		kept = append(kept, entry)
 	}
 	return kept
+}
+
+// isEnvEntryFor reports whether a KEY=VALUE entry (or a bare KEY) names key.
+func isEnvEntryFor(entry, key string) bool {
+	return entry == key || strings.HasPrefix(entry, key+"=")
 }
 
 // PrefixWriterFunc adapts a function to PrefixedWriter.

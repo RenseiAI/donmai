@@ -1799,6 +1799,14 @@ func (d *Daemon) Start(ctx context.Context) error {
 	if spawnerOpts.SessionTmpRecordDir == "" {
 		spawnerOpts.SessionTmpRecordDir = statepath.Resolve("session-tmp-record", "/tmp/.donmai/session-tmp-record")
 	}
+	// A session that declares no scratch directory gets one the daemon
+	// derives (/tmp/donmai-<random>) rather than the host's shared per-user
+	// temp, which its tools would otherwise fill and macOS empties at boot
+	// before any user process may start. A declared value always wins; an
+	// embedder may pin its own prefix. See daemon/README.md.
+	if spawnerOpts.SessionTmpDerivedPrefix == "" {
+		spawnerOpts.SessionTmpDerivedPrefix = DefaultSessionTmpDerivedPrefix
+	}
 	// Default WorktreeParentDir to the same statepath-resolved worktrees
 	// directory the spawned `donmai agent run` worker uses when no
 	// --worktree-dir override is passed (afcli/agent_run.go). Keeping the

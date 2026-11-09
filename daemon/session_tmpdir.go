@@ -3,18 +3,51 @@ package daemon
 // Per-session scratch directories (executor-owned per-session scratch).
 //
 // Every seat session gets its own scratch directory on the seat host, so
-// concurrent seats cannot read or overwrite each other's temp files. The
-// platform stamps exactly one advisory key on the seat's non-secret scope
-// env — DONMAI_SESSION_TMPDIR=<absolute path> — and the daemon's per-session
-// env composition carries it into the env the executor receives. The
-// platform never stamps TMPDIR, TMP or TEMP itself, and no key means today's
-// behaviour.
+// concurrent seats cannot read or overwrite each other's temp files, and
+// whatever a seat's tools leave in their temp directory (a Node compile
+// cache, a tsx cache, harness probe files) is deleted with the session
+// instead of piling up in the host's shared per-user temp, which macOS
+// empties at boot before any user process may start.
 //
-// The executor (this spawner's launch path) validates the advisory value and
+// Where the directory comes from. The launch path resolves it once, from
+// the env the worker will actually exec with — after the embedder's
+// OnPreSpawn hook, because that hook is where an embedding product
+// delivers its per-session scope env:
+//
+//  1. Declared: DONMAI_SESSION_TMPDIR=<absolute path> in that final env.
+//     It may come from the work item's env, from BaseEnv, or from
+//     OnPreSpawn; the hook runs last, so its value wins. A declared value
+//     always wins over the derived default below. The daemon's own
+//     inherited copy of the key never counts: it names whatever session
+//     the daemon itself was started inside, not this one, so the parent
+//     env filter drops it.
+//  2. Derived: with nothing declared and SpawnerOptions.SessionTmpDerivedPrefix
+//     set (the daemon sets DefaultSessionTmpDerivedPrefix), the launch
+//     derives /tmp/<prefix><12 random hex digits> and states it to the
+//     worker as DONMAI_SESSION_TMPDIR, so the session sees what it was
+//     given. The name is random rather than session-derived: it cannot
+//     be squatted ahead of the launch, and two daemons running the same
+//     session id never share one.
+//  3. None: derivation disabled and nothing declared. The worker inherits
+//     the daemon's own TMPDIR, TMP and TEMP unchanged.
+//
+// An orchestrator stamps only the advisory key, never TMPDIR, TMP or TEMP:
+// those would reach the worker before any directory exists.
+//
+// The executor (this spawner's launch path) validates the value and
 // creates the directory (mode 0700, owned by the seat user) before the
 // worker process starts, then binds TMPDIR, TMP and TEMP to it for the
 // worker and every child it spawns. Creation failure fails the launch
 // closed: it never falls back to the shared host temp.
+//
+// Path length. A unix socket path must fit sun_path: 104 bytes on macOS
+// with the terminating NUL, 108 on Linux. Tools bind sockets under TMPDIR
+// (tsx's IPC pipe is TMPDIR/tsx-<uid>/<pid>.pipe), so an over-long scratch
+// path breaks them far from the cause. Every directory is held to
+// sessionTmpMaxPathLen bytes — the macOS cap, less the NUL and
+// sessionTmpSocketHeadroom bytes for the socket's own name below it — and
+// a longer value refuses the launch with an error naming both lengths.
+// The derived default is 24 bytes long.
 //
 // Teardown removes the directory on every terminal path (success, failure,
 // stop/cancel). Crash recovery is covered by an executor-side record — a
@@ -40,6 +73,8 @@ package daemon
 // stamp is outside the contract, which derives a per-session path.
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -53,16 +88,45 @@ import (
 	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 )
 
-// SessionTmpDirEnv is the advisory key the platform stamps on a seat's
-// non-secret scope env naming that seat's scratch directory. Advisory: the
-// executor validates it before trusting it, and the platform never stamps
-// TMPDIR, TMP or TEMP (stamping those would reach the worker before any
+// SessionTmpDirEnv is the advisory key that declares a seat's scratch
+// directory, whether an orchestrator stamped it on the work item, the
+// embedder's OnPreSpawn hook supplied it, or the daemon derived it.
+// Advisory: the executor validates it before trusting it. Orchestrators
+// never stamp TMPDIR, TMP or TEMP (those would reach the worker before any
 // directory exists).
 const SessionTmpDirEnv = "DONMAI_SESSION_TMPDIR"
+
+// DefaultSessionTmpDerivedPrefix is the name prefix the daemon gives the
+// scratch directory of a session that declares none:
+// /tmp/donmai-<12 random hex digits>. See SpawnerOptions.SessionTmpDerivedPrefix.
+const DefaultSessionTmpDerivedPrefix = "donmai-"
+
+// sessionTmpDerivedRandomBytes is the entropy in a derived name: 6 bytes,
+// rendered as 12 hex digits.
+const sessionTmpDerivedRandomBytes = 6
+
+// Path-length budget (see the file header). unixSocketPathMax is the
+// macOS sun_path size, the strictest of the supported platforms;
+// sessionTmpSocketHeadroom is what a socket name below the scratch
+// directory may use, which covers tsx (tsx-<uid>/<pid>.pipe), tmux
+// (tmux-<uid>/default), ssh-agent (ssh-XXXXXXXXXX/agent.<pid>) and a
+// Postgres socket (.s.PGSQL.<port>).
+const (
+	unixSocketPathMax        = 104
+	sessionTmpSocketHeadroom = 40
+	sessionTmpMaxPathLen     = unixSocketPathMax - 1 - sessionTmpSocketHeadroom
+)
 
 // sessionTmpBindingKeys are the variables bound to the session scratch
 // directory for the worker and every child it spawns.
 var sessionTmpBindingKeys = []string{"TMPDIR", "TMP", "TEMP"}
+
+// Sources of a launch's scratch directory, reported in the bind log line
+// and in refusals.
+const (
+	sessionTmpSourceDeclared = "declared"
+	sessionTmpSourceDerived  = "derived"
+)
 
 // sessionTmpOwnerFile is the marker written into every executor-created
 // scratch directory at creation. It names the owning session and the
@@ -106,6 +170,45 @@ func validateSessionTmpDir(raw string) (string, error) {
 		return "", fmt.Errorf("session tmpdir: name %q holds %q, outside [A-Za-z0-9._-]", base, string(r))
 	}
 	return cleaned, nil
+}
+
+// validateSessionTmpLaunchValue is validateSessionTmpDir plus the
+// path-length budget a launch must meet. The startup sweep validates
+// without the budget, so it can still reclaim a recorded directory that
+// predates it.
+func validateSessionTmpLaunchValue(raw string) (string, error) {
+	dir, err := validateSessionTmpDir(raw)
+	if err != nil {
+		return "", err
+	}
+	if len(dir) > sessionTmpMaxPathLen {
+		return "", fmt.Errorf("session tmpdir: %q is %d bytes, over the %d-byte limit that keeps a unix socket under it within the %d-byte socket path cap (refused)", dir, len(dir), sessionTmpMaxPathLen, unixSocketPathMax)
+	}
+	return dir, nil
+}
+
+// deriveSessionTmpDir names a fresh scratch directory for a session that
+// declares none: /tmp/<prefix><12 random hex digits>. A failed entropy read
+// fails the launch closed rather than falling back to a guessable name.
+func deriveSessionTmpDir(prefix string) (string, error) {
+	var b [sessionTmpDerivedRandomBytes]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("session tmpdir: derive a directory name: %w", err)
+	}
+	return "/tmp/" + prefix + hex.EncodeToString(b[:]), nil
+}
+
+// declaredSessionTmpDir reports the value the final spawn env declares for
+// the advisory key. The last entry wins, as it does for exec.
+func declaredSessionTmpDir(env []string) string {
+	prefix := SessionTmpDirEnv + "="
+	value := ""
+	for _, kv := range env {
+		if strings.HasPrefix(kv, prefix) {
+			value = kv[len(prefix):]
+		}
+	}
+	return value
 }
 
 // errSessionTmpOwnershipUnavailable reports that the current process cannot
@@ -295,26 +398,28 @@ func sessionTmpOwnerMatches(dir string, claim sessionTmpClaim) bool {
 	return record.Gen == claim.Gen && record.Gen != 0
 }
 
-// applySessionTmpBindings returns env with the three scratch bindings set
-// to dir. Any prior binding of those keys is dropped first, so the session
-// scratch is bound exactly once however the worker was otherwise
-// configured; the advisory key itself is left alone.
+// applySessionTmpBindings returns env with the three scratch bindings and
+// the advisory key set to dir. Any prior entry for those keys is dropped
+// first, so each is bound exactly once however the worker was otherwise
+// configured, and a session given a derived directory sees it named in
+// DONMAI_SESSION_TMPDIR just as a declared one does.
 func applySessionTmpBindings(env []string, dir string) []string {
-	out := make([]string, 0, len(env)+len(sessionTmpBindingKeys))
+	keys := append(append([]string(nil), sessionTmpBindingKeys...), SessionTmpDirEnv)
+	out := make([]string, 0, len(env)+len(keys))
 dropped:
 	for _, kv := range env {
 		key := kv
 		if i := strings.IndexByte(kv, '='); i >= 0 {
 			key = kv[:i]
 		}
-		for _, bound := range sessionTmpBindingKeys {
+		for _, bound := range keys {
 			if key == bound {
 				continue dropped
 			}
 		}
 		out = append(out, kv)
 	}
-	for _, key := range sessionTmpBindingKeys {
+	for _, key := range keys {
 		out = append(out, key+"="+dir)
 	}
 	return out
@@ -327,6 +432,13 @@ dropped:
 type sessionTmpRecordEntry struct {
 	Path      string `json:"path"`
 	CreatedAt string `json:"createdAt"`
+	// PID is the daemon process that recorded the entry. The startup sweep
+	// reclaims what a previous daemon process left behind, so it keeps an
+	// entry this very process wrote: that entry belongs to a live spawner
+	// in this process (another daemon sharing the state home), which
+	// removes it itself. Zero — an entry written before the field existed
+	// — always counts as a previous process's.
+	PID int `json:"pid,omitempty"`
 }
 
 // sessionTmpRecord is the executor-side record of created scratch
@@ -411,14 +523,46 @@ func saveSessionTmpRecord(dir string, record sessionTmpRecord) error {
 // this process, and the marker resets them on every creation.
 var nextSessionTmpGen atomic.Uint64
 
-// prepareSessionTmpDir validates the advisory value carried on the session
-// env, ensures the directory, stamps ownership and records the creation.
-// Empty (no key) returns no claim: today's behaviour. Every error fails the
-// launch closed before any worker process starts.
-func (s *WorkerSpawner) prepareSessionTmpDir(spec SessionSpec) (sessionTmpClaim, error) {
-	raw := runtimeenv.FilterHostOwnedMap(spec.Env)[SessionTmpDirEnv]
+// workItemSessionTmpDir reports the scratch directory a work item's own env
+// declares, after the host-owned filter the spawn composition applies.
+func workItemSessionTmpDir(spec SessionSpec) string {
+	return runtimeenv.FilterHostOwnedMap(spec.Env)[SessionTmpDirEnv]
+}
+
+// bindSessionTmpDir resolves one launch's scratch directory from the env
+// the worker will exec with — after OnPreSpawn, so a value the embedder
+// delivers there counts — prepares it, and returns the claim plus that env
+// with TMPDIR, TMP, TEMP and the advisory key bound to the directory. A
+// declared value wins; with none, the configured prefix derives one; with
+// neither, the zero claim and the env come back unchanged. Every error
+// fails the launch closed before any worker process starts.
+func (s *WorkerSpawner) bindSessionTmpDir(spec SessionSpec, env []string) (sessionTmpClaim, []string, error) {
+	raw, source := declaredSessionTmpDir(env), sessionTmpSourceDeclared
 	if raw == "" {
-		return sessionTmpClaim{}, nil
+		if s.opts.SessionTmpDerivedPrefix == "" {
+			return sessionTmpClaim{}, env, nil
+		}
+		derived, err := deriveSessionTmpDir(s.opts.SessionTmpDerivedPrefix)
+		if err != nil {
+			return sessionTmpClaim{}, env, err
+		}
+		raw, source = derived, sessionTmpSourceDerived
+	}
+	claim, err := s.prepareSessionTmpDir(spec.SessionID, raw)
+	if err != nil {
+		return sessionTmpClaim{}, env, fmt.Errorf("%s scratch directory for session %q: %w", source, spec.SessionID, err)
+	}
+	slog.Info("session scratch directory bound", "sessionId", spec.SessionID, "dir", claim.Dir, "source", source)
+	return claim, applySessionTmpBindings(env, claim.Dir), nil
+}
+
+// prepareSessionTmpDir validates a launch's scratch-directory value (shape
+// and path-length budget), ensures the directory, stamps ownership and
+// records the creation. Every error fails the launch closed before any
+// worker process starts.
+func (s *WorkerSpawner) prepareSessionTmpDir(sessionID, raw string) (sessionTmpClaim, error) {
+	if _, err := validateSessionTmpLaunchValue(raw); err != nil {
+		return sessionTmpClaim{}, err
 	}
 	dir, created, err := ensureSessionTmpDirCreated(raw)
 	if err != nil {
@@ -459,12 +603,12 @@ func (s *WorkerSpawner) prepareSessionTmpDir(spec SessionSpec) (sessionTmpClaim,
 	// directory whose owner it cannot prove.
 	s.mu.Lock()
 	for id, existing := range s.sessionTmpDirs {
-		if id != spec.SessionID && existing.owned() && existing.Dir == dir {
+		if id != sessionID && existing.owned() && existing.Dir == dir {
 			s.mu.Unlock()
 			if created {
 				_ = os.Remove(dir)
 			}
-			return sessionTmpClaim{}, fmt.Errorf("session tmpdir: %q already claimed by live session %q (session %q refused)", dir, id, spec.SessionID)
+			return sessionTmpClaim{}, fmt.Errorf("session tmpdir: %q already claimed by live session %q (session %q refused)", dir, id, sessionID)
 		}
 	}
 	if owner, hasOwner, ownerErr := readSessionTmpOwnerRecord(dir); ownerErr != nil {
@@ -472,15 +616,15 @@ func (s *WorkerSpawner) prepareSessionTmpDir(spec SessionSpec) (sessionTmpClaim,
 		if created {
 			_ = os.Remove(dir)
 		}
-		return sessionTmpClaim{}, fmt.Errorf("session tmpdir: %q ownership marker unreadable (session %q refused): %w", dir, spec.SessionID, ownerErr)
-	} else if hasOwner && owner.SessionID != spec.SessionID {
+		return sessionTmpClaim{}, fmt.Errorf("session tmpdir: %q ownership marker unreadable (session %q refused): %w", dir, sessionID, ownerErr)
+	} else if hasOwner && owner.SessionID != sessionID {
 		s.mu.Unlock()
 		if created {
 			_ = os.Remove(dir)
 		}
-		return sessionTmpClaim{}, fmt.Errorf("session tmpdir: %q already owned by session %q (session %q refused)", dir, owner.SessionID, spec.SessionID)
+		return sessionTmpClaim{}, fmt.Errorf("session tmpdir: %q already owned by session %q (session %q refused)", dir, owner.SessionID, sessionID)
 	}
-	if err := writeSessionTmpOwner(dir, spec.SessionID, gen); err != nil {
+	if err := writeSessionTmpOwner(dir, sessionID, gen); err != nil {
 		s.mu.Unlock()
 		if created {
 			_ = os.RemoveAll(dir)
@@ -490,7 +634,7 @@ func (s *WorkerSpawner) prepareSessionTmpDir(spec SessionSpec) (sessionTmpClaim,
 	if s.sessionTmpDirs == nil {
 		s.sessionTmpDirs = map[string]sessionTmpClaim{}
 	}
-	s.sessionTmpDirs[spec.SessionID] = claim
+	s.sessionTmpDirs[sessionID] = claim
 	recordDir := s.opts.SessionTmpRecordDir
 	s.mu.Unlock()
 	if recordDir != "" {
@@ -498,15 +642,15 @@ func (s *WorkerSpawner) prepareSessionTmpDir(spec SessionSpec) (sessionTmpClaim,
 		record, err := loadSessionTmpRecord(recordDir)
 		if err != nil {
 			s.sessionTmpRecordMu.Unlock()
-			s.forgetSessionTmpClaim(spec.SessionID, claim)
+			s.forgetSessionTmpClaim(sessionID, claim)
 			removeOwn()
 			return sessionTmpClaim{}, err
 		}
-		record.Entries[spec.SessionID] = sessionTmpRecordEntry{Path: dir, CreatedAt: time.Now().UTC().Format(time.RFC3339)}
+		record.Entries[sessionID] = sessionTmpRecordEntry{Path: dir, CreatedAt: time.Now().UTC().Format(time.RFC3339), PID: os.Getpid()}
 		err = saveSessionTmpRecord(recordDir, record)
 		s.sessionTmpRecordMu.Unlock()
 		if err != nil {
-			s.forgetSessionTmpClaim(spec.SessionID, claim)
+			s.forgetSessionTmpClaim(sessionID, claim)
 			removeOwn()
 			return sessionTmpClaim{}, err
 		}
@@ -627,7 +771,7 @@ type SessionTmpSweepReport struct {
 	// by a live session, and deleted.
 	Removed int
 	// KeptLive is the number of recorded directories still owned by a
-	// running session.
+	// running session, or recorded by this process itself.
 	KeptLive int
 	// Dropped is the number of record entries discarded without deleting:
 	// already gone, malformed, or no longer provably ours.
@@ -672,19 +816,28 @@ func (s *WorkerSpawner) SweepSessionTmpDirs(liveIDs map[string]struct{}) Session
 		slog.Warn("session scratch sweep: unreadable record, reclaiming nothing", "err", err)
 		return report
 	}
+	// An entry is live when its session is, or when this very process
+	// recorded it: the sweep reclaims what a previous daemon process left
+	// behind, and an entry of this process's own belongs to a spawner here
+	// that removes it itself (see sessionTmpRecordEntry.PID).
+	self := os.Getpid()
+	isLive := func(sessionID string, entry sessionTmpRecordEntry) bool {
+		_, live := protected[sessionID]
+		return live || (entry.PID != 0 && entry.PID == self)
+	}
 	// Protected paths: a live entry's path is never deleted, even by a
 	// dead entry naming the same path (a duplicated stamp). A dead entry
 	// sharing a live path is dropped without deleting.
 	protectedPaths := map[string]struct{}{}
 	for sessionID, entry := range record.Entries {
-		if _, live := protected[sessionID]; live && entry.Path != "" {
+		if isLive(sessionID, entry) && entry.Path != "" {
 			protectedPaths[entry.Path] = struct{}{}
 		}
 	}
 	changed := false
 	for sessionID, entry := range record.Entries {
 		report.Examined++
-		if _, live := protected[sessionID]; live {
+		if isLive(sessionID, entry) {
 			report.KeptLive++
 			continue
 		}

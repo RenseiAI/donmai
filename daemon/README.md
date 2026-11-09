@@ -173,6 +173,70 @@ project/repository mismatch, but the explicit
 log makes the resolution-time failure observable separately from
 the spawn-time rejection.
 
+### Per-session scratch directory (`TMPDIR`)
+
+Every session the daemon launches runs with its own temp directory:
+`TMPDIR`, `TMP` and `TEMP` point at it for the worker and every process
+the worker starts. Everything a seat's tools leave in their temp
+directory lands there and is deleted with the session, including Node's
+`node-compile-cache` and tsx's `tsx-<uid>` cache, which both derive their
+location from `os.tmpdir()`. Without this, the leftovers accumulate in the
+host's shared per-user temp, which on macOS is `/var/folders/*/*/T`. macOS
+empties that directory at boot, before any user process may start, and
+with millions of files that cleanup delays login by minutes.
+
+**Where the directory comes from.** The spawner decides once per launch,
+reading the environment the worker will actually be started with. That
+is the environment after the embedder's `OnPreSpawn` hook has run, which
+is where an embedding product delivers its per-session values.
+
+| Case | Directory | Notes |
+|---|---|---|
+| Declared | The value of `DONMAI_SESSION_TMPDIR` | It can come from the work item's env, `SpawnerOptions.BaseEnv` or `OnPreSpawn`. The hook runs last, so its value wins. A declared value always wins over the derived default. |
+| Not declared | `/tmp/<prefix><12 random hex digits>`, for example `/tmp/donmai-9f86d081884c` | `<prefix>` is `SpawnerOptions.SessionTmpDerivedPrefix`. The daemon sets it to `donmai-` unless an embedder sets its own. The worker is told the path through `DONMAI_SESSION_TMPDIR`, so a session always sees which directory it was given. |
+| Derivation off | None | Only a spawner built without the daemon (an empty prefix) has this case. The worker inherits the daemon's own `TMPDIR`, `TMP` and `TEMP`. |
+
+The derived name is random, not taken from the session id. That way
+nothing can create the path before the launch does, and two daemons
+running the same session id never share a directory. To find which
+session owns a directory, read its `.owner.json` marker, the record
+described below, or the `session scratch directory bound` log line, which
+names the session, the directory and its source (`declared` or
+`derived`).
+
+If the daemon was itself started inside another session, it inherits
+that session's `DONMAI_SESSION_TMPDIR`. The daemon never passes that copy
+on, because it names the other session's directory, not one of its own
+sessions'.
+
+**Rules a directory must meet.** A declared value must be:
+
+- an absolute path that `filepath.Clean` leaves unchanged;
+- a direct child of `/tmp` (`/private/tmp` is accepted);
+- named only with characters from `[A-Za-z0-9._-]`;
+- no longer than **63 bytes**. A unix socket path may be at most 104
+  bytes on macOS, counting the terminating NUL, and tools create sockets
+  under `TMPDIR` (tsx puts its IPC pipe at `TMPDIR/tsx-<uid>/<pid>.pipe`).
+  The 63-byte limit leaves 40 bytes for the socket's own name.
+
+If a path already exists, the daemon reuses it only when it is a real
+directory (not a symlink), owned by the daemon's uid, with mode `0700`.
+A value that breaks any of these rules refuses the launch with an error
+that names the rule. The daemon never falls back to the shared temp. If
+the work item itself declares a bad value, the launch is refused before
+`OnPreSpawn` runs. If the bad value came from the hook, the launch is
+refused after it, and `OnSpawnAborted` releases what the hook acquired.
+
+**Lifecycle.** The daemon creates the directory with mode `0700` before
+the worker starts, writes an ownership marker into it, and records it in
+`<state home>/session-tmp-record/session-tmpdirs.json`. The directory is
+removed when the session completes, fails or is stopped, and on the
+reaper's terminal path. For a session owned by a session shim, it is
+removed when the shim exits. If the daemon dies mid-session, the next
+daemon start sweeps every recorded directory whose session is no longer
+running. The sweep only removes recorded paths that still pass the checks
+above; it never matches by name prefix.
+
 ## HTTP control API
 
 Localhost-only (binds 127.0.0.1). Endpoints:
