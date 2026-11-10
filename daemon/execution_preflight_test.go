@@ -131,12 +131,19 @@ func TestAdaptationDeniedIsPersistedBeforeCredentialOrChildSideEffects(t *testin
 	}
 }
 
+// The store stays append-only once the spawn commits: a differing receipt
+// for a spawned session is refused and the stored bytes are untouched. (A
+// receipt whose session never spawned may be replaced on redelivery; see
+// TestFileExecutionPreflightStorePersistReplacesOnlyUnspawnedReceipt.)
 func TestFileExecutionPreflightStoreIsDurableAndAppendOnly(t *testing.T) {
 	dir := t.TempDir()
 	store := NewFileExecutionPreflightStore(dir)
 	receipt := json.RawMessage(`{"contractVersion":"host-adaptation/v1","requestId":"session-1","workerId":"worker-1","placementId":"host-local","decision":"denied","denial":"unsupported"}`)
 	if err := store.Persist("session-1", receipt); err != nil {
 		t.Fatal(err)
+	}
+	if err := store.MarkExecutionPreflightSpawned("session-1"); err != nil {
+		t.Fatalf("mark spawned: %v", err)
 	}
 	got, err := os.ReadFile(filepath.Join(dir, executionPreflightReceiptName("session-1")))
 	if err != nil {

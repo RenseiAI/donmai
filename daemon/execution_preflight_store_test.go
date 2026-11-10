@@ -58,13 +58,13 @@ func TestFileExecutionPreflightStorePersistReplacesOnlyUnspawnedReceipt(t *testi
 	}{
 		{
 			name:         "never spawned differing receipt is replaced",
-			setup:        func(t *testing.T, dir string, store *FileExecutionPreflightStore) {},
+			setup:        func(*testing.T, string, *FileExecutionPreflightStore) {},
 			secondWorker: "worker-2",
 			wantReplaced: true,
 		},
 		{
 			name: "spawned session keeps its receipt",
-			setup: func(t *testing.T, dir string, store *FileExecutionPreflightStore) {
+			setup: func(t *testing.T, _ string, store *FileExecutionPreflightStore) {
 				if err := store.MarkExecutionPreflightSpawned(sessionID); err != nil {
 					t.Fatalf("mark spawned: %v", err)
 				}
@@ -74,7 +74,7 @@ func TestFileExecutionPreflightStorePersistReplacesOnlyUnspawnedReceipt(t *testi
 		},
 		{
 			name: "consumed start authority keeps the receipt",
-			setup: func(t *testing.T, dir string, store *FileExecutionPreflightStore) {
+			setup: func(t *testing.T, dir string, _ *FileExecutionPreflightStore) {
 				writeMarkerFile(t, dir, executionPreflightStartName(sessionID))
 			},
 			secondWorker: "worker-2",
@@ -82,7 +82,7 @@ func TestFileExecutionPreflightStorePersistReplacesOnlyUnspawnedReceipt(t *testi
 		},
 		{
 			name: "retired session keeps its receipt",
-			setup: func(t *testing.T, dir string, store *FileExecutionPreflightStore) {
+			setup: func(t *testing.T, dir string, _ *FileExecutionPreflightStore) {
 				writeMarkerFile(t, dir, executionPreflightRetirementName(sessionID))
 			},
 			secondWorker: "worker-2",
@@ -90,7 +90,7 @@ func TestFileExecutionPreflightStorePersistReplacesOnlyUnspawnedReceipt(t *testi
 		},
 		{
 			name: "symlink destination is refused without touching its target",
-			setup: func(t *testing.T, dir string, store *FileExecutionPreflightStore) {
+			setup: func(t *testing.T, dir string, _ *FileExecutionPreflightStore) {
 				target := filepath.Join(dir, "swap-target.json")
 				if err := os.WriteFile(target, []byte("outside"), 0o600); err != nil {
 					t.Fatal(err)
@@ -108,7 +108,7 @@ func TestFileExecutionPreflightStorePersistReplacesOnlyUnspawnedReceipt(t *testi
 		},
 		{
 			name: "non-regular destination is refused",
-			setup: func(t *testing.T, dir string, store *FileExecutionPreflightStore) {
+			setup: func(t *testing.T, dir string, _ *FileExecutionPreflightStore) {
 				finalPath := filepath.Join(dir, executionPreflightReceiptName(sessionID))
 				if err := os.Remove(finalPath); err != nil {
 					t.Fatal(err)
