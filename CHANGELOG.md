@@ -8,6 +8,10 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+No unreleased changes.
+
+## v0.73.4 — 2026-11-10
+
 ### Features
 
 - Add `host doctor temp`: reports the user temp folder by producer (donmai artefacts, codex homes, donmai caches, shared tool caches) with sampled counts and sizes, flat-directory warnings and a boot-cleanup estimate; `--fix` removes donmai artefacts whose owner is gone, and `--fix --include-tool-caches` removes shared tool caches after confirmation with no seat running. The report and fix are a Go API (`tempdoctor`) an embedding product can wrap.
