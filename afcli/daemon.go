@@ -1401,6 +1401,7 @@ var allowedCapacityKeys = map[string]struct{}{
 	"repoKeeper.authorizationWindowSeconds": {},
 	"usagePing.enabled":                     {},
 	"usagePing.endpoint":                    {},
+	daemonRuntime.SessionScratchDeriveKey:   {},
 }
 
 // repoKeeperRestartKeys are the process-level keeper keys: the running daemon
@@ -1444,10 +1445,16 @@ func newDaemonSetCmd(factory daemonClientFactory) *cobra.Command {
 			"                                  1 mints a random installation id; 0 clears\n" +
 			"                                  it and stops all sending.\n" +
 			"  usagePing.endpoint              HTTPS receiver URL for the weekly\n" +
-			"                                  usage ping (empty disables sending).\n\n" +
+			"                                  usage ping (empty disables sending).\n" +
+			"  sessionScratch.derive           Give a session that declares no\n" +
+			"                                  DONMAI_SESSION_TMPDIR its own temp directory,\n" +
+			"                                  /tmp/donmai-<random>, removed when it ends\n" +
+			"                                  (0 or 1; default 1). 0 leaves such a session\n" +
+			"                                  on the daemon's own TMPDIR.\n\n" +
 			"The change is written atomically to ~/.donmai/daemon.yaml. Capacity keys\n" +
 			"reload the affected subsystem without a restart; repoKeeper.* keys are\n" +
-			"process-level and need a drain-aware restart to take effect.",
+			"process-level and need a drain-aware restart to take effect, as does\n" +
+			"sessionScratch.derive.",
 		Args:         cobra.ExactArgs(2),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -1455,7 +1462,7 @@ func newDaemonSetCmd(factory daemonClientFactory) *cobra.Command {
 			value := args[1]
 
 			if _, ok := allowedCapacityKeys[key]; !ok {
-				return fmt.Errorf("unknown config key %q — supported keys: capacity.maxConcurrentSessions, capacity.poolMaxDiskGb, repoKeeper.enabled, repoKeeper.maxDiskGb, repoKeeper.fetchIntervalSeconds, repoKeeper.authorizationWindowSeconds, usagePing.enabled, usagePing.endpoint", key)
+				return fmt.Errorf("unknown config key %q — supported keys: capacity.maxConcurrentSessions, capacity.poolMaxDiskGb, repoKeeper.enabled, repoKeeper.maxDiskGb, repoKeeper.fetchIntervalSeconds, repoKeeper.authorizationWindowSeconds, usagePing.enabled, usagePing.endpoint, sessionScratch.derive", key)
 			}
 
 			// The usage-count consent lives in daemon.yaml under
@@ -1473,6 +1480,25 @@ func newDaemonSetCmd(factory daemonClientFactory) *cobra.Command {
 					return err
 				}
 				notifyUsagePingSet(cmd, factory, host, port, jsonOut, key, value, msg)
+				return nil
+			}
+
+			// sessionScratch.derive is process-level like the keeper keys.
+			// It is written with a raw-node edit (the project-tree YAML
+			// model does not carry the block), preserving every other key.
+			if key == daemonRuntime.SessionScratchDeriveKey {
+				n, err := strconv.Atoi(value)
+				if err != nil || (n != 0 && n != 1) {
+					return fmt.Errorf("%s must be 0 or 1, got %q", key, value)
+				}
+				yamlPath := cfgPath
+				if yamlPath == "" {
+					yamlPath = afclient.DefaultDaemonYAMLPath()
+				}
+				if err := writeSessionScratchDerive(yamlPath, n == 1); err != nil {
+					return err
+				}
+				notifyRepoKeeperRestartKey(cmd, factory, host, port, jsonOut, key, value)
 				return nil
 			}
 

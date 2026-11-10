@@ -826,6 +826,9 @@ func TestMain(m *testing.M) {
 	if os.Getenv(envDaemonShimHelper) == "1" {
 		os.Exit(runDaemonShimHelper())
 	}
+	if os.Getenv(sessionTmpCrashHelperEnv) != "" {
+		os.Exit(runSessionTmpCrashHelper())
+	}
 	cleanup := testisolation.Isolate()
 	code := m.Run()
 	cleanup()

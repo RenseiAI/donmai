@@ -110,6 +110,11 @@ type Config struct {
 	// configures an endpoint. Consent state is separate from daemon
 	// registration, credentials, and auto-update configuration.
 	UsagePing UsagePingConfig `yaml:"usagePing,omitempty" json:"usagePing,omitempty"`
+	// SessionScratch holds the per-session scratch directory setting (see
+	// SessionScratchConfig and daemon/README.md). Optional; absent means
+	// derivation is on. Process-level: a change takes effect at the next
+	// daemon start.
+	SessionScratch SessionScratchConfig `yaml:"sessionScratch,omitempty" json:"sessionScratch,omitempty"`
 	// Trust holds the daemon-wide signature-verification policy
 	// (sigstore bundle-mode verifier mode + issuer allowlist + audit
 	// actor). Optional; applyDefaults seeds Mode via
@@ -125,6 +130,28 @@ type Config struct {
 	// losing their own settings on the next write. Declared fields
 	// always win: keys also present in the marshaled Config are skipped.
 	unknownFields map[string]*yaml.Node
+}
+
+// SessionScratchDeriveKey is the dotted daemon.yaml key that turns the
+// derived per-session scratch directory on or off (`host set
+// sessionScratch.derive 0|1`).
+const SessionScratchDeriveKey = "sessionScratch.derive"
+
+// SessionScratchConfig is the daemon's per-session scratch directory
+// setting.
+type SessionScratchConfig struct {
+	// Derive decides what a session that declares no DONMAI_SESSION_TMPDIR
+	// runs with. True — the default when absent — gives it a directory of
+	// its own, /tmp/donmai-<12 random hex digits>, created before the worker
+	// starts and removed when the session ends. False leaves it on the
+	// daemon's own TMPDIR, TMP and TEMP, exactly as before derivation
+	// existed. A declared value binds either way.
+	Derive *bool `yaml:"derive,omitempty" json:"derive,omitempty"`
+}
+
+// DeriveEnabled reports the effective setting: on unless explicitly false.
+func (c SessionScratchConfig) DeriveEnabled() bool {
+	return c.Derive == nil || *c.Derive
 }
 
 // LocalRuntimeConfig is non-secret operator policy. Credentials remain in

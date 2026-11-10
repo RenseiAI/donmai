@@ -312,13 +312,20 @@ func TestSpawner_SessionTmp_ContinuedTurnRecreates(t *testing.T) {
 	}
 }
 
-// TestSpawner_SessionTmp_NoKeyLeavesEnvAlone pins AC-5: with no advisory
-// key the worker env is byte-identical to today's — the composition adds
-// nothing of its own. The temp variables and the advisory key read exactly
-// as inherited from the daemon's own environment (which on a seat host
-// already carries them for the daemon itself).
+// TestSpawner_SessionTmp_NoKeyLeavesEnvAlone pins AC-5 at the composition
+// layer: with no declared key the composition adds no temp binding of its
+// own — TMPDIR, TMP and TEMP read exactly as the daemon inherited them —
+// and the daemon's own inherited DONMAI_SESSION_TMPDIR is dropped, because
+// it names whatever session the daemon was started inside. Carried along,
+// it would read as every launched session's declaration and bind them all
+// to that one directory.
+//
+// Not parallel: it sets the process environment the composition inherits.
+//
+// RED: drop the advisory key from filterSpawnerParentEnv's refusals and
+// the outer session's path reaches the composed env.
 func TestSpawner_SessionTmp_NoKeyLeavesEnvAlone(t *testing.T) {
-	t.Parallel()
+	t.Setenv(SessionTmpDirEnv, "/tmp/outer-session-scratch")
 	parent := map[string]string{}
 	for _, kv := range os.Environ() {
 		if i := strings.IndexByte(kv, '='); i >= 0 {
@@ -326,11 +333,20 @@ func TestSpawner_SessionTmp_NoKeyLeavesEnvAlone(t *testing.T) {
 		}
 	}
 	s := NewWorkerSpawner(SpawnerOptions{})
-	got := envToMapSessionTmpTest(s.sessionEnv(SessionSpec{SessionID: "plain", Repository: "github.com/a/b"}, nil))
-	for _, key := range append([]string{SessionTmpDirEnv}, sessionTmpBindingKeys...) {
+	composed := s.sessionEnv(SessionSpec{SessionID: "plain", Repository: "github.com/a/b"}, nil)
+	got := envToMapSessionTmpTest(composed)
+	for _, key := range sessionTmpBindingKeys {
 		if got[key] != parent[key] {
-			t.Fatalf("%s = %q, want the inherited %q: the composition must add nothing without a stamped key", key, got[key], parent[key])
+			t.Fatalf("%s = %q, want the inherited %q: the composition must add nothing without a declared key", key, got[key], parent[key])
 		}
+	}
+	for _, kv := range composed {
+		if isEnvEntryFor(kv, SessionTmpDirEnv) {
+			t.Fatalf("composed env carries the daemon's inherited %q: it names another session's scratch directory", kv)
+		}
+	}
+	if declared := declaredSessionTmpDir(composed); declared != "" {
+		t.Fatalf("composed env declares %q with no work-item or hook value", declared)
 	}
 }
 
@@ -468,21 +484,29 @@ func TestSpawner_SessionTmp_BookkeepingFailureKeepsReusedDir(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(recordDir, sessionTmpRecordFileName), []byte("{corrupt"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	var started bool
+	var aborted int
 	s := NewWorkerSpawner(SpawnerOptions{
 		Projects:            []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
 		WorkerCommand:       []string{"/bin/sh", "-c", "exit 0"},
 		SessionTmpRecordDir: recordDir,
 		OnPreSpawn: func(_ SessionSpec, _ []string) ([]string, error) {
-			started = true
 			return nil, nil
 		},
+		OnSpawnAborted: func(SessionSpec, error) { aborted++ },
 	})
+	started := false
+	s.startCommand = func(*exec.Cmd) error {
+		started = true
+		return errors.New("a worker must never start after a record failure")
+	}
 	if _, err := s.AcceptWork(seatTmpSpec("seat-bookkeeping", dir)); err == nil {
 		t.Fatal("expected a record-failure refusal, got an accept")
 	}
 	if started {
 		t.Fatal("a worker started despite the record failure")
+	}
+	if aborted != 1 {
+		t.Fatalf("OnSpawnAborted ran %d times, want once: the hook's acquisitions leak when the scratch directory refuses the launch after it", aborted)
 	}
 	raw, err := os.ReadFile(sentinel) //nolint:gosec // G304: the path is a constant fixture under /tmp.
 	if err != nil || string(raw) != "prior" {
@@ -568,7 +592,7 @@ func TestSpawner_SessionTmp_ConcurrentRecordKeepsExactEntries(t *testing.T) {
 			id := fmt.Sprintf("concurrent-%d-%d", pid, i)
 			dir := fmt.Sprintf("/tmp/concurrent-record-%d-%d", pid, i)
 			_ = os.RemoveAll(dir)
-			claim, err := s.prepareSessionTmpDir(seatTmpSpec(id, dir))
+			claim, err := s.prepareSessionTmpDir(id, dir)
 			got[i] = prepared{id: id, dir: dir, claim: claim}
 			errs[i] = err
 		}(i)
@@ -822,7 +846,7 @@ func TestSpawner_SessionTmp_DuplicatePathAfterRestartRefusesSecondLaunch(t *test
 	_ = os.RemoveAll(dir)
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 
-	claimA, err := s1.prepareSessionTmpDir(seatTmpSpec("seat-restart-live", dir))
+	claimA, err := s1.prepareSessionTmpDir("seat-restart-live", dir)
 	if err != nil {
 		t.Fatalf("prepare live: %v", err)
 	}
@@ -838,7 +862,7 @@ func TestSpawner_SessionTmp_DuplicatePathAfterRestartRefusesSecondLaunch(t *test
 		WorkerCommand:         []string{"/bin/sh", "-c", "exit 0"},
 		SessionTmpRecordDir:   recordDir,
 	})
-	if _, err := s2.prepareSessionTmpDir(seatTmpSpec("seat-restart-second", dir)); err == nil {
+	if _, err := s2.prepareSessionTmpDir("seat-restart-second", dir); err == nil {
 		t.Fatal("second prepare on an adopted session's path accepted; it must fail closed")
 	} else if !strings.Contains(err.Error(), "seat-restart-live") || !strings.Contains(err.Error(), "seat-restart-second") {
 		t.Fatalf("restart duplicate refusal = %v, want an error naming both sessions", err)
@@ -877,11 +901,11 @@ func TestSpawner_SessionTmp_StaleClaimCleanupKeepsLive(t *testing.T) {
 	_ = os.RemoveAll(dir)
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 
-	old, err := s.prepareSessionTmpDir(seatTmpSpec("seat-stale", dir))
+	old, err := s.prepareSessionTmpDir("seat-stale", dir)
 	if err != nil {
 		t.Fatalf("prepare old generation: %v", err)
 	}
-	live, err := s.prepareSessionTmpDir(seatTmpSpec("seat-stale", dir))
+	live, err := s.prepareSessionTmpDir("seat-stale", dir)
 	if err != nil {
 		t.Fatalf("prepare live generation: %v", err)
 	}
@@ -931,20 +955,26 @@ func TestSpawner_SessionTmp_MarkerWriteFailureRefusesLaunch(t *testing.T) {
 	if err := os.Mkdir(filepath.Join(dir, sessionTmpOwnerFile), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	var started bool
+	var aborted int
 	s := NewWorkerSpawner(SpawnerOptions{
-		Projects:      []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
-		WorkerCommand: []string{"/bin/sh", "-c", "exit 0"},
-		OnPreSpawn: func(_ SessionSpec, _ []string) ([]string, error) {
-			started = true
-			return nil, nil
-		},
+		Projects:       []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		WorkerCommand:  []string{"/bin/sh", "-c", "exit 0"},
+		OnPreSpawn:     func(_ SessionSpec, _ []string) ([]string, error) { return nil, nil },
+		OnSpawnAborted: func(SessionSpec, error) { aborted++ },
 	})
+	started := false
+	s.startCommand = func(*exec.Cmd) error {
+		started = true
+		return errors.New("a worker must never start after a marker failure")
+	}
 	if _, err := s.AcceptWork(seatTmpSpec("seat-marker-fails", dir)); err == nil {
 		t.Fatal("launch with an unwritable ownership marker accepted; it must fail closed")
 	}
 	if started {
 		t.Fatal("a worker started despite the marker failure")
+	}
+	if aborted != 1 {
+		t.Fatalf("OnSpawnAborted ran %d times, want once after the hook transferred ownership", aborted)
 	}
 	if fi, err := os.Lstat(dir); err != nil || !fi.Mode().IsDir() {
 		t.Fatalf("reused directory disturbed by the refused launch: %v %v", fi, err)
@@ -1006,7 +1036,7 @@ func TestSpawner_SessionTmp_ShimFinishRemovesDir(t *testing.T) {
 	dir := fmt.Sprintf("/tmp/shim-finish-removes-%d", os.Getpid())
 	_ = os.RemoveAll(dir)
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
-	claim, err := s.prepareSessionTmpDir(seatTmpSpec(sessionID, dir))
+	claim, err := s.prepareSessionTmpDir(sessionID, dir)
 	if err != nil {
 		t.Fatalf("prepare: %v", err)
 	}
@@ -1070,7 +1100,7 @@ func TestSpawner_SessionTmp_UnreadableMarkerRefusesSecondPrepare(t *testing.T) {
 	_ = os.RemoveAll(dir)
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 
-	claimA, err := s1.prepareSessionTmpDir(seatTmpSpec("seat-unreadable-live", dir))
+	claimA, err := s1.prepareSessionTmpDir("seat-unreadable-live", dir)
 	if err != nil {
 		t.Fatalf("prepare live: %v", err)
 	}
@@ -1094,7 +1124,7 @@ func TestSpawner_SessionTmp_UnreadableMarkerRefusesSecondPrepare(t *testing.T) {
 		WorkerCommand:         []string{"/bin/sh", "-c", "exit 0"},
 		SessionTmpRecordDir:   recordDir,
 	})
-	if _, err := s2.prepareSessionTmpDir(seatTmpSpec("seat-unreadable-second", dir)); err == nil {
+	if _, err := s2.prepareSessionTmpDir("seat-unreadable-second", dir); err == nil {
 		_ = os.Chmod(marker, 0o600)
 		t.Fatal("second prepare with an unreadable ownership marker accepted; it must fail closed")
 	} else if !strings.Contains(err.Error(), "seat-unreadable-second") || !strings.Contains(err.Error(), dir) {
@@ -1140,7 +1170,7 @@ func TestSpawner_SessionTmp_CorruptMarkerRefusesSecondPrepare(t *testing.T) {
 	_ = os.RemoveAll(dir)
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 
-	claimA, err := s1.prepareSessionTmpDir(seatTmpSpec("seat-corrupt-live", dir))
+	claimA, err := s1.prepareSessionTmpDir("seat-corrupt-live", dir)
 	if err != nil {
 		t.Fatalf("prepare live: %v", err)
 	}
@@ -1157,7 +1187,7 @@ func TestSpawner_SessionTmp_CorruptMarkerRefusesSecondPrepare(t *testing.T) {
 		WorkerCommand:         []string{"/bin/sh", "-c", "exit 0"},
 		SessionTmpRecordDir:   recordDir,
 	})
-	if _, err := s2.prepareSessionTmpDir(seatTmpSpec("seat-corrupt-second", dir)); err == nil {
+	if _, err := s2.prepareSessionTmpDir("seat-corrupt-second", dir); err == nil {
 		t.Fatal("second prepare with a corrupt ownership marker accepted; it must fail closed")
 	} else if !strings.Contains(err.Error(), "seat-corrupt-second") || !strings.Contains(err.Error(), dir) {
 		t.Fatalf("corrupt-marker refusal = %v, want an error naming the directory and the refused session", err)

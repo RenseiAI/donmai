@@ -513,6 +513,20 @@ func (d *Daemon) applyRepoKeeperSet(key string, n int64) bool {
 	return true
 }
 
+// applySessionScratchDerive mirrors a `host set sessionScratch.derive`
+// change into the in-memory config, so a later daemon-side config write
+// keeps it. The running spawner never re-reads it: it takes effect on a
+// drain-aware restart. Reports false when no config is loaded.
+func (d *Daemon) applySessionScratchDerive(on bool) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.config == nil {
+		return false
+	}
+	d.config.SessionScratch.Derive = &on
+	return true
+}
+
 // applyUsagePingEnabled mirrors a `host set usagePing.enabled` change
 // into the live config. Enabling never mints here — the id comes from
 // daemon.yaml (minted by setup or by the CLI's set path). Reports
@@ -728,6 +742,24 @@ func (s *Server) handleSetCapacity(w http.ResponseWriter, r *http.Request) {
 	if err != nil || n < 0 {
 		writeJSON(w, http.StatusBadRequest, &afclient.SetCapacityResponse{
 			OK: false, Key: body.Key, Value: body.Value, Message: "value must be non-negative integer",
+		})
+		return
+	}
+	if body.Key == SessionScratchDeriveKey {
+		if n > 1 {
+			writeJSON(w, http.StatusBadRequest, &afclient.SetCapacityResponse{
+				OK: false, Key: body.Key, Value: body.Value, Message: SessionScratchDeriveKey + " must be 0 or 1",
+			})
+			return
+		}
+		if !s.daemon.applySessionScratchDerive(n == 1) {
+			writeJSON(w, http.StatusInternalServerError, &afclient.SetCapacityResponse{
+				OK: false, Key: body.Key, Value: body.Value, Message: "daemon has no loaded config",
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, &afclient.SetCapacityResponse{
+			OK: true, Key: body.Key, Value: body.Value, Message: "persisted; restart the daemon with drained work for it to take effect",
 		})
 		return
 	}
