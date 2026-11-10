@@ -1141,6 +1141,14 @@ func acceptDefectNackReasonForError(err error) *acceptDefectNackReason {
 	if errors.As(err, &conflictErr) {
 		return &acceptDefectNackReason{ContractVersion: acceptDefectNackReasonContractVersion, Defect: acceptDefectSession}
 	}
+	// A markerless legacy receipt stays immutable because the store cannot
+	// prove it never spawned. The refusal is this host's lack of affirmative
+	// replaceability evidence, not the session's content, so it is safe to
+	// redeliver elsewhere.
+	var legacyErr *executionPreflightReceiptLegacyConflictError
+	if errors.As(err, &legacyErr) {
+		return &acceptDefectNackReason{ContractVersion: acceptDefectNackReasonContractVersion, Defect: acceptDefectHost}
+	}
 	// An execution-security refusal rejects the session's own stamp on every
 	// host for the same harness.
 	if refusal := agent.ExecutionSecurityRefusalFromError(err); refusal != nil {

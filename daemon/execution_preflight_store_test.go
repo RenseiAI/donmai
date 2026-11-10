@@ -5,7 +5,6 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -147,8 +146,11 @@ func TestFileExecutionPreflightStorePersistReplacesOnlyUnspawnedReceipt(t *testi
 				if readErr != nil {
 					t.Fatal(readErr)
 				}
-				if len(entries) != 1 {
-					t.Fatalf("receipt dir entries = %d, want 1 (no leftover pending or marker files)", len(entries))
+				if len(entries) != 2 {
+					t.Fatalf("receipt dir entries = %d, want 2 (receipt plus attempt-pending marker, no leftover temp files)", len(entries))
+				}
+				if _, err := os.Lstat(filepath.Join(dir, executionPreflightAttemptPendingName(sessionID))); err != nil {
+					t.Fatalf("attempt-pending marker missing after replace: %v", err)
 				}
 				return
 			}
@@ -241,8 +243,8 @@ func TestFileExecutionPreflightStorePersistReplaceNeverFollowsSwappedSymlink(t *
 }
 
 // Marking the spawn is idempotent, fsynced, and never alters the receipt: a
-// duplicate mark reaffirms the directory, and the marker plus receipt are the
-// only entries left behind.
+// duplicate mark reaffirms the directory, and the receipt plus pending plus
+// spawn markers are the only entries left behind.
 func TestFileExecutionPreflightStoreMarkSpawnedIsIdempotent(t *testing.T) {
 	dir := t.TempDir()
 	const sessionID = "session-marked"
@@ -267,12 +269,12 @@ func TestFileExecutionPreflightStoreMarkSpawnedIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 2 {
+	if len(entries) != 3 {
 		names := make([]string, 0, len(entries))
 		for _, entry := range entries {
 			names = append(names, entry.Name())
 		}
-		t.Fatalf("receipt dir entries = %v, want receipt plus spawn marker", names)
+		t.Fatalf("receipt dir entries = %v, want receipt plus pending plus spawn markers", names)
 	}
 	if err := store.Persist(sessionID, differingReceipt(t, sessionID, "worker-2")); err == nil {
 		t.Fatal("differing republish after spawn mark succeeded")
@@ -286,7 +288,8 @@ func TestFileExecutionPreflightStoreMarkSpawnedIsIdempotent(t *testing.T) {
 
 // An identical republish of a never-spawned receipt stays idempotent: the
 // link races, the bytes compare equal, and the directory is reaffirmed without
-// creating markers or pending leftovers.
+// creating temp leftovers. The first publish leaves the receipt plus the
+// attempt-pending marker behind.
 func TestFileExecutionPreflightStorePersistIdenticalUnspawnedIsIdempotent(t *testing.T) {
 	dir := t.TempDir()
 	const sessionID = "session-identical-unspawned"
@@ -302,8 +305,8 @@ func TestFileExecutionPreflightStorePersistIdenticalUnspawnedIsIdempotent(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 1 || !strings.HasSuffix(entries[0].Name(), ".json") {
-		t.Fatalf("receipt dir entries = %v, want exactly the receipt", entries)
+	if len(entries) != 2 {
+		t.Fatalf("receipt dir entries = %v, want receipt plus attempt-pending marker", entries)
 	}
 	got, err := store.Load(sessionID)
 	if err != nil {

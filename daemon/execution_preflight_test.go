@@ -229,8 +229,8 @@ func TestFileExecutionPreflightStorePersistIsIdempotentForIdenticalBytes(t *test
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(entries) != 2 {
-				t.Fatalf("receipt dir entries = %d, want 2 (receipt plus spawn marker, no leftover pending files)", len(entries))
+			if len(entries) != 3 {
+				t.Fatalf("receipt dir entries = %d, want 3 (receipt plus pending plus spawn markers, no leftover temp files)", len(entries))
 			}
 		})
 	}
@@ -411,8 +411,14 @@ func TestFileExecutionPreflightStoreHashesUntrustedSessionIDInsideRoot(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 1 || entries[0].Name() != executionPreflightReceiptName(sessionID) {
-		t.Fatalf("receipt entries = %v", entries)
+	if len(entries) != 2 {
+		t.Fatalf("receipt entries = %v, want receipt plus attempt-pending marker", entries)
+	}
+	want := map[string]bool{executionPreflightReceiptName(sessionID): true, executionPreflightAttemptPendingName(sessionID): true}
+	for _, entry := range entries {
+		if !want[entry.Name()] {
+			t.Fatalf("receipt entries = %v, want receipt plus attempt-pending marker", entries)
+		}
 	}
 	if _, err := os.Stat(filepath.Join(filepath.Dir(dir), "outside.json")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("receipt escaped configured root: %v", err)
@@ -577,8 +583,8 @@ func TestRedeliveredSessionAfterPreSpawnFailureAccepts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 2 {
-		t.Fatalf("receipt dir entries = %d, want 2 (receipt plus spawn marker)", len(entries))
+	if len(entries) != 3 {
+		t.Fatalf("receipt dir entries = %d, want 3 (receipt plus pending plus spawn markers)", len(entries))
 	}
 	third := varyingReadyReceipt(t, sessionID, 999)
 	conflictErr := store.Persist(sessionID, third)

@@ -17,11 +17,14 @@ import (
 
 // FileExecutionPreflightStore is an fsync-backed receipt store with
 // append-only semantics once a session has spawned. One initial receipt is
-// published per session id; while the session never spawned (no spawn, start,
+// published per session id together with an atomic attempt-pending marker;
+// while the session never spawned (pending marker present, no spawn, start,
 // or retirement marker) a redelivered attempt may atomically replace it, so a
 // transient pre-spawn failure does not wedge every redelivery on the stale
-// bytes. After the spawn is committed the receipt is immutable and a
-// differing republish is still refused.
+// bytes. A receipt without the pending marker is legacy: it may have been
+// written by a previous lifecycle that never recorded spawn evidence, so it
+// stays immutable. After the spawn is committed the receipt is immutable and
+// a differing republish is still refused.
 type FileExecutionPreflightStore struct {
 	dir      string
 	syncRoot func(*os.Root) error
@@ -85,6 +88,16 @@ type executionPreflightReceiptConflictError struct {
 	cause error
 }
 
+// executionPreflightReceiptLegacyConflictError reports a refused differing
+// republish for a markerless legacy receipt: the store cannot prove the
+// session never spawned, so it keeps the bytes immutable. It unwraps to the
+// os.ErrExist-bearing link error like the spawned conflict, but the NACK
+// path projects it as a host defect (safe to redeliver elsewhere) rather
+// than a terminal session defect.
+type executionPreflightReceiptLegacyConflictError struct {
+	cause error
+}
+
 func (e *executionPreflightReceiptConflictError) Error() string {
 	if e == nil || e.cause == nil {
 		return "publish immutable execution preflight receipt: file exists"
@@ -99,6 +112,20 @@ func (e *executionPreflightReceiptConflictError) Unwrap() error {
 	return e.cause
 }
 
+func (e *executionPreflightReceiptLegacyConflictError) Error() string {
+	if e == nil || e.cause == nil {
+		return "publish immutable execution preflight receipt: file exists"
+	}
+	return "publish immutable execution preflight receipt: " + e.cause.Error()
+}
+
+func (e *executionPreflightReceiptLegacyConflictError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
+
 // Persist fsyncs the one immutable initial receipt for sessionID.
 //
 // Persist is idempotent for identical bytes: when the session already has a
@@ -107,8 +134,10 @@ func (e *executionPreflightReceiptConflictError) Unwrap() error {
 // receipt can be accepted again. A different receipt for the same session
 // whose spawn was already committed (or whose start authority was consumed)
 // is still refused, and that error wraps os.ErrExist. A different receipt
-// for a session that never spawned is atomically published over the stale
-// one, so a transient pre-spawn failure does not wedge every redelivery.
+// for a session that carries the attempt-pending marker and never spawned
+// is atomically published over the stale one, so a transient pre-spawn
+// failure does not wedge every redelivery. A different receipt for a
+// markerless legacy receipt is refused without touching the stored bytes.
 func (s *FileExecutionPreflightStore) Persist(sessionID string, receipt json.RawMessage) error {
 	if s == nil || strings.TrimSpace(s.dir) == "" {
 		return errors.New("execution preflight receipt directory is required")
@@ -172,19 +201,32 @@ func (s *FileExecutionPreflightStore) Persist(sessionID string, receipt json.Raw
 		}
 		return s.reaffirmRoot(root)
 	}
+	if err := s.ensureExecutionPreflightAttemptPending(root, sessionID); err != nil {
+		return err
+	}
 	return s.reaffirmRoot(root)
 }
 
 // replaceUnspawnedReceipt atomically publishes the fully fsynced pending
-// file over an existing differing receipt for a session that never spawned.
-// The rename replaces the directory entry and never follows a destination
-// symlink, so a name swapped to a link between the checks is replaced, never
-// traversed: nothing outside the root is ever written through. A pre-created
-// symlink or non-regular incumbent is still refused without touching it, and
-// any spawn, start, or retirement marker keeps the receipt immutable.
+// file over an existing differing receipt for a session that carries the
+// attempt-pending marker and never spawned. The rename replaces the
+// directory entry and never follows a destination symlink, so a name swapped
+// to a link between the checks is replaced, never traversed: nothing outside
+// the root is ever written through. A pre-created symlink or non-regular
+// incumbent is still refused without touching it, and any spawn, start, or
+// retirement marker keeps the receipt immutable. A receipt without the
+// attempt-pending marker is legacy and stays immutable: the store cannot
+// prove it never spawned.
 func (s *FileExecutionPreflightStore) replaceUnspawnedReceipt(root *os.Root, sessionID, finalName, pendingName string, linkErr error) error {
 	conflict := func() error {
 		return &executionPreflightReceiptConflictError{cause: linkErr}
+	}
+	legacyConflict := func() error {
+		return &executionPreflightReceiptLegacyConflictError{cause: linkErr}
+	}
+	pendingInfo, err := root.Lstat(executionPreflightAttemptPendingName(sessionID))
+	if err != nil || !pendingInfo.Mode().IsRegular() {
+		return legacyConflict()
 	}
 	for _, marker := range []string{
 		executionPreflightSpawnName(sessionID),
@@ -313,10 +355,60 @@ func executionPreflightStartName(sessionID string) string {
 // executionPreflightSpawnName is the post-commit spawn marker. It is written
 // exactly once, after the spawner accepts the session, and gates receipt
 // replacement: a receipt with this marker belongs to a live (or lived)
-// worker and stays immutable, while a receipt without it never produced a
-// worker and may be replaced by a redelivered attempt.
+// worker and stays immutable. A receipt without the attempt-pending marker
+// is legacy and stays immutable even without this marker; only a receipt
+// carrying the pending marker and none of the terminal markers may be
+// replaced by a redelivered attempt.
 func executionPreflightSpawnName(sessionID string) string {
 	return strings.TrimSuffix(executionPreflightReceiptName(sessionID), ".json") + ".spawned.json"
+}
+
+// executionPreflightAttemptPendingName is the affirmative replaceability
+// marker for the new lifecycle. It is published atomically inside the store
+// root alongside the first receipt and never follows symlinks. Only a
+// receipt carrying this regular-file marker, with no spawn, start, or
+// retirement marker, may be replaced. A receipt without it is legacy and
+// stays immutable.
+func executionPreflightAttemptPendingName(sessionID string) string {
+	return strings.TrimSuffix(executionPreflightReceiptName(sessionID), ".json") + ".attempt-pending.json"
+}
+
+type fileExecutionPreflightAttemptPendingRecord struct {
+	ContractVersion string `json:"contractVersion"`
+	RequestID       string `json:"requestId"`
+}
+
+const fileExecutionPreflightAttemptPendingVersion = "execution-preflight-attempt-pending/v1"
+
+// ensureExecutionPreflightAttemptPending publishes the attempt-pending marker
+// for sessionID when absent. The marker is created through a temp file plus
+// hard link inside the store root, so creation is atomic and never follows a
+// destination symlink. An existing regular-file marker is idempotent; a
+// symlink or non-regular incumbent fails closed without being touched.
+func (s *FileExecutionPreflightStore) ensureExecutionPreflightAttemptPending(root *os.Root, sessionID string) error {
+	name := executionPreflightAttemptPendingName(sessionID)
+	if info, err := root.Lstat(name); err == nil {
+		if !info.Mode().IsRegular() {
+			return &executionPreflightReceiptLegacyConflictError{cause: os.ErrExist}
+		}
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("publish immutable execution preflight receipt: %w", err)
+	}
+	raw, err := json.Marshal(fileExecutionPreflightAttemptPendingRecord{ContractVersion: fileExecutionPreflightAttemptPendingVersion, RequestID: sessionID})
+	if err != nil {
+		return err
+	}
+	if err := durableLocalPreflightRecord(root, name, raw); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			if info, statErr := root.Lstat(name); statErr == nil && info.Mode().IsRegular() {
+				return nil
+			}
+			return &executionPreflightReceiptLegacyConflictError{cause: err}
+		}
+		return fmt.Errorf("publish immutable execution preflight receipt: %w", err)
+	}
+	return nil
 }
 
 type fileExecutionPreflightSpawnRecord struct {
