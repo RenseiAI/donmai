@@ -3268,7 +3268,13 @@ func (d *Daemon) acceptWorkWithDetail(spec SessionSpec, detail *SessionDetail, p
 	// arm the spawn marker below; legacy detail-free work leaves no receipt
 	// to protect.
 	receiptCommitted := false
+	var detailLease sessionDetailLease
+	detailReserved := false
+	detailTransferred := false
 	defer func() {
+		if detailReserved && !detailTransferred && d.sessionDetails != nil {
+			d.sessionDetails.DeleteIfOwner(detailLease)
+		}
 		if configReserved && !configLeaseTransferred && d.preflightConfigs != nil {
 			d.preflightConfigs.cleanupIfOwner(spec.SessionID, configGeneration)
 		}
@@ -3364,6 +3370,19 @@ func (d *Daemon) acceptWorkWithDetail(spec SessionSpec, detail *SessionDetail, p
 		// seat's deny at an arbitrary host file.
 		if path := strings.TrimSpace(d.opts.ControlTokenPath); path != "" {
 			detail.ControlTokenPath = path
+		}
+		// Reserve the session before compiling or publishing its receipt and
+		// hold the lease through spawn and marker completion. A contender
+		// that loses this reservation returns before touching the durable
+		// receipt, so concurrent deliveries cannot leave the winner's worker
+		// holding the loser's bytes.
+		if d.sessionDetails != nil {
+			var stored bool
+			detailLease, stored = d.sessionDetails.StoreIfAbsent(detail)
+			if !stored {
+				return nil, fmt.Errorf("session %q already has an active detail", spec.SessionID)
+			}
+			detailReserved = true
 		}
 		if len(detail.AdmissionReceipt) > 0 {
 			// The narrow-only claim gate runs first: for a claim-bound
@@ -3712,32 +3731,12 @@ func (d *Daemon) acceptWorkWithDetail(spec SessionSpec, detail *SessionDetail, p
 			receiptCommitted = len(persistedReceipt) > 0
 		}
 	}
-	var detailLease sessionDetailLease
-	if detail != nil && d.sessionDetails != nil {
-		var stored bool
-		detailLease, stored = d.sessionDetails.StoreIfAbsent(detail)
-		if !stored {
-			return nil, fmt.Errorf("session %q already has an active detail", spec.SessionID)
-		}
-	}
 	if localPreflightRequest != nil && localPreflightResponse != nil && preflightReplay != nil {
 		if err := preflightReplay.BeginExecutionPreflightStart(context.Background(), *localPreflightRequest, *localPreflightResponse); err != nil {
-			if detailLease.generation != 0 {
-				d.sessionDetails.DeleteIfOwner(detailLease)
-			}
-			if configReserved {
-				d.preflightConfigs.cleanupIfOwner(spec.SessionID, configGeneration)
-			}
 			return nil, fmt.Errorf("consume host execution preflight start authority: %w", err)
 		}
 		if localPreflight != nil {
 			if err := localPreflight.beginExecutionPreflightStart(context.Background(), *localPreflightRequest, *localPreflightResponse); err != nil {
-				if detailLease.generation != 0 {
-					d.sessionDetails.DeleteIfOwner(detailLease)
-				}
-				if configReserved {
-					d.preflightConfigs.cleanupIfOwner(spec.SessionID, configGeneration)
-				}
 				retireErr := preflightReplay.RetireExecutionPreflight(context.Background(), spec.SessionID)
 				if retireErr != nil {
 					return nil, errors.Join(fmt.Errorf("consume local execution preflight start authority: %w", err), fmt.Errorf("retire host execution preflight start: %w", retireErr))
@@ -3748,12 +3747,6 @@ func (d *Daemon) acceptWorkWithDetail(spec SessionSpec, detail *SessionDetail, p
 	}
 	handle, err := d.spawner.AcceptWork(spec)
 	if err != nil {
-		if detailLease.generation != 0 {
-			d.sessionDetails.DeleteIfOwner(detailLease)
-		}
-		if configReserved {
-			d.preflightConfigs.cleanupIfOwner(spec.SessionID, configGeneration)
-		}
 		if localPreflight != nil {
 			if retireErr := localPreflight.retireExecutionPreflight(context.Background(), spec.SessionID); retireErr != nil {
 				return nil, errors.Join(err, fmt.Errorf("retire failed local execution preflight start: %w", retireErr))
@@ -3779,6 +3772,9 @@ func (d *Daemon) acceptWorkWithDetail(spec SessionSpec, detail *SessionDetail, p
 					"session_id", spec.SessionID, "error", markErr.Error())
 			}
 		}
+	}
+	if detailReserved {
+		detailTransferred = true
 	}
 	if configReserved {
 		configLeaseTransferred = true
