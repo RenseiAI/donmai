@@ -301,7 +301,7 @@ func (h hangServer) handler() http.HandlerFunc {
 		if r.Method == http.MethodDelete {
 			if h.hangDelete {
 				<-r.Context().Done()
-			return
+				return
 			}
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -376,7 +376,7 @@ func TestHTTPClient_TimeoutsAgainstNeverAnsweringServer(t *testing.T) {
 				return
 			}
 
-				c, err := dial()
+			c, err := dial()
 			if err != nil {
 				t.Fatalf("Dial: %v", err)
 			}
