@@ -2,10 +2,13 @@ package daemon
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -156,8 +159,10 @@ func TestFileExecutionPreflightStoreIsDurableAndAppendOnly(t *testing.T) {
 }
 
 // A redelivered claim recompiles the same receipt. Persisting identical bytes
-// again must succeed without touching the stored receipt; anything else for
-// the same session is refused with an error that wraps os.ErrExist.
+// again must succeed without touching the stored receipt, even after the
+// spawn committed; anything else for a spawned session is refused with an
+// error that wraps os.ErrExist. (The never-spawned replacement path is
+// covered by TestFileExecutionPreflightStorePersistReplacesOnlyUnspawnedReceipt.)
 func TestFileExecutionPreflightStorePersistIsIdempotentForIdenticalBytes(t *testing.T) {
 	const sessionID = "session-retry"
 	first := rawJSON(t, executioncell.HostAdaptationReceipt{
@@ -192,6 +197,9 @@ func TestFileExecutionPreflightStorePersistIsIdempotentForIdenticalBytes(t *test
 			if err := store.Persist(sessionID, first); err != nil {
 				t.Fatalf("first persist: %v", err)
 			}
+			if err := store.MarkExecutionPreflightSpawned(sessionID); err != nil {
+				t.Fatalf("mark spawned: %v", err)
+			}
 			err := store.Persist(sessionID, tc.second)
 			if tc.wantErr {
 				if err == nil {
@@ -214,8 +222,8 @@ func TestFileExecutionPreflightStorePersistIsIdempotentForIdenticalBytes(t *test
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(entries) != 1 {
-				t.Fatalf("receipt dir entries = %d, want 1 (no leftover pending files)", len(entries))
+			if len(entries) != 2 {
+				t.Fatalf("receipt dir entries = %d, want 2 (receipt plus spawn marker, no leftover pending files)", len(entries))
 			}
 		})
 	}
@@ -429,4 +437,171 @@ func TestFileExecutionPreflightStoreRefusesDestinationSymlink(t *testing.T) {
 	if err != nil || string(got) != "unchanged" {
 		t.Fatalf("outside target changed: %q err=%v", got, err)
 	}
+}
+
+// varyingReadyExecutionPreflight compiles a valid ready receipt whose plan
+// differs on every call, modelling a redelivery that rebuilds the receipt
+// from changed inputs.
+type varyingReadyExecutionPreflight struct {
+	calls     atomic.Int32
+	sessionID string
+	workerID  string
+	placement string
+}
+
+func (p *varyingReadyExecutionPreflight) Names() []string { return []string{"stub"} }
+func (p *varyingReadyExecutionPreflight) Capabilities(string) (map[string]any, bool) {
+	return map[string]any{}, true
+}
+
+func (p *varyingReadyExecutionPreflight) PreflightExecution(json.RawMessage) (json.RawMessage, error) {
+	n := p.calls.Add(1)
+	plan := []byte(`{"step":` + strconv.Itoa(int(n)) + `}`)
+	sum := sha256.Sum256(plan)
+	raw, err := json.Marshal(executioncell.HostAdaptationReceipt{
+		ContractVersion:      executioncell.HostAdaptationContractVersion,
+		RequestID:            p.sessionID,
+		WorkerID:             p.workerID,
+		PlacementID:          p.placement,
+		Decision:             "ready",
+		Plan:                 plan,
+		PlanDigest:           hex.EncodeToString(sum[:]),
+		PromptReceipt:        json.RawMessage(`{"decision":"ready"}`),
+		ToolLifecycleReceipt: json.RawMessage(`{"decision":"ready"}`),
+	})
+	if err != nil {
+		return nil, err
+	}
+	return raw, nil
+}
+
+func readyRedeliveryDetail(t *testing.T, sessionID string) *SessionDetail {
+	t.Helper()
+	cell := daemonExecutionCell()
+	binding := executioncell.RuntimeBinding{
+		ContractVersion: executioncell.RuntimeBindingContractVersion,
+		RequestID:       sessionID,
+		WorkerID:        "worker-local",
+		PlacementID:     cell.Placement.ID,
+	}
+	return &SessionDetail{
+		SessionID:               sessionID,
+		WorkerID:                "worker-local",
+		AdmissionReceipt:        json.RawMessage(`{"paired":"admission"}`),
+		EffectiveCell:           rawJSON(t, cell),
+		ExecutionRuntimeBinding: rawJSON(t, binding),
+	}
+}
+
+// A first accept that fails before spawn (here: a pre-spawn credential
+// refusal) must not wedge the session: the redelivery replaces the
+// never-spawned receipt and spawns. Afterwards the receipt is immutable.
+func TestRedeliveredSessionAfterPreSpawnFailureAccepts(t *testing.T) {
+	tmp := t.TempDir()
+	const sessionID = "session-prespawn-redelivery"
+	if err := WriteConfig(filepath.Join(tmp, "daemon.yaml"), &Config{
+		APIVersion: "donmai.dev/v1", Kind: "LocalDaemon", ProjectAdmissionVersion: ProjectAdmissionVersionV2,
+		ProjectAdmissionMode: ProjectAdmissionModeAllRouted, Machine: MachineConfig{ID: "redelivery-test"},
+		Capacity:     CapacityConfig{MaxConcurrentSessions: 8},
+		Orchestrator: OrchestratorConfig{URL: "https://example.test"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	provider := &varyingReadyExecutionPreflight{sessionID: sessionID, workerID: "worker-local", placement: "host-local"}
+	store := NewFileExecutionPreflightStore(filepath.Join(tmp, "receipts"))
+	var hookCalls atomic.Int32
+	failHook := atomic.Bool{}
+	failHook.Store(true)
+	d := New(Options{
+		ConfigPath: filepath.Join(tmp, "daemon.yaml"), JWTPath: filepath.Join(tmp, "daemon.jwt"),
+		SkipWizard: true, SkipRegistration: true, ProviderRegistry: provider, ExecutionPreflightStore: store,
+		SpawnerOptions: SpawnerOptions{
+			WorkerCommand:        []string{"/bin/sh", "-c", "exit 0"},
+			ProjectAdmissionMode: ProjectAdmissionModeAllRouted,
+			OnPreSpawn: func(_ SessionSpec, env []string) ([]string, error) {
+				if hookCalls.Add(1) == 1 && failHook.Load() {
+					return nil, errors.New("keyed session requires a credential snapshot and none is available")
+				}
+				return env, nil
+			},
+		},
+	})
+	if err := d.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = d.Stop(context.Background()) })
+
+	// ProjectID routes past project admission (default all-routed mode) to the
+	// preflight and spawn stages this test exercises.
+	spec := SessionSpec{SessionID: sessionID, ProjectID: "project-test"}
+	_, err := d.AcceptWorkWithDetail(spec, readyRedeliveryDetail(t, sessionID))
+	if err == nil {
+		t.Fatal("first accept with a failing pre-spawn hook succeeded")
+	}
+	var hookErr *preSpawnHookError
+	if !errors.As(err, &hookErr) {
+		t.Fatalf("first accept error = %v, want the typed pre-spawn hook failure", err)
+	}
+	if defect := acceptDefectNackReasonForError(err); defect == nil || defect.Defect != acceptDefectHost {
+		t.Fatalf("first accept defect = %+v, want the host-defect NACK reason", defect)
+	}
+
+	failHook.Store(false)
+	handle, err := d.AcceptWorkWithDetail(spec, readyRedeliveryDetail(t, sessionID))
+	if err != nil {
+		t.Fatalf("redelivery after pre-spawn failure: %v", err)
+	}
+	if handle == nil {
+		t.Fatal("redelivery accepted without a session handle")
+	}
+	if got := provider.calls.Load(); got != 2 {
+		t.Fatalf("preflight compilations = %d, want 2 (one per attempt)", got)
+	}
+	stored, err := store.Load(sessionID)
+	if err != nil {
+		t.Fatalf("load after redelivery: %v", err)
+	}
+	// The redelivery replaced the stale first-attempt receipt: the stored
+	// bytes are the second compilation, not the first.
+	if hookCalls.Load() != 2 {
+		t.Fatalf("pre-spawn hook calls = %d, want 2", hookCalls.Load())
+	}
+	entries, err := os.ReadDir(filepath.Join(tmp, "receipts"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("receipt dir entries = %d, want 2 (receipt plus spawn marker)", len(entries))
+	}
+	third := varyingReadyReceipt(t, sessionID, 999)
+	conflictErr := store.Persist(sessionID, third)
+	if conflictErr == nil {
+		t.Fatal("differing republish after the spawn committed succeeded")
+	}
+	if !errors.Is(conflictErr, os.ErrExist) {
+		t.Fatalf("differing republish error = %v, want it to wrap os.ErrExist", conflictErr)
+	}
+	if defect := acceptDefectNackReasonForError(conflictErr); defect == nil || defect.Defect != acceptDefectSession {
+		t.Fatalf("spawned-conflict defect = %+v, want the session-defect NACK reason", defect)
+	}
+	if err := store.Persist(sessionID, stored); err != nil {
+		t.Fatalf("identical republish after the spawn committed: %v", err)
+	}
+}
+
+func varyingReadyReceipt(t *testing.T, sessionID string, step int) json.RawMessage {
+	t.Helper()
+	plan := []byte(`{"step":` + strconv.Itoa(step) + `}`)
+	sum := sha256.Sum256(plan)
+	return rawJSON(t, executioncell.HostAdaptationReceipt{
+		ContractVersion:      executioncell.HostAdaptationContractVersion,
+		RequestID:            sessionID,
+		WorkerID:             "worker-local",
+		PlacementID:          "host-local",
+		Decision:             "ready",
+		Plan:                 plan,
+		PlanDigest:           hex.EncodeToString(sum[:]),
+		PromptReceipt:        json.RawMessage(`{"decision":"ready"}`),
+		ToolLifecycleReceipt: json.RawMessage(`{"decision":"ready"}`),
+	})
 }

@@ -3263,6 +3263,11 @@ func (d *Daemon) acceptWorkWithDetail(spec SessionSpec, detail *SessionDetail, p
 	var configGeneration uint64
 	configReserved := false
 	configLeaseTransferred := false
+	// receiptCommitted reports whether this accept published (or replayed) a
+	// durable preflight receipt for the session. Only receipt-bearing accepts
+	// arm the spawn marker below; legacy detail-free work leaves no receipt
+	// to protect.
+	receiptCommitted := false
 	defer func() {
 		if configReserved && !configLeaseTransferred && d.preflightConfigs != nil {
 			d.preflightConfigs.cleanupIfOwner(spec.SessionID, configGeneration)
@@ -3704,6 +3709,7 @@ func (d *Daemon) acceptWorkWithDetail(spec SessionSpec, detail *SessionDetail, p
 				return nil, fmt.Errorf("execution adaptation preflight: %w", preflightErr)
 			}
 			detail.HostAdaptationReceipt = append(json.RawMessage(nil), persistedReceipt...)
+			receiptCommitted = len(persistedReceipt) > 0
 		}
 	}
 	var detailLease sessionDetailLease
@@ -3759,6 +3765,20 @@ func (d *Daemon) acceptWorkWithDetail(spec SessionSpec, detail *SessionDetail, p
 			}
 		}
 		return nil, err
+	}
+	// The spawn committed: record it so the session's receipt turns immutable
+	// from here on. A redelivery can still replace the receipt of an attempt
+	// that never got this far, but never the receipt of a live worker. The
+	// marker is bookkeeping, not authority: the worker is already running, so
+	// a marker failure is logged and the accept still succeeds rather than
+	// orphaning a live child behind a false rejection.
+	if receiptCommitted {
+		if tracker, ok := d.opts.ExecutionPreflightStore.(ExecutionPreflightSpawnTracker); ok {
+			if markErr := tracker.MarkExecutionPreflightSpawned(spec.SessionID); markErr != nil {
+				slog.Warn("daemon accept: spawn marker not recorded; receipt stays replaceable",
+					"session_id", spec.SessionID, "error", markErr.Error())
+			}
+		}
 	}
 	if configReserved {
 		configLeaseTransferred = true

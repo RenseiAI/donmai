@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/executioncell"
 	"github.com/RenseiAI/donmai/internal/kit"
 	"github.com/RenseiAI/donmai/kgextract"
@@ -1091,6 +1092,63 @@ func receiptPreflightNackReasonForError(err error) *receiptPreflightNackReason {
 	}
 }
 
+// acceptDefectNackReasonContractVersion identifies the additive, closed
+// host-vs-session defect projection on the NACK wire. It tells the
+// orchestrator whether redelivering the session elsewhere can succeed
+// (host defect: this machine's environment refused, e.g. a pre-spawn
+// credential prerequisite) or is futile (session defect: the session's own
+// content can never be admitted, e.g. a spawned session's receipt was
+// republished with different bytes).
+const acceptDefectNackReasonContractVersion = "accept-defect-nack-reason/v1"
+
+const (
+	// acceptDefectHost marks a host defect: the session is intact, but this
+	// machine refused it on environmental grounds. Safe to redeliver.
+	acceptDefectHost = "host"
+	// acceptDefectSession marks a session defect: redelivery fails everywhere
+	// the same way. The session should fail rather than bounce.
+	acceptDefectSession = "session"
+)
+
+type acceptDefectNackReason struct {
+	ContractVersion string `json:"contractVersion"`
+	Defect          string `json:"defect"`
+}
+
+// acceptDefectNackReasonForError projects the typed accept failure onto its
+// closed host/session defect report. Only canonical typed causes project;
+// prose is never trusted, so an untyped error with the same text yields no
+// report and the orchestrator keeps its legacy behaviour. Unrecognized typed
+// failures also omit the report rather than guessing.
+func acceptDefectNackReasonForError(err error) *acceptDefectNackReason {
+	if err == nil {
+		return nil
+	}
+	// A durable permanent pre-spawn denial is terminal session evidence: the
+	// session itself can never run, on any host.
+	if durablePermanentDenialReport(err) != nil {
+		return &acceptDefectNackReason{ContractVersion: acceptDefectNackReasonContractVersion, Defect: acceptDefectSession}
+	}
+	// A pre-spawn hook refusal (credential snapshot unavailable, environment
+	// prerequisite missing) is this host's state, not the session's content.
+	var hookErr *preSpawnHookError
+	if errors.As(err, &hookErr) {
+		return &acceptDefectNackReason{ContractVersion: acceptDefectNackReasonContractVersion, Defect: acceptDefectHost}
+	}
+	// A refused differing republish means the session already spawned: its
+	// receipt is immutable, so redelivery fails identically everywhere.
+	var conflictErr *executionPreflightReceiptConflictError
+	if errors.As(err, &conflictErr) {
+		return &acceptDefectNackReason{ContractVersion: acceptDefectNackReasonContractVersion, Defect: acceptDefectSession}
+	}
+	// An execution-security refusal rejects the session's own stamp on every
+	// host for the same harness.
+	if refusal := agent.ExecutionSecurityRefusalFromError(err); refusal != nil {
+		return &acceptDefectNackReason{ContractVersion: acceptDefectNackReasonContractVersion, Defect: acceptDefectSession}
+	}
+	return nil
+}
+
 // subscriptionWindowExhaustedReport is the additive, closed quota-exhaustion
 // projection on the NACK wire. It is emitted only for the typed admission
 // refusal with a validated sibling claimAttempt; every other error omits it.
@@ -1172,6 +1230,7 @@ func NackRejectedWork(
 		receiptPreflightNackReasonForError(acceptErr),
 		quotaExhausted,
 		permanentDenial,
+		acceptDefectNackReasonForError(acceptErr),
 		item,
 	)
 }
@@ -1191,6 +1250,7 @@ func callNackEndpoint(
 	receiptPreflightReason *receiptPreflightNackReason,
 	quotaExhausted *subscriptionWindowExhaustedReport,
 	permanentDenial *preSpawnPermanentDenialReport,
+	acceptDefect *acceptDefectNackReason,
 	work *PollWorkItem,
 ) error {
 	if sessionID == "" {
@@ -1218,6 +1278,7 @@ func callNackEndpoint(
 		ClaimAttempt            *workClaimAttemptProof             `json:"claimAttempt,omitempty"`
 		SubscriptionExhausted   *subscriptionWindowExhaustedReport `json:"subscriptionWindowExhausted,omitempty"`
 		PreSpawnPermanentDenial *preSpawnPermanentDenialReport     `json:"preSpawnPermanentDenial,omitempty"`
+		AcceptDefect            *acceptDefectNackReason            `json:"acceptDefect,omitempty"`
 		Work                    *PollWorkItem                      `json:"work"`
 	}{
 		WorkerID:                workerID,
@@ -1226,6 +1287,7 @@ func callNackEndpoint(
 		ClaimAttempt:            work.claimAttempt,
 		SubscriptionExhausted:   quotaExhausted,
 		PreSpawnPermanentDenial: permanentDenial,
+		AcceptDefect:            acceptDefect,
 		Work:                    work,
 	}
 	buf, err := json.Marshal(body)

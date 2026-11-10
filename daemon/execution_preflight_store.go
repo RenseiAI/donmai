@@ -15,8 +15,13 @@ import (
 	"github.com/RenseiAI/donmai/executioncell"
 )
 
-// FileExecutionPreflightStore is an append-only, fsync-backed receipt store.
-// One immutable initial receipt is allowed per session id.
+// FileExecutionPreflightStore is an fsync-backed receipt store with
+// append-only semantics once a session has spawned. One initial receipt is
+// published per session id; while the session never spawned (no spawn, start,
+// or retirement marker) a redelivered attempt may atomically replace it, so a
+// transient pre-spawn failure does not wedge every redelivery on the stale
+// bytes. After the spawn is committed the receipt is immutable and a
+// differing republish is still refused.
 type FileExecutionPreflightStore struct {
 	dir      string
 	syncRoot func(*os.Root) error
@@ -34,6 +39,16 @@ type ExecutionPreflightReplayStore interface {
 	Load(sessionID string) (json.RawMessage, error)
 	BeginExecutionPreflightStart(context.Context, executioncell.PreflightRegistrationRequest, executioncell.PreflightRegistrationResponse) error
 	RetireExecutionPreflight(context.Context, string) error
+}
+
+// ExecutionPreflightSpawnTracker is an optional ExecutionPreflightStore
+// extension that records the moment a session's spawn commits. The receipt
+// store uses the marker to tell a never-spawned attempt (safe to replace on
+// redelivery) from a spawned one (immutable). Stores without this extension
+// keep the legacy refuse-every-differing-republish behaviour.
+type ExecutionPreflightSpawnTracker interface {
+	ExecutionPreflightStore
+	MarkExecutionPreflightSpawned(sessionID string) error
 }
 
 // NewFileExecutionPreflightStore constructs an append-only store rooted at dir.
@@ -60,13 +75,40 @@ func (s *FileExecutionPreflightStore) reaffirmRoot(root *os.Root) error {
 	return s.syncRoot(root)
 }
 
+// executionPreflightReceiptConflictError reports a refused differing
+// republish: the session already owns a receipt (or lifecycle marker) that a
+// new attempt must not disturb. It unwraps to the os.ErrExist-bearing link
+// error so callers keep treating it as an existence conflict, while letting
+// the NACK path tell a spawned-session conflict (session defect, redelivery
+// is futile) from a host-environment failure (safe to redeliver).
+type executionPreflightReceiptConflictError struct {
+	cause error
+}
+
+func (e *executionPreflightReceiptConflictError) Error() string {
+	if e == nil || e.cause == nil {
+		return "publish immutable execution preflight receipt: file exists"
+	}
+	return "publish immutable execution preflight receipt: " + e.cause.Error()
+}
+
+func (e *executionPreflightReceiptConflictError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
+
 // Persist fsyncs the one immutable initial receipt for sessionID.
 //
 // Persist is idempotent for identical bytes: when the session already has a
 // receipt whose content is byte-identical to receipt, it reaffirms the
 // directory and returns nil, so a redelivered claim that compiles the same
-// receipt can be accepted again. A different receipt for the same session is
-// still refused, and that error wraps os.ErrExist.
+// receipt can be accepted again. A different receipt for the same session
+// whose spawn was already committed (or whose start authority was consumed)
+// is still refused, and that error wraps os.ErrExist. A different receipt
+// for a session that never spawned is atomically published over the stale
+// one, so a transient pre-spawn failure does not wedge every redelivery.
 func (s *FileExecutionPreflightStore) Persist(sessionID string, receipt json.RawMessage) error {
 	if s == nil || strings.TrimSpace(s.dir) == "" {
 		return errors.New("execution preflight receipt directory is required")
@@ -119,12 +161,55 @@ func (s *FileExecutionPreflightStore) Persist(sessionID string, receipt json.Raw
 	// rename, cannot replace an existing receipt or follow a destination
 	// symlink. Both names are constrained by os.Root.
 	if err := root.Link(pendingName, finalName); err != nil {
-		if errors.Is(err, os.ErrExist) && storedReceiptEquals(root, finalName, receipt, s.preOpenHook) {
+		if !errors.Is(err, os.ErrExist) {
+			return fmt.Errorf("publish immutable execution preflight receipt: %w", err)
+		}
+		if storedReceiptEquals(root, finalName, receipt, s.preOpenHook) {
 			return s.reaffirmRoot(root)
 		}
-		return fmt.Errorf("publish immutable execution preflight receipt: %w", err)
+		if replaceErr := s.replaceUnspawnedReceipt(root, sessionID, finalName, pendingName, err); replaceErr != nil {
+			return replaceErr
+		}
+		return s.reaffirmRoot(root)
 	}
 	return s.reaffirmRoot(root)
+}
+
+// replaceUnspawnedReceipt atomically publishes the fully fsynced pending
+// file over an existing differing receipt for a session that never spawned.
+// The rename replaces the directory entry and never follows a destination
+// symlink, so a name swapped to a link between the checks is replaced, never
+// traversed: nothing outside the root is ever written through. A pre-created
+// symlink or non-regular incumbent is still refused without touching it, and
+// any spawn, start, or retirement marker keeps the receipt immutable.
+func (s *FileExecutionPreflightStore) replaceUnspawnedReceipt(root *os.Root, sessionID, finalName, pendingName string, linkErr error) error {
+	conflict := func() error {
+		return &executionPreflightReceiptConflictError{cause: linkErr}
+	}
+	for _, marker := range []string{
+		executionPreflightSpawnName(sessionID),
+		executionPreflightStartName(sessionID),
+		executionPreflightRetirementName(sessionID),
+	} {
+		exists, err := localPreflightRecordExists(root, marker)
+		if err != nil {
+			return fmt.Errorf("publish immutable execution preflight receipt: %w", err)
+		}
+		if exists {
+			return conflict()
+		}
+	}
+	info, err := root.Lstat(finalName)
+	if err != nil || !info.Mode().IsRegular() {
+		return conflict()
+	}
+	if s.preOpenHook != nil {
+		s.preOpenHook()
+	}
+	if err := root.Rename(pendingName, finalName); err != nil {
+		return fmt.Errorf("publish immutable execution preflight receipt: %w", err)
+	}
+	return nil
 }
 
 // storedReceiptEquals reports whether name is a regular file inside root whose
@@ -223,6 +308,65 @@ type fileExecutionPreflightRetirementRecord struct {
 
 func executionPreflightStartName(sessionID string) string {
 	return strings.TrimSuffix(executionPreflightReceiptName(sessionID), ".json") + ".started.json"
+}
+
+// executionPreflightSpawnName is the post-commit spawn marker. It is written
+// exactly once, after the spawner accepts the session, and gates receipt
+// replacement: a receipt with this marker belongs to a live (or lived)
+// worker and stays immutable, while a receipt without it never produced a
+// worker and may be replaced by a redelivered attempt.
+func executionPreflightSpawnName(sessionID string) string {
+	return strings.TrimSuffix(executionPreflightReceiptName(sessionID), ".json") + ".spawned.json"
+}
+
+type fileExecutionPreflightSpawnRecord struct {
+	ContractVersion string `json:"contractVersion"`
+	RequestID       string `json:"requestId"`
+}
+
+const fileExecutionPreflightSpawnVersion = "execution-preflight-spawn/v1"
+
+// MarkExecutionPreflightSpawned records that the session's spawn committed.
+// The marker is append-only and idempotent: remarking the same session
+// reaffirms the directory and returns nil. It never alters the receipt.
+func (s *FileExecutionPreflightStore) MarkExecutionPreflightSpawned(sessionID string) error {
+	if s == nil || strings.TrimSpace(s.dir) == "" {
+		return errors.New("execution preflight receipt directory is required")
+	}
+	if strings.TrimSpace(sessionID) == "" {
+		return errors.New("invalid execution preflight session id")
+	}
+	if err := os.MkdirAll(s.dir, 0o700); err != nil {
+		return fmt.Errorf("create execution preflight receipt directory: %w", err)
+	}
+	root, err := os.OpenRoot(s.dir)
+	if err != nil {
+		return fmt.Errorf("open execution preflight receipt root: %w", err)
+	}
+	defer func() { _ = root.Close() }()
+	name := executionPreflightSpawnName(sessionID)
+	raw, err := json.Marshal(fileExecutionPreflightSpawnRecord{ContractVersion: fileExecutionPreflightSpawnVersion, RequestID: sessionID})
+	if err != nil {
+		return err
+	}
+	if existing, readErr := readLocalPreflightRecord(root, name); readErr == nil {
+		if !bytes.Equal(existing, raw) {
+			return errors.New("execution preflight spawn marker changed")
+		}
+		return s.reaffirmRoot(root)
+	} else if !errors.Is(readErr, os.ErrNotExist) {
+		return readErr
+	}
+	if err := durableLocalPreflightRecord(root, name, raw); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			if existing, readErr := readLocalPreflightRecord(root, name); readErr == nil && bytes.Equal(existing, raw) {
+				return s.reaffirmRoot(root)
+			}
+			return errors.New("execution preflight spawn marker changed")
+		}
+		return err
+	}
+	return s.reaffirmRoot(root)
 }
 
 func executionPreflightRetirementName(sessionID string) string {

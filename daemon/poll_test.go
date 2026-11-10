@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -1244,6 +1245,7 @@ func TestCallNackEndpoint_PostsExpectedShape(t *testing.T) {
 		nil,
 		nil,
 		nil,
+		nil,
 		item,
 	)
 	if err != nil {
@@ -1301,6 +1303,7 @@ func TestCallNackEndpoint_PropagatesServerError(t *testing.T) {
 		nil,
 		nil,
 		nil,
+		nil,
 		&PollWorkItem{SessionID: "s1", IssueID: "i", IssueIdentifier: "OPS-1", Priority: 1, QueuedAt: 1},
 	)
 	if err == nil {
@@ -1329,7 +1332,7 @@ func TestCallNackEndpoint_RejectsMissingArgs(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			err := callNackEndpoint(
-				context.Background(), nil, "http://x", tc.sessionID, tc.workerID, "j", "r", nil, nil, nil, tc.work,
+				context.Background(), nil, "http://x", tc.sessionID, tc.workerID, "j", "r", nil, nil, nil, nil, tc.work,
 			)
 			if err == nil {
 				t.Fatalf("expected error")
@@ -1515,6 +1518,7 @@ func TestCallNackEndpoint_ReceiptPreflightReasonWire(t *testing.T) {
 				"accept work failed: "+tc.err.Error(), receiptPreflightNackReasonForError(tc.err),
 				nil,
 				nil,
+				nil,
 				&PollWorkItem{SessionID: "s1", IssueID: "iss-1", IssueIdentifier: "OPS-1", Priority: 1, QueuedAt: 1},
 			)
 			if err != nil {
@@ -1574,7 +1578,7 @@ func TestCallNackEndpoint_SubscriptionWindowExhaustedWire(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if err := callNackEndpoint(context.Background(), nil, srv.URL, "s1", "wkr-1", "jwt-token",
 				"accept work failed: "+tc.err.Error(), nil,
-				subscriptionWindowExhaustedReportForError(tc.err), nil, item); err != nil {
+				subscriptionWindowExhaustedReportForError(tc.err), nil, nil, item); err != nil {
 				t.Fatalf("callNackEndpoint: %v", err)
 			}
 			if got, ok := bodies[len(bodies)-1]["subscriptionWindowExhausted"]; tc.wantMember == nil {
@@ -1606,6 +1610,7 @@ func TestCallNackEndpoint_ReceiptPreflightReasonLegacyWireCompatibility(t *testi
 	err := callNackEndpoint(
 		context.Background(), nil, srv.URL, "s1", "wkr-1", "jwt-token",
 		"accept work failed: fallback_not_allowed", receiptPreflightNackReasonForError(errors.New("accept work failed: fallback_not_allowed")),
+		nil,
 		nil,
 		nil,
 		&PollWorkItem{SessionID: "s1", IssueID: "iss-1", IssueIdentifier: "OPS-1", Priority: 1, QueuedAt: 1},
@@ -2467,5 +2472,129 @@ func TestPollResponse_DecodesDeferFailureTransition(t *testing.T) {
 	}
 	if len(resp.Work) != 1 || !resp.Work[0].DeferFailureTransition {
 		t.Fatalf("DeferFailureTransition not decoded: %+v", resp.Work)
+	}
+}
+
+// acceptDefectNackReasonForError projects only canonical typed causes: a host
+// defect that is safe to redeliver, or a session defect that fails the same
+// way everywhere. Identical prose without the type must not project.
+func TestAcceptDefectNackReasonForError(t *testing.T) {
+	hookCause := errors.New("keyed session requires a credential snapshot and none is available")
+	conflictCause := &executionPreflightReceiptConflictError{cause: fmt.Errorf("linkat .abc.pending deadbeef.json: %w", os.ErrExist)}
+	durableDenial := &preSpawnPermanentDenialError{
+		cause:   errors.New("retained permanent pre-spawn denial"),
+		report:  &preSpawnPermanentDenialReport{ContractVersion: preSpawnPermanentDenialContractVersion},
+		durable: true,
+	}
+	securityErr := &agent.ExecutionSecurityError{Code: agent.ExecutionSecurityUnresolvable, Detail: "malformed stamp"}
+	transientDenial := &preSpawnPermanentDenialError{cause: errors.New("transient")}
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{name: "nil projects nothing", err: nil, want: ""},
+		{name: "unrelated error projects nothing", err: errors.New("boom"), want: ""},
+		{name: "pre-spawn hook failure is a host defect", err: &preSpawnHookError{err: hookCause}, want: acceptDefectHost},
+		{name: "wrapped pre-spawn hook failure is a host defect", err: fmt.Errorf("accept work: %w", &preSpawnHookError{err: hookCause}), want: acceptDefectHost},
+		{name: "identical hook prose without the type projects nothing", err: errors.New("pre-spawn hook: " + hookCause.Error()), want: ""},
+		{name: "inner hook cause alone projects nothing", err: hookCause, want: ""},
+		{name: "spawned receipt conflict is a session defect", err: conflictCause, want: acceptDefectSession},
+		{name: "daemon-wrapped receipt conflict is a session defect", err: fmt.Errorf("persist execution adaptation receipt: %w", conflictCause), want: acceptDefectSession},
+		{name: "bare existence error without the conflict type projects nothing", err: fmt.Errorf("persist execution adaptation receipt: %w", os.ErrExist), want: ""},
+		{name: "durable permanent denial is a session defect", err: durableDenial, want: acceptDefectSession},
+		{name: "transient denial wrapper without a report projects nothing", err: transientDenial, want: ""},
+		{name: "execution-security refusal is a session defect", err: securityErr, want: acceptDefectSession},
+		{name: "wrapped execution-security refusal is a session defect", err: fmt.Errorf("accept work: %w", securityErr), want: acceptDefectSession},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := acceptDefectNackReasonForError(tc.err)
+			if tc.want == "" {
+				if got != nil {
+					t.Fatalf("defect = %+v, want omitted", got)
+				}
+				return
+			}
+			if got == nil {
+				t.Fatalf("defect = nil, want %q", tc.want)
+			}
+			if got.ContractVersion != acceptDefectNackReasonContractVersion {
+				t.Fatalf("contractVersion = %q, want %q", got.ContractVersion, acceptDefectNackReasonContractVersion)
+			}
+			if got.Defect != tc.want {
+				t.Fatalf("defect = %q, want %q", got.Defect, tc.want)
+			}
+		})
+	}
+}
+
+// NackRejectedWork carries the host/session defect projection on the wire so
+// the orchestrator can tell a redeliverable host refusal from a terminal
+// session defect, while the human-readable reason prose stays unchanged.
+func TestNackRejectedWork_ProjectsAcceptDefect(t *testing.T) {
+	hookCause := errors.New("keyed session requires a credential snapshot and none is available")
+	conflictCause := &executionPreflightReceiptConflictError{cause: fmt.Errorf("linkat .abc.pending deadbeef.json: %w", os.ErrExist)}
+	tests := []struct {
+		name       string
+		acceptErr  error
+		wantDefect map[string]any
+	}{
+		{
+			name:      "host defect for pre-spawn hook refusal",
+			acceptErr: fmt.Errorf("accept work: %w", &preSpawnHookError{err: hookCause}),
+			wantDefect: map[string]any{
+				"contractVersion": acceptDefectNackReasonContractVersion,
+				"defect":          acceptDefectHost,
+			},
+		},
+		{
+			name:      "session defect for spawned receipt conflict",
+			acceptErr: fmt.Errorf("persist execution adaptation receipt: %w", conflictCause),
+			wantDefect: map[string]any{
+				"contractVersion": acceptDefectNackReasonContractVersion,
+				"defect":          acceptDefectSession,
+			},
+		},
+		{
+			name:       "untyped failure omits the member",
+			acceptErr:  errors.New("accept work failed at an unknown stage"),
+			wantDefect: nil,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			item := &PollWorkItem{
+				SessionID: "session-1", ProjectID: "project-1", RepositoryID: "repository-1",
+				Repository: "example.invalid/org/repo", IssueID: "issue-1", IssueIdentifier: "ISSUE-1",
+				Priority: 3, QueuedAt: 1700000000000, WorkType: "agent",
+			}
+			var body struct {
+				Reason       string         `json:"reason"`
+				AcceptDefect map[string]any `json:"acceptDefect"`
+			}
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Errorf("decode NACK body: %v", err)
+				}
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			t.Cleanup(srv.Close)
+			if err := NackRejectedWork(
+				context.Background(), srv.Client(), srv.URL, "caller-worker", "caller-runtime-jwt", item, tc.acceptErr,
+			); err != nil {
+				t.Fatalf("NackRejectedWork: %v", err)
+			}
+			if want := "accept work failed: " + tc.acceptErr.Error(); body.Reason != want {
+				t.Fatalf("reason = %q, want compatibility prose %q", body.Reason, want)
+			}
+			if tc.wantDefect == nil {
+				if body.AcceptDefect != nil {
+					t.Fatalf("acceptDefect = %#v, want omitted", body.AcceptDefect)
+				}
+			} else if !mapsEqual(body.AcceptDefect, tc.wantDefect) {
+				t.Fatalf("acceptDefect = %#v, want %#v", body.AcceptDefect, tc.wantDefect)
+			}
+		})
 	}
 }
