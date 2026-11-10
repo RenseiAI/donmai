@@ -3372,13 +3372,17 @@ func (d *Daemon) acceptWorkWithDetail(spec SessionSpec, detail *SessionDetail, p
 			detail.ControlTokenPath = path
 		}
 		// Reserve the session before compiling or publishing its receipt and
-		// hold the lease through spawn and marker completion. A contender
+		// hold the lease through spawn and marker completion. The
+		// reservation is invisible: no detail is published yet, so the
+		// accept builds its private detail copy without sharing it with
+		// concurrent readers or the runtime-token refresher. Publish
+		// installs the fully built copy just before spawn. A contender
 		// that loses this reservation returns before touching the durable
 		// receipt, so concurrent deliveries cannot leave the winner's worker
 		// holding the loser's bytes.
 		if d.sessionDetails != nil {
 			var stored bool
-			detailLease, stored = d.sessionDetails.StoreIfAbsent(detail)
+			detailLease, stored = d.sessionDetails.Reserve(spec.SessionID, detail.WorkerID, detail.AuthToken)
 			if !stored {
 				return nil, fmt.Errorf("session %q already has an active detail", spec.SessionID)
 			}
@@ -3743,6 +3747,15 @@ func (d *Daemon) acceptWorkWithDetail(spec SessionSpec, detail *SessionDetail, p
 				}
 				return nil, fmt.Errorf("consume local execution preflight start authority: %w", err)
 			}
+		}
+	}
+	// Publish the fully built detail before spawn. The private copy above is
+	// no longer mutated after this point, so readers observe either nothing
+	// or the complete struct — never a half-built one. Any credential refresh
+	// that landed on the reservation mid-accept is folded in by Publish.
+	if detailReserved {
+		if d.sessionDetails == nil || !d.sessionDetails.Publish(detailLease, detail) {
+			return nil, fmt.Errorf("session %q already has an active detail", spec.SessionID)
 		}
 	}
 	handle, err := d.spawner.AcceptWork(spec)
