@@ -3263,7 +3263,18 @@ func (d *Daemon) acceptWorkWithDetail(spec SessionSpec, detail *SessionDetail, p
 	var configGeneration uint64
 	configReserved := false
 	configLeaseTransferred := false
+	// receiptCommitted reports whether this accept published (or replayed) a
+	// durable preflight receipt for the session. Only receipt-bearing accepts
+	// arm the spawn marker below; legacy detail-free work leaves no receipt
+	// to protect.
+	receiptCommitted := false
+	var detailLease sessionDetailLease
+	detailReserved := false
+	detailTransferred := false
 	defer func() {
+		if detailReserved && !detailTransferred && d.sessionDetails != nil {
+			d.sessionDetails.DeleteIfOwner(detailLease)
+		}
 		if configReserved && !configLeaseTransferred && d.preflightConfigs != nil {
 			d.preflightConfigs.cleanupIfOwner(spec.SessionID, configGeneration)
 		}
@@ -3359,6 +3370,23 @@ func (d *Daemon) acceptWorkWithDetail(spec SessionSpec, detail *SessionDetail, p
 		// seat's deny at an arbitrary host file.
 		if path := strings.TrimSpace(d.opts.ControlTokenPath); path != "" {
 			detail.ControlTokenPath = path
+		}
+		// Reserve the session before compiling or publishing its receipt and
+		// hold the lease through spawn and marker completion. The
+		// reservation is invisible: no detail is published yet, so the
+		// accept builds its private detail copy without sharing it with
+		// concurrent readers or the runtime-token refresher. Publish
+		// installs the fully built copy just before spawn. A contender
+		// that loses this reservation returns before touching the durable
+		// receipt, so concurrent deliveries cannot leave the winner's worker
+		// holding the loser's bytes.
+		if d.sessionDetails != nil {
+			var stored bool
+			detailLease, stored = d.sessionDetails.Reserve(spec.SessionID, detail.WorkerID, detail.AuthToken)
+			if !stored {
+				return nil, fmt.Errorf("session %q already has an active detail", spec.SessionID)
+			}
+			detailReserved = true
 		}
 		if len(detail.AdmissionReceipt) > 0 {
 			// The narrow-only claim gate runs first: for a claim-bound
@@ -3704,34 +3732,15 @@ func (d *Daemon) acceptWorkWithDetail(spec SessionSpec, detail *SessionDetail, p
 				return nil, fmt.Errorf("execution adaptation preflight: %w", preflightErr)
 			}
 			detail.HostAdaptationReceipt = append(json.RawMessage(nil), persistedReceipt...)
-		}
-	}
-	var detailLease sessionDetailLease
-	if detail != nil && d.sessionDetails != nil {
-		var stored bool
-		detailLease, stored = d.sessionDetails.StoreIfAbsent(detail)
-		if !stored {
-			return nil, fmt.Errorf("session %q already has an active detail", spec.SessionID)
+			receiptCommitted = len(persistedReceipt) > 0
 		}
 	}
 	if localPreflightRequest != nil && localPreflightResponse != nil && preflightReplay != nil {
 		if err := preflightReplay.BeginExecutionPreflightStart(context.Background(), *localPreflightRequest, *localPreflightResponse); err != nil {
-			if detailLease.generation != 0 {
-				d.sessionDetails.DeleteIfOwner(detailLease)
-			}
-			if configReserved {
-				d.preflightConfigs.cleanupIfOwner(spec.SessionID, configGeneration)
-			}
 			return nil, fmt.Errorf("consume host execution preflight start authority: %w", err)
 		}
 		if localPreflight != nil {
 			if err := localPreflight.beginExecutionPreflightStart(context.Background(), *localPreflightRequest, *localPreflightResponse); err != nil {
-				if detailLease.generation != 0 {
-					d.sessionDetails.DeleteIfOwner(detailLease)
-				}
-				if configReserved {
-					d.preflightConfigs.cleanupIfOwner(spec.SessionID, configGeneration)
-				}
 				retireErr := preflightReplay.RetireExecutionPreflight(context.Background(), spec.SessionID)
 				if retireErr != nil {
 					return nil, errors.Join(fmt.Errorf("consume local execution preflight start authority: %w", err), fmt.Errorf("retire host execution preflight start: %w", retireErr))
@@ -3740,14 +3749,17 @@ func (d *Daemon) acceptWorkWithDetail(spec SessionSpec, detail *SessionDetail, p
 			}
 		}
 	}
+	// Publish the fully built detail before spawn. The private copy above is
+	// no longer mutated after this point, so readers observe either nothing
+	// or the complete struct — never a half-built one. Any credential refresh
+	// that landed on the reservation mid-accept is folded in by Publish.
+	if detailReserved {
+		if d.sessionDetails == nil || !d.sessionDetails.Publish(detailLease, detail) {
+			return nil, fmt.Errorf("session %q already has an active detail", spec.SessionID)
+		}
+	}
 	handle, err := d.spawner.AcceptWork(spec)
 	if err != nil {
-		if detailLease.generation != 0 {
-			d.sessionDetails.DeleteIfOwner(detailLease)
-		}
-		if configReserved {
-			d.preflightConfigs.cleanupIfOwner(spec.SessionID, configGeneration)
-		}
 		if localPreflight != nil {
 			if retireErr := localPreflight.retireExecutionPreflight(context.Background(), spec.SessionID); retireErr != nil {
 				return nil, errors.Join(err, fmt.Errorf("retire failed local execution preflight start: %w", retireErr))
@@ -3759,6 +3771,23 @@ func (d *Daemon) acceptWorkWithDetail(spec SessionSpec, detail *SessionDetail, p
 			}
 		}
 		return nil, err
+	}
+	// The spawn committed: record it so the session's receipt turns immutable
+	// from here on. A redelivery can still replace the receipt of an attempt
+	// that never got this far, but never the receipt of a live worker. The
+	// marker is bookkeeping, not authority: the worker is already running, so
+	// a marker failure is logged and the accept still succeeds rather than
+	// orphaning a live child behind a false rejection.
+	if receiptCommitted {
+		if tracker, ok := d.opts.ExecutionPreflightStore.(ExecutionPreflightSpawnTracker); ok {
+			if markErr := tracker.MarkExecutionPreflightSpawned(spec.SessionID); markErr != nil {
+				slog.Warn("daemon accept: spawn marker not recorded; receipt stays replaceable",
+					"session_id", spec.SessionID, "error", markErr.Error())
+			}
+		}
+	}
+	if detailReserved {
+		detailTransferred = true
 	}
 	if configReserved {
 		configLeaseTransferred = true

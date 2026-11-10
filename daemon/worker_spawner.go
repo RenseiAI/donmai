@@ -29,6 +29,29 @@ import (
 // members rather than archives only.
 var _ ActiveWorkareaProvider = (*WorkerSpawner)(nil)
 
+// preSpawnHookError marks a spawn refused by the pre-spawn hook (credential
+// resolution, environment assembly, or any host-side prerequisite the hook
+// enforces). The message keeps the historical "pre-spawn hook: ..." shape;
+// the type lets the NACK path classify the refusal as a host defect that is
+// safe to redeliver, as opposed to a defect in the session itself.
+type preSpawnHookError struct {
+	err error
+}
+
+func (e *preSpawnHookError) Error() string {
+	if e == nil || e.err == nil {
+		return "pre-spawn hook refused the spawn"
+	}
+	return "pre-spawn hook: " + e.err.Error()
+}
+
+func (e *preSpawnHookError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.err
+}
+
 // SpawnerOptions configure a WorkerSpawner.
 type SpawnerOptions struct {
 	// SessionReadToken reports the live per-session read credential for
@@ -1067,7 +1090,7 @@ func (s *WorkerSpawner) spawnThroughShim(spec SessionSpec, project *ProjectConfi
 	if s.opts.OnPreSpawn != nil {
 		next, hookErr := s.opts.OnPreSpawn(spec, env)
 		if hookErr != nil {
-			return nil, sessionTmpClaim{}, true, fmt.Errorf("pre-spawn hook: %w", hookErr)
+			return nil, sessionTmpClaim{}, true, &preSpawnHookError{err: hookErr}
 		}
 		if next != nil {
 			env = next
@@ -1450,7 +1473,7 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 		if hookErr != nil {
 			closeWorkerPipes()
 			cancel()
-			return nil, fmt.Errorf("pre-spawn hook: %w", hookErr)
+			return nil, &preSpawnHookError{err: hookErr}
 		}
 		preSpawnOwnsCleanup = true
 		if next != nil {
