@@ -265,7 +265,10 @@ type kitDependencyStoreTOML struct {
 	Lockfiles []string `toml:"lockfiles"`
 	Inputs    []string `toml:"inputs"`
 	Version   string   `toml:"version"`
-	Store     struct {
+	// Versions is the semver range of manager versions this entry covers
+	// (the donmai.dev/v2 amendment); empty covers every version.
+	Versions string `toml:"versions"`
+	Store    struct {
 		Env         []string          `toml:"env"`
 		Default     map[string]string `toml:"default"`
 		Sharing     string            `toml:"sharing"`
@@ -279,6 +282,14 @@ type kitDependencyStoreTOML struct {
 	Import struct {
 		Env map[string]string `toml:"env"`
 	} `toml:"import"`
+	// NoCode and Credentials are pointers so a declared block (even an
+	// empty [no_code] table) is told apart from an absent one.
+	NoCode *struct {
+		Env kitStringTableTOML `toml:"env"`
+	} `toml:"no_code"`
+	Credentials *struct {
+		ConfigEnv string `toml:"config_env"`
+	} `toml:"credentials"`
 	Commands         map[string]string            `toml:"commands"`
 	CommandsOverride map[string]map[string]string `toml:"commands_override"`
 	Snapshot         struct {
@@ -290,6 +301,30 @@ type kitDependencyStoreTOML struct {
 	Proxy struct {
 		Env map[string]string `toml:"env"`
 	} `toml:"proxy"`
+}
+
+// kitStringTableTOML is a TOML table whose values are all strings. The
+// default map decoding turns an array into an empty map without an error,
+// which for no_code.env would read as a declared block that sets nothing;
+// this type rejects anything but a table of strings.
+type kitStringTableTOML map[string]string
+
+// UnmarshalTOML implements toml.Unmarshaler.
+func (t *kitStringTableTOML) UnmarshalTOML(data any) error {
+	table, ok := data.(map[string]any)
+	if !ok {
+		return errors.New("must be a table of strings")
+	}
+	out := make(kitStringTableTOML, len(table))
+	for name, value := range table {
+		text, ok := value.(string)
+		if !ok {
+			return fmt.Errorf("%q must be a string", name)
+		}
+		out[name] = text
+	}
+	*t = out
+	return nil
 }
 
 // KitRegistry is a minimal in-process Kit registry.
