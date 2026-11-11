@@ -10,6 +10,12 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 No unreleased changes.
 
+## v0.73.5 — 2026-11-11
+
+### Chores
+
+- Allow redelivery to replace a never-spawned preflight receipt
+
 ## v0.73.4 — 2026-11-10
 
 ### Features
