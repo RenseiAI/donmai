@@ -16,6 +16,7 @@
 | [`runtime/state`](./state/) | `.agent/state.json` persistence per-worktree. Atomic tmpfile + rename, per-worktree mutex, cross-issue recovery guard, malformed-recovery. |
 | [`runtime/heartbeat`](./heartbeat/) | Per-session heartbeat to platform `POST /api/sessions/<id>/lock-refresh`. 3-strike rule emits `LostOwnership` event the runner consumes. Distinct from worker-level heartbeat in `daemon/heartbeat.go`. |
 | [`runtime/confinement`](./confinement/) | Executor OS confinement of a harness process (`ADR-2026-10-03-executor-os-confinement.md`): the closed writable set, the macOS profile backend, the deny-only composer callback, the typed refusals and the startup self-test. |
+| [`runtime/depprep`](./depprep/) | Session-independent dependency preparation (`ADR-2026-11-11-session-independent-dependency-preparation.md`): `New(Config)` and `Prepare(ctx, Request)` install a plain checkout's dependencies through the kit dependency-store entries that select it, for an agent session or a non-agent invocation. Keeper-absent path: a two-phase frozen online install (fetch, then offline install) into a per-run cache under the caller's scratch directory, a constructed environment, package code off unless a confiner is supplied, nine closed error codes. |
 | [`runtime/span`](./span/) | Correlate per-call LLM/tool/session spans and forward metadata-only JSON batches through a bounded, non-blocking poster. |
 
 ## Layered consumption
