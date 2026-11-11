@@ -8,7 +8,9 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
-No unreleased changes.
+### Fixes
+
+- Raise the Go toolchain to 1.26.11, which fixes GO-2026-6859 (HTTP/1 server crash from a `MaxBytesReader` header race in `net/http`); the `Go vuln scan` check passes again. Toolchain pins in `go.mod`, the Makefile, the signing-integration workflow, the worker, E2B and upgrade-acceptance images, and the contributor docs move together.
 
 ## v0.73.5 — 2026-11-11
 
