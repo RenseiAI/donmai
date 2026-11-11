@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/runtime/workarea"
 )
 
 // TestDirs_ContractOfTheTable pins the properties every consumer relies on,
@@ -49,7 +50,7 @@ func TestDirs_ContractOfTheTable(t *testing.T) {
 // a REMOVAL visible rather than silently narrowing the guarantee everywhere.
 func TestDirs_CoversTheKnownHarnessState(t *testing.T) {
 	t.Parallel()
-	want := []string{".agent", ".claude", ".codex", ".pi", ".scratch"}
+	want := []string{".agent", ".claude", ".codex", ".pi", ".scratch", ".workarea"}
 	got := Dirs()
 	if len(got) != len(want) {
 		t.Fatalf("Dirs() = %v, want %v", got, want)
@@ -107,6 +108,7 @@ func TestIsStateDir_MatchesWholeNames(t *testing.T) {
 		".claude":      true,
 		".codex":       true,
 		".scratch":     true,
+		".workarea":    true,
 		".pi-cache":    false,
 		".agentfoo":    false,
 		"pi":           false,
@@ -120,6 +122,16 @@ func TestIsStateDir_MatchesWholeNames(t *testing.T) {
 		if got := IsStateDir(name); got != want {
 			t.Errorf("IsStateDir(%q) = %v, want %v", name, got, want)
 		}
+	}
+}
+
+// TestWorkareaDirMatchesDeclaration pins the table entry to the workarea
+// package's reserved metadata leaf: a rename on either side must fail here
+// rather than silently dropping session documents back into commits.
+func TestWorkareaDirMatchesDeclaration(t *testing.T) {
+	t.Parallel()
+	if !IsStateDir(workarea.DeclarationDirName) {
+		t.Fatalf("%q is not harness state; negotiated documents inside a flat checkout would enter commits", workarea.DeclarationDirName)
 	}
 }
 
