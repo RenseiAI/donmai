@@ -718,6 +718,14 @@ type Daemon struct {
 	// a restart plus redelivery to run a second swap.
 	hostUpgradeDurableBroken bool
 	hostUpgradeDurableError  string
+
+	// systemUpdateMu guards the in-memory platform-provided update-defaults
+	// snapshot consumed from the heartbeat reply. It is never persisted to
+	// the local config file and never takes part in config writes: the
+	// effective resolver reads it alongside the local file on every use.
+	systemUpdateMu   sync.Mutex
+	systemUpdate     SystemUpdateDefaults
+	systemUpdateDiag string
 }
 
 // New constructs a Daemon. Call Start() to bring it online.
@@ -2097,6 +2105,11 @@ func (d *Daemon) Start(ctx context.Context) error {
 			// to af daemon stats. The latest observed status is stored
 			// in d.hostStatus; callers read via Daemon.HostStatus().
 			OnHostStatus: d.setLastHostStatus,
+			// Platform-provided update defaults ride the same beat.
+			// The production consumer records the system snapshot
+			// in-memory; the effective resolver prefers explicit
+			// host-local values above it. Never persisted to disk.
+			OnUpdateDefaults: d.applySystemUpdateDefaults,
 			// Three-axis seat state rides every beat: one report per
 			// in-flight seat plus the axis-count fold.
 			GetSeatStates: d.seatStates,
@@ -4085,13 +4098,14 @@ func (a *updateAttempt) run(ctx context.Context) (*UpdateResult, error) {
 	if cfg == nil {
 		return nil, errors.New("no config loaded")
 	}
+	effective := d.EffectiveAutoUpdateConfig()
 	if d.runPreparedUpdate != nil {
-		return d.runPreparedUpdate(ctx, cfg.AutoUpdate, d.EffectiveVersion())
+		return d.runPreparedUpdate(ctx, effective, d.EffectiveVersion())
 	}
 	updater := NewUpdater(UpdaterOptions{
 		CurrentVersion: d.EffectiveVersion(),
-		Config:         cfg.AutoUpdate,
-		CDNBase:        effectiveUpdateCDNBase(cfg.AutoUpdate),
+		Config:         effective,
+		CDNBase:        effective.CDNBase,
 		SkipExit:       true, // HTTP-driven update: caller decides to exit.
 	})
 	return updater.RunUpdate(ctx)

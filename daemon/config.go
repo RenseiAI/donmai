@@ -130,6 +130,18 @@ type Config struct {
 	// losing their own settings on the next write. Declared fields
 	// always win: keys also present in the marshaled Config are skipped.
 	unknownFields map[string]*yaml.Node
+	// autoUpdateChannelAuthored records whether daemon.yaml explicitly
+	// set autoUpdate.channel. LoadConfig populates it from the raw
+	// document so the effective update-channel resolver can distinguish
+	// an explicit "stable" from the compiled default filled by
+	// applyDefaults when the key is omitted. Unmarshaled configs that
+	// bypass LoadConfig leave it false; callers that construct an
+	// explicit local override in memory must record it via
+	// SetAutoUpdateChannel. Direct assignment of a non-default channel
+	// still round-trips (WriteConfig preserves it), but only the setter
+	// can mark an explicit "stable", which is otherwise indistinguishable
+	// from the compiled default.
+	autoUpdateChannelAuthored bool
 }
 
 // SessionScratchDeriveKey is the dotted daemon.yaml key that turns the
@@ -533,7 +545,7 @@ type OrchestratorConfig struct {
 
 // AutoUpdateConfig is the auto-update preferences block.
 type AutoUpdateConfig struct {
-	Channel             UpdateChannel  `yaml:"channel"             json:"channel"`
+	Channel             UpdateChannel  `yaml:"channel,omitempty"       json:"channel,omitempty"`
 	Schedule            UpdateSchedule `yaml:"schedule"            json:"schedule"`
 	DrainTimeoutSeconds int            `yaml:"drainTimeoutSeconds" json:"drainTimeoutSeconds"`
 
@@ -697,10 +709,14 @@ func LoadConfig(path string) (*Config, error) {
 		Capacity struct {
 			MaxConcurrentSessions *int `yaml:"maxConcurrentSessions"`
 		} `yaml:"capacity"`
+		AutoUpdate struct {
+			Channel *string `yaml:"channel"`
+		} `yaml:"autoUpdate"`
 	}
 	if err := yaml.Unmarshal(data, &authored); err != nil {
 		return nil, fmt.Errorf("parse daemon capacity %q: %w", path, err)
 	}
+	cfg.autoUpdateChannelAuthored = authored.AutoUpdate.Channel != nil && strings.TrimSpace(*authored.AutoUpdate.Channel) != ""
 
 	// Apply env-var substitution on authToken.
 	if cfg.Orchestrator.AuthToken != "" {
@@ -728,6 +744,19 @@ func WriteConfig(path string, cfg *Config) error {
 	}
 	normalized := *cfg
 	normalizeProjectContract(&normalized)
+	// A default-filled channel is not an explicit host-local override:
+	// omitting it preserves the authored-false distinction so a later
+	// reload still lets the system snapshot win. Without this, any write
+	// would materialize "stable" and mask the system layer. A non-default
+	// channel is always preserved even when the authored mark is unset:
+	// external callers build on DefaultConfig (stable, unmarked) and assign
+	// through the exported API, which cannot set the unexported mark.
+	// Callers that need an explicit "stable" must use SetAutoUpdateChannel,
+	// which records the mark alongside the value.
+	if channel := UpdateChannel(strings.TrimSpace(string(normalized.AutoUpdate.Channel))); !normalized.autoUpdateChannelAuthored &&
+		(channel == "" || channel == ChannelStable) {
+		normalized.AutoUpdate.Channel = ""
+	}
 	if normalized.ProjectAdmissionVersion == 0 {
 		// Keep a legacy write legacy. The enabled set is an in-memory
 		// projection until the first successful v2 mutation.
@@ -749,6 +778,27 @@ func WriteConfig(path string, cfg *Config) error {
 		return fmt.Errorf("rename temp config: %w", err)
 	}
 	return nil
+}
+
+// SetAutoUpdateChannel records an explicit host-local update-channel
+// override. Unlike direct field assignment it also records the authored
+// mark, so an explicit "stable" survives WriteConfig as a local override
+// that masks the system snapshot instead of being omitted as the
+// compiled default. Assigning the empty value clears the override.
+func (c *Config) SetAutoUpdateChannel(channel UpdateChannel) {
+	if c == nil {
+		return
+	}
+	c.AutoUpdate.Channel = channel
+	c.autoUpdateChannelAuthored = strings.TrimSpace(string(channel)) != ""
+}
+
+// AutoUpdateChannelAuthored reports whether the host-local update channel
+// was explicitly authored (in daemon.yaml or via SetAutoUpdateChannel)
+// rather than filled by the compiled default. Only an authored value
+// masks the system snapshot in the effective resolver.
+func (c *Config) AutoUpdateChannelAuthored() bool {
+	return c != nil && c.autoUpdateChannelAuthored
 }
 
 // knownConfigKeys is the set of top-level daemon.yaml keys declared by the
