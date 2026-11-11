@@ -274,12 +274,22 @@ func ComposeForTarget(views []ManifestView, target CompositionTarget, lock *Comp
 			}
 		}
 
-		// hooks — OS-keyed overlay wins over generic (005:296).
+		// hooks — OS-keyed overlay wins over generic (005:296). A path hook
+		// resolves inside the kit's verified package root (or is refused);
+		// inline shell text passes through (see resolveHookCommand).
 		if pa := resolveHook(v.Hooks, targetOS, true); pa != "" {
-			d.PostAcquire = append(d.PostAcquire, pa)
+			cmd, err := resolveHookCommand(v, targetOS, "post_acquire", pa)
+			if err != nil {
+				return nil, err
+			}
+			d.PostAcquire = append(d.PostAcquire, cmd)
 		}
 		if pr := resolveHook(v.Hooks, targetOS, false); pr != "" {
-			d.PreRelease = append(d.PreRelease, pr)
+			cmd, err := resolveHookCommand(v, targetOS, "pre_release", pr)
+			if err != nil {
+				return nil, err
+			}
+			d.PreRelease = append(d.PreRelease, cmd)
 		}
 	}
 	commands, err := ResolveCommandComposition(views, target, lock, delegations)

@@ -12,6 +12,10 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 - Kit manifests (`api = "donmai.dev/v2"`) gain three dependency-store keys: `versions` (a semver range of package-manager versions an entry covers), `[provide.dependency_store.no_code] env` (settings that make every phase run no package code) and `[provide.dependency_store.credentials] config_env` (the variable that names the per-run credential file). A kit may now declare one manager more than once when the `versions` ranges are disjoint, for example pnpm `>=9 <10` and `>=10 <11`; overlapping ranges within a kit are a validation error, and across kits they conflict unless the composition lock selects one. Composition now keys entries by manager and range, and carries each installed kit package's verified root so a package-owned path resolves against it. Daemons built before this change reject a manifest carrying the new keys.
 
+### Fixes
+
+- Kit hooks: a relative `post_acquire` or `pre_release` path (a single token with a path separator, such as `bin/setup.sh`) now runs the file inside the kit's verified package, never the repository's file of that name. Before, `sh -c bin/setup.sh` ran in the repository worktree: a repository without that file failed provisioning, and a repository with one had its own script run in the kit's name. An absolute path, a path that escapes the package (`..` or a symlink), a missing file, or a relative path in a manifest with no verified package root (a flat, non-package kit) is refused at composition with `ErrHookPathInvalid`. Inline shell text (a command with arguments, `make setup`, `npm ci`, a bare word with no separator) is unchanged and still runs in the repository. A kit that relied on a hook naming the repository's own script must use inline text such as `sh ./bin/setup.sh`, or ship the script in its package.
+
 ## v0.73.5 — 2026-11-11
 
 ### Chores
