@@ -46,12 +46,24 @@ func dependencyStoreViews(m kitManifestTOML) ([]kit.DependencyStoreView, error) 
 
 // projectDependencyStore maps one TOML entry onto the engine view type.
 func projectDependencyStore(entry kitDependencyStoreTOML) kit.DependencyStoreView {
+	view := projectDependencyStoreBase(entry)
+	if entry.NoCode != nil {
+		view.NoCode = &kit.DependencyStoreNoCode{Env: copyStringMap(entry.NoCode.Env)}
+	}
+	if entry.Credentials != nil {
+		view.Credentials = &kit.DependencyStoreCredentials{ConfigEnv: entry.Credentials.ConfigEnv}
+	}
+	return view
+}
+
+func projectDependencyStoreBase(entry kitDependencyStoreTOML) kit.DependencyStoreView {
 	return kit.DependencyStoreView{
 		Manager:   entry.Manager,
 		Ecosystem: entry.Ecosystem,
 		Lockfiles: append([]string{}, entry.Lockfiles...),
 		Inputs:    append([]string{}, entry.Inputs...),
 		Version:   entry.Version,
+		Versions:  entry.Versions,
 		Store: kit.DependencyStoreLayout{
 			Env:         append([]string{}, entry.Store.Env...),
 			Default:     copyStringMap(entry.Store.Default),

@@ -176,7 +176,7 @@ func TestReleasedTypescriptAndNextPackagesConflictWithoutOwnerLock(t *testing.T)
 		if err != nil {
 			t.Fatal(err)
 		}
-		views = append(views, manifestToView(manifest, sha256Hex(descriptor), ""))
+		views = append(views, manifestToView(manifest, sha256Hex(descriptor), "", ""))
 	}
 	views = kit.SortManifests(views)
 	_, err := kit.ComposeForTarget(views, kit.CompositionTarget{OS: kit.OSLinux, WorkType: "implementation", PathScope: "."}, nil, nil)
