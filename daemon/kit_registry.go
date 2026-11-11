@@ -215,8 +215,8 @@ type kitManifestTOML struct {
 		// DependencyStores is [[provide.dependency_store]] — one entry per
 		// package manager the kit supports. Introduced with the v2
 		// manifest api revision; validated and composed by internal/kit
-		// (ValidateDependencyStores, ComposeDependencyStores,
-		// SelectDependencyStores).
+		// (ValidateDependencyStores, ComposeDependencyStores) and served to
+		// runtime/depprep by KitRegistry.Entries, which selects nothing.
 		DependencyStores []kitDependencyStoreTOML `toml:"dependency_store"`
 	} `toml:"provide"`
 

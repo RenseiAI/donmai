@@ -1,7 +1,7 @@
 package daemon
 
 import (
-	"errors"
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +11,7 @@ import (
 
 	"github.com/RenseiAI/donmai/afclient"
 	"github.com/RenseiAI/donmai/internal/kit"
+	"github.com/RenseiAI/donmai/runtime/depprep"
 )
 
 // versionedPnpmManifestTOML is a v2 manifest carrying two pnpm entries with
@@ -326,7 +327,7 @@ func TestPreRevisionConsumerRejectsAmendedManifest(t *testing.T) {
 	}
 }
 
-func TestKitRegistry_ComposeForRepoSelectsPnpmEntryByPin(t *testing.T) {
+func TestKitRegistry_ComposeForRepoKeysPnpmEntriesByRange(t *testing.T) {
 	t.Parallel()
 	reg := scanVersionedKit(t, versionedPnpmManifestTOML)
 	repo := t.TempDir()
@@ -340,24 +341,11 @@ func TestKitRegistry_ComposeForRepoSelectsPnpmEntryByPin(t *testing.T) {
 	if len(demand.DependencyStores) != 2 {
 		t.Fatalf("composed stores = %d, want the two pnpm entries (keyed by manager and range)", len(demand.DependencyStores))
 	}
-	leaf := func(pm string) kit.LeafDependencyFacts {
-		return kit.LeafDependencyFacts{Files: []string{"pnpm-lock.yaml"}, PackageManager: pm}
-	}
-	// The driving case: the repository pins pnpm 9.15.9 on a host whose own
-	// pnpm is 12.x. The pin, never the host, selects the entry.
-	got, err := kit.SelectDependencyStores(demand.DependencyStores, leaf("pnpm@9.15.9"))
-	if err != nil || len(got) != 1 || got[0].Versions != ">=9 <10" || got[0].Store.Content[0] != "v3/files" {
-		t.Fatalf("pnpm@9.15.9 selected %+v, %v; want the >=9 <10 entry with the v3 layout", got, err)
-	}
-	got, err = kit.SelectDependencyStores(demand.DependencyStores, leaf("pnpm@10.4.1"))
-	if err != nil || len(got) != 1 || got[0].Versions != ">=10 <11" || got[0].Store.Content[0] != "v10/files" {
-		t.Fatalf("pnpm@10.4.1 selected %+v, %v; want the >=10 <11 entry", got, err)
-	}
-	if _, err := kit.SelectDependencyStores(demand.DependencyStores, leaf("pnpm@12.16.1")); !errors.Is(err, kit.ErrDependencyStoreToolchainMismatch) {
-		t.Fatalf("pnpm@12.16.1 error = %v, want toolchain mismatch", err)
-	}
-	if _, err := kit.SelectDependencyStores(demand.DependencyStores, leaf("")); !errors.Is(err, kit.ErrDependencyStoreVersionRequired) {
-		t.Fatalf("no pin error = %v, want ErrDependencyStoreVersionRequired", err)
+	// Which of the two entries a leaf gets is the dependency preparer's
+	// selection (the pin, else the manager's reported version); see
+	// TestKitRegistryEntrySourcePreparesTypescriptPnpm.
+	if demand.DependencyStores[0].Versions != ">=10 <11" || demand.DependencyStores[1].Versions != ">=9 <10" {
+		t.Fatalf("composed ranges = %q, %q", demand.DependencyStores[0].Versions, demand.DependencyStores[1].Versions)
 	}
 }
 
@@ -419,5 +407,16 @@ func TestKitRegistry_PackageRootReachesComposedStore(t *testing.T) {
 	}
 	if _, err := os.Stat(resolved); err != nil {
 		t.Fatalf("resolved relocate path is not the installed payload: %v", err)
+	}
+
+	// The entry source carries the same root to the dependency preparer.
+	leaf := t.TempDir()
+	mustWrite(t, filepath.Join(leaf, "go.sum"), []byte(""), 0o600)
+	entries, err := registry.Entries(context.Background(), depprep.Leaf{Root: leaf, OS: kit.OSLinux})
+	if err != nil || len(entries) != 1 || entries[0].PackageRoot != wantRoot || entries[0].Commands.Relocate != "bin/relocate" {
+		t.Fatalf("entries = %+v, %v; want the package root %q and the relative relocate path", entries, err, wantRoot)
+	}
+	if entries[0].KitDigestKind != "package" || entries[0].KitDigest != result.Kit.PackageDigest {
+		t.Fatalf("entry owner = %s:%s, want the package digest", entries[0].KitDigestKind, entries[0].KitDigest)
 	}
 }
