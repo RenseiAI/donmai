@@ -195,6 +195,9 @@ type Handle struct {
 	evidenceDone      bool
 	evidenceCached    []agent.TerminalTranscriptDescriptor
 	evidenceCachedErr error
+	// maxToolOutputBytes bounds one tool result's content handed to the
+	// model and to the runner. Zero means the shared default.
+	maxToolOutputBytes int
 	// stopped closes once Stop has reaped the child and removed the
 	// session credential files: transcript writers have stopped and the
 	// state root is stable for evidence collection. TerminalTranscripts
@@ -330,6 +333,7 @@ func newHandle(client *rpcClient, cmd *exec.Cmd, spec agent.Spec, token string, 
 	}
 	return &Handle{
 		client:                         client,
+		maxToolOutputBytes:             agent.ResolveToolOutputLimit(spec.ProviderConfig, spec.Env),
 		cmd:                            cmd,
 		policy:                         NewPolicyEngine(spec),
 		spec:                           spec,
@@ -1202,7 +1206,21 @@ func (h *Handle) closeEvents() {
 }
 
 // emit publishes without blocking; drops when the channel is full or closed.
+// toolOutputLimit returns the per-tool-result byte bound for this session.
+func (h *Handle) toolOutputLimit() int {
+	if h == nil || h.maxToolOutputBytes <= 0 {
+		return agent.DefaultMaxToolOutputBytes
+	}
+	return h.maxToolOutputBytes
+}
+
 func (h *Handle) emit(ev agent.Event) {
+	if toolRes, ok := ev.(agent.ToolResultEvent); ok {
+		if truncated, changed := agent.TruncateToolOutput(toolRes.Content, h.toolOutputLimit()); changed {
+			toolRes.Content = truncated
+			ev = toolRes
+		}
+	}
 	h.eventsMu.RLock()
 	defer h.eventsMu.RUnlock()
 	if h.eventsClosed.Load() {

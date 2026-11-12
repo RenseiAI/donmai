@@ -461,6 +461,10 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
 	}
+	// Resolve the per-session tool-output bound and export it to the child
+	// environment so the child-side enforcement applies the same limit the
+	// Go-side truncation uses.
+	spec.Env = agent.WithToolOutputLimitEnv(spec.Env, agent.ResolveToolOutputLimit(spec.ProviderConfig, spec.Env))
 	// Interactive spawn mode (W4): independent of this Provider's shared
 	// headless app-server state — see interactive.go.
 	// Capability-gated on the live manifest so a future edit that flips
@@ -518,6 +522,7 @@ func (p *Provider) Resume(ctx context.Context, sessionID string, spec agent.Spec
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}
+	spec.Env = agent.WithToolOutputLimitEnv(spec.Env, agent.ResolveToolOutputLimit(spec.ProviderConfig, spec.Env))
 	ready, skills, err := p.ensureHeadlessReady(spec)
 	if err != nil {
 		return nil, err

@@ -176,6 +176,13 @@ type Handle struct {
 	cleanupMu   sync.Mutex
 	cleanups    []func() error
 	cleanupDone bool
+
+	// maxToolOutputBytes bounds one tool result's content handed to the model
+	// and to the runner. Resolved at spawn from the session limit
+	// (see agent.ResolveToolOutputLimit) and exported to the child
+	// environment so the child-side enforcement applies the same bound.
+	// Zero means the shared default (see toolOutputLimit).
+	maxToolOutputBytes int
 }
 
 // sendEvent multiplexes one event onto the public events channel.
@@ -185,6 +192,15 @@ type Handle struct {
 // has signalled disinterest, so the right thing is to drop rather
 // than panic on send-to-closed-channel.
 func (h *Handle) sendEvent(ev agent.Event) {
+	// Bound oversized tool output before it reaches the model and the
+	// runner: the same documented limit the runner applies, with the
+	// same truncation marker.
+	if toolRes, ok := ev.(agent.ToolResultEvent); ok {
+		if truncated, changed := agent.TruncateToolOutput(toolRes.Content, h.toolOutputLimit()); changed {
+			toolRes.Content = truncated
+			ev = toolRes
+		}
+	}
 	h.eventsMu.RLock()
 	defer h.eventsMu.RUnlock()
 	if h.eventsClosed.Load() {
@@ -196,6 +212,16 @@ func (h *Handle) sendEvent(ev agent.Event) {
 		// Stop is in progress; drop rather than block on a slow
 		// consumer that will never drain.
 	}
+}
+
+// toolOutputLimit returns the per-tool-result byte bound for this
+// session. A zero value resolves to the shared default so hand-built
+// handles hold the same cap as spawned ones.
+func (h *Handle) toolOutputLimit() int {
+	if h == nil || h.maxToolOutputBytes <= 0 {
+		return agent.DefaultMaxToolOutputBytes
+	}
+	return h.maxToolOutputBytes
 }
 
 // closeEvents closes the events channel exactly once, setting the
@@ -299,6 +325,12 @@ func spawnRaw(
 	onProcessSpawned func(pid int),
 	ownedSessionID string,
 ) (*Handle, error) {
+	// Resolve the per-session tool-output bound and export it to the child
+	// so the child-side enforcement applies the same limit the Go-side
+	// truncation uses (see agent.ToolOutputLimitEnvVar). A caller-supplied
+	// positive value is preserved.
+	env = agent.WithToolOutputLimitEnv(env, agent.ResolveToolOutputLimit(nil, env))
+	toolOutputLimit := agent.ResolveToolOutputLimit(nil, env)
 	// nolint:gosec // binary is resolved at provider construction
 	// from exec.LookPath; argv values come from a typed agent.Spec
 	// and a closed set of CLI flags. The shell-out target is the
@@ -365,19 +397,20 @@ func spawnRaw(
 	}
 
 	h := &Handle{
-		binary:          binary,
-		mcpConfigPath:   mcpConfigPath,
-		cwd:             cwd,
-		env:             append([]string(nil), childEnv...),
-		resumeExtraArgs: append([]string(nil), resumeExtraArgs...),
-		cmd:             cmd,
-		events:          make(chan agent.Event, eventBufferSize),
-		logger:          slog.With("provider", "claude", "pid", cmd.Process.Pid),
-		stdoutPipe:      stdout,
-		stderrPipe:      stderr,
-		stderrBuf:       stderrBuf,
-		shutdown:        make(chan struct{}),
-		done:            make(chan struct{}),
+		binary:             binary,
+		mcpConfigPath:      mcpConfigPath,
+		maxToolOutputBytes: toolOutputLimit,
+		cwd:                cwd,
+		env:                append([]string(nil), childEnv...),
+		resumeExtraArgs:    append([]string(nil), resumeExtraArgs...),
+		cmd:                cmd,
+		events:             make(chan agent.Event, eventBufferSize),
+		logger:             slog.With("provider", "claude", "pid", cmd.Process.Pid),
+		stdoutPipe:         stdout,
+		stderrPipe:         stderr,
+		stderrBuf:          stderrBuf,
+		shutdown:           make(chan struct{}),
+		done:               make(chan struct{}),
 	}
 	if owned != nil {
 		h.sessionID.Store(owned)

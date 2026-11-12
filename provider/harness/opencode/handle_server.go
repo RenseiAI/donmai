@@ -50,6 +50,9 @@ type serverHandle struct {
 	sessID  atomic.Pointer[string]
 	spec    agent.Spec
 	stopSSE func() error
+	// maxToolOutputBytes bounds one tool result's content handed to the
+	// model and to the runner. Zero means the shared default.
+	maxToolOutputBytes int
 
 	// releaseOwned stops the provider-owned serve child and then destroys its
 	// isolated config. nil in external-attach mode.
@@ -93,17 +96,18 @@ type serverHandle struct {
 
 func newServerHandle(child *serveChild, client serverClient, sessionID string, spec agent.Spec, logger *slog.Logger) *serverHandle {
 	h := &serverHandle{
-		child:        child,
-		client:       client,
-		mapper:       newSSEMapper(sessionID),
-		pump:         newPermPump(client, newPermEngine(spec), sessionID),
-		logger:       logger,
-		spec:         spec,
-		events:       make(chan agent.Event, eventBufferSize),
-		injectClosed: make(chan struct{}),
-		shutdown:     make(chan struct{}),
-		done:         make(chan struct{}),
-		permInterval: permPollInterval,
+		child:              child,
+		client:             client,
+		mapper:             newSSEMapper(sessionID),
+		pump:               newPermPump(client, newPermEngine(spec), sessionID),
+		logger:             logger,
+		spec:               spec,
+		maxToolOutputBytes: agent.ResolveToolOutputLimit(spec.ProviderConfig, spec.Env),
+		events:             make(chan agent.Event, eventBufferSize),
+		injectClosed:       make(chan struct{}),
+		shutdown:           make(chan struct{}),
+		done:               make(chan struct{}),
+		permInterval:       permPollInterval,
 	}
 	id := sessionID
 	h.sessID.Store(&id)
@@ -384,7 +388,21 @@ func (h *serverHandle) emitAll(events []agent.Event) {
 	}
 }
 
+// toolOutputLimit returns the per-tool-result byte bound for this session.
+func (h *serverHandle) toolOutputLimit() int {
+	if h == nil || h.maxToolOutputBytes <= 0 {
+		return agent.DefaultMaxToolOutputBytes
+	}
+	return h.maxToolOutputBytes
+}
+
 func (h *serverHandle) emit(ev agent.Event) {
+	if toolRes, ok := ev.(agent.ToolResultEvent); ok {
+		if truncated, changed := agent.TruncateToolOutput(toolRes.Content, h.toolOutputLimit()); changed {
+			toolRes.Content = truncated
+			ev = toolRes
+		}
+	}
 	h.eventsMu.RLock()
 	defer h.eventsMu.RUnlock()
 	if h.eventsClosed.Load() {
