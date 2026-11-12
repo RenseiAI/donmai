@@ -12,6 +12,10 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 - Add `runtime/depprep`, a session-independent entry point that prepares a plain checkout's dependencies through the kit dependency-store entries that select it. Any caller, including a non-agent executor in another Go module, calls `New(Config)` and `Prepare(ctx, Request)`. Without a keeper it runs a two-phase frozen install (fetch, then an offline install) into a per-run cache under the caller's scratch directory, with an environment built from nothing, install-time package code off unless a confiner is supplied, the 60-second online floor and 15-second reserve, and nine closed error codes. A leaf no entry selects returns `not_applicable` and runs nothing. The runner's own install is unchanged.
 
+### Fixes
+
+- Raise the Go toolchain to 1.26.11, which fixes GO-2026-6859 (HTTP/1 server crash from a `MaxBytesReader` header race in `net/http`); the `Go vuln scan` check passes again. Toolchain pins in `go.mod`, the Makefile, the signing-integration workflow, the worker, E2B and upgrade-acceptance images, and the contributor docs move together.
+
 ## v0.73.5 — 2026-11-11
 
 ### Chores
