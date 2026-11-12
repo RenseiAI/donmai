@@ -23,6 +23,7 @@ const {
   assertVersionOutput,
   executableDockerfileText,
   hasBuildTimeVectorSmoke,
+  hasSystemdSafePgControl,
   hasCToolchainForRace,
   hasClusterOwnedBySandboxUser,
   hasE2bCompatibleGoPath,
@@ -2315,4 +2316,46 @@ test('e2b.node-pg.Dockerfile proves an unprivileged start at build time', () => 
   const executable = executableDockerfileText(dockerfile)
   assert.match(executable, /su user -s \/bin\/sh -c 'pg-start'/)
   assert.match(executable, /su user -s \/bin\/sh -c "[^"]*CREATE EXTENSION vector/)
+})
+
+test('e2b.node-pg.Dockerfile keeps Postgres start and stop off systemd', () => {
+  // The E2B builder runs systemd. A bare root `pg_ctlcluster 17 main start`
+  // is redirected to systemctl there and fails the build-time smoke with
+  // "Job for postgresql@17-main.service failed"; the server also refuses to
+  // start as the sandbox account while ssl is on (the snakeoil key belongs
+  // to the postgres account), and an auto-started unit races pg-start.
+  const repoRoot = testRepoRoot()
+  const dockerfile = fs.readFileSync(
+    path.join(repoRoot, 'worker', 'e2b', 'e2b.node-pg.Dockerfile'),
+    'utf8'
+  )
+  assert.equal(hasSystemdSafePgControl(dockerfile), true)
+  assert.equal(hasPgStartScript(dockerfile), true)
+  assert.equal(hasBuildTimeVectorSmoke(dockerfile), true)
+
+  const good = [
+    'FROM x',
+    'RUN echo "ssl = off" >> /etc/postgresql/17/main/postgresql.conf && echo manual > /etc/postgresql/17/main/start.conf',
+    "RUN echo 'pg_ctlcluster --skip-systemctl-redirect 17 main start' >> /usr/local/bin/pg-start",
+    'RUN pg-start && pg_ctlcluster --skip-systemctl-redirect 17 main stop',
+    '',
+  ].join('\n')
+  assert.equal(hasSystemdSafePgControl(good), true)
+  assert.equal(
+    hasSystemdSafePgControl(good.replace('pg_ctlcluster --skip-systemctl-redirect 17 main start', 'pg_ctlcluster 17 main start')),
+    false,
+    'a start without the flag is redirected to systemctl'
+  )
+  assert.equal(
+    hasSystemdSafePgControl(good.replace('pg_ctlcluster --skip-systemctl-redirect 17 main stop', 'pg_ctlcluster 17 main stop')),
+    false,
+    'a stop without the flag is redirected to systemctl'
+  )
+  assert.equal(hasSystemdSafePgControl(good.replace('echo "ssl = off"', 'echo "ssl = on"')), false)
+  assert.equal(hasSystemdSafePgControl(good.replace('echo manual >', 'echo auto >')), false)
+  assert.equal(
+    hasSystemdSafePgControl('# pg_ctlcluster --skip-systemctl-redirect 17 main start\n# echo "ssl = off" >> /etc/postgresql/17/main/postgresql.conf\nFROM x\n'),
+    false,
+    'comments do not count'
+  )
 })
