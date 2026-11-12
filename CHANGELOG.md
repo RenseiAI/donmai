@@ -12,6 +12,10 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 - Kit manifests (`api = "donmai.dev/v2"`) gain three dependency-store keys: `versions` (a semver range of package-manager versions an entry covers), `[provide.dependency_store.no_code] env` (settings that make every phase run no package code) and `[provide.dependency_store.credentials] config_env` (the variable that names the per-run credential file). A kit may now declare one manager more than once when the `versions` ranges are disjoint, for example pnpm `>=9 <10` and `>=10 <11`; overlapping ranges within a kit are a validation error, and across kits they conflict unless the composition lock selects one. Composition now keys entries by manager and range, and carries each installed kit package's verified root so a package-owned path resolves against it. Daemons built before this change reject a manifest carrying the new keys.
 
+### Fixes
+
+- Raise the Go toolchain to 1.26.11, which fixes GO-2026-6859 (HTTP/1 server crash from a `MaxBytesReader` header race in `net/http`); the `Go vuln scan` check passes again. Toolchain pins in `go.mod`, the Makefile, the signing-integration workflow, the worker, E2B and upgrade-acceptance images, and the contributor docs move together.
+
 ## v0.73.5 — 2026-11-11
 
 ### Chores
