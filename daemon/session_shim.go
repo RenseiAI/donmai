@@ -850,11 +850,14 @@ type SessionShimConfig struct {
 	// its own bounded context.
 	ReadoptionHeldPastWindow func(context.Context, sessionshim.Identity) bool
 
-	// OnReadoptionWindowExhausted runs exactly once when a ReadoptionLineageLive
-	// window ends with the shim STILL observable — the case the dead-shim path
-	// cannot produce. It runs BEFORE the lineage is withdrawn, off the daemon's
-	// lock, so a composition can record the distinction — or start its own
-	// repair — while the lineage is still adopted.
+	// OnReadoptionWindowExhausted is legacy: with unbounded holds while the shim
+	// stays observable, a live window no longer exhausts, so this no longer fires
+	// for an observable shim. It is retained for source compatibility and still
+	// fires if a caller routes through sessionShimWindowExhausted with the shim
+	// observable (legacy bounded paths and tests). New code should not rely on
+	// it to detect outage ends; the hold ends only on positive evidence (shim
+	// gone, lineage released, decisive answer) and the quarantine detail names
+	// the harness liveness at release.
 	OnReadoptionWindowExhausted func(context.Context, sessionshim.Identity)
 
 	// OnSessionShimCarrierBindLost runs when this daemon learns a lineage's
@@ -1931,68 +1934,50 @@ func (d *Daemon) sessionResumeKey(sessionID, organizationID string) (*sessionshi
 // (§D8, amendment 2026-09-03). The ZERO value is fixed-attempt mode, so an
 // upgrade changes nothing until an embedder opts in.
 //
-// ReadoptionFixedAttempts is the 2026-09-02 behaviour and the one the doc on
-// DefaultSessionShimReadoptionPolicy walks through: bounded attempts whose
-// whole window — every attempt AND every backoff between them — ends strictly
-// inside the shim's resolved orphan deadline, because the shim's clock starts
-// the moment the controller stream ends and only a Welcome it accepts disarms
-// it. Each attempt is bounded by AttemptTimeout rather than by the dynamic
-// publication timeout (four callback timeouts, thirty seconds each in a
-// composed deployment, so 120 s per attempt and a worst case of 3 × 120 s +
-// 15 s of backoff = 375 s — several times any deadline a composing deployment
-// resolves to). The deadline it is held to is whatever sessionShimConfig
-// resolves: the standalone default is fifteen minutes; a composing deployment
-// that declares an external release threshold and leaves Orphan.Deadline zero
-// gets sessionShimOrphanDeadlineUnderExternalRelease's derivation — a
-// three-minute threshold yields 3m − 5s − 30s − 30s = 115 s. The default
-// fixed-attempt window is pinned strictly below both 90 s and 115 s in
-// session_shim_readopt_test.go.
+// Since the interactive-outage fix, BOTH modes hold past their initial
+// budget while the shim stays observable: fixed holds past its attempt budget
+// and lineage-live continues past its window, in both cases with the orphan
+// keepalive running and capped backoff (see DefaultSessionShimReadoptionBackoffCap).
+// While the control plane is unreachable or answering 5xx/timeouts, a session
+// whose shim and harness are still alive is NOT released or reaped, and its
+// harness is NOT signalled. Re-adoption keeps retrying with backoff for as
+// long as the shim is observable, with no fixed attempt window: release or
+// reap needs positive evidence the harness or shim is gone (process exit,
+// shim socket gone, decisive released answer, expired credential, recorded
+// conflicting evidence, or the composing layer no longer holding the lineage),
+// never missing re-adoption alone.
 //
-// ReadoptionLineageLive drops that containment on purpose. A carrier can be
-// gone for longer than any orphan deadline a deployment would ever want to
-// set, and reaping a healthy harness because a relay took four minutes to come
-// back is the failure this mode exists to remove. In this mode the daemon
-// retries with exponential backoff capped at BackoffCap for Window — which MAY
-// exceed the resolved orphan deadline — for exactly as long as it can still
-// SEE the lineage: the discovery record's incarnation is live, no tombstone
-// exists, and the embedder's LineageLive predicate (SessionShimConfig.
-// LineageLive) still says this daemon holds it. Because the window may outlast
-// the shim's own deadline, the daemon carries a matching obligation: it sends
-// the shim a periodic orphan keepalive (sessionshim.KeepAlive) that re-arms
-// the shim's deadline for one further interval. A shim that stops answering
-// that keepalive — or that this daemon can no longer observe — is back on its
-// ordinary orphan deadline immediately, which is exactly the outcome the mode
-// is willing to accept: the daemon never asks a shim it cannot see to stay
-// alive. Window exhaustion with a live shim withdraws the lineage under a
-// reason distinct from the dead-shim path, so an operator can tell a carrier
-// that never came back from a harness that died, and
-// SessionShimConfig.OnReadoptionWindowExhausted fires first, while the lineage
-// is still adopted, so a composition that wants its own disposition gets it
-// before the withdrawal rather than instead of it.
+// ReadoptionFixedAttempts names the initial budget: Attempts of at most
+// AttemptTimeout each (see DefaultSessionShimReadoptionPolicy for the 60s
+// arithmetic). The budget sizes the initial burst, not the outage the daemon
+// survives: past it, the daemon keeps the lineage adopted, keeps extending the
+// shim's clock, and keeps harness output buffered locally until the carrier
+// returns or positive evidence ends the hold.
 //
-// There is deliberately no "keep it adopted" post-window option, and the
-// corpus says so: ADR-2026-09-03-readoption-exhaustion-withdraws amends rule 8
-// to make the withdrawal unconditional with the notification first. The
-// keepalive stops when the window does, so a retained lineage's shim reaps on
-// its own deadline within minutes and writes a tombstone that nothing consumes
-// — the tombstone reconciler iterates the QUARANTINED set — leaving the daemon
-// reporting an adopted lineage whose shim is gone, holding its capacity
-// forever. That is a false complete-snapshot and a permanent capacity leak.
+// ReadoptionLineageLive names the same hold with a Window-sized initial
+// budget (see DefaultLineageLiveSessionShimReadoptionPolicy). Window MAY
+// exceed the resolved orphan deadline — the keepalive pays for that — and past
+// it the daemon continues in place while it can still SEE the lineage: the
+// discovery record's incarnation is live, no tombstone exists, and the
+// embedder's LineageLive predicate (SessionShimConfig.LineageLive) still says
+// this daemon holds it (nil means held for a standalone daemon). A shim that
+// stops answering the keepalive — or that this daemon can no longer observe —
+// is back on its ordinary orphan deadline immediately: the daemon never asks
+// a shim it cannot see to stay alive.
 //
-// Continuing is not keeping. SessionShimConfig.ReadoptionHeldPastWindow lets a
-// composing layer that holds a lineage without an external release bound — an
-// interactive session nobody asked to stop — start another window instead of
-// exhausting this one (amendment 2026-10-21). In fixed-attempt mode the same
-// predicate holds the lineage past its spent budget instead, with the
-// keepalive running and capped backoff. The keepalive, the liveness
-// gate, and the attempts all keep running, so the lineage is still under the
-// same observation that would withdraw it the instant any of them fails; it is
-// never an adopted entry nothing is watching.
+// Continuing is not keeping. The keepalive, the liveness gate, and the
+// attempts all keep running, so the lineage is still under the same
+// observation that would withdraw it the instant any of them fails; it is
+// never an adopted entry nothing is watching. SessionShimConfig.
+// ReadoptionHeldPastWindow remains for source compatibility and still gates
+// the held-past-window conjunction where set, but the hold no longer needs it:
+// an observable shim with no positive evidence to end it keeps its lineage.
 //
-// Attempts is read only in fixed mode; Window, BackoffCap and KeepaliveInterval
-// only in lineage-live mode. Validate refuses the combinations that would make
-// one policy answer two ways, and it is checked when the configuration is
-// installed, not when a fault arrives.
+// Attempts is read only in fixed mode; Window and KeepaliveInterval only in
+// lineage-live mode. BackoffCap ceilings the doubling in both modes (see
+// DefaultSessionShimReadoptionBackoffCap). Validate refuses the combinations
+// that would make one policy answer two ways, and it is checked when the
+// configuration is installed, not when a fault arrives.
 type SessionShimReadoptionPolicy struct {
 	// Mode selects the bound. The zero value, ReadoptionFixedAttempts, is the
 	// pre-existing behaviour.
@@ -2000,10 +1985,10 @@ type SessionShimReadoptionPolicy struct {
 	// Disabled keeps the pre-existing disposition: no re-dial, immediate
 	// quarantine. It is a separate flag so the zero policy means "default".
 	Disabled bool
-	// Attempts is how many re-adoptions are tried before quarantining in
-	// ReadoptionFixedAttempts mode. Zero uses
-	// defaultSessionShimReadoptionAttempts. Validate refuses a non-zero value
-	// in ReadoptionLineageLive mode, where nothing reads it.
+	// Attempts sizes the initial burst in ReadoptionFixedAttempts mode before
+	// the daemon holds past the budget while the shim stays observable. Zero
+	// uses defaultSessionShimReadoptionAttempts. Validate refuses a non-zero
+	// value in ReadoptionLineageLive mode, where nothing reads it.
 	Attempts int
 	// Backoff is the delay before the second attempt; each later attempt
 	// doubles it, capped at BackoffCap in lineage-live mode and in a
@@ -2018,13 +2003,14 @@ type SessionShimReadoptionPolicy struct {
 	// defaultSessionShimReadoptionAttemptTimeout. The dynamic publication
 	// timeout still applies when it is the smaller of the two.
 	AttemptTimeout time.Duration
-	// Window is how long ReadoptionLineageLive keeps retrying while the shim
-	// stays observable. Zero uses defaultSessionShimReadoptionWindow (10 min).
-	// Validate refuses a non-zero value in fixed mode.
+	// Window sizes the initial budget in ReadoptionLineageLive mode; past it
+	// the daemon continues in place while the shim stays observable. Zero uses
+	// defaultSessionShimReadoptionWindow (10 min). Validate refuses a non-zero
+	// value in fixed mode.
 	Window time.Duration
-	// BackoffCap ceilings the doubling in lineage-live mode. Zero uses
-	// defaultSessionShimReadoptionBackoffCap (30 s). Validate refuses a
-	// non-zero value in fixed mode.
+	// BackoffCap ceilings the doubling in both modes: lineage-live throughout,
+	// and fixed while holding past the attempt budget. Zero uses
+	// DefaultSessionShimReadoptionBackoffCap (30 s).
 	BackoffCap time.Duration
 	// KeepaliveInterval is how often the daemon extends the shim's orphan
 	// clock during a lineage-live window. Zero derives it from the resolved
@@ -2104,10 +2090,11 @@ func (p SessionShimReadoptionPolicy) Validate() error {
 			return fmt.Errorf("%w: Window=%s is meaningless in %s mode; set Mode: ReadoptionLineageLive to use it",
 				ErrSessionShimReadoptionPolicy, p.Window, p.Mode)
 		}
-		if p.BackoffCap > 0 {
-			return fmt.Errorf("%w: BackoffCap=%s is meaningless in %s mode",
-				ErrSessionShimReadoptionPolicy, p.BackoffCap, p.Mode)
-		}
+		// BackoffCap ceilings the doubling while the daemon holds past its
+		// attempt budget with the shim still observable: the hold retries
+		// indefinitely with capped backoff, so the cap is meaningful in both
+		// modes. KeepaliveInterval stays refused here; the hold derives its
+		// interval from the orphan deadline.
 		if p.KeepaliveInterval > 0 {
 			return fmt.Errorf("%w: KeepaliveInterval=%s is meaningless in %s mode",
 				ErrSessionShimReadoptionPolicy, p.KeepaliveInterval, p.Mode)
@@ -2128,7 +2115,14 @@ const (
 	defaultSessionShimReadoptionBackoff        = 5 * time.Second
 	defaultSessionShimReadoptionAttemptTimeout = 15 * time.Second
 	defaultSessionShimReadoptionWindow         = 10 * time.Minute
-	defaultSessionShimReadoptionBackoffCap     = 30 * time.Second
+	defaultSessionShimReadoptionBackoffCap     = DefaultSessionShimReadoptionBackoffCap
+	// DefaultSessionShimReadoptionBackoffCap is the visible default ceiling
+	// for the doubling re-adoption backoff. It applies in lineage-live mode
+	// and while a fixed-attempt run holds past its budget with the shim
+	// still observable: the wait between attempts doubles per attempt and
+	// never grows past this cap, so re-attachment after a long outage waits
+	// one capped backoff rather than about as long as the outage lasted.
+	// Configure SessionShimReadoptionPolicy.BackoffCap to override it.
 	// sessionShimKeepaliveDeadlineDivisor derives the keepalive interval from
 	// the resolved orphan deadline. Three gives two whole missed keepalives of
 	// slack before a shim that is still answering would reap itself, which is
@@ -2169,6 +2163,12 @@ const (
 	// cannot answer them.
 	sessionShimDurableAckCyclesSpentDetail = "durable_ack_cycles_spent: consecutive re-adoptions each ran the durable-acknowledgement ambiguity bound out"
 )
+
+// DefaultSessionShimReadoptionBackoffCap is the documented, configurable
+// ceiling for the doubling re-adoption backoff (30s). Every re-adoption loop
+// that holds past its initial budget while the shim stays observable retries
+// with this cap unless SessionShimReadoptionPolicy.BackoffCap overrides it.
+const DefaultSessionShimReadoptionBackoffCap = 30 * time.Second
 
 // DefaultSessionShimReadoptionPolicy is the policy a zero value resolves to:
 // three attempts of at most fifteen seconds each, the second after a five
@@ -2250,9 +2250,13 @@ func (c SessionShimConfig) readoption() SessionShimReadoptionPolicy {
 		if policy.Attempts <= 0 {
 			policy.Attempts = defaultSessionShimReadoptionAttempts
 		}
-		// No BackoffCap default here: a configured value stays refused in
-		// fixed mode, and the fixed-attempt hold reads the default itself
-		// when the resolved value is zero.
+		// The hold past the budget retries with capped backoff, so the cap
+		// is meaningful in fixed mode too. It defaults to the same visible
+		// default as lineage-live mode (see
+		// DefaultSessionShimReadoptionBackoffCap).
+		if policy.BackoffCap <= 0 {
+			policy.BackoffCap = defaultSessionShimReadoptionBackoffCap
+		}
 	}
 	return policy
 }
@@ -2304,20 +2308,25 @@ func (c SessionShimConfig) validateReadoptionAgainstOrphanPolicy() error {
 				ErrSessionShimReadoptionPolicy)
 		}
 	}
-	if policy.Disabled || (policy.Mode != ReadoptionLineageLive && c.ReadoptionHeldPastWindow == nil) {
+	// Both modes now hold past their initial budget while the shim stays
+	// observable (fixed holds past its attempt budget, lineage-live continues
+	// past its window), with the orphan keepalive running throughout. Either
+	// extends the shim's deadline indefinitely, so either needs LineageLive
+	// under a declared external release threshold. Only a disabled policy
+	// extends nothing.
+	if policy.Disabled {
 		return nil
 	}
 	if c.Orphan.ExternalReleaseThreshold > 0 && c.LineageLive == nil {
 		return fmt.Errorf(
-			"%w: %s mode extends the shim's orphan deadline for up to %s, so the time from controller "+
-				"loss to a reaped harness becomes %s + %s + %s + %s, which is not strictly less than the "+
+			"%w: %s mode holds the lineage while the shim stays observable and extends the shim's orphan deadline "+
+				"indefinitely, so the time from controller loss to a reaped harness is unbounded, which is not strictly less than the "+
 				"declared external release threshold %s — an external component could release the claim "+
-				"while the harness is still running. The amendment permits the extension only while this "+
+				"while the harness is still running. The hold continues only while this "+
 				"daemon still holds the lineage, and only SessionShimConfig.LineageLive can answer that, "+
-				"so wire it or use %s mode",
-			ErrSessionShimReadoptionPolicy, policy.Mode, policy.WorstCaseWindow(),
-			policy.WorstCaseWindow(), c.Orphan.Deadline, c.Orphan.TerminationGrace, c.Orphan.PropagationMargin,
-			c.Orphan.ExternalReleaseThreshold, ReadoptionFixedAttempts,
+				"so wire it or disable re-adoption",
+			ErrSessionShimReadoptionPolicy, policy.Mode,
+			c.Orphan.ExternalReleaseThreshold,
 		)
 	}
 	deadline := c.orphanDeadlineOfResolvedConfig()
@@ -2397,12 +2406,13 @@ func (c SessionShimConfig) readoptionAttemptTimeout() time.Duration {
 	return min(c.readoption().AttemptTimeout, c.adoptionPublicationTimeout())
 }
 
-// WorstCaseWindow is the longest the policy can keep a lineage between
-// controllers, in whichever mode the policy is in. An embedder checks its own
-// policy against its own orphan deadline with this before configuring it, so
-// it must answer for the bound the loop actually runs — a fixed-mode answer
-// given for a lineage-live policy is how an embedder sized a 90 s deadline
-// against a 60 s number and terminalized a live lineage anyway.
+// WorstCaseWindow is the initial budget the policy keeps a lineage between
+// controllers before holding past it while the shim stays observable, in
+// whichever mode the policy is in. An embedder checks its own policy against
+// its own orphan deadline with this before configuring it. The hold past the
+// budget is unbounded while the shim is observable (the keepalive pays for
+// that), so this answers the initial burst for sizing, not the outage the
+// daemon survives.
 //
 // In ReadoptionLineageLive mode the answer is the resolved Window, and it is
 // EXPECTED to exceed the orphan deadline: the daemon's keepalive is what pays
