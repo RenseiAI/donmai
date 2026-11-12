@@ -3650,6 +3650,25 @@ func (d *Daemon) quarantineLostSessionShim(
 		return
 	}
 	now := d.shimNow()
+	// Read the current harness liveness BEFORE taking the write lock: the
+	// terminal record must say whether the harness was still alive at the
+	// moment of release, and the lost controller's Hello is stale (it is the
+	// phase at adoption, not at release). Best effort — a momentarily
+	// unreadable record falls back to the Hello's phase rather than refusing
+	// the withdrawal.
+	hello := entry.controller.Hello()
+	releasePhase := hello.Phase
+	if registry := d.openedShimRegistry(); registry != nil {
+		if rec, err := registry.Get(id); err == nil && rec.Phase.Known() {
+			releasePhase = rec.Phase
+		}
+	}
+	harnessAlive := releasePhase.HarnessLive()
+	if detail != "" {
+		detail = fmt.Sprintf("%s; harness alive at release: %t (phase=%s)", detail, harnessAlive, string(releasePhase))
+	} else {
+		detail = fmt.Sprintf("harness alive at release: %t (phase=%s)", harnessAlive, string(releasePhase))
+	}
 	d.shims.mu.Lock()
 	current, ok := d.shims.adopted[id]
 	if ok && current.controller != entry.controller {
@@ -3661,7 +3680,6 @@ func (d *Daemon) quarantineLostSessionShim(
 		// Withdrawn: there is nothing left to count, and a later lineage on
 		// this identity must start from a clean streak.
 		delete(d.shims.ambiguityCycles, id)
-		hello := entry.controller.Hello()
 		q := sessionshim.NewQuarantinedSession(sessionshim.Record{
 			OrgID:             id.OrgID,
 			SessionID:         id.SessionID,
@@ -3669,7 +3687,7 @@ func (d *Daemon) quarantineLostSessionShim(
 			ProcessEpoch:      hello.ProcessEpoch,
 			ProtocolMin:       hello.Min,
 			ProtocolMax:       hello.Max,
-			Phase:             hello.Phase,
+			Phase:             releasePhase,
 			CreatedAtUnixNano: now.UnixNano(),
 		}, reason, detail, now)
 		q.ControllerGeneration = uint64(entry.controller.Generation())

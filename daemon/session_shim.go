@@ -1989,10 +1989,13 @@ func (d *Daemon) sessionResumeKey(sessionID, organizationID string) (*sessionshi
 // same observation that would withdraw it the instant any of them fails; it is
 // never an adopted entry nothing is watching.
 //
-// Attempts is read only in fixed mode; Window, BackoffCap and KeepaliveInterval
-// only in lineage-live mode. Validate refuses the combinations that would make
-// one policy answer two ways, and it is checked when the configuration is
-// installed, not when a fault arrives.
+// Attempts is read only in fixed mode; Window and KeepaliveInterval only in
+// lineage-live mode. BackoffCap ceilings the doubling wherever the daemon
+// retries past its initial bound: throughout a lineage-live window, and in a
+// fixed-attempt hold past its budget (see
+// DefaultSessionShimReadoptionBackoffCap). Validate refuses the combinations
+// that would make one policy answer two ways, and it is checked when the
+// configuration is installed, not when a fault arrives.
 type SessionShimReadoptionPolicy struct {
 	// Mode selects the bound. The zero value, ReadoptionFixedAttempts, is the
 	// pre-existing behaviour.
@@ -2022,9 +2025,12 @@ type SessionShimReadoptionPolicy struct {
 	// stays observable. Zero uses defaultSessionShimReadoptionWindow (10 min).
 	// Validate refuses a non-zero value in fixed mode.
 	Window time.Duration
-	// BackoffCap ceilings the doubling in lineage-live mode. Zero uses
-	// defaultSessionShimReadoptionBackoffCap (30 s). Validate refuses a
-	// non-zero value in fixed mode.
+	// BackoffCap ceilings the doubling in lineage-live mode and in a
+	// fixed-attempt hold past its budget. Zero uses
+	// DefaultSessionShimReadoptionBackoffCap (30 s). In fixed mode it is read
+	// only by the hold (SessionShimConfig.ReadoptionHeldPastWindow); the
+	// initial attempt budget keeps its uncapped doubling, and a zero value
+	// stays zero after resolution so the default fixed window is unchanged.
 	BackoffCap time.Duration
 	// KeepaliveInterval is how often the daemon extends the shim's orphan
 	// clock during a lineage-live window. Zero derives it from the resolved
@@ -2104,10 +2110,9 @@ func (p SessionShimReadoptionPolicy) Validate() error {
 			return fmt.Errorf("%w: Window=%s is meaningless in %s mode; set Mode: ReadoptionLineageLive to use it",
 				ErrSessionShimReadoptionPolicy, p.Window, p.Mode)
 		}
-		if p.BackoffCap > 0 {
-			return fmt.Errorf("%w: BackoffCap=%s is meaningless in %s mode",
-				ErrSessionShimReadoptionPolicy, p.BackoffCap, p.Mode)
-		}
+		// BackoffCap is accepted: it ceilings the fixed-attempt hold past
+		// its budget. KeepaliveInterval stays refused here; the hold derives
+		// its interval from the orphan deadline.
 		if p.KeepaliveInterval > 0 {
 			return fmt.Errorf("%w: KeepaliveInterval=%s is meaningless in %s mode",
 				ErrSessionShimReadoptionPolicy, p.KeepaliveInterval, p.Mode)
@@ -2128,7 +2133,7 @@ const (
 	defaultSessionShimReadoptionBackoff        = 5 * time.Second
 	defaultSessionShimReadoptionAttemptTimeout = 15 * time.Second
 	defaultSessionShimReadoptionWindow         = 10 * time.Minute
-	defaultSessionShimReadoptionBackoffCap     = 30 * time.Second
+	defaultSessionShimReadoptionBackoffCap     = DefaultSessionShimReadoptionBackoffCap
 	// sessionShimKeepaliveDeadlineDivisor derives the keepalive interval from
 	// the resolved orphan deadline. Three gives two whole missed keepalives of
 	// slack before a shim that is still answering would reap itself, which is
@@ -2169,6 +2174,14 @@ const (
 	// cannot answer them.
 	sessionShimDurableAckCyclesSpentDetail = "durable_ack_cycles_spent: consecutive re-adoptions each ran the durable-acknowledgement ambiguity bound out"
 )
+
+// DefaultSessionShimReadoptionBackoffCap is the documented, configurable
+// ceiling for the doubling re-adoption backoff (30s). A lineage-live window
+// and a fixed-attempt hold past its budget both retry with this cap unless
+// SessionShimReadoptionPolicy.BackoffCap overrides it, so re-attachment after
+// a long outage waits at most one capped backoff rather than about as long as
+// the outage lasted.
+const DefaultSessionShimReadoptionBackoffCap = 30 * time.Second
 
 // DefaultSessionShimReadoptionPolicy is the policy a zero value resolves to:
 // three attempts of at most fifteen seconds each, the second after a five
@@ -2250,11 +2263,25 @@ func (c SessionShimConfig) readoption() SessionShimReadoptionPolicy {
 		if policy.Attempts <= 0 {
 			policy.Attempts = defaultSessionShimReadoptionAttempts
 		}
-		// No BackoffCap default here: a configured value stays refused in
-		// fixed mode, and the fixed-attempt hold reads the default itself
-		// when the resolved value is zero.
+		// No BackoffCap default here: the fixed-attempt initial budget does
+		// not read it, so the resolved default fixed policy stays exactly what
+		// it was, and the hold past the budget reads the default itself when
+		// the resolved value is zero (see sessionShimHoldBackoffCap).
 	}
 	return policy
+}
+
+// sessionShimHoldBackoffCap is the ceiling a re-adoption hold past its
+// initial bound doubles its backoff up to: the policy's configured BackoffCap,
+// or DefaultSessionShimReadoptionBackoffCap when none is configured. A
+// lineage-live policy resolves its cap in readoption(); a fixed-attempt policy
+// keeps a zero cap after resolution (its initial budget never reads one), so
+// the hold supplies the default here.
+func sessionShimHoldBackoffCap(policy SessionShimReadoptionPolicy) time.Duration {
+	if policy.BackoffCap > 0 {
+		return policy.BackoffCap
+	}
+	return DefaultSessionShimReadoptionBackoffCap
 }
 
 // validateReadoptionAgainstOrphanPolicy refuses the configurations that only
