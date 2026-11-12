@@ -1802,6 +1802,10 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// lastTurn is the latest turn's own observation; tail recovery reads how
 	// it ended.
 	lastTurn := streamRes
+	// lastTurnFollowUp is set once lastTurn is a follow-up turn's own
+	// observation (a memory inject, the pull request nudge, a
+	// continuation or a retry) rather than the first turn's.
+	lastTurnFollowUp := false
 	if runtimeInjectEnabled && !streamRes.blocked && budgetStop == nil {
 		injRes := r.drainMemoryInjects(ctx, handle, runnerStatePath, qw, res, enforcer, sink, traceProcessor, injectCh, beacons)
 		injRes.applyTo(res, provider.Name())
@@ -1810,6 +1814,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		}
 		if injRes.terminalEvent != nil {
 			lastTurn = injRes
+			lastTurnFollowUp = true
 		}
 		budgetStop = r.stopAtBudget(qw, handle, enforcer, nil)
 	}
@@ -1928,6 +1933,7 @@ tailRecovery:
 			tailRes.applyTo(res, provider.Name())
 			applyFollowUp(tailRes)
 			lastTurn = tailRes
+			lastTurnFollowUp = true
 			if budgetStop = r.stopAtBudget(qw, handle, enforcer, tailErr); budgetStop != nil {
 				break tailRecovery
 			}
@@ -2028,6 +2034,7 @@ tailRecovery:
 		tail.applyTo(res, provider.Name())
 		applyFollowUp(tail)
 		lastTurn = tail
+		lastTurnFollowUp = true
 		if budget != nil {
 			budgetStop = budget
 			break tailRecovery
@@ -2150,15 +2157,24 @@ tailRecovery:
 	// recorded, so a runner-authored refusal (divergence, provision)
 	// keeps its own typed reason.
 	if qw.ContinuePullRequest != nil && !repositoryFree && qw.requiresPR() && res.FailureMode == "" && budgetStop == nil {
-		// A turn that ended abnormally — the harness exited, or a tool
-		// result went over the size limit — records that cause here and
-		// never reaches the delivery check below: the "still a draft"
-		// message is only for a turn that completed normally and
-		// delivered no code.
-		if mode, message, abnormal := abnormalContinueTurnEndCause(res, streamRes, lastTurn, qw.ContinuePullRequest.Number, r.toolOutputLimit()); abnormal {
+		// A latest turn that ended abnormally — the harness exited or
+		// reported failure, or a provider or harness error ended it,
+		// possibly after a tool result went over the size limit —
+		// records that cause as the terminal reason: the "still a
+		// draft" message is only for a turn that completed normally and
+		// delivered no code. The first turn's death fails here, before
+		// the delivery check, as step 12 would fail it anyway. A
+		// continuation turn's death goes through the delivery check
+		// first: when the continued pull request already carries the
+		// session's delivered code the run completes with the death as
+		// a warning, otherwise the death replaces the check's message
+		// (settleAbnormalContinuationTurn). Either way a WORK_RESULT
+		// marker alone never counts as passed for a dead turn.
+		abnormalMode, abnormalMessage, abnormal := abnormalContinueTurnEndCause(res, streamRes, lastTurn, qw.ContinuePullRequest.Number, r.toolOutputLimit())
+		if abnormal && !lastTurnFollowUp {
 			res.Status = "failed"
-			res.FailureMode = mode
-			res.Error = message
+			res.FailureMode = abnormalMode
+			res.Error = abnormalMessage
 		} else if res.PullRequestURL != "" || continuePullRequestURL(verifyCtx, qw, repositoryDeclaration, wpath) != "" {
 			startHead := strings.TrimSpace(qw.ContinuePullRequest.HeadSha)
 			gateCtx, gateCancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -2196,8 +2212,8 @@ tailRecovery:
 				// A passed turn counts only when the turn itself
 				// ended successfully: a WORK_RESULT marker alone
 				// must not promote a turn that then ended on a
-				// provider error to completed.
-				passed := res.WorkResult == "passed" && res.Status != "failed" && lastTurn.providerError == ""
+				// provider error, or died, to completed.
+				passed := res.WorkResult == "passed" && res.Status != "failed" && lastTurn.providerError == "" && !abnormal
 				// completeContinueNoOp ends the run completed with the
 				// no-op continuation outcome, keeping the old failure
 				// message as a post-session warning so it stays
@@ -2276,6 +2292,13 @@ tailRecovery:
 					res.Error = fmt.Sprintf("continued pull request #%d has no code change since dispatch (only merges or scratch files)", qw.ContinuePullRequest.Number)
 				}
 			}()
+			if abnormal {
+				settleAbnormalContinuationTurn(res, abnormalMode, abnormalMessage)
+			}
+		} else if abnormal {
+			res.Status = "failed"
+			res.FailureMode = abnormalMode
+			res.Error = abnormalMessage
 		}
 	}
 

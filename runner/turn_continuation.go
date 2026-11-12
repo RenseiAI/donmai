@@ -169,53 +169,74 @@ func classifyTurnEnding(res *Result, session, turn streamObservation, reportedPR
 
 // abnormalContinueTurnEndCause reports whether a continue-mode run's latest
 // turn ended abnormally — the harness exited without a terminal result,
-// the harness reported a failed terminal, or a provider error ended the
-// turn — instead of completing normally. An abnormal turn never reaches
-// the continue-mode delivery check: its cause is recorded as the terminal
-// reason with a stable reason code, so the run cannot fall through to the
-// "still a draft" contract-check message that is meant only for a turn
-// that completed normally and delivered no code. A turn that ended on an
-// oversized tool result names that too, from the truncation the ingress
-// bound recorded. Returns false when the turn completed normally, or when
-// the run already carries a failure the delivery gate must not relabel.
+// the harness reported a failed terminal, or a provider or harness error
+// ended the turn — instead of completing normally. Its cause is recorded
+// as the terminal reason with a stable reason code, so the run cannot fall
+// through to the "still a draft" contract-check message that is meant
+// only for a turn that completed normally and delivered no code. A turn
+// that ended after an oversized tool result names that too, from the
+// truncation the ingress bound recorded on any turn of the session.
+// Returns false when the turn completed normally, or when the run already
+// carries a failure the delivery gate must not relabel.
+//
+// The terminal state is read from lastTurn, the latest turn's own
+// observation: streamRes is the first turn's, and tail recovery never
+// updates its terminal fields, so a continuation turn that died would
+// otherwise read as the first turn's clean ending. With no follow-up turn
+// lastTurn is streamRes. A provider error an earlier turn recovered from
+// (a retry that then ended cleanly) is not the latest turn's cause.
 func abnormalContinueTurnEndCause(res *Result, streamRes, lastTurn streamObservation, prNumber, toolOutputLimit int) (mode, message string, abnormal bool) {
 	if res == nil || res.FailureMode != "" || res.Status == "failed" {
 		return "", "", false
 	}
 	if providerErr := strings.TrimSpace(lastTurn.providerError); providerErr != "" {
 		return FailureProviderError,
-			fmt.Sprintf("harness turn ended on a model provider error before the pull request check: %s", providerErr),
+			fmt.Sprintf("harness turn ended on a model provider error while continuing pull request #%d: %s", prNumber, providerErr),
 			true
 	}
-	if providerErr := strings.TrimSpace(streamRes.providerError); providerErr != "" {
+	if lastTurn.errorEvent != nil && strings.TrimSpace(lastTurn.errorEvent.Message) != "" {
 		return FailureProviderError,
-			fmt.Sprintf("harness turn ended on a model provider error before the pull request check: %s", providerErr),
-			true
-	}
-	if streamRes.errorEvent != nil && strings.TrimSpace(streamRes.errorEvent.Message) != "" {
-		return FailureProviderError,
-			fmt.Sprintf("harness turn ended on a harness error before the pull request check: %s", strings.TrimSpace(streamRes.errorEvent.Message)),
+			fmt.Sprintf("harness turn ended on a harness error while continuing pull request #%d: %s", prNumber, strings.TrimSpace(lastTurn.errorEvent.Message)),
 			true
 	}
 	oversizeNote := ""
 	if n := max(streamRes.toolOutputBytes, lastTurn.toolOutputBytes); n > 0 && (streamRes.toolOutputTruncated || lastTurn.toolOutputTruncated) {
 		oversizeNote = fmt.Sprintf("; tool output exceeded the %d-byte limit and was truncated with a marker during the turn (largest result %d bytes)", toolOutputLimit, n)
 	}
-	if streamRes.terminalEvent == nil {
+	if lastTurn.terminalEvent == nil {
 		return FailureSilentExit,
-			fmt.Sprintf("harness turn ended without a terminal result (the harness exited before reporting), so continued pull request #%d was not checked%s", prNumber, oversizeNote),
+			fmt.Sprintf("harness turn ended without a terminal result (the harness exited before reporting) while continuing pull request #%d%s", prNumber, oversizeNote),
 			true
 	}
-	if !streamRes.terminalSuccess {
+	if !lastTurn.terminalSuccess {
 		detail := ""
-		if errs := streamRes.terminalEvent.Errors; len(errs) > 0 {
+		if errs := lastTurn.terminalEvent.Errors; len(errs) > 0 {
 			detail = ": " + boundedFailureTail(strings.Join(errs, "; "))
 		}
 		return FailureSilentExit,
-			fmt.Sprintf("harness turn reported failure before the pull request check, so continued pull request #%d was not checked%s%s", prNumber, detail, oversizeNote),
+			fmt.Sprintf("harness turn reported failure while continuing pull request #%d%s%s", prNumber, detail, oversizeNote),
 			true
 	}
 	return "", "", false
+}
+
+// settleAbnormalContinuationTurn applies a continuation turn's abnormal
+// end after the continue-mode delivery check ran. A check that failed
+// (still a draft, no new commit, no code change, …) is replaced by the
+// turn's own cause: the contract message would hide why the turn ended.
+// A check that passed means the continued pull request already carries
+// the session's delivered code — pushed, and not a draft unless the
+// delivery policy allows one — so the run keeps its completed outcome and
+// the death rides as a post-session warning: failing delivered work would
+// send it back for a redo the pull request does not need.
+func settleAbnormalContinuationTurn(res *Result, mode, message string) {
+	if res.Status == "failed" {
+		res.FailureMode = mode
+		res.Error = message
+		return
+	}
+	res.PostSessionWarnings = append(res.PostSessionWarnings,
+		message+"; the continued pull request already carried the session's delivered code, so the run completed")
 }
 
 // pullRequestIsTheOnlyResult reports whether the session's verified pull

@@ -142,12 +142,42 @@ func TestAbnormalContinueTurnEndCause(t *testing.T) {
 			wantContain: "model provider error",
 		},
 		{
-			name:        "provider error on the first turn is the cause",
+			name:        "provider error with no follow-up turn is the cause",
 			stream:      streamObservation{providerError: "gateway 503"},
-			last:        clean,
+			last:        streamObservation{providerError: "gateway 503"},
 			wantAbnorm:  true,
 			wantMode:    FailureProviderError,
 			wantContain: "gateway 503",
+		},
+		{
+			name:       "provider error a later turn recovered from is not the cause",
+			stream:     streamObservation{providerError: "gateway 503"},
+			last:       clean,
+			wantAbnorm: false,
+		},
+		{
+			name:        "continuation turn silent close is the cause after a clean first turn",
+			stream:      clean,
+			last:        streamObservation{},
+			wantAbnorm:  true,
+			wantMode:    FailureSilentExit,
+			wantContain: "without a terminal result",
+		},
+		{
+			name:        "continuation turn failed terminal is the cause after a clean first turn",
+			stream:      clean,
+			last:        streamObservation{terminalEvent: &agent.ResultEvent{Success: false, Errors: []string{"exit status 137"}}},
+			wantAbnorm:  true,
+			wantMode:    FailureSilentExit,
+			wantContain: "exit status 137",
+		},
+		{
+			name:        "continuation turn harness error is the cause after a clean first turn",
+			stream:      clean,
+			last:        streamObservation{errorEvent: &agent.ErrorEvent{Message: "harness crashed"}},
+			wantAbnorm:  true,
+			wantMode:    FailureProviderError,
+			wantContain: "harness crashed",
 		},
 		{
 			name:        "silent close is the cause, not the draft message",
@@ -160,7 +190,7 @@ func TestAbnormalContinueTurnEndCause(t *testing.T) {
 		{
 			name:        "failed terminal is the cause, not the draft message",
 			stream:      streamObservation{terminalEvent: &agent.ResultEvent{Success: false, Errors: []string{"exit status 1"}}, terminalSuccess: false},
-			last:        streamObservation{terminalEvent: &agent.ResultEvent{Success: false}, terminalSuccess: false},
+			last:        streamObservation{terminalEvent: &agent.ResultEvent{Success: false, Errors: []string{"exit status 1"}}, terminalSuccess: false},
 			wantAbnorm:  true,
 			wantMode:    FailureSilentExit,
 			wantContain: "reported failure",
@@ -392,4 +422,102 @@ func sawToolOutputTruncationWarning(res *Result) bool {
 		}
 	}
 	return false
+}
+
+// TestRun_ContinueModeContinuationTurnDeathRecordsHarnessCause proves the
+// guard reads the LATEST turn, not the first: the first turn ends normally
+// with no new commit, tail recovery continues it, and the continuation
+// turn dies. The death is the terminal reason — never the "still a draft"
+// contract message the first turn's clean ending would otherwise reach.
+func TestRun_ContinueModeContinuationTurnDeathRecordsHarnessCause(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		death       verdictScriptTurn
+		wantMode    string
+		wantContain string
+	}{
+		{
+			name:        "silent close",
+			death:       verdictScriptTurn{silentClose: true},
+			wantMode:    FailureSilentExit,
+			wantContain: "without a terminal result",
+		},
+		{
+			name: "failed terminal",
+			death: verdictScriptTurn{
+				hang:   true,
+				events: []agent.Event{agent.ResultEvent{Success: false, Errors: []string{"harness gave up: exit status 1"}}},
+			},
+			wantMode:    FailureSilentExit,
+			wantContain: "harness gave up",
+		},
+		{
+			name:        "harness error",
+			death:       verdictScriptTurn{crash: true},
+			wantMode:    FailureProviderError,
+			wantContain: "provider crashed mid turn",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			res, provider := runScriptedSession(t, scriptedSession{
+				workType:       "development",
+				repository:     followUpRepository,
+				continueNumber: 12,
+				draft:          func(context.Context, string, string) (bool, error) { return true, nil },
+				turns: []verdictScriptTurn{
+					{text: "working on it", toolCalls: 1},
+					tc.death,
+				},
+			})
+			if len(provider.prompts) == 0 {
+				t.Fatal("no continuation was sent; the death must happen on a continuation turn")
+			}
+			if res.Status != "failed" || res.FailureMode != tc.wantMode {
+				t.Fatalf("Status = %q (%s: %s); want failed/%s", res.Status, res.FailureMode, res.Error, tc.wantMode)
+			}
+			if strings.Contains(res.Error, "still a draft") {
+				t.Fatalf("Error = %q; a dead continuation turn must not report the draft message", res.Error)
+			}
+			if !strings.Contains(res.Error, tc.wantContain) {
+				t.Fatalf("Error = %q; want the continuation turn's cause %q", res.Error, tc.wantContain)
+			}
+		})
+	}
+}
+
+// TestRun_ContinueModeContinuationTurnDeathAfterDeliveryCompletes pins the
+// decision for a continuation turn that dies after it delivered: the
+// session pushed a commit to the continued pull request, which is not a
+// draft, and then the harness died. The delivery contract is met, so the
+// session completes as it did before the guard existed; the death rides
+// as a post-session warning instead of failing delivered work.
+func TestRun_ContinueModeContinuationTurnDeathAfterDeliveryCompletes(t *testing.T) {
+	res, provider := runScriptedSession(t, scriptedSession{
+		workType:       "development",
+		repository:     followUpRepository,
+		continueNumber: 12,
+		turns: []verdictScriptTurn{
+			{text: "working on it", toolCalls: 1},
+			{
+				files:       map[string]string{"fix.txt": "work\n"},
+				push:        []string{"refs/heads/continued/pr-12", "refs/pull/12/head"},
+				silentClose: true,
+			},
+		},
+	})
+	if len(provider.prompts) == 0 {
+		t.Fatal("no continuation was sent; the death must happen on a continuation turn")
+	}
+	if res.Status != "completed" || res.FailureMode != "" {
+		t.Fatalf("Status = %q (%s: %s); want completed: the continued pull request carries the delivered code", res.Status, res.FailureMode, res.Error)
+	}
+	found := false
+	for _, w := range res.PostSessionWarnings {
+		if strings.Contains(w, "without a terminal result") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("PostSessionWarnings = %q; want the continuation turn's death named", res.PostSessionWarnings)
+	}
 }

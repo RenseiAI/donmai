@@ -34,8 +34,8 @@ type verdictScriptTurn struct {
 	crash    bool
 	// silentClose closes the event stream without any terminal event,
 	// as a harness that dies (process exit, kill) without reporting
-	// leaves it. Only the first turn's shape matters: a follow-up turn
-	// never plays after a closed stream in these tests.
+	// leaves it. Any turn may close silently (a continuation turn
+	// included); no later turn plays after a closed stream.
 	silentClose bool
 	// laterMtime stamps the written manifest one minute ahead, so a rewrite
 	// with identical bytes still moves the mtime on filesystems whose
