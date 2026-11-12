@@ -41,11 +41,35 @@ func newReleaseLivenessFixture(t *testing.T) *readoptFixture {
 	})
 }
 
+// settledLostEntry is lostEntry once the fixture's shim has finished reacting
+// to the loss.
+//
+// Closing the controller makes the in-process shim republish its OWN record
+// (phase orphaned, a fresh orphan deadline) from its connection teardown, a
+// few milliseconds later and on its own goroutine. A test that rewrites or
+// removes the record before that republish lands has its edit silently
+// replaced by the lost incarnation's record. Once the republish is visible the
+// shim writes nothing more until its orphan deadline, which this fixture sets
+// a minute out, so the registry is the test's to arrange.
+func (f *readoptFixture) settledLostEntry(t *testing.T) adoptedShim {
+	t.Helper()
+	lost := f.lostEntry(t)
+	waitFor(t, 10*time.Second, "the lost shim's orphan record", func() bool {
+		rec, err := f.registry.Get(f.id)
+		return err == nil && rec.ShimID == lost.shimID &&
+			rec.Phase == shimwire.PhaseOrphaned && rec.OrphanDeadlineUnixNano != 0
+	})
+	return lost
+}
+
 // A shim whose discovery record is gone has no harness this daemon can stand
 // behind. The carrier-loss release must say so, not repeat the Hello.
 func TestReleaseWithRecordGoneReportsHarnessNotAlive(t *testing.T) {
 	t.Parallel()
 	f := newReleaseLivenessFixture(t)
+	// Settle the loss first, or the shim's own orphan republish can put the
+	// record back between this Remove and the release's read.
+	f.settledLostEntry(t)
 	if err := f.registry.Remove(f.id); err != nil {
 		t.Fatalf("remove record: %v", err)
 	}
@@ -92,7 +116,10 @@ func TestReleaseOfTombstonedShimReportsHarnessNotAlive(t *testing.T) {
 func TestReleaseIgnoresANewerIncarnationsRecord(t *testing.T) {
 	t.Parallel()
 	f := newReleaseLivenessFixture(t)
-	lost := f.lostEntry(t)
+	// The lost shim's orphan republish must land BEFORE the newer record is
+	// written, not after it: otherwise it replaces the newer record and the
+	// release reads the lost incarnation's own record instead.
+	lost := f.settledLostEntry(t)
 	hello := lost.controller.Hello()
 	rec, err := f.registry.Get(f.id)
 	if err != nil {
@@ -112,6 +139,11 @@ func TestReleaseIgnoresANewerIncarnationsRecord(t *testing.T) {
 	}
 	f.daemon.quarantineLostSessionShim(f.id, lost, sessionshim.QuarantineSocketUnreachable, sessionShimControllerLostDetail)
 
+	// The case under test is the one the registry still holds: a release that
+	// read anything but the newer record proves nothing about it.
+	if got, err := f.registry.Get(f.id); err != nil || got.ShimID != rec.ShimID || got.ProcessEpoch != rec.ProcessEpoch {
+		t.Fatalf("registry after release = %+v, %v; want the newer incarnation %s/%d still recorded", got, err, rec.ShimID, rec.ProcessEpoch)
+	}
 	q := quarantinedRow(t, f.daemon, f.id)
 	if want := sessionShimControllerLostDetail + "; harness alive at release: false (record superseded)"; q.Detail != want {
 		t.Fatalf("detail = %q, want %q", q.Detail, want)
@@ -129,7 +161,7 @@ func TestReleaseIgnoresANewerIncarnationsRecord(t *testing.T) {
 func TestReleaseUsesTheLostIncarnationsOwnRecord(t *testing.T) {
 	t.Parallel()
 	f := newReleaseLivenessFixture(t)
-	lost := f.lostEntry(t)
+	lost := f.settledLostEntry(t)
 	rec, err := f.registry.Get(f.id)
 	if err != nil {
 		t.Fatalf("registry.Get: %v", err)
