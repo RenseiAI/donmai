@@ -167,6 +167,57 @@ func classifyTurnEnding(res *Result, session, turn streamObservation, reportedPR
 	}
 }
 
+// abnormalContinueTurnEndCause reports whether a continue-mode run's latest
+// turn ended abnormally — the harness exited without a terminal result,
+// the harness reported a failed terminal, or a provider error ended the
+// turn — instead of completing normally. An abnormal turn never reaches
+// the continue-mode delivery check: its cause is recorded as the terminal
+// reason with a stable reason code, so the run cannot fall through to the
+// "still a draft" contract-check message that is meant only for a turn
+// that completed normally and delivered no code. A turn that ended on an
+// oversized tool result names that too, from the truncation the ingress
+// bound recorded. Returns false when the turn completed normally, or when
+// the run already carries a failure the delivery gate must not relabel.
+func abnormalContinueTurnEndCause(res *Result, streamRes, lastTurn streamObservation, prNumber, toolOutputLimit int) (mode, message string, abnormal bool) {
+	if res == nil || res.FailureMode != "" || res.Status == "failed" {
+		return "", "", false
+	}
+	if providerErr := strings.TrimSpace(lastTurn.providerError); providerErr != "" {
+		return FailureProviderError,
+			fmt.Sprintf("harness turn ended on a model provider error before the pull request check: %s", providerErr),
+			true
+	}
+	if providerErr := strings.TrimSpace(streamRes.providerError); providerErr != "" {
+		return FailureProviderError,
+			fmt.Sprintf("harness turn ended on a model provider error before the pull request check: %s", providerErr),
+			true
+	}
+	if streamRes.errorEvent != nil && strings.TrimSpace(streamRes.errorEvent.Message) != "" {
+		return FailureProviderError,
+			fmt.Sprintf("harness turn ended on a harness error before the pull request check: %s", strings.TrimSpace(streamRes.errorEvent.Message)),
+			true
+	}
+	oversizeNote := ""
+	if n := max(streamRes.toolOutputBytes, lastTurn.toolOutputBytes); n > 0 && (streamRes.toolOutputTruncated || lastTurn.toolOutputTruncated) {
+		oversizeNote = fmt.Sprintf("; tool output exceeded the %d-byte limit and was truncated with a marker during the turn (largest result %d bytes)", toolOutputLimit, n)
+	}
+	if streamRes.terminalEvent == nil {
+		return FailureSilentExit,
+			fmt.Sprintf("harness turn ended without a terminal result (the harness exited before reporting), so continued pull request #%d was not checked%s", prNumber, oversizeNote),
+			true
+	}
+	if !streamRes.terminalSuccess {
+		detail := ""
+		if errs := streamRes.terminalEvent.Errors; len(errs) > 0 {
+			detail = ": " + boundedFailureTail(strings.Join(errs, "; "))
+		}
+		return FailureSilentExit,
+			fmt.Sprintf("harness turn reported failure before the pull request check, so continued pull request #%d was not checked%s%s", prNumber, detail, oversizeNote),
+			true
+	}
+	return "", "", false
+}
+
 // pullRequestIsTheOnlyResult reports whether the session's verified pull
 // request is all that finished the latest turn: without it the turn would
 // have stopped early. Only then is the pull request re-read to see whether

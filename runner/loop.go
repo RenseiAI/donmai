@@ -2150,8 +2150,17 @@ tailRecovery:
 	// recorded, so a runner-authored refusal (divergence, provision)
 	// keeps its own typed reason.
 	if qw.ContinuePullRequest != nil && !repositoryFree && qw.requiresPR() && res.FailureMode == "" && budgetStop == nil {
-		startHead := strings.TrimSpace(qw.ContinuePullRequest.HeadSha)
-		if res.PullRequestURL != "" || continuePullRequestURL(verifyCtx, qw, repositoryDeclaration, wpath) != "" {
+		// A turn that ended abnormally — the harness exited, or a tool
+		// result went over the size limit — records that cause here and
+		// never reaches the delivery check below: the "still a draft"
+		// message is only for a turn that completed normally and
+		// delivered no code.
+		if mode, message, abnormal := abnormalContinueTurnEndCause(res, streamRes, lastTurn, qw.ContinuePullRequest.Number, r.toolOutputLimit()); abnormal {
+			res.Status = "failed"
+			res.FailureMode = mode
+			res.Error = message
+		} else if res.PullRequestURL != "" || continuePullRequestURL(verifyCtx, qw, repositoryDeclaration, wpath) != "" {
+			startHead := strings.TrimSpace(qw.ContinuePullRequest.HeadSha)
 			gateCtx, gateCancel := context.WithTimeout(context.Background(), 30*time.Second)
 			func() {
 				defer gateCancel()
@@ -2832,9 +2841,17 @@ func mergeInjectObservation(merged, turn streamObservation) streamObservation {
 	if first == "" {
 		first = turn.pullRequestURL
 	}
+	// A truncation in any merged turn stays visible: the envelope warning
+	// must name it even when a later turn was small.
+	truncated := merged.toolOutputTruncated || turn.toolOutputTruncated
+	truncLimit := max(merged.toolOutputLimit, turn.toolOutputLimit)
+	truncBytes := max(merged.toolOutputBytes, turn.toolOutputBytes)
 	merged = turn
 	merged.pullRequestCandidates = cands
 	merged.pullRequestURL = first
+	merged.toolOutputTruncated = truncated
+	merged.toolOutputLimit = truncLimit
+	merged.toolOutputBytes = truncBytes
 	return merged
 }
 
@@ -2996,6 +3013,15 @@ type streamObservation struct {
 	// has a last assistant message with no tool call: lastAssistantText is
 	// set and no ToolUseEvent came after it. Updated in observeEvent.
 	toolAfterLastAssistant bool
+	// toolOutputTruncated reports that a tool result of this stream
+	// exceeded the runner's tool-output limit and was truncated around
+	// a marker before the runner retained it (see truncateToolOutput).
+	// Protective, never a failure: the turn keeps going on the bounded
+	// copy. toolOutputBytes is the largest original byte size truncated
+	// on this stream; toolOutputLimit is the limit applied.
+	toolOutputTruncated bool
+	toolOutputBytes     int
+	toolOutputLimit     int
 	// finalProvider names the provider the stream's model calls last
 	// identified from native response evidence
 	// (LlmCallEvent.ResponseModelProvider): the provider the wire response
@@ -3145,6 +3171,11 @@ func (o streamObservation) applyTo(res *Result, providerName agent.ProviderName)
 	if res.Status == "failed" && res.Upstream == nil && o.upstream != nil && !o.upstream.Empty() {
 		res.Upstream = agent.CanonicalUpstreamError(o.upstream)
 	}
+	// An oversized tool result the runner truncated rides as a
+	// post-session warning — observability, never a failure — so the
+	// bound copy the seat kept going on stays visible wherever
+	// warnings surface.
+	noteToolOutputTruncation(res, o)
 }
 
 // consumeEvents drains the handle's events channel with the
@@ -3481,6 +3512,34 @@ func (r *Runner) consumeEventsWithin(
 		case ev, ok := <-handle.Events():
 			if !ok {
 				return obs, nil
+			}
+			// Bound oversized tool output at ingress: a result larger than
+			// the runner's tool-output limit is truncated around a marker
+			// before anything downstream — the audit log, the activity
+			// sink, the pull-request scan — retains it, so one
+			// escape-laden CI log cannot wedge the turn. Protective,
+			// never a failure: the turn keeps going on the bounded copy,
+			// and the observation records that it happened so the
+			// terminal reason can name it when the turn still dies.
+			// Middle-elision keeps the tail, so a pull request URL at
+			// the end of the output still scans.
+			if toolRes, ok := ev.(agent.ToolResultEvent); ok {
+				if truncated, changed := truncateToolOutput(toolRes.Content, r.toolOutputLimit()); changed {
+					original := len(toolRes.Content)
+					toolRes.Content = truncated
+					ev = toolRes
+					obs.toolOutputTruncated = true
+					obs.toolOutputLimit = r.toolOutputLimit()
+					if original > obs.toolOutputBytes {
+						obs.toolOutputBytes = original
+					}
+					r.logger.Warn("tool output exceeded the size limit; truncated with a marker",
+						"sessionId", qw.SessionID,
+						"tool", toolRes.ToolName,
+						"bytes", original,
+						"limit", r.toolOutputLimit(),
+					)
+				}
 			}
 			// Capture native response evidence before correlation can synthesize
 			// aggregate calls, and before any budget or terminal early return.
