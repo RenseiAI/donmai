@@ -2175,11 +2175,12 @@ tailRecovery:
 		// a WORK_RESULT marker alone never counts as passed for an
 		// abnormal turn.
 		abnormalMode, abnormalMessage, abnormal := abnormalContinueTurnEndCause(res, streamRes, lastTurn, qw.ContinuePullRequest.Number, r.toolOutputLimit())
-		if abnormal && !lastTurnFollowUp && !lastTurn.terminalSuccess {
+		switch {
+		case abnormal && !lastTurnFollowUp && !lastTurn.terminalSuccess:
 			res.Status = "failed"
 			res.FailureMode = abnormalMode
 			res.Error = abnormalMessage
-		} else if res.PullRequestURL != "" || continuePullRequestURL(verifyCtx, qw, repositoryDeclaration, wpath) != "" {
+		case res.PullRequestURL != "" || continuePullRequestURL(verifyCtx, qw, repositoryDeclaration, wpath) != "":
 			startHead := strings.TrimSpace(qw.ContinuePullRequest.HeadSha)
 			gateCtx, gateCancel := context.WithTimeout(context.Background(), 30*time.Second)
 			func() {
@@ -2299,7 +2300,7 @@ tailRecovery:
 			if abnormal {
 				settleAbnormalContinuationTurn(res, abnormalMode, abnormalMessage)
 			}
-		} else if abnormal {
+		case abnormal:
 			res.Status = "failed"
 			res.FailureMode = abnormalMode
 			res.Error = abnormalMessage
