@@ -17,8 +17,13 @@ name: e2b-template
 # `donmai-worker-go` layers the pinned Go toolchain, golangci-lint and gofumpt
 # on the same base and builds at 4 vCPU / 8 GiB for `go test -race ./...`.
 # `donmai-worker-node-pg` layers pinned pnpm, a warm pnpm store, and Postgres 17
-# with pgvector on the same base and builds at 8 vCPU / 16 GiB for large
-# TypeScript repositories (vitest, 12 GiB-heap type checks, pgvector-backed suites).
+# with pgvector on the same base and builds at 8 vCPU / 8 GiB for large
+# TypeScript repositories (vitest, type checks, pgvector-backed suites). 8 GiB
+# is the E2B account's per-sandbox memory ceiling: a larger request is refused
+# with `400: Memory can't be higher than 8192 MiB` and fails the whole
+# publisher. Once E2B support raises the account limit, set the repository
+# variable E2B_NODE_PG_MEMORY_MB (for example 16384) to build larger without a
+# code change; unset, the build requests 8192.
 #
 # @e2b/cli 2.13.3 help confirms `template create` accepts only an untagged name
 # constrained to lowercase letters, numbers, dashes, and underscores. E2B's
@@ -235,7 +240,7 @@ jobs:
           E2B_ADDITIONAL_TAGS: ${{ steps.release.outputs.e2b_additional_tags }}
           E2B_DOCKERFILE: e2b.node-pg.Dockerfile
           E2B_CPU_COUNT: 8
-          E2B_MEMORY_MB: 16384
+          E2B_MEMORY_MB: ${{ vars.E2B_NODE_PG_MEMORY_MB || '8192' }}
         run: node "${RUNNER_TEMP}/build-e2b-template.cjs"
 
       - name: Assert published E2B node-pg template toolchain

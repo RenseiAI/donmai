@@ -8,7 +8,9 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
-No unreleased changes.
+### Fixes
+
+- E2B template publisher: build `donmai-worker-node-pg` at 8 vCPU / 8 GiB instead of 16 GiB. The E2B account refuses any sandbox above 8192 MiB (`400: Memory can't be higher than 8192 MiB`), so the node-pg build has failed on every release since the template first shipped in v0.73.3, failing the publisher and the release train stages behind it. The memory request now comes from the repository variable `E2B_NODE_PG_MEMORY_MB` and defaults to 8192, so it can be raised without a code change once E2B lifts the account limit. Type checks in this template should use a 6 GiB heap (`NODE_OPTIONS=--max-old-space-size=6144`) instead of 12 GiB. The base and Go templates are unchanged.
 
 ## v0.73.6 — 2026-11-12
 

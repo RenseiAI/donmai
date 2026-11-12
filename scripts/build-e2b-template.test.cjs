@@ -473,7 +473,7 @@ test('hasNodePgDockerfile reports the node-pg Dockerfile only when present', () 
   }
 })
 
-test('main() wires the node-pg Dockerfile with 8 vCPU and 16384 MB', async () => {
+test('main() wires the node-pg Dockerfile with 8 vCPU and 8192 MB', async () => {
   const contextDir = makeTempContext()
   fs.writeFileSync(path.join(contextDir, 'e2b.node-pg.Dockerfile'), 'FROM debian:bookworm-slim # node-pg\n')
   const outputFile = path.join(contextDir, 'github-output')
@@ -487,7 +487,7 @@ test('main() wires the node-pg Dockerfile with 8 vCPU and 16384 MB', async () =>
         E2B_ADDITIONAL_TAGS: 'default',
         E2B_DOCKERFILE: 'e2b.node-pg.Dockerfile',
         E2B_CPU_COUNT: '8',
-        E2B_MEMORY_MB: '16384',
+        E2B_MEMORY_MB: '8192',
         GITHUB_OUTPUT: outputFile,
       },
       cwd: contextDir,
@@ -498,7 +498,7 @@ test('main() wires the node-pg Dockerfile with 8 vCPU and 16384 MB', async () =>
     const call = buildCallFor(calls)
     assert.equal(call.target, 'donmai-worker-node-pg:v1.2.3')
     assert.equal(call.options.cpuCount, 8)
-    assert.equal(call.options.memoryMB, 16384)
+    assert.equal(call.options.memoryMB, 8192)
     assert.match(dockerfileFor(calls), /# node-pg/)
     const contextEntry = calls.find((entry) => entry.fileContextPath)
     assert.equal(contextEntry.fileContextPath, contextDir)
@@ -543,7 +543,7 @@ test('historical checkout without the node-pg Dockerfile still builds the base t
           E2B_ADDITIONAL_TAGS: '',
           E2B_DOCKERFILE: 'e2b.node-pg.Dockerfile',
           E2B_CPU_COUNT: '8',
-          E2B_MEMORY_MB: '16384',
+          E2B_MEMORY_MB: '8192',
           GITHUB_OUTPUT: outputFile,
         },
         cwd: contextDir,
@@ -574,7 +574,15 @@ test('release workflow gates the node-pg template build on the release checkout'
     'node-pg template build must be gated on the release containing the node-pg Dockerfile'
   )
   assert.match(nodePgBuild, /E2B_CPU_COUNT:\s*8/, 'node-pg template build must request 8 vCPU')
-  assert.match(nodePgBuild, /E2B_MEMORY_MB:\s*16384/, 'node-pg template build must request 16384 MB')
+  // The account's per-sandbox ceiling is 8192 MiB: a larger literal fails the
+  // publisher with a 400. The request comes from the repository variable
+  // E2B_NODE_PG_MEMORY_MB and falls back to 8192 when the variable is unset.
+  assert.match(
+    nodePgBuild,
+    /E2B_MEMORY_MB:\s*\$\{\{\s*vars\.E2B_NODE_PG_MEMORY_MB\s*\|\|\s*'8192'\s*\}\}/,
+    'node-pg template build must request vars.E2B_NODE_PG_MEMORY_MB, defaulting to 8192 MB'
+  )
+  assert.doesNotMatch(nodePgBuild, /E2B_MEMORY_MB:\s*\d/, 'node-pg memory must not be a hard-coded literal')
   assert.match(nodePgBuild, /E2B_DOCKERFILE:\s*e2b\.node-pg\.Dockerfile/, 'node-pg build must select the node-pg Dockerfile')
   const baseBuild = workflowStepBlock(workflow, 'Build versioned E2B template')
   assert.doesNotMatch(

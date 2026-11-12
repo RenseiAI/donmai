@@ -35,8 +35,10 @@
 #   template ships, including an unprivileged start as the sandbox account.
 #
 # Seats running tsc on large repositories should export
-# NODE_OPTIONS=--max-old-space-size=12288 (12 GiB of the 16 GiB box). It is
-# intentionally NOT set here so the provider CLIs keep their default heaps.
+# NODE_OPTIONS=--max-old-space-size=6144 (6 GiB of the 8 GiB box; scale it to
+# about three quarters of the box when E2B_NODE_PG_MEMORY_MB raises the build
+# memory). It is intentionally NOT set here so the provider CLIs keep their
+# default heaps.
 #
 # The donmai binary is built OUTSIDE this Dockerfile (see build.sh / README.md)
 # and copied in, exactly like e2b.Dockerfile. Do NOT commit the binary.
@@ -44,11 +46,13 @@
 # Single-stage only: the E2B template build SDK rejects multi-stage
 # Dockerfiles, so this file must keep exactly one FROM and no COPY --from.
 #
-# Build resources are set at build time (8 vCPU / 16 GiB) via E2B_CPU_COUNT /
+# Build resources are set at build time (8 vCPU / 8 GiB) via E2B_CPU_COUNT /
 # E2B_MEMORY_MB in e2b-template.yml — E2B's defaults (2 vCPU / 1 GiB) are too
-# small for `vitest` plus a type check with a 12 GiB heap on a large
-# TypeScript repository. The base `donmai-worker` template keeps E2B's
-# defaults; the Go template builds at 4 vCPU / 8 GiB.
+# small for `vitest` plus a type check on a large TypeScript repository.
+# 8 GiB is the E2B account's per-sandbox memory ceiling; the repository
+# variable E2B_NODE_PG_MEMORY_MB raises the request once the account limit
+# is lifted. The base `donmai-worker` template keeps E2B's defaults; the Go
+# template builds at 4 vCPU / 8 GiB.
 FROM debian:bookworm-slim
 
 # Unprivileged sandbox account. The E2B build SDK appends USER user when the
