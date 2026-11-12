@@ -64,6 +64,11 @@ type ManifestView struct {
 	SupportedArch []string
 	// PackageDigest is the immutable package digest used in command identity.
 	PackageDigest string
+	// PackageRoot is the verified root directory of the kit's package, empty
+	// for a legacy manifest that has no verified package. Composition
+	// carries it into each dependency-store entry so package-owned paths
+	// (relocate) resolve against it, never against the leaf.
+	PackageRoot string
 	// LegacyManifestDigest is used only when no package digest exists; keeping
 	// the fields separate prevents a legacy manifest from being serialized as a
 	// verified package identity.

@@ -92,7 +92,7 @@ func (r *KitRegistry) detectForRepo(repoRoot string, osFilter func(supported []s
 		if err != nil {
 			return nil, fmt.Errorf("kit detect: command owner digest for %s: %w", m.Kit.ID, err)
 		}
-		matched = append(matched, manifestToView(m, packageDigest, legacyDigest))
+		matched = append(matched, manifestToView(m, packageDigest, legacyDigest, commandOwnerPackageRoot(manifestPaths[i], packageDigest)))
 	}
 
 	// Order foundation → framework → project (deterministic within group).
@@ -173,7 +173,7 @@ func detectMatches(m kitManifestTOML, repoRoot string) bool {
 // manifestToView projects a parsed manifest into the exported view the
 // compose layer consumes (K1.2 bridge — keeps kitManifestTOML
 // daemon-private while the runner imports only internal/kit).
-func manifestToView(m kitManifestTOML, packageDigest, legacyDigest string) kit.ManifestView {
+func manifestToView(m kitManifestTOML, packageDigest, legacyDigest, packageRoot string) kit.ManifestView {
 	v := kit.ManifestView{
 		ID:                   m.Kit.ID,
 		Version:              m.Kit.Version,
@@ -182,6 +182,7 @@ func manifestToView(m kitManifestTOML, packageDigest, legacyDigest string) kit.M
 		SupportedOS:          copyStrings(m.Supports.OS),
 		SupportedArch:        copyStrings(m.Supports.Arch),
 		PackageDigest:        packageDigest,
+		PackageRoot:          packageRoot,
 		LegacyManifestDigest: legacyDigest,
 		PathScope:            ".",
 		Commands:             copyStringMap(m.Provide.Commands),
@@ -227,6 +228,16 @@ func manifestToView(m kitManifestTOML, packageDigest, legacyDigest string) kit.M
 		v.DependencyStores = stores
 	}
 	return v
+}
+
+// commandOwnerPackageRoot returns the verified package root for a manifest
+// that came from an installed package (the directory holding the manifest
+// and its descriptor), and "" for a legacy manifest, which has none.
+func commandOwnerPackageRoot(manifestPath, packageDigest string) string {
+	if packageDigest == "" {
+		return ""
+	}
+	return filepath.Dir(manifestPath)
 }
 
 // commandOwnerDigest returns the immutable package digest when a manifest is
