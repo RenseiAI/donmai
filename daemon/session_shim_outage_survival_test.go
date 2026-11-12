@@ -11,11 +11,13 @@ import (
 )
 
 // TestOutageLongerThanWindowSurvivesAndReattaches pins the interactive-outage
-// fix: a control-plane outage longer than today's ten-minute window does not
-// release a session whose shim and harness are still alive. The daemon keeps
-// the lineage adopted, retries with capped backoff (see
-// DefaultSessionShimReadoptionBackoffCap) for as long as the shim is observable,
-// and re-attaches when the carrier returns, with no lost transcript.
+// fix: a control-plane outage longer than the ten-minute window does not
+// release an interactive session — one the composing layer holds on terms the
+// window does not bound (LineageLive and ReadoptionHeldPastWindow both true) —
+// whose shim and harness are still alive. The daemon keeps the lineage
+// adopted, retries with capped backoff (see
+// DefaultSessionShimReadoptionBackoffCap) for as long as the shim is observable
+// and held, and re-attaches when the carrier returns, with no lost transcript.
 //
 // Fake clock, no real sleeps: the virtual clock advances only on the backoffs
 // the hold really asks for, so thirty simulated minutes cost milliseconds.
@@ -35,7 +37,9 @@ func TestOutageLongerThanWindowSurvivesAndReattaches(t *testing.T) {
 			Mode: ReadoptionLineageLive, Backoff: backoff, BackoffCap: backoffCap,
 			Window: window, KeepaliveInterval: keepaliveSkip,
 		},
-		clock: clock,
+		clock:          clock,
+		lineageLive:    alwaysLive,
+		heldPastWindow: func(context.Context, sessionshim.Identity) bool { return true },
 		adoption: func(_ context.Context, attempt int) error {
 			if attempt < returnsOn {
 				// The control plane is unreachable: timeouts and 5xx carry no
@@ -94,7 +98,10 @@ func TestOutageLongerThanWindowSurvivesAndReattaches(t *testing.T) {
 // TestOutageHoldBackoffCeilingIsConfigurable pins that the hold's backoff
 // ceiling is a documented, configurable daemon setting with a visible default.
 // The visible default is DefaultSessionShimReadoptionBackoffCap; a deployment
-// that configures BackoffCap gets its own ceiling in both modes.
+// that configures BackoffCap gets its own ceiling in both modes. A fixed policy
+// that configures nothing still RESOLVES to a zero cap — its initial budget
+// never reads one, so the resolved default fixed policy is unchanged — and
+// the hold past the budget supplies the visible default itself.
 func TestOutageHoldBackoffCeilingIsConfigurable(t *testing.T) {
 	t.Parallel()
 	if DefaultSessionShimReadoptionBackoffCap != 30*time.Second {
@@ -111,9 +118,12 @@ func TestOutageHoldBackoffCeilingIsConfigurable(t *testing.T) {
 		{name: "fixed configured wins", policy: SessionShimReadoptionPolicy{BackoffCap: 7 * time.Second}, want: 7 * time.Second},
 	} {
 		cfg := SessionShimConfig{Readoption: tc.policy}
-		if got := cfg.readoption().BackoffCap; got != tc.want {
-			t.Errorf("%s: resolved BackoffCap = %s, want %s", tc.name, got, tc.want)
+		if got := sessionShimHoldBackoffCap(cfg.readoption()); got != tc.want {
+			t.Errorf("%s: hold backoff cap = %s, want %s", tc.name, got, tc.want)
 		}
+	}
+	if got := (SessionShimConfig{}).readoption().BackoffCap; got != 0 {
+		t.Fatalf("the default fixed policy resolved BackoffCap = %s, want 0 — a configuration that does not opt in must resolve as before", got)
 	}
 }
 
