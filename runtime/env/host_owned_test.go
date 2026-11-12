@@ -84,3 +84,18 @@ func TestFilterHostOwnedMap_DropsKeepFailedWorktree(t *testing.T) {
 		t.Fatalf("FilterHostOwnedMap = %q, want only KEEP=yes", out)
 	}
 }
+
+// TestFilterHostOwnedMap_DropsMaxToolOutputBytes pins that a work item
+// cannot raise or lower the host's tool-output bound for its own session:
+// the operator's limit is not the session's to override.
+func TestFilterHostOwnedMap_DropsMaxToolOutputBytes(t *testing.T) {
+	t.Parallel()
+	const key = "DONMAI_MAX_TOOL_OUTPUT_BYTES"
+	if !IsHostOwned(key) {
+		t.Fatalf("%s is not host-owned", key)
+	}
+	out := FilterHostOwnedMap(map[string]string{key: "999999999", "KEEP": "yes"})
+	if len(out) != 1 || out["KEEP"] != "yes" {
+		t.Fatalf("FilterHostOwnedMap = %q, want only KEEP=yes", out)
+	}
+}

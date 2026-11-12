@@ -1652,3 +1652,61 @@ func TestDaemonStart_KeepFailedWorktreesStatesWorkerEnv(t *testing.T) {
 		})
 	}
 }
+
+// TestDaemonStart_MaxToolOutputBytesStatesWorkerEnv pins the operator's
+// tool-output bound reaching every worker: a positive maxToolOutputBytes
+// in daemon.yaml states DONMAI_MAX_TOOL_OUTPUT_BYTES, an omitted or
+// non-positive one states nothing (the runner default applies), and an
+// embedder-composed base environment keeps priority.
+func TestDaemonStart_MaxToolOutputBytesStatesWorkerEnv(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		configKey string
+		baseEnv   map[string]string
+		want      string
+		wantOK    bool
+	}{
+		{name: "omitted states nothing", configKey: "", wantOK: false},
+		{name: "positive states the bound", configKey: "maxToolOutputBytes: 65536\n", want: "65536", wantOK: true},
+		{name: "zero states nothing", configKey: "maxToolOutputBytes: 0\n", wantOK: false},
+		{name: "negative states nothing", configKey: "maxToolOutputBytes: -1\n", wantOK: false},
+		{
+			name: "embedder base env keeps priority", configKey: "maxToolOutputBytes: 65536\n",
+			baseEnv: map[string]string{"DONMAI_MAX_TOOL_OUTPUT_BYTES": "1024"}, want: "1024", wantOK: true,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "daemon.yaml")
+			body := "machine:\n  id: isolated-fixture\norchestrator:\n  url: file:///" + dir + "/queue\n" + tt.configKey
+			if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			d := New(Options{
+				ConfigPath:       path,
+				JWTPath:          filepath.Join(dir, "daemon.jwt"),
+				SkipWizard:       true,
+				SkipRegistration: true,
+				HTTPHost:         "127.0.0.1",
+				HTTPPort:         0,
+				SpawnerOptions:   SpawnerOptions{WorkerCommand: []string{"/bin/false"}, BaseEnv: tt.baseEnv},
+			})
+			if err := d.Start(context.Background()); err != nil {
+				t.Fatalf("foreground Start: %v", err)
+			}
+			t.Cleanup(func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				if err := d.Stop(ctx); err != nil {
+					t.Errorf("foreground Stop: %v", err)
+				}
+			})
+			d.spawner.mu.Lock()
+			got, ok := d.spawner.opts.BaseEnv["DONMAI_MAX_TOOL_OUTPUT_BYTES"]
+			d.spawner.mu.Unlock()
+			if ok != tt.wantOK || (ok && got != tt.want) {
+				t.Fatalf("worker tool-output env = %q, %v; want %q, %v", got, ok, tt.want, tt.wantOK)
+			}
+		})
+	}
+}

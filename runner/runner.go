@@ -147,6 +147,22 @@ const (
 	// attempts, and the outer idle timeout still owns the seat.
 	DefaultProviderStallRetries = 2
 
+	// DefaultMaxToolOutputBytes bounds one tool result's content kept by
+	// the runner, applied when [Options.MaxToolOutputBytes] is zero or
+	// negative. A tool result larger than this is truncated around a
+	// marker that names the truncation (see truncateToolOutput) before
+	// the runner retains or forwards it, so an oversized result — a
+	// multi-megabyte CI log, escape-laden output that balloons
+	// downstream buffers — cannot balloon the runner's audit log,
+	// activity stream or pull request scan, and a turn that still dies
+	// after one names it in its terminal reason. It bounds the runner's
+	// copy only: the harness has already handed the full result to the
+	// model. 256 KiB keeps legitimate outputs (test logs, diffs) intact
+	// while bounding the pathological ones; the runner never fails a
+	// turn for oversize output alone. The daemon's maxToolOutputBytes
+	// setting and `agent run --max-tool-output-bytes` override it.
+	DefaultMaxToolOutputBytes = 256 * 1024
+
 	// DefaultStatusBeaconInterval bounds the runner's current-step beacon
 	// posts to the session progress endpoint: at most one POST per
 	// interval, no matter how often the step changes (the latest step
@@ -291,6 +307,20 @@ type Options struct {
 	// retries (a stall then behaves exactly like the idle watchdog
 	// cut-off it replaces).
 	ProviderStallRetries int
+
+	// MaxToolOutputBytes bounds one tool result's content (in bytes) the
+	// runner retains per ToolResultEvent. A larger result is truncated
+	// around a marker naming the truncation (see truncateToolOutput)
+	// before the runner stores or forwards it (audit log, activity
+	// stream, pull request scan), and the seat keeps going. The harness
+	// emitted the event after its own tool loop handed the full result
+	// to the model, so this bounds the runner's copy, not the model's
+	// context. Zero or negative uses DefaultMaxToolOutputBytes; there is
+	// no unbounded setting — the cap is protective, never advisory. The
+	// daemon states it per worker from its maxToolOutputBytes setting
+	// (DONMAI_MAX_TOOL_OUTPUT_BYTES, read by `agent run
+	// --max-tool-output-bytes`).
+	MaxToolOutputBytes int
 
 	// PreserveWorktreeOnFailure keeps the worktree on disk after a
 	// failed Run for debugging. The operator surface is opt-in: `agent run
@@ -611,6 +641,10 @@ type Runner struct {
 	turnContinuationUndeliveredLimit int
 	// narrationNudgeLimit is Options.NarrationNudgeLimit.
 	narrationNudgeLimit int
+	// maxToolOutputBytes is Options.MaxToolOutputBytes, resolved to
+	// DefaultMaxToolOutputBytes when unset. It bounds one tool result's
+	// retained content (see truncateToolOutput).
+	maxToolOutputBytes int
 	// providerRetryBackoff spaces provider-error retries; nil uses
 	// defaultProviderRetryBackoff. Tests substitute a zero wait.
 	providerRetryBackoff func(attempt int) time.Duration
@@ -742,6 +776,7 @@ func New(opts Options) (*Runner, error) {
 		turnContinuationCeiling:           opts.TurnContinuationCeiling,
 		turnContinuationUndeliveredLimit:  opts.TurnContinuationUndeliveredLimit,
 		narrationNudgeLimit:               opts.NarrationNudgeLimit,
+		maxToolOutputBytes:                opts.MaxToolOutputBytes,
 		quotaReporterForSession:           opts.QuotaReporterForSession,
 		quotaReporters:                    map[string]*QuotaReporter{},
 		interactiveUsage:                  map[string]*interactiveUsageTotals{},
@@ -783,6 +818,9 @@ func New(opts Options) (*Runner, error) {
 	}
 	if r.providerStallRetries == 0 {
 		r.providerStallRetries = DefaultProviderStallRetries
+	}
+	if r.maxToolOutputBytes <= 0 {
+		r.maxToolOutputBytes = DefaultMaxToolOutputBytes
 	}
 	return r, nil
 }

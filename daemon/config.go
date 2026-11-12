@@ -90,6 +90,17 @@ type Config struct {
 	// always torn down; interactive sessions keep their own publication
 	// hold regardless of this setting.
 	KeepFailedWorktrees bool `yaml:"keepFailedWorktrees,omitempty" json:"keepFailedWorktrees,omitempty"`
+	// MaxToolOutputBytes bounds one tool result's content, in bytes, that
+	// each spawned worker's runner retains or forwards (the audit log,
+	// the activity stream, the pull request scan). A larger result is
+	// truncated around a marker naming the truncation, and the seat keeps
+	// going; the harness has already handed the full result to the model
+	// by then, so this bounds the runner's copy, not the model's context.
+	// Absent, zero or negative leaves the runner default,
+	// runner.DefaultMaxToolOutputBytes (262144, 256 KiB); a positive
+	// value states DONMAI_MAX_TOOL_OUTPUT_BYTES in every spawned worker's
+	// environment. Read at daemon start.
+	MaxToolOutputBytes int `yaml:"maxToolOutputBytes,omitempty" json:"maxToolOutputBytes,omitempty"`
 	// Workarea holds Layer-3 workarea-surface tunables (archive root,
 	// diff streaming threshold). Optional; populated with defaults if
 	// absent.

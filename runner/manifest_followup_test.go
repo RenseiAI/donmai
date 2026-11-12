@@ -26,11 +26,17 @@ import (
 // writes (or rewrites) the turn-result manifest when manifest is set, then
 // emits text as an assistant message, then ends with a clean terminal
 // ResultEvent — or, when crash is set, with a provider ErrorEvent and a closed
-// stream.
+// stream, or, when silentClose is set, with a closed stream carrying no
+// terminal event at all, as a killed harness process leaves it.
 type verdictScriptTurn struct {
 	manifest string
 	text     string
 	crash    bool
+	// silentClose closes the event stream without any terminal event,
+	// as a harness that dies (process exit, kill) without reporting
+	// leaves it. Any turn may close silently (a continuation turn
+	// included); no later turn plays after a closed stream.
+	silentClose bool
 	// laterMtime stamps the written manifest one minute ahead, so a rewrite
 	// with identical bytes still moves the mtime on filesystems whose
 	// timestamp tick is coarser than the gap between two turns.
@@ -226,6 +232,13 @@ func (h *verdictScriptHandle) playLocked() {
 		close(h.events)
 		return
 	}
+	if turn.silentClose {
+		// The harness died without a terminal event: the channel closes
+		// with nothing terminal on it, as a killed harness process does.
+		h.closed = true
+		close(h.events)
+		return
+	}
 	if turn.hang {
 		return
 	}
@@ -392,6 +405,10 @@ type scriptedSession struct {
 	idleTimeout time.Duration
 	// providerStallTimeout is Options.ProviderStallTimeout (0 = default).
 	providerStallTimeout time.Duration
+	// toolOutputLimit is Options.MaxToolOutputBytes (0 = default). Tests
+	// that need an oversized tool result without buffering hundreds of
+	// kilobytes set a small bound here.
+	toolOutputLimit int
 	// providerStallRetries is Options.ProviderStallRetries (0 = default).
 	providerStallRetries int
 	// heartbeatInterval is Options.HeartbeatInterval (0 = default).
@@ -465,6 +482,7 @@ func runScriptedSession(t *testing.T, cfg scriptedSession) (*Result, *verdictScr
 			o.NarrationNudgeLimit = cfg.narrationLimit
 		}
 		o.IdleTimeout = cfg.idleTimeout
+		o.MaxToolOutputBytes = cfg.toolOutputLimit
 		o.ProviderStallTimeout = cfg.providerStallTimeout
 		o.ProviderStallRetries = cfg.providerStallRetries
 		o.HeartbeatInterval = cfg.heartbeatInterval
