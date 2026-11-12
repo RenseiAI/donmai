@@ -538,13 +538,18 @@ func TestFixedHoldBackoffStaysCapped(t *testing.T) {
 	go func() {
 		done <- f.daemon.readoptSessionShimAfterControllerLoss(f.id, lost, 0)
 	}()
-	deadline := time.Now().Add(10 * time.Second)
+	// The waits are virtual, but every attempt between them is a real dial
+	// and durable-adoption round trip. Six of them under a loaded parallel
+	// -race run can take well over ten seconds of wall time, so the backstop
+	// only catches a hold that makes no progress at all; the schedule
+	// assertions below are what this test pins.
+	deadline := time.Now().Add(2 * time.Minute)
 	for {
 		if waits := clock.requestedWaits(); len(waits) >= 6 {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("the hold did not sleep six backoffs within 10s")
+			t.Fatal("the hold did not sleep six backoffs within 2m")
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
