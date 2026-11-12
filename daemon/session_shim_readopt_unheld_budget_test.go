@@ -61,6 +61,11 @@ func readoptUnlessOverrun(t *testing.T, f *readoptFixture, lost adoptedShim, ove
 // unset. The continuation predicate is consulted only once the window is
 // spent: neither the loop nor the keepalive asks it during the window, so the
 // keepalive keeps extending the shim's clock on LineageLive alone until then.
+//
+// Attempts are counted from the window's own backoffs — the only waits that
+// reach the virtual clock (the keepalive paces on the real one) — not from
+// durable-adoption calls: on a loaded host an attempt can fail at the dial,
+// before it reaches durable adoption, and still be an attempt.
 func TestUnheldLineageLiveWindowRunsItsWholeWindow(t *testing.T) {
 	t.Parallel()
 	const (
@@ -113,9 +118,9 @@ func TestUnheldLineageLiveWindowRunsItsWholeWindow(t *testing.T) {
 			if got := readoptUnlessOverrun(t, f, lost, overran); got != readoptionWindowExhausted {
 				t.Fatalf("disposition = %d, want readoptionWindowExhausted (%d)", got, readoptionWindowExhausted)
 			}
-			if adoptions, _ := f.snapshot(); adoptions != wantAttempts {
-				t.Fatalf("durable adoption attempted %d times, want the whole window's %d — the window was cut short",
-					adoptions, wantAttempts)
+			if got := len(clock.requestedWaits()) + 1; got != wantAttempts {
+				t.Fatalf("the window ran %d attempts (backoffs %v), want the whole window's %d — the window was cut short",
+					got, clock.requestedWaits(), wantAttempts)
 			}
 			if elapsed := clock.elapsed(started); elapsed < window-backoffCap || elapsed > window {
 				t.Fatalf("the window spent %s of simulated time, want the whole %s window", elapsed, window)
@@ -140,6 +145,12 @@ func TestUnheldLineageLiveWindowRunsItsWholeWindow(t *testing.T) {
 // three-attempt budget spends all three attempts before the spent-budget
 // outcome, whether the continuation predicate answers false or is unset, and
 // the predicate is not consulted until the budget is spent.
+//
+// Attempts are counted at the per-attempt LineageLive gate, which every
+// attempt passes before it dials — not from durable-adoption calls, which an
+// attempt that fails at the dial on a loaded host never reaches. The
+// held-past-window conjunction also asks LineageLive, immediately before the
+// continuation predicate, so those calls are subtracted.
 func TestUnheldFixedBudgetSpendsEveryAttempt(t *testing.T) {
 	t.Parallel()
 	const attempts = 3
@@ -153,39 +164,56 @@ func TestUnheldFixedBudgetSpendsEveryAttempt(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			var (
-				f           *readoptFixture
-				askedEarly  atomic.Int64
-				asked       atomic.Int64
-				heldPredict func(context.Context, sessionshim.Identity) bool
+				mu         sync.Mutex
+				gateCalls  int // LineageLive calls: attempts plus conjunction checks
+				asked      int // ReadoptionHeldPastWindow calls
+				askedEarly int // asks made before the budget was spent
 			)
+			attemptsSoFar := func() int { return gateCalls - asked }
+			lineageLive := func(context.Context, sessionshim.Identity) bool {
+				mu.Lock()
+				gateCalls++
+				mu.Unlock()
+				return true
+			}
+			var heldPredict func(context.Context, sessionshim.Identity) bool
 			if tc.held {
 				heldPredict = func(context.Context, sessionshim.Identity) bool {
-					asked.Add(1)
-					if adoptions, _ := f.snapshot(); adoptions < attempts {
-						askedEarly.Add(1)
+					mu.Lock()
+					asked++
+					if attemptsSoFar() < attempts {
+						askedEarly++
 					}
+					mu.Unlock()
 					return false
 				}
 			}
-			f = newReadoptFixtureWithOptions(t, readoptFixtureOptions{
+			f := newReadoptFixtureWithOptions(t, readoptFixtureOptions{
 				policy:         SessionShimReadoptionPolicy{Attempts: attempts, Backoff: time.Millisecond},
 				adoption:       refusingCarrier(),
-				lineageLive:    alwaysLive,
+				lineageLive:    lineageLive,
 				heldPastWindow: heldPredict,
 			})
 			lost := f.lostEntry(t)
 
-			overran := func() bool { adoptions, _ := f.snapshot(); return adoptions > 2*attempts }
+			overran := func() bool {
+				mu.Lock()
+				defer mu.Unlock()
+				return attemptsSoFar() > 2*attempts
+			}
 			if got := readoptUnlessOverrun(t, f, lost, overran); got != readoptionAttemptsSpent {
 				t.Fatalf("disposition = %d, want readoptionAttemptsSpent (%d)", got, readoptionAttemptsSpent)
 			}
-			if adoptions, _ := f.snapshot(); adoptions != attempts {
-				t.Fatalf("durable adoption attempted %d times, want the whole budget of %d", adoptions, attempts)
+			mu.Lock()
+			spent, askedTotal, early := attemptsSoFar(), asked, askedEarly
+			mu.Unlock()
+			if spent != attempts {
+				t.Fatalf("the run spent %d attempts, want the whole budget of %d", spent, attempts)
 			}
-			if n := askedEarly.Load(); n != 0 {
-				t.Fatalf("ReadoptionHeldPastWindow consulted %d times before the budget was spent, want none", n)
+			if early != 0 {
+				t.Fatalf("ReadoptionHeldPastWindow consulted %d times before the budget was spent, want none", early)
 			}
-			if tc.held && asked.Load() == 0 {
+			if tc.held && askedTotal == 0 {
 				t.Fatal("ReadoptionHeldPastWindow was never consulted once the budget was spent")
 			}
 		})
