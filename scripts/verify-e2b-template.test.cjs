@@ -2068,7 +2068,11 @@ test('release workflow gates node-pg verification on the release checkout', () =
     'node-pg template build must be gated on the release containing the node-pg Dockerfile'
   )
   assert.match(nodePgBuild, /E2B_CPU_COUNT:\s*8/, 'node-pg template build must request 8 vCPU')
-  assert.match(nodePgBuild, /E2B_MEMORY_MB:\s*16384/, 'node-pg template build must request 16384 MB')
+  assert.match(
+    nodePgBuild,
+    /E2B_MEMORY_MB:\s*\$\{\{\s*vars\.E2B_NODE_PG_MEMORY_MB\s*\|\|\s*'8192'\s*\}\}/,
+    'node-pg template build must request vars.E2B_NODE_PG_MEMORY_MB, defaulting to 8192 MB'
+  )
   assert.match(nodePgBuild, /E2B_DOCKERFILE:\s*e2b\.node-pg\.Dockerfile/, 'node-pg build must select the node-pg Dockerfile')
   const baseVerify = workflowStepBlock(workflow, 'Assert published E2B template binary version')
   assert.doesNotMatch(
