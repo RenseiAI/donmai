@@ -71,7 +71,7 @@ func (r *KitRegistry) activeViewsForExactSelections(targetOS string, selected []
 		if err != nil {
 			return nil, fmt.Errorf("kit compose: command owner digest for %s: %w", manifest.Kit.ID, err)
 		}
-		views = append(views, manifestToView(manifest, packageDigest, legacyDigest))
+		views = append(views, manifestToView(manifest, packageDigest, legacyDigest, commandOwnerPackageRoot(manifestPaths[i], packageDigest)))
 	}
 	return selectExactKitViews(kit.SortManifests(views), selected)
 }
