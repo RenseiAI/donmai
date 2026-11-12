@@ -238,6 +238,16 @@ func TestPrepareSelectsEntryByVersion(t *testing.T) {
 		{name: "unpinned asks the manager", hostVer: "10.2.0", wantDigest: "ten"},
 		{name: "pin no range covers", pin: "pnpm@8.15.0", wantCode: CodeToolchainMismatch},
 		{name: "manager no range covers", hostVer: "12.16.1", wantCode: CodeToolchainMismatch},
+		// Cases carried over from the manifest package's selection suite,
+		// which this selection replaces.
+		{name: "pin with a hash", pin: "pnpm@9.15.9+sha512.0123abcd", wantDigest: "nine"},
+		{name: "pin at the range floor", pin: "pnpm@9.0.0", wantDigest: "nine"},
+		{name: "pin late in a range", pin: "pnpm@10.33.2", wantDigest: "ten"},
+		{name: "pin above every range", pin: "pnpm@11.0.0", wantCode: CodeToolchainMismatch},
+		{name: "host-sized pin", pin: "pnpm@12.16.1", wantCode: CodeToolchainMismatch},
+		{name: "pre-release pin selects its own line", pin: "pnpm@10.0.0-rc.1", wantDigest: "ten"},
+		{name: "dist-tag pin asks the manager", pin: "pnpm@latest", hostVer: "9.15.9", wantDigest: "nine"},
+		{name: "another manager's pin asks the manager", pin: "yarn@1.22.0", hostVer: "10.2.0", wantDigest: "ten"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -252,7 +262,7 @@ func TestPrepareSelectsEntryByVersion(t *testing.T) {
 				if e.MissReason != MissToolchainMismatch || rep.Entries[0].MissReason != MissToolchainMismatch {
 					t.Fatalf("miss reason = %s / %s", e.MissReason, rep.Entries[0].MissReason)
 				}
-				if tc.pin != "" && counter.n.Load() != 0 {
+				if tc.pin != "" && tc.hostVer == "" && counter.n.Load() != 0 {
 					t.Fatal("a pinned mismatch ran a process")
 				}
 				return
@@ -264,6 +274,41 @@ func TestPrepareSelectsEntryByVersion(t *testing.T) {
 				t.Fatalf("selected %s, want %s", got, tc.wantDigest)
 			}
 		})
+	}
+}
+
+// TestPrepareLeafDeclarationPicksManagerThenVersion: two managers of one
+// ecosystem match the leaf; its packageManager picks the manager, then the
+// pinned version picks that manager's entry. Without a declaration the leaf
+// is manager_ambiguous and nothing runs.
+func TestPrepareLeafDeclarationPicksManagerThenVersion(t *testing.T) {
+	t.Parallel()
+	pnpm9, pnpm10 := pnpmEntry(">=9 <10"), pnpmEntry(">=10 <11")
+	pnpm9.KitDigest, pnpm10.KitDigest = "nine", "ten"
+	yarn := pnpmEntry("")
+	yarn.Manager, yarn.KitDigest = "yarn", "yarn"
+	yarn.Lockfiles = []string{"pnpm-lock.yaml", "yarn.lock"}
+	entries := StaticEntries{pnpm9, pnpm10, yarn}
+
+	f := newFixture(t, fakeManager{})
+	f.writeLeaf("yarn.lock", "# yarn\n")
+	f.pin("pnpm@9.15.9")
+	p, _ := newPreparer(t, Config{Entries: entries})
+	rep, err := p.Prepare(context.Background(), f.request())
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	if len(rep.Entries) != 1 || rep.Entries[0].Manager != "pnpm" || rep.Entries[0].KitDigest != "nine" {
+		t.Fatalf("entries = %+v, want the pnpm >=9 <10 entry", rep.Entries)
+	}
+
+	undecided := newFixture(t, fakeManager{})
+	undecided.writeLeaf("yarn.lock", "# yarn\n")
+	p, counter := newPreparer(t, Config{Entries: entries})
+	_, err = p.Prepare(context.Background(), undecided.request())
+	_ = wantCode(t, err, CodeManagerAmbiguous)
+	if counter.n.Load() != 0 {
+		t.Fatal("an ambiguous leaf ran a process")
 	}
 }
 
@@ -649,6 +694,17 @@ func TestParseCommand(t *testing.T) {
 		bad     bool
 	}{
 		{line: "pnpm fetch", program: "pnpm", args: []string{"fetch"}, assign: map[string]string{}},
+		// The official TypeScript kit's pnpm entries, verbatim: every
+		// command it declares runs without a shell.
+		{line: "pnpm --version", program: "pnpm", args: []string{"--version"}, assign: map[string]string{}},
+		{
+			line: "pnpm install --offline --frozen-lockfile", program: "pnpm",
+			args: []string{"install", "--offline", "--frozen-lockfile"}, assign: map[string]string{},
+		},
+		{
+			line: "pnpm install --prefer-offline --frozen-lockfile", program: "pnpm",
+			args: []string{"install", "--prefer-offline", "--frozen-lockfile"}, assign: map[string]string{},
+		},
 		{
 			line: "GOPROXY=off GOFLAGS=-mod=mod go mod download", program: "go", args: []string{"mod", "download"},
 			assign: map[string]string{"GOPROXY": "off", "GOFLAGS": "-mod=mod"},

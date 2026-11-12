@@ -3,17 +3,15 @@
 // A kit declares each package manager it supports as one
 // [[provide.dependency_store]] entry, or as several entries with disjoint
 // `versions` ranges when one manager changed its store layout between
-// majors. This file is the slice-1 engine: validation of a single entry,
-// composition of entries across kits (union keyed by manager and version
-// range, conflict on overlapping ranges unless the composition lock selects
-// a kit), and selection of the applicable entry for a mutable leaf (by
-// lockfile presence, then the leaf's own declaration, then the version its
-// pin names).
+// majors. This file validates a single entry and composes entries across
+// kits (union keyed by manager and version range, conflict on overlapping
+// ranges unless the composition lock selects a kit).
 //
-// The keeper, filler, views, snapshots, budgets and events that consume the
-// composed result are later slices; this file only parses, validates,
-// composes and selects. Nothing here executes a manager command or touches
-// a store.
+// Selecting the entry that applies to a leaf (lockfile presence, the leaf's
+// own manager declaration, then the version its pin or the manager reports)
+// is not done here: runtime/depprep's Prepare owns it, because the version
+// may only be known by running the entry's version command in the leaf.
+// Nothing here executes a manager command or touches a store.
 package kit
 
 import (
@@ -27,6 +25,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/RenseiAI/donmai/internal/semverrange"
 	jsoncanonicalizer "github.com/cyberphone/json-canonicalization/go/src/webpki.org/jsoncanonicalizer"
 )
 
@@ -42,10 +41,6 @@ var (
 	// ErrDependencyStoreConflict marks two kits declaring the same
 	// manager without a composition-lock selection.
 	ErrDependencyStoreConflict = errors.New("kit dependency store conflict")
-	// ErrDependencyStoreAmbiguous marks two entries of one ecosystem
-	// matching a leaf with no leaf declaration to decide between them.
-	// The message carries the closed miss-reason token manager_ambiguous.
-	ErrDependencyStoreAmbiguous = errors.New("kit dependency store ambiguous")
 	// ErrDependencyStoreVersions marks a `versions` value that is not a
 	// valid range. It wraps ErrDependencyStoreInvalid.
 	ErrDependencyStoreVersions = errors.New("kit dependency store versions invalid")
@@ -53,17 +48,6 @@ var (
 	// one kit whose `versions` ranges overlap (a missing `versions`
 	// overlaps every range). It wraps ErrDependencyStoreInvalid.
 	ErrDependencyStoreRangeOverlap = errors.New("kit dependency store version ranges overlap")
-	// ErrDependencyStoreToolchainMismatch marks a leaf pinning a manager
-	// version that no entry's `versions` range covers. The message carries
-	// the closed miss-reason token toolchain_mismatch.
-	ErrDependencyStoreToolchainMismatch = errors.New("kit dependency store toolchain mismatch")
-	// ErrDependencyStoreVersionRequired marks several entries of one
-	// manager (disjoint ranges) with no version to choose between them:
-	// the leaf has no pin naming one. It wraps
-	// ErrDependencyStoreAmbiguous. The caller reads the version from the
-	// manager (the entry's `version` command) and selects with
-	// SelectDependencyStoreForVersion.
-	ErrDependencyStoreVersionRequired = fmt.Errorf("%w: version required", ErrDependencyStoreAmbiguous)
 	// ErrPackagePathInvalid marks a package-relative path that is not
 	// contained in the kit's package root, or a composed entry that
 	// carries no verified package root.
@@ -234,14 +218,6 @@ type LockedDependencyBinding struct {
 	SelectedDigest     string `json:"selectedDigest"`
 }
 
-// LeafDependencyFacts are the mutable-leaf facts selection needs: which
-// repo-relative paths the leaf holds and the leaf's own manager
-// declaration (Node packageManager, "" when the ecosystem has none).
-type LeafDependencyFacts struct {
-	Files          []string
-	PackageManager string
-}
-
 // ValidateDependencyStore validates one entry. manager, lockfiles, fetch
 // and install are required, and manager is a path-safe identifier;
 // integrity is on-use, on-fetch or none with none forcing session-only;
@@ -385,10 +361,20 @@ func ValidateDependencyStore(store DependencyStoreView) error {
 	if relocation := store.Snapshot.Relocation; relocation != "" && relocation != "reconcile" && relocation != "none" {
 		return fmt.Errorf("%w: %s has unknown snapshot relocation %q", ErrDependencyStoreInvalid, store.Manager, relocation)
 	}
-	if _, err := ParseVersionRange(store.Versions); err != nil {
+	if _, err := parseVersions(store.Versions); err != nil {
 		return fmt.Errorf("%w: %w: %s versions: %w", ErrDependencyStoreInvalid, ErrDependencyStoreVersions, store.Manager, err)
 	}
 	return validateNoCodeAndCredentials(store)
+}
+
+// parseVersions parses an entry's `versions` value with the one range
+// grammar the preparer also selects by (internal/semverrange). A missing
+// value covers every version.
+func parseVersions(s string) (semverrange.Range, error) {
+	if strings.TrimSpace(s) == "" {
+		return semverrange.All(), nil
+	}
+	return semverrange.ParseRange(s)
 }
 
 // forbiddenProcessEnv reports a variable the preparer never lets a manifest
@@ -467,8 +453,8 @@ func ValidateDependencyStores(stores []DependencyStoreView) error {
 			if j <= i {
 				continue
 			}
-			a, _ := ParseVersionRange(stores[i].Versions) // validated above
-			b, _ := ParseVersionRange(stores[j].Versions)
+			a, _ := parseVersions(stores[i].Versions) // validated above
+			b, _ := parseVersions(stores[j].Versions)
 			if a.Overlaps(b) {
 				return fmt.Errorf("%w: %w: manager %q declares overlapping versions %q and %q in one kit",
 					ErrDependencyStoreInvalid, ErrDependencyStoreRangeOverlap, stores[i].Manager, a.String(), b.String())
@@ -750,8 +736,8 @@ func resolveManagerClaimants(manager string, claimants []storeClaimant, target C
 			if claimants[i].kitID == claimants[j].kitID {
 				continue
 			}
-			a, _ := ParseVersionRange(claimants[i].store.Versions) // validated above
-			b, _ := ParseVersionRange(claimants[j].store.Versions)
+			a, _ := parseVersions(claimants[i].store.Versions) // validated above
+			b, _ := parseVersions(claimants[j].store.Versions)
 			if a.Overlaps(b) {
 				conflicting[claimants[i].kitID] = struct{}{}
 				conflicting[claimants[j].kitID] = struct{}{}
@@ -824,135 +810,6 @@ func validateAppliedDependencyLock(stores []ComposedDependencyStore, target Comp
 	return nil
 }
 
-// SelectDependencyStores selects the applicable composed store per
-// ecosystem for a mutable leaf. An entry applies when the leaf holds one
-// of its lockfiles. When entries of two managers in one ecosystem match, the
-// leaf's own declaration decides where the ecosystem has one; otherwise no
-// entry applies and selection reports manager_ambiguous.
-//
-// When the chosen manager has several entries (disjoint `versions` ranges),
-// the version in the leaf's declaration (Node packageManager, for example
-// "pnpm@9.15.9") selects the entry whose range covers it, or the result is
-// toolchain_mismatch, whether the manager has one entry or several. With a
-// single entry and no usable pin, that entry is selected (the caller checks
-// the version the manager reports). With no usable pin and several entries,
-// the result is ErrDependencyStoreVersionRequired, and the caller selects
-// with SelectDependencyStoreForVersion once the manager reports its version.
-func SelectDependencyStores(stores []ComposedDependencyStore, leaf LeafDependencyFacts) ([]ComposedDependencyStore, error) {
-	present := make(map[string]struct{}, len(leaf.Files))
-	for _, file := range leaf.Files {
-		present[file] = struct{}{}
-	}
-	byEcosystem := map[string][]ComposedDependencyStore{}
-	ecosystems := []string{}
-	for _, store := range stores {
-		matched := false
-		for _, lockfile := range store.Lockfiles {
-			if _, ok := present[lockfile]; ok {
-				matched = true
-				break
-			}
-		}
-		if !matched {
-			continue
-		}
-		group := store.Ecosystem
-		if group == "" {
-			group = "\x00" + store.Manager
-		}
-		if _, ok := byEcosystem[group]; !ok {
-			ecosystems = append(ecosystems, group)
-		}
-		byEcosystem[group] = append(byEcosystem[group], store)
-	}
-	sort.Strings(ecosystems)
-
-	token, pinned := leafManagerToken(leaf.PackageManager), leafManagerVersion(leaf.PackageManager)
-	var selected []ComposedDependencyStore
-	for _, group := range ecosystems {
-		candidates := byEcosystem[group]
-		managers := map[string][]ComposedDependencyStore{}
-		names := []string{}
-		for _, candidate := range candidates {
-			if _, ok := managers[candidate.Manager]; !ok {
-				names = append(names, candidate.Manager)
-			}
-			managers[candidate.Manager] = append(managers[candidate.Manager], candidate)
-		}
-		sort.Strings(names)
-		manager := names[0]
-		if len(names) > 1 {
-			if _, ok := managers[token]; !ok {
-				return nil, fmt.Errorf("%w: manager_ambiguous: ecosystem %q matched by [%s] with no leaf declaration selecting one",
-					ErrDependencyStoreAmbiguous, candidates[0].Ecosystem, strings.Join(names, ", "))
-			}
-			manager = token
-		}
-		entries := managers[manager]
-		// The pin's version describes the pinned manager only.
-		version := pinned
-		if token != manager {
-			version = ""
-		}
-		if version == "" && len(entries) > 1 {
-			return nil, fmt.Errorf("%w: manager %q has %d entries with disjoint versions and the leaf pins no version",
-				ErrDependencyStoreVersionRequired, manager, len(entries))
-		}
-		if version == "" {
-			selected = append(selected, entries[0])
-			continue
-		}
-		entry, err := SelectDependencyStoreForVersion(entries, manager, version)
-		if err != nil {
-			return nil, err
-		}
-		selected = append(selected, entry)
-	}
-	sort.Slice(selected, func(i, j int) bool { return selected[i].Manager < selected[j].Manager })
-	return selected, nil
-}
-
-// SelectDependencyStoreForVersion returns the entry of manager whose
-// `versions` range covers version (for example "9.15.9"). An entry with no
-// `versions` covers every version. When no entry covers it the error wraps
-// ErrDependencyStoreToolchainMismatch. Ranges are disjoint after composition
-// and validation, so at most one entry covers a version, apart from an
-// unranged entry the lock selected beside ranged ones, which loses to the
-// ranged entry covering the version.
-func SelectDependencyStoreForVersion(stores []ComposedDependencyStore, manager, version string) (ComposedDependencyStore, error) {
-	var unranged *ComposedDependencyStore
-	for i := range stores {
-		if stores[i].Manager != manager {
-			continue
-		}
-		rng, err := ParseVersionRange(stores[i].Versions)
-		if err != nil {
-			return ComposedDependencyStore{}, fmt.Errorf("%w: %s versions: %w", ErrDependencyStoreInvalid, manager, err)
-		}
-		if rng.Unbounded() {
-			unranged = &stores[i]
-			continue
-		}
-		covered, err := rng.Covers(version)
-		if err != nil {
-			return ComposedDependencyStore{}, fmt.Errorf("%w: toolchain_mismatch: %s version %q: %w",
-				ErrDependencyStoreToolchainMismatch, manager, version, err)
-		}
-		if covered {
-			return stores[i], nil
-		}
-	}
-	if unranged != nil {
-		if _, err := parseManagerVersion(version); err != nil {
-			return ComposedDependencyStore{}, fmt.Errorf("%w: toolchain_mismatch: %s version %q: %w",
-				ErrDependencyStoreToolchainMismatch, manager, version, err)
-		}
-		return *unranged, nil
-	}
-	return ComposedDependencyStore{}, fmt.Errorf("%w: toolchain_mismatch: no %s entry covers version %q",
-		ErrDependencyStoreToolchainMismatch, manager, version)
-}
-
 // ResolvePackagePath resolves a package-relative path (relocate) against the
 // entry's verified package root and returns the absolute path. It refuses an
 // entry with no package root, and a path that is not one canonical relative
@@ -978,38 +835,6 @@ func (c ComposedDependencyStore) ResolveRelocate() (resolved string, ok bool, er
 	}
 	resolved, err = c.ResolvePackagePath(rel)
 	return resolved, true, err
-}
-
-// leafManagerToken reduces a leaf declaration such as "pnpm@10.1.0" to
-// its manager token "pnpm". Empty input selects nothing.
-func leafManagerToken(declaration string) string {
-	declaration = strings.TrimSpace(declaration)
-	if declaration == "" {
-		return ""
-	}
-	if at := strings.Index(declaration, "@"); at >= 0 {
-		return declaration[:at]
-	}
-	return declaration
-}
-
-// leafManagerVersion returns the version part of a leaf declaration such as
-// "pnpm@9.15.9+sha512.abc", without the hash, or "" when there is none or it
-// is not major.minor.patch (a dist-tag such as "latest" names no version).
-func leafManagerVersion(declaration string) string {
-	declaration = strings.TrimSpace(declaration)
-	at := strings.Index(declaration, "@")
-	if at < 0 {
-		return ""
-	}
-	version := declaration[at+1:]
-	if plus := strings.Index(version, "+"); plus >= 0 {
-		version = version[:plus]
-	}
-	if _, err := parseManagerVersion(version); err != nil {
-		return ""
-	}
-	return version
 }
 
 // dependencyStoreDigest binds the resolved managers, owners and commands. The

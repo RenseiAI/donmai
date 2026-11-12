@@ -7,8 +7,6 @@ import (
 	"testing"
 )
 
-const pnpm9Declaration = "pnpm@9.15.9"
-
 // pnpm9StoreView is the pnpm 9 entry: store layout v3, versions >=9 <10.
 func pnpm9StoreView() DependencyStoreView {
 	v := pnpmStoreView()
@@ -317,127 +315,6 @@ func TestComposedStoreResolvesRelocateAgainstPackageRoot(t *testing.T) {
 		if _, err := plan.Stores[0].ResolvePackagePath(rel); !errors.Is(err, ErrPackagePathInvalid) {
 			t.Errorf("ResolvePackagePath(%q) = %v, want ErrPackagePathInvalid", rel, err)
 		}
-	}
-}
-
-func composedPnpmPair(t *testing.T) []ComposedDependencyStore {
-	t.Helper()
-	plan, err := ComposeDependencyStores([]ManifestView{
-		storeKitView("default/typescript", storeDigestA, pnpm9StoreView(), pnpm10StoreView()),
-	}, storeTarget(), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return plan.Stores
-}
-
-func TestSelectDependencyStoresByPinnedVersion(t *testing.T) {
-	t.Parallel()
-	stores := composedPnpmPair(t)
-	leaf := func(pm string) LeafDependencyFacts {
-		return LeafDependencyFacts{Files: []string{"pnpm-lock.yaml"}, PackageManager: pm}
-	}
-	cases := []struct {
-		pm   string
-		want string // Versions of the selected entry
-	}{
-		{pnpm9Declaration, ">=9 <10"},
-		{"pnpm@9.15.9+sha512.0123abcd", ">=9 <10"},
-		{"pnpm@9.0.0", ">=9 <10"},
-		{"pnpm@10.0.0", ">=10 <11"},
-		{"pnpm@10.33.2", ">=10 <11"},
-	}
-	for _, tc := range cases {
-		got, err := SelectDependencyStores(stores, leaf(tc.pm))
-		if err != nil || len(got) != 1 || got[0].Versions != tc.want {
-			t.Errorf("pin %q: selected %+v err=%v, want the %q entry", tc.pm, got, err, tc.want)
-		}
-	}
-}
-
-func TestSelectDependencyStoresToolchainMismatch(t *testing.T) {
-	t.Parallel()
-	stores := composedPnpmPair(t)
-	for _, pm := range []string{"pnpm@8.15.0", "pnpm@11.0.0", "pnpm@12.16.1", "pnpm@10.0.0-rc.1"} {
-		_, err := SelectDependencyStores(stores, LeafDependencyFacts{Files: []string{"pnpm-lock.yaml"}, PackageManager: pm})
-		if !errors.Is(err, ErrDependencyStoreToolchainMismatch) || !strings.Contains(err.Error(), "toolchain_mismatch") {
-			t.Errorf("pin %q: error = %v, want ErrDependencyStoreToolchainMismatch", pm, err)
-		}
-	}
-	// A single ranged entry is not exempt from the pin.
-	_, err := SelectDependencyStores(stores[:1], LeafDependencyFacts{Files: []string{"pnpm-lock.yaml"}, PackageManager: "pnpm@8.15.0"})
-	if !errors.Is(err, ErrDependencyStoreToolchainMismatch) {
-		t.Errorf("single ranged entry with an uncovered pin: error = %v", err)
-	}
-}
-
-func TestSelectDependencyStoresNoPin(t *testing.T) {
-	t.Parallel()
-	stores := composedPnpmPair(t)
-	// A pin naming another manager's version says nothing about pnpm's.
-	for _, pm := range []string{"", "pnpm", "pnpm@latest", "yarn@1.22.0"} {
-		_, err := SelectDependencyStores(stores, LeafDependencyFacts{Files: []string{"pnpm-lock.yaml"}, PackageManager: pm})
-		if !errors.Is(err, ErrDependencyStoreVersionRequired) || !errors.Is(err, ErrDependencyStoreAmbiguous) {
-			t.Errorf("pin %q with two ranged entries: error = %v, want ErrDependencyStoreVersionRequired", pm, err)
-		}
-	}
-	// One entry, no pin: selected; the caller checks the manager's version.
-	got, err := SelectDependencyStores(stores[:1], LeafDependencyFacts{Files: []string{"pnpm-lock.yaml"}})
-	if err != nil || len(got) != 1 {
-		t.Fatalf("single entry, no pin = %v, %+v", err, got)
-	}
-	// An unranged entry covers every version, pinned or not.
-	plain, err := ComposeDependencyStores([]ManifestView{storeKitView("k", storeDigestA, pnpmStoreView())}, storeTarget(), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, pm := range []string{"", "pnpm@9.15.9", "pnpm@12.16.1", "pnpm@10.0.0-rc.1"} {
-		got, err := SelectDependencyStores(plain.Stores, LeafDependencyFacts{Files: []string{"pnpm-lock.yaml"}, PackageManager: pm})
-		if err != nil || len(got) != 1 {
-			t.Errorf("unranged entry, pin %q = %v, %+v", pm, err, got)
-		}
-	}
-}
-
-func TestSelectDependencyStoreForVersion(t *testing.T) {
-	t.Parallel()
-	stores := composedPnpmPair(t)
-	got, err := SelectDependencyStoreForVersion(stores, "pnpm", "9.15.9")
-	if err != nil || got.Versions != ">=9 <10" {
-		t.Fatalf("9.15.9 = %+v, %v", got, err)
-	}
-	if _, err := SelectDependencyStoreForVersion(stores, "pnpm", "8.0.0"); !errors.Is(err, ErrDependencyStoreToolchainMismatch) {
-		t.Fatalf("8.0.0 error = %v", err)
-	}
-	if _, err := SelectDependencyStoreForVersion(stores, "pnpm", "latest"); !errors.Is(err, ErrDependencyStoreToolchainMismatch) {
-		t.Fatalf("latest error = %v", err)
-	}
-	if _, err := SelectDependencyStoreForVersion(stores, "yarn", "1.22.0"); !errors.Is(err, ErrDependencyStoreToolchainMismatch) {
-		t.Fatalf("a manager with no entry error = %v", err)
-	}
-}
-
-func TestSelectDependencyStoresMixedManagersAndRanges(t *testing.T) {
-	t.Parallel()
-	// Two managers in one ecosystem, one of them ranged twice: the leaf's
-	// declaration picks the manager, then the version picks the entry.
-	yarn := pnpm10StoreView()
-	yarn.Manager = "yarn"
-	yarn.Versions = ""
-	yarn.Lockfiles = []string{"pnpm-lock.yaml", "yarn.lock"}
-	plan, err := ComposeDependencyStores([]ManifestView{
-		storeKitView("k", storeDigestA, pnpm9StoreView(), pnpm10StoreView(), yarn),
-	}, storeTarget(), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	files := []string{"pnpm-lock.yaml", "yarn.lock"}
-	got, err := SelectDependencyStores(plan.Stores, LeafDependencyFacts{Files: files, PackageManager: pnpm9Declaration})
-	if err != nil || len(got) != 1 || got[0].Manager != "pnpm" || got[0].Versions != ">=9 <10" {
-		t.Fatalf("pnpm@9.15.9 = %+v, %v", got, err)
-	}
-	if _, err := SelectDependencyStores(plan.Stores, LeafDependencyFacts{Files: files}); !errors.Is(err, ErrDependencyStoreAmbiguous) {
-		t.Fatalf("no declaration error = %v, want manager_ambiguous", err)
 	}
 }
 

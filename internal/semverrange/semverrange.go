@@ -1,24 +1,35 @@
 // Package semverrange parses semantic versions and the small range grammar a
-// kit dependency-store entry uses for its `versions` field.
+// kit dependency-store entry uses for its `versions` field. It is the only
+// range implementation: manifest validation and composition (internal/kit)
+// and entry selection (runtime/depprep) both use it, so a range a kit
+// validates is the range a preparer selects by.
 //
 // The grammar is a subset of the npm range syntax:
 //
 //	range      = set *( "||" set )
 //	set        = comparator *( whitespace comparator )
-//	comparator = [ ">=" | "<=" | ">" | "<" | "=" | "^" | "~" ] partial
-//	partial    = major [ "." minor [ "." patch [ "-" pre ] ] ]
+//	comparator = [ ">=" | "<=" | ">" | "<" | "=" | "^" | "~" ] [ whitespace ] bound
+//	bound      = part [ "." part [ "." part ] ]
+//	part       = number | "x" | "X" | "*"
+//
+// A missing or wildcard part is a wildcard; nothing but wildcards may follow
+// one ("9.x" and "9.x.x" are "9"; "9.x.1" is refused). A bare "*" (or "x")
+// is every version, and only "", "=", ">=" and "<=" may precede a bare
+// wildcard. Bounds are plain release versions: a "v" prefix, a pre-release
+// or build part, a hyphen range and "&&" are refused rather than guessed
+// at. A set that no version can satisfy (">=10 <9") is refused.
 //
 // A bare or "=" partial covers every version it names a prefix of ("9" is
-// ">=9.0.0-0 <10.0.0-0"). "^" and "~" follow npm. Wildcards ("x", "*") and
-// hyphen ranges are refused rather than guessed at. A version satisfies a
+// ">=9.0.0-0 <10.0.0-0"). "^" and "~" follow npm. A version satisfies a
 // range when it satisfies every comparator of at least one set. A partial
-// version names a whole release line, its pre-releases included, so
-// 10.0.0-rc.1 satisfies ">=10 <11" and not ">=9 <10". The npm rule that
-// hides pre-releases from ranges without one is not applied: a manager's
-// pre-release still has to select an entry.
+// bound names a whole release line, its pre-releases included, so
+// 10.0.0-rc.1 satisfies ">=10 <11" and not ">=9 <10": a manager's
+// pre-release selects the entry of the line it belongs to. The npm rule
+// that hides pre-releases from ranges without one is not applied, because
+// a manager's pre-release still has to select an entry.
 //
-// The empty string is not a range: callers that treat a missing range as
-// "every version" check for "" themselves.
+// The empty string is not a range. A caller for which a missing range means
+// "every version" uses All.
 package semverrange
 
 import (
@@ -150,8 +161,17 @@ type Range struct {
 	sets [][]comparator
 }
 
-// String returns the range as written.
-func (r Range) String() string { return r.raw }
+// All is the range every version satisfies, pre-releases included. It is
+// what a missing `versions` key means.
+func All() Range { return Range{sets: [][]comparator{nil}} }
+
+// String returns the range as written, or "*" for All.
+func (r Range) String() string {
+	if strings.TrimSpace(r.raw) == "" {
+		return "*"
+	}
+	return r.raw
+}
 
 // Contains reports whether v satisfies the range.
 func (r Range) Contains(v Version) bool {
@@ -209,14 +229,17 @@ func interval(set []comparator) [2]bound {
 	return [2]bound{lo, hi}
 }
 
-func intervalsMeet(a [2]bound, b [2]bound) bool {
-	lo := maxLow(a[0], b[0])
-	hi := minHigh(a[1], b[1])
+// nonEmpty reports whether some version lies between the bounds.
+func nonEmpty(lo, hi bound) bool {
 	if lo.v == nil || hi.v == nil {
 		return true
 	}
 	c := Compare(*lo.v, *hi.v)
 	return c < 0 || (c == 0 && lo.inclusive && hi.inclusive)
+}
+
+func intervalsMeet(a [2]bound, b [2]bound) bool {
+	return nonEmpty(maxLow(a[0], b[0]), minHigh(a[1], b[1]))
 }
 
 func maxLow(a, b bound) bound {
@@ -247,6 +270,18 @@ func minHigh(a, b bound) bound {
 	return b
 }
 
+// operators, longest first so ">=" is not read as ">".
+var operators = []string{">=", "<=", ">", "<", "=", "^", "~"}
+
+func isOperator(tok string) bool {
+	for _, o := range operators {
+		if tok == o {
+			return true
+		}
+	}
+	return false
+}
+
 // ParseRange parses a range in the grammar above.
 func ParseRange(s string) (Range, error) {
 	raw := s
@@ -260,13 +295,26 @@ func ParseRange(s string) (Range, error) {
 		if len(fields) == 0 {
 			return Range{}, fmt.Errorf("%w: range %q has an empty alternative", ErrInvalid, raw)
 		}
-		var set []comparator
-		for _, field := range fields {
+		set := []comparator{}
+		for i := 0; i < len(fields); i++ {
+			field := fields[i]
+			// ">= 9" spelled with a space joins the operator to its bound.
+			if isOperator(field) {
+				if i+1 >= len(fields) {
+					return Range{}, fmt.Errorf("%w: comparator %q has no version (in range %q)", ErrInvalid, field, raw)
+				}
+				i++
+				field += fields[i]
+			}
 			cs, err := parseComparator(field)
 			if err != nil {
 				return Range{}, fmt.Errorf("%w (in range %q)", err, raw)
 			}
 			set = append(set, cs...)
+		}
+		iv := interval(set)
+		if !nonEmpty(iv[0], iv[1]) {
+			return Range{}, fmt.Errorf("%w: %q matches no version (in range %q)", ErrInvalid, strings.TrimSpace(setText), raw)
 		}
 		r.sets = append(r.sets, set)
 	}
@@ -275,19 +323,28 @@ func ParseRange(s string) (Range, error) {
 
 func parseComparator(field string) ([]comparator, error) {
 	var prefix string
-	for _, p := range []string{">=", "<=", ">", "<", "=", "^", "~"} {
+	for _, p := range operators {
 		if strings.HasPrefix(field, p) {
 			prefix = p
 			break
 		}
 	}
-	text := strings.TrimPrefix(strings.TrimPrefix(field, prefix), "v")
+	text := strings.TrimPrefix(field, prefix)
 	if text == "" {
 		return nil, fmt.Errorf("%w: comparator %q has no version", ErrInvalid, field)
 	}
-	v, parts, err := parsePartial(text)
+	v, parts, err := parseBound(text)
 	if err != nil {
 		return nil, err
+	}
+	if parts == 0 {
+		// "*", "x", ">=*": every version. Any other operator over a bare
+		// wildcard means nothing.
+		switch prefix {
+		case "", "=", ">=", "<=":
+			return nil, nil
+		}
+		return nil, fmt.Errorf("%w: operator %q over a wildcard", ErrInvalid, prefix)
 	}
 	if parts < 3 {
 		// A partial names a whole release line, pre-releases included:
@@ -332,6 +389,55 @@ func parseComparator(field string) ([]comparator, error) {
 	}
 }
 
+// parseBound parses a range bound: up to three dot-separated parts, each a
+// number or a wildcard, with only wildcards after the first wildcard. It
+// reports how many numeric parts lead the bound (0 for a bare wildcard).
+func parseBound(s string) (Version, int, error) {
+	if strings.ContainsAny(s, "-+") {
+		return Version{}, 0, fmt.Errorf("%w: bound %q carries a prerelease or build part; bounds are plain versions", ErrInvalid, s)
+	}
+	fields := strings.Split(s, ".")
+	if len(fields) > 3 {
+		return Version{}, 0, fmt.Errorf("%w: bound %q has more than three parts", ErrInvalid, s)
+	}
+	var vals [3]uint64
+	parts := 0
+	for i, f := range fields {
+		if f == "x" || f == "X" || f == "*" {
+			for _, rest := range fields[i:] {
+				if rest != "x" && rest != "X" && rest != "*" {
+					return Version{}, 0, fmt.Errorf("%w: bound %q has a number after a wildcard", ErrInvalid, s)
+				}
+			}
+			break
+		}
+		n, err := parseNumber(f)
+		if err != nil {
+			return Version{}, 0, err
+		}
+		vals[i] = n
+		parts = i + 1
+	}
+	return Version{Major: vals[0], Minor: vals[1], Patch: vals[2]}, parts, nil
+}
+
+// parseNumber parses one numeric version part: digits, no leading zero.
+func parseNumber(n string) (uint64, error) {
+	if n == "" || (len(n) > 1 && n[0] == '0') {
+		return 0, fmt.Errorf("%w: version part %q", ErrInvalid, n)
+	}
+	for j := 0; j < len(n); j++ {
+		if n[j] < '0' || n[j] > '9' {
+			return 0, fmt.Errorf("%w: version part %q", ErrInvalid, n)
+		}
+	}
+	val, err := strconv.ParseUint(n, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("%w: version part %q", ErrInvalid, n)
+	}
+	return val, nil
+}
+
 // bumpAt returns the first version after every version the partial names:
 // "9" -> 10.0.0, "9.1" -> 9.2.0.
 func bumpAt(v Version, parts int) Version {
@@ -349,7 +455,7 @@ func lowest(v Version) Version {
 }
 
 // parsePartial parses major[.minor[.patch[-pre]]][+build] and reports how
-// many numeric parts were present.
+// many numeric parts were present. It parses versions, not range bounds.
 func parsePartial(s string) (Version, int, error) {
 	if plus := strings.IndexByte(s, '+'); plus >= 0 {
 		if plus == len(s)-1 {
@@ -380,17 +486,9 @@ func parsePartial(s string) (Version, int, error) {
 	}
 	var vals [3]uint64
 	for i, n := range nums {
-		if n == "" || (len(n) > 1 && n[0] == '0') {
-			return Version{}, 0, fmt.Errorf("%w: version part %q", ErrInvalid, n)
-		}
-		for j := 0; j < len(n); j++ {
-			if n[j] < '0' || n[j] > '9' {
-				return Version{}, 0, fmt.Errorf("%w: version part %q", ErrInvalid, n)
-			}
-		}
-		val, err := strconv.ParseUint(n, 10, 64)
+		val, err := parseNumber(n)
 		if err != nil {
-			return Version{}, 0, fmt.Errorf("%w: version part %q", ErrInvalid, n)
+			return Version{}, 0, err
 		}
 		vals[i] = val
 	}

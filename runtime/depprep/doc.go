@@ -38,8 +38,11 @@
 //
 // # What later work plugs in
 //
-//   - EntrySource: the composing binary's kit registry supplies entries.
-//     StaticEntries serves tests and embedders with fixed entries.
+//   - EntrySource: the composing binary's kit registry supplies entries. The
+//     daemon's KitRegistry implements it (every enabled kit's entries whose
+//     lockfiles the leaf holds, detection not consulted); Prepare alone
+//     selects among them. StaticEntries serves tests and embedders with
+//     fixed entries.
 //   - Config.Confiner: runs the offline install under the host's confinement
 //     backend, so the repository's own manager allowlist decides which
 //     lifecycle scripts run.
