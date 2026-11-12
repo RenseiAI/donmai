@@ -12,7 +12,7 @@
 # Dockerfiles, so this file must keep exactly one FROM and no COPY --from.
 #
 # Pins:
-# - Go 1.26.10 tracks go.mod (`go 1.26.10`), via the official Go tarball
+# - Go 1.26.11 tracks go.mod (`go 1.26.11`), via the official Go tarball
 #   below. Bump the URL together with go.mod.
 # - golangci-lint v2.11.4 tracks CI's lint action
 #   (.github/workflows/ci.yml `golangci-lint-action` version).
@@ -62,7 +62,7 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
 COPY donmai /usr/local/bin/donmai
 RUN chmod +x /usr/local/bin/donmai
 
-# Go toolchain for Go seats (matches go.mod's 1.26.10 floor). Single-stage
+# Go toolchain for Go seats (matches go.mod's 1.26.11 floor). Single-stage
 # tarball install keeps this Dockerfile to one FROM for the E2B build SDK.
 # NOTE: E2B runs build steps and later SDK version checks under `bash -l -c`,
 # and bookworm's /etc/profile overwrites PATH for login shells, dropping
@@ -70,7 +70,7 @@ RUN chmod +x /usr/local/bin/donmai
 # those shells. Symlink go/gofmt into /usr/local/bin (always on the login
 # default PATH) so unqualified `go` resolves in login shells, Docker RUN, and
 # SDK exec alike.
-RUN curl -fsSL https://go.dev/dl/go1.26.10.linux-amd64.tar.gz -o /tmp/go.tgz \
+RUN curl -fsSL https://go.dev/dl/go1.26.11.linux-amd64.tar.gz -o /tmp/go.tgz \
     && tar -C /usr/local -xzf /tmp/go.tgz \
     && rm /tmp/go.tgz \
     && ln -s /usr/local/go/bin/go /usr/local/bin/go \
