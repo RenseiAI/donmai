@@ -11,6 +11,11 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 ### Fixes
 
 - E2B template publisher: build `donmai-worker-node-pg` at 8 vCPU / 8 GiB instead of 16 GiB. The E2B account refuses any sandbox above 8192 MiB (`400: Memory can't be higher than 8192 MiB`), so the node-pg build has failed on every release since the template first shipped in v0.73.3, failing the publisher and the release train stages behind it. The memory request now comes from the repository variable `E2B_NODE_PG_MEMORY_MB` and defaults to 8192, so it can be raised without a code change once E2B lifts the account limit. Type checks in this template should use a 6 GiB heap (`NODE_OPTIONS=--max-old-space-size=6144`) instead of 12 GiB. The base and Go templates are unchanged.
+- E2B node-pg template: the Postgres build-time smoke now passes on a builder that runs systemd. With the memory request accepted, the build failed next at `pg-start` with `Job for postgresql@17-main.service failed`: as root under systemd, `pg_ctlcluster 17 main start` hands the start to `systemctl`, and the server then refused to start as the unprivileged sandbox account because the default TLS key belongs to the `postgres` account. `pg-start` and the smoke's stop calls now pass `--skip-systemctl-redirect`, the cluster sets `ssl = off` (local trust connections only, as before) and its `start.conf` is `manual`, so systemd never starts the cluster at boot and `pg-start` stays the only way it comes up.
+
+### Chores
+
+- E2B template publisher: the `donmai-worker-node-pg` build and verification steps are now non-fatal. A release can ship without the node-pg template: the publisher run concludes success, and the release train continues, when only that template fails. The failure is not silent. The run carries a workflow warning annotation and a job summary line (`NOT PUBLISHED` or `FAILED VERIFICATION`) naming the failed step. Nothing consumes the template yet; anything that starts to must check the publisher summary for its release. The base and Go template steps stay fatal.
 
 ## v0.73.6 — 2026-11-12
 

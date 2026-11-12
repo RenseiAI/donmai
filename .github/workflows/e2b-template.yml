@@ -25,6 +25,13 @@ name: e2b-template
 # variable E2B_NODE_PG_MEMORY_MB (for example 16384) to build larger without a
 # code change; unset, the build requests 8192.
 #
+# The node-pg build and its verification are non-fatal (continue-on-error):
+# nothing consumes `donmai-worker-node-pg` yet, and a failure there must not
+# fail the publisher and stop the release train behind it. A release can
+# therefore ship WITHOUT the node-pg template. That is never silent: the
+# summary step raises a workflow warning annotation and writes a job summary
+# line naming the failed step. The base and Go template steps stay fatal.
+#
 # @e2b/cli 2.13.3 help confirms `template create` accepts only an untagged name
 # constrained to lowercase letters, numbers, dashes, and underscores. E2B's
 # supported SDK `Template.build(template, "name:tag", { tags: [...] })` API is
@@ -230,9 +237,11 @@ jobs:
           DONMAI_VERSION: ${{ steps.release.outputs.tag }}
         run: node "${RUNNER_TEMP}/verify-e2b-template.cjs"
 
+      # Non-fatal: see the header. The outcome is reported by the summary step.
       - name: Build versioned E2B node-pg template
         if: steps.node-pg-template.outputs.present == 'true'
         id: template-node-pg
+        continue-on-error: true
         working-directory: worker/e2b
         env:
           E2B_API_KEY: ${{ secrets.E2B_API_KEY }}
@@ -243,8 +252,11 @@ jobs:
           E2B_MEMORY_MB: ${{ vars.E2B_NODE_PG_MEMORY_MB || '8192' }}
         run: node "${RUNNER_TEMP}/build-e2b-template.cjs"
 
+      # Non-fatal, and only meaningful when the build above published a target.
       - name: Assert published E2B node-pg template toolchain
-        if: steps.node-pg-template.outputs.present == 'true'
+        if: steps.node-pg-template.outputs.present == 'true' && steps.template-node-pg.outcome == 'success'
+        id: verify-node-pg
+        continue-on-error: true
         env:
           E2B_API_KEY: ${{ secrets.E2B_API_KEY }}
           E2B_TEMPLATE_REF: ${{ steps.template-node-pg.outputs.template_ref }}
@@ -262,7 +274,18 @@ jobs:
           NODE_PG_TEMPLATE_REF: ${{ steps.template-node-pg.outputs.template_ref }}
           NODE_PG_TEMPLATE_ID: ${{ steps.template-node-pg.outputs.template_id }}
           NODE_PG_BUILD_ID: ${{ steps.template-node-pg.outputs.build_id }}
+          NODE_PG_BUILD_OUTCOME: ${{ steps.template-node-pg.outcome }}
+          NODE_PG_VERIFY_OUTCOME: ${{ steps.verify-node-pg.outcome }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
         run: |
+          node_pg_failed_step=''
+          if [[ "${NODE_PG_BUILD_OUTCOME}" == failure ]]; then
+            node_pg_failed_step='Build versioned E2B node-pg template'
+            echo "::warning title=node-pg E2B template not published::Step '${node_pg_failed_step}' failed. ${RELEASE_TAG} ships without donmai-worker-node-pg:${RELEASE_TAG}; the base and Go templates are unaffected."
+          elif [[ "${NODE_PG_VERIFY_OUTCOME}" == failure ]]; then
+            node_pg_failed_step='Assert published E2B node-pg template toolchain'
+            echo "::warning title=node-pg E2B template failed verification::Step '${node_pg_failed_step}' failed. donmai-worker-node-pg:${RELEASE_TAG} was built but did not pass its toolchain checks; do not rely on it. The base and Go templates are unaffected."
+          fi
           {
             printf '## E2B template release\n\n'
             printf -- "- Target: \`%s\`\n" "${TEMPLATE_REF}"
@@ -275,7 +298,11 @@ jobs:
             else
               printf -- "- Go template: not present in this release (base-only retry)\n"
             fi
-            if [[ -n "${NODE_PG_TEMPLATE_REF}" ]]; then
+            if [[ "${node_pg_failed_step}" == 'Build versioned E2B node-pg template' ]]; then
+              printf -- "- node-pg template: **NOT PUBLISHED**. Step \`%s\` failed (non-fatal); this release ships without \`donmai-worker-node-pg:%s\`\n" "${node_pg_failed_step}" "${RELEASE_TAG}"
+            elif [[ -n "${node_pg_failed_step}" ]]; then
+              printf -- "- node-pg template: **FAILED VERIFICATION**. Step \`%s\` failed (non-fatal); \`%s\` (template \`%s\`, build \`%s\`) was built but is unverified\n" "${node_pg_failed_step}" "${NODE_PG_TEMPLATE_REF}" "${NODE_PG_TEMPLATE_ID}" "${NODE_PG_BUILD_ID}"
+            elif [[ -n "${NODE_PG_TEMPLATE_REF}" ]]; then
               printf -- "- node-pg target: \`%s\`\n" "${NODE_PG_TEMPLATE_REF}"
               printf -- "- node-pg template ID: \`%s\`\n" "${NODE_PG_TEMPLATE_ID}"
               printf -- "- node-pg build ID: \`%s\`\n" "${NODE_PG_BUILD_ID}"

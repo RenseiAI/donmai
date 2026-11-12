@@ -610,3 +610,46 @@ test('release workflow gates the node-pg template build on the release checkout'
     fs.rmSync(withoutNodePg, { recursive: true, force: true })
   }
 })
+
+test('release workflow keeps node-pg failures non-fatal and loud while base and Go stay fatal', () => {
+  // The node-pg template has no consumer, so its failure must not fail the
+  // publisher (the release train requires a successful run), yet it must
+  // never be silent: the summary step raises a warning annotation and a job
+  // summary line naming the failed step. Removing either continue-on-error,
+  // adding one to a base or Go step, or dropping the report must fail here.
+  const workflow = fs.readFileSync(resolveWorkflowPath(), 'utf8')
+  const nodePgBuild = workflowStepBlock(workflow, 'Build versioned E2B node-pg template')
+  const nodePgVerify = workflowStepBlock(workflow, 'Assert published E2B node-pg template toolchain')
+  assert.match(nodePgBuild, /^\s*continue-on-error:\s*true\s*$/m, 'node-pg build must be non-fatal')
+  assert.match(nodePgVerify, /^\s*continue-on-error:\s*true\s*$/m, 'node-pg verification must be non-fatal')
+  assert.match(nodePgBuild, /^\s*id:\s*template-node-pg\s*$/m)
+  assert.match(nodePgVerify, /^\s*id:\s*verify-node-pg\s*$/m)
+  assert.match(
+    nodePgVerify,
+    /steps\.template-node-pg\.outcome\s*==\s*'success'/,
+    'node-pg verification must only run against a target the build published'
+  )
+  for (const fatal of [
+    'Build versioned E2B template',
+    'Build versioned E2B Go template',
+    'Assert published E2B template binary version',
+    'Assert published E2B Go template toolchain',
+  ]) {
+    assert.doesNotMatch(
+      workflowStepBlock(workflow, fatal),
+      /^\s*continue-on-error:/m,
+      `${fatal} must stay fatal`
+    )
+  }
+  const nonFatal = workflow.match(/^\s*continue-on-error:\s*true\s*$/gm) || []
+  assert.equal(nonFatal.length, 2, `only the two node-pg steps may be non-fatal, found ${nonFatal.length}`)
+  const summary = workflowStepBlock(workflow, 'Summarize E2B template build')
+  assert.doesNotMatch(summary, /^\s*continue-on-error:/m, 'the summary step must stay fatal')
+  assert.match(summary, /NODE_PG_BUILD_OUTCOME:\s*\$\{\{\s*steps\.template-node-pg\.outcome\s*\}\}/)
+  assert.match(summary, /NODE_PG_VERIFY_OUTCOME:\s*\$\{\{\s*steps\.verify-node-pg\.outcome\s*\}\}/)
+  const warnings = summary.match(/echo "::warning title=node-pg E2B template[^"]*\$\{node_pg_failed_step\}/g) || []
+  assert.equal(warnings.length, 2, 'a failed node-pg build or verification must each raise a warning naming the step')
+  assert.match(summary, /NOT PUBLISHED/, 'the job summary must say the template was not published')
+  assert.match(summary, /FAILED VERIFICATION/, 'the job summary must say the template failed verification')
+  assert.match(summary, /GITHUB_STEP_SUMMARY/)
+})
