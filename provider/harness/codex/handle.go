@@ -87,6 +87,12 @@ type Handle struct {
 	// when the session runs without notices. Set before the forwarder
 	// starts; the forwarder drains it on the terminal event.
 	tail *rolloutContextTail
+
+	// maxToolOutputBytes bounds one tool result's content handed to the
+	// model and to the runner. Resolved at spawn from the session limit
+	// and exported to the child environment so the child-side enforcement
+	// applies the same bound. Zero means the shared default.
+	maxToolOutputBytes int
 }
 
 // HandleOptions tweaks handle behavior. Used by tests; production code
@@ -108,15 +114,16 @@ func newHandle(p *Provider, client *Client, spec agent.Spec, opts HandleOptions)
 		opts.EventBuffer = 256
 	}
 	return &Handle{
-		provider:   p,
-		client:     client,
-		bridge:     NewApprovalBridge(spec.PermissionConfig),
-		spec:       spec,
-		rpcTimeout: opts.RPCTimeout,
-		events:     make(chan agent.Event, opts.EventBuffer),
-		notifyCh:   make(chan notification, 256),
-		closed:     make(chan struct{}),
-		state:      &mapperState{model: resolveModel(spec)},
+		provider:           p,
+		client:             client,
+		bridge:             NewApprovalBridge(spec.PermissionConfig),
+		spec:               spec,
+		maxToolOutputBytes: agent.ResolveToolOutputLimit(spec.ProviderConfig, spec.Env),
+		rpcTimeout:         opts.RPCTimeout,
+		events:             make(chan agent.Event, opts.EventBuffer),
+		notifyCh:           make(chan notification, 256),
+		closed:             make(chan struct{}),
+		state:              &mapperState{model: resolveModel(spec)},
 	}
 }
 
@@ -552,7 +559,25 @@ func (h *Handle) handleServerRequest(n notification) {
 // a closed channel via the send path. The h.closed broadcast is also
 // selected against so a slow send unblocks promptly when shutdown
 // begins, even if the closer has not yet acquired the write lock.
+
+// toolOutputLimit returns the per-tool-result byte bound for this session.
+func (h *Handle) toolOutputLimit() int {
+	if h == nil || h.maxToolOutputBytes <= 0 {
+		return agent.DefaultMaxToolOutputBytes
+	}
+	return h.maxToolOutputBytes
+}
+
+// emit publishes an event on the events channel without blocking (see above
+// for the close protocol). It bounds oversized tool output before handing it
+// to the runner and the model.
 func (h *Handle) emit(ev agent.Event) {
+	if toolRes, ok := ev.(agent.ToolResultEvent); ok {
+		if truncated, changed := agent.TruncateToolOutput(toolRes.Content, h.toolOutputLimit()); changed {
+			toolRes.Content = truncated
+			ev = toolRes
+		}
+	}
 	h.eventsMu.RLock()
 	defer h.eventsMu.RUnlock()
 	if h.eventsClosed.Load() {

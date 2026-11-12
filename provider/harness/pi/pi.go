@@ -308,6 +308,7 @@ func (p *Provider) prepare(ctx context.Context, spec agent.Spec) (agent.Spec, er
 	if err != nil {
 		return spec, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
 	}
+	spec.Env = agent.WithToolOutputLimitEnv(spec.Env, agent.ResolveToolOutputLimit(spec.ProviderConfig, spec.Env))
 	spec, err = applyEndpoint(spec)
 	if err != nil {
 		return spec, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)

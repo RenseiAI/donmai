@@ -222,6 +222,7 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 	if err != nil {
 		return nil, fmt.Errorf("muse spawn: prepare harness: %w", errors.Join(agent.ErrSpawnFailed, err))
 	}
+	spec.Env = agent.WithToolOutputLimitEnv(spec.Env, agent.ResolveToolOutputLimit(spec.ProviderConfig, spec.Env))
 	p.mu.Lock()
 	if p.shutdown {
 		p.mu.Unlock()
@@ -252,6 +253,7 @@ func (p *Provider) Resume(ctx context.Context, sessionID string, spec agent.Spec
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}
+	spec.Env = agent.WithToolOutputLimitEnv(spec.Env, agent.ResolveToolOutputLimit(spec.ProviderConfig, spec.Env))
 	if sessionID == "" {
 		return nil, agent.ErrSessionNotFound
 	}

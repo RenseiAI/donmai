@@ -147,6 +147,15 @@ const (
 	// attempts, and the outer idle timeout still owns the seat.
 	DefaultProviderStallRetries = 2
 
+	// DefaultMaxToolOutputBytes bounds one tool result's content kept by
+	// the runner, applied when [Options.MaxToolOutputBytes] is zero or
+	// negative. It aliases agent.DefaultMaxToolOutputBytes so the runner
+	// and every harness share one documented, configurable limit with a
+	// visible default. A larger result is truncated around a marker that
+	// names the truncation (see agent.TruncateToolOutput) before the
+	// runner retains it, so an oversized result cannot wedge the turn.
+	DefaultMaxToolOutputBytes = agent.DefaultMaxToolOutputBytes
+
 	// DefaultStatusBeaconInterval bounds the runner's current-step beacon
 	// posts to the session progress endpoint: at most one POST per
 	// interval, no matter how often the step changes (the latest step
@@ -291,6 +300,17 @@ type Options struct {
 	// retries (a stall then behaves exactly like the idle watchdog
 	// cut-off it replaces).
 	ProviderStallRetries int
+
+	// MaxToolOutputBytes bounds one tool result's content (in bytes) the
+	// runner retains per ToolResultEvent. A larger result is truncated
+	// around a marker naming the truncation (see agent.TruncateToolOutput)
+	// before the runner stores or forwards it, so an oversized result
+	// cannot wedge the turn and the seat keeps going on the bounded
+	// copy. Zero or negative uses DefaultMaxToolOutputBytes; there is
+	// no unbounded setting — the cap is protective, never advisory.
+	// It is the same documented limit every harness applies before
+	// handing tool output to the model.
+	MaxToolOutputBytes int
 
 	// PreserveWorktreeOnFailure keeps the worktree on disk after a
 	// failed Run for debugging. The operator surface is opt-in: `agent run
@@ -611,6 +631,10 @@ type Runner struct {
 	turnContinuationUndeliveredLimit int
 	// narrationNudgeLimit is Options.NarrationNudgeLimit.
 	narrationNudgeLimit int
+	// maxToolOutputBytes is Options.MaxToolOutputBytes, resolved to
+	// DefaultMaxToolOutputBytes when unset. It bounds one tool result's
+	// retained content (see agent.TruncateToolOutput).
+	maxToolOutputBytes int
 	// providerRetryBackoff spaces provider-error retries; nil uses
 	// defaultProviderRetryBackoff. Tests substitute a zero wait.
 	providerRetryBackoff func(attempt int) time.Duration
@@ -742,6 +766,7 @@ func New(opts Options) (*Runner, error) {
 		turnContinuationCeiling:           opts.TurnContinuationCeiling,
 		turnContinuationUndeliveredLimit:  opts.TurnContinuationUndeliveredLimit,
 		narrationNudgeLimit:               opts.NarrationNudgeLimit,
+		maxToolOutputBytes:                opts.MaxToolOutputBytes,
 		quotaReporterForSession:           opts.QuotaReporterForSession,
 		quotaReporters:                    map[string]*QuotaReporter{},
 		interactiveUsage:                  map[string]*interactiveUsageTotals{},
@@ -783,6 +808,9 @@ func New(opts Options) (*Runner, error) {
 	}
 	if r.providerStallRetries == 0 {
 		r.providerStallRetries = DefaultProviderStallRetries
+	}
+	if r.maxToolOutputBytes <= 0 {
+		r.maxToolOutputBytes = DefaultMaxToolOutputBytes
 	}
 	return r, nil
 }

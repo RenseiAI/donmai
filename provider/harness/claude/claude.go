@@ -163,6 +163,7 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 		spec.Env = withEffortEnv(spec.Env, spec.Effort)
 	}
 	spec.Env = withAutoMemoryDisabledEnv(spec.Env)
+	spec.Env = agent.WithToolOutputLimitEnv(spec.Env, agent.ResolveToolOutputLimit(spec.ProviderConfig, spec.Env))
 	// Interactive spawn mode (W4): capability-gated on the live manifest, not
 	// a static branch — a future edit that flips SupportsInteractivePTY back
 	// to false makes this a silent no-op fallthrough to the headless path
@@ -276,6 +277,7 @@ func (p *Provider) Resume(ctx context.Context, sessionID string, spec agent.Spec
 		spec.Env = withEffortEnv(spec.Env, spec.Effort)
 	}
 	spec.Env = withAutoMemoryDisabledEnv(spec.Env)
+	spec.Env = agent.WithToolOutputLimitEnv(spec.Env, agent.ResolveToolOutputLimit(spec.ProviderConfig, spec.Env))
 	return p.spawn(ctx, spec, sessionID, "")
 }
 
