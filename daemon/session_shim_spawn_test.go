@@ -2455,8 +2455,8 @@ func TestShimControllerDisconnectDoesNotEmitTerminalLifecycle(t *testing.T) {
 	if q.Reason != sessionshim.QuarantineSocketUnreachable || !q.ConsumesCapacity {
 		t.Errorf("quarantine = %+v, want socket_unreachable and consumesCapacity=true", q)
 	}
-	if q.Detail != "controller stream ended before a terminal observation" {
-		t.Errorf("quarantine detail = %q, want bounded controller-loss detail", q.Detail)
+	if !strings.HasPrefix(q.Detail, "controller stream ended before a terminal observation; harness alive at release: ") {
+		t.Errorf("quarantine detail = %q, want bounded controller-loss detail naming the harness liveness at release", q.Detail)
 	}
 	// Repeated projections must not duplicate the same quarantine or capacity
 	// charge while heartbeat/status readers race terminal reconciliation.

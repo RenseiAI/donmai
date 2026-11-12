@@ -406,68 +406,6 @@ func TestValidateDependencyStoreTable(t *testing.T) {
 	}
 }
 
-func TestSelectDependencyStoresByLockfile(t *testing.T) {
-	t.Parallel()
-	views := []ManifestView{
-		storeKitView("node-kit", storeDigestA, pnpmStoreView()),
-		storeKitView("go-kit", storeDigestB, goStoreView()),
-	}
-	plan, err := ComposeDependencyStores(views, storeTarget(), nil)
-	if err != nil {
-		t.Fatalf("compose: %v", err)
-	}
-	selected, err := SelectDependencyStores(plan.Stores, LeafDependencyFacts{
-		Files: []string{"pnpm-lock.yaml", "package.json"},
-	})
-	if err != nil {
-		t.Fatalf("select: %v", err)
-	}
-	if len(selected) != 1 || selected[0].Manager != "pnpm" {
-		t.Fatalf("selected = %+v, want pnpm only", selected)
-	}
-	empty, err := SelectDependencyStores(plan.Stores, LeafDependencyFacts{
-		Files: []string{"README.md"},
-	})
-	if err != nil {
-		t.Fatalf("no-lockfile select: %v", err)
-	}
-	if len(empty) != 0 {
-		t.Fatalf("no-lockfile selected = %+v, want none", empty)
-	}
-}
-
-func TestSelectDependencyStoresAmbiguousWithoutLeafDeclaration(t *testing.T) {
-	t.Parallel()
-	npmEntry := pnpmStoreView()
-	npmEntry.Manager = "npm"
-	npmEntry.Lockfiles = []string{"package-lock.json"}
-	bunEntry := pnpmStoreView()
-	bunEntry.Manager = "bun"
-	bunEntry.Lockfiles = []string{"bun.lock"}
-	views := []ManifestView{
-		storeKitView("npm-kit", storeDigestA, npmEntry),
-		storeKitView("bun-kit", storeDigestB, bunEntry),
-	}
-	plan, err := ComposeDependencyStores(views, storeTarget(), nil)
-	if err != nil {
-		t.Fatalf("compose: %v", err)
-	}
-	leaf := LeafDependencyFacts{Files: []string{"package-lock.json", "bun.lock", "package.json"}}
-	if _, err := SelectDependencyStores(plan.Stores, leaf); !errors.Is(err, ErrDependencyStoreAmbiguous) {
-		t.Fatalf("ambiguous error = %v, want ErrDependencyStoreAmbiguous", err)
-	} else if !strings.Contains(err.Error(), "manager_ambiguous") {
-		t.Fatalf("ambiguous error %q missing manager_ambiguous token", err)
-	}
-	leaf.PackageManager = "bun@1.2.0"
-	selected, err := SelectDependencyStores(plan.Stores, leaf)
-	if err != nil {
-		t.Fatalf("declared select: %v", err)
-	}
-	if len(selected) != 1 || selected[0].Manager != "bun" {
-		t.Fatalf("selected = %+v, want bun via packageManager", selected)
-	}
-}
-
 func TestComposeForTargetResolvesOSKeyedStoreCommands(t *testing.T) {
 	t.Parallel()
 	entry := pnpmStoreView()

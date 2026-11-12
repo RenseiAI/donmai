@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io/fs"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/RenseiAI/donmai/afclient"
 	"github.com/RenseiAI/donmai/internal/kit"
+	"github.com/RenseiAI/donmai/runtime/depprep"
 )
 
 const dependencyStoreManifestTOML = `api = "donmai.dev/v2"
@@ -168,14 +170,14 @@ func TestKitRegistry_LegacyScanRoundTripDependencyStores(t *testing.T) {
 	if len(demand.DependencyStores) != 1 || demand.DependencyStores[0].Manager != "pnpm" {
 		t.Fatalf("composed stores = %+v, want pnpm", demand.DependencyStores)
 	}
-	selected, err := kit.SelectDependencyStores(demand.DependencyStores, kit.LeafDependencyFacts{
-		Files: []string{"pnpm-lock.yaml"},
-	})
+	// The same entry reaches the dependency preparer through the
+	// registry's entry source.
+	entries, err := reg.Entries(context.Background(), depprep.Leaf{Root: repo, OS: kit.OSLinux})
 	if err != nil {
-		t.Fatalf("select: %v", err)
+		t.Fatalf("entries: %v", err)
 	}
-	if len(selected) != 1 || selected[0].Commands["fetch"] != "pnpm fetch" {
-		t.Fatalf("selected = %+v, want pnpm fetch", selected)
+	if len(entries) != 1 || entries[0].Commands.Fetch != "pnpm fetch" {
+		t.Fatalf("entries = %+v, want pnpm fetch", entries)
 	}
 }
 

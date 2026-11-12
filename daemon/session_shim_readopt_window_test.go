@@ -582,8 +582,13 @@ func TestExhaustedWindowQuarantinesUnderItsOwnReason(t *testing.T) {
 			if projected[0].Reason != sessionshim.QuarantineSocketUnreachable {
 				t.Fatalf("quarantine reason = %q, want socket_unreachable", projected[0].Reason)
 			}
-			if projected[0].Detail != tc.wantDetail {
-				t.Fatalf("quarantine detail = %q, want %q", projected[0].Detail, tc.wantDetail)
+			if !strings.HasPrefix(projected[0].Detail, tc.wantDetail) {
+				t.Fatalf("quarantine detail = %q, want prefix %q", projected[0].Detail, tc.wantDetail)
+			}
+			// The window or budget ended with the shim still observable, so
+			// the terminal record says the harness was alive at release.
+			if !strings.Contains(projected[0].Detail, "harness alive at release: true") {
+				t.Fatalf("quarantine detail = %q, want it to name the live harness at release", projected[0].Detail)
 			}
 		})
 	}
@@ -655,7 +660,7 @@ func TestExhaustedWindowNeverStrandsTheLineage(t *testing.T) {
 		t.Fatalf("adopted set after an exhausted window = %+v, want the lineage withdrawn", adopted)
 	}
 	projected := f.daemon.QuarantinedSessions()
-	if len(projected) != 1 || projected[0].Detail != sessionShimReadoptionWindowExhaustedDetail {
+	if len(projected) != 1 || !strings.HasPrefix(projected[0].Detail, sessionShimReadoptionWindowExhaustedDetail) {
 		t.Fatalf("quarantine projection = %+v, want the lineage quarantined under the exhausted-window reason", projected)
 	}
 
@@ -727,7 +732,10 @@ func TestReadoptionPolicyValidateRejectsContradictoryFields(t *testing.T) {
 		{name: "the exported fixed default", policy: DefaultSessionShimReadoptionPolicy(), valid: true},
 		{name: "the exported lineage-live default", policy: DefaultLineageLiveSessionShimReadoptionPolicy(), valid: true},
 		{name: "fixed mode with a window", policy: SessionShimReadoptionPolicy{Window: 5 * time.Minute}},
-		{name: "fixed mode with a backoff cap", policy: SessionShimReadoptionPolicy{BackoffCap: time.Second}},
+		// The backoff ceiling is configurable in both modes (see
+		// DefaultSessionShimReadoptionBackoffCap): it ceilings a fixed-attempt
+		// hold past its budget.
+		{name: "fixed mode with a backoff cap", policy: SessionShimReadoptionPolicy{BackoffCap: time.Second}, valid: true},
 		{name: "fixed mode with a keepalive interval", policy: SessionShimReadoptionPolicy{KeepaliveInterval: time.Second}},
 		{name: "lineage-live mode with attempts", policy: SessionShimReadoptionPolicy{Mode: ReadoptionLineageLive, Attempts: 3}},
 		{name: "negative window", policy: SessionShimReadoptionPolicy{Mode: ReadoptionLineageLive, Window: -time.Second}},
