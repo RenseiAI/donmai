@@ -3038,9 +3038,9 @@ type streamObservation struct {
 	toolAfterLastAssistant bool
 	// toolOutputTruncated reports that a tool result of this stream
 	// exceeded the runner's tool-output limit and was truncated around
-	// a marker before the runner retained it (see truncateToolOutput).
-	// Protective, never a failure: the turn keeps going on the bounded
-	// copy. toolOutputBytes is the largest original byte size truncated
+	// a marker before the runner retained or forwarded it (see
+	// truncateToolOutput; the model already saw the full result).
+	// Protective, never a failure: the turn keeps going. toolOutputBytes is the largest original byte size truncated
 	// on this stream; toolOutputLimit is the limit applied.
 	toolOutputTruncated bool
 	toolOutputBytes     int
@@ -3196,7 +3196,7 @@ func (o streamObservation) applyTo(res *Result, providerName agent.ProviderName)
 	}
 	// An oversized tool result the runner truncated rides as a
 	// post-session warning — observability, never a failure — so the
-	// bound copy the seat kept going on stays visible wherever
+	// truncation of the runner's retained copy stays visible wherever
 	// warnings surface.
 	noteToolOutputTruncation(res, o)
 }
@@ -3536,16 +3536,20 @@ func (r *Runner) consumeEventsWithin(
 			if !ok {
 				return obs, nil
 			}
-			// Bound oversized tool output at ingress: a result larger than
-			// the runner's tool-output limit is truncated around a marker
-			// before anything downstream — the audit log, the activity
-			// sink, the pull-request scan — retains it, so one
-			// escape-laden CI log cannot wedge the turn. Protective,
-			// never a failure: the turn keeps going on the bounded copy,
-			// and the observation records that it happened so the
-			// terminal reason can name it when the turn still dies.
-			// Middle-elision keeps the tail, so a pull request URL at
-			// the end of the output still scans.
+			// Bound oversized tool output at the runner's ingress: a
+			// result larger than the runner's tool-output limit is
+			// truncated around a marker before the runner retains or
+			// forwards it — the audit log, the activity sink, the
+			// pull-request scan — so one escape-laden CI log cannot
+			// balloon the runner's own buffers. This is the runner's
+			// copy only: the harness built this event from its own tool
+			// loop and has already handed the full result to the model,
+			// so it does not bound the model's context (bounding the
+			// harness tool loops is separate work). Protective, never a
+			// failure: the turn keeps going, and the observation records
+			// the truncation so the terminal reason can name it when the
+			// turn still dies. Middle-elision keeps the tail, so a pull
+			// request URL at the end of the output still scans.
 			if toolRes, ok := ev.(agent.ToolResultEvent); ok {
 				if truncated, changed := truncateToolOutput(toolRes.Content, r.toolOutputLimit()); changed {
 					original := len(toolRes.Content)

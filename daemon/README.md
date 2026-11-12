@@ -260,6 +260,33 @@ daemon start sweeps every recorded directory whose session is no longer
 running. The sweep only removes recorded paths that still pass the checks
 above; it never matches by name prefix.
 
+### Tool output bound (`maxToolOutputBytes`)
+
+Each worker's runner bounds one tool result before it retains or forwards
+it: the session audit log (`.agent/events.jsonl`), the activity stream and
+the pull request scan. A result larger than the bound is cut in the middle
+around a marker that names the truncation (`[tool output truncated: N-byte
+output exceeds the L-byte limit; showing head and tail]`), keeping the head
+and the tail, and the seat keeps going. Oversize output never fails a turn
+on its own; the session records a post-session warning, and a turn that
+still dies afterwards names the oversize in its terminal reason.
+
+The bound applies to the runner's copy only. The harness builds each tool
+result from its own tool loop and has already handed the full output to
+the model, so this setting does not shrink what the model sees.
+
+| Setting | Default | Notes |
+|---|---|---|
+| `maxToolOutputBytes` in `daemon.yaml` | `262144` (256 KiB, `runner.DefaultMaxToolOutputBytes`) | Absent, zero or negative keeps the default. A positive value states `DONMAI_MAX_TOOL_OUTPUT_BYTES` in every spawned worker's environment; an embedder-composed `SpawnerOptions.BaseEnv` value keeps priority. Read at daemon start. |
+| `donmai agent run --max-tool-output-bytes` | the value of `DONMAI_MAX_TOOL_OUTPUT_BYTES`, else `262144` | A value that is not a positive integer falls back to the default. Embedders set `runner.Options.MaxToolOutputBytes` directly. |
+
+```yaml
+maxToolOutputBytes: 524288   # absent: 262144 (256 KiB)
+```
+
+`DONMAI_MAX_TOOL_OUTPUT_BYTES` is host-owned: a work item's environment
+cannot set it, so a session cannot lift the bound for itself.
+
 ## HTTP control API
 
 Localhost-only (binds 127.0.0.1). Endpoints:

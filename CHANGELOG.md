@@ -8,7 +8,10 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
-No unreleased changes.
+### Fixes
+
+- A continue-mode turn that ends abnormally (the harness exits or is killed, reports a failed result, or ends on a provider or harness error) now records that cause as the terminal reason with its stable failure mode (`silent-exit`, `provider-error`) instead of the "continued pull request is still a draft" contract message, on every turn including continuation turns. The draft message is kept for a turn that completed normally and delivered no code. A continuation turn that dies after the continued pull request already carries the session's delivered code still completes, with the death recorded as a post-session warning.
+- The runner truncates an oversized tool result around a marker before it retains or forwards it (audit log, activity stream, pull request scan), keeping the head and the tail; the seat keeps going and the session records a warning, and a turn that still dies names the oversize in its terminal reason. The bound applies to the runner's copy: the harness has already handed the full result to the model. The default is 256 KiB (`runner.DefaultMaxToolOutputBytes`); operators set `maxToolOutputBytes` in the daemon configuration (stated to each worker as `DONMAI_MAX_TOOL_OUTPUT_BYTES`, read by `agent run --max-tool-output-bytes`), and embedders set `runner.Options.MaxToolOutputBytes`.
 
 ## v0.73.5 — 2026-11-11
 

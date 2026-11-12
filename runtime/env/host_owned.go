@@ -90,6 +90,16 @@ const SessionReadTokenEnv = "DONMAI_SESSION_READ_TOKEN" //nolint:gosec // G101: 
 // drop) its own worktree against the operator's recovery policy.
 const KeepFailedWorktreeEnv = "DONMAI_KEEP_FAILED_WORKTREE"
 
+// MaxToolOutputBytesEnv states the per-tool-result byte bound a worker's
+// runner applies before it retains or forwards a tool result (the audit
+// log, the activity stream, the pull request scan): a larger result is
+// truncated around a marker. The daemon states it from its
+// maxToolOutputBytes setting; unset, or anything but a positive integer,
+// leaves the runner default (256 KiB). A work item must not be able to
+// set it: the bound protects the host's worker, so a session could
+// otherwise lift it for itself.
+const MaxToolOutputBytesEnv = "DONMAI_MAX_TOOL_OUTPUT_BYTES"
+
 // DefaultDaemonControlPort is the daemon control API's well-known loopback
 // port (daemon.DefaultHTTPPort is this constant).
 const DefaultDaemonControlPort = 7734
@@ -100,7 +110,7 @@ func IsHostOwned(key string) bool {
 	switch key {
 	case PiConfinementEnv, PiConfinementReadEnv, PiConfinementReadPathsEnv,
 		MuseConfinementEnv, MuseConfinementReadEnv, MuseConfinementReadPathsEnv,
-		KeepFailedWorktreeEnv:
+		KeepFailedWorktreeEnv, MaxToolOutputBytesEnv:
 		return true
 	default:
 		return false

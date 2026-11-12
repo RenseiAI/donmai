@@ -2850,3 +2850,37 @@ func TestAgentRunCmd_PreserveWorktreeDefault(t *testing.T) {
 		})
 	}
 }
+
+// TestAgentRunCmd_MaxToolOutputBytesFlag pins the worker's tool-output
+// bound: the flag shows the runner default when nothing states one, the
+// daemon's DONMAI_MAX_TOOL_OUTPUT_BYTES answers it per worker, and a
+// value that is not a positive integer falls back to the default.
+func TestAgentRunCmd_MaxToolOutputBytesFlag(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		env  string
+		set  bool
+		want string
+	}{
+		{name: "unset shows the default", want: "262144"},
+		{name: "daemon env answers it", env: "65536", set: true, want: "65536"},
+		{name: "zero falls back to the default", env: "0", set: true, want: "262144"},
+		{name: "garbage falls back to the default", env: "lots", set: true, want: "262144"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.set {
+				t.Setenv("DONMAI_MAX_TOOL_OUTPUT_BYTES", tc.env)
+			} else {
+				t.Setenv("DONMAI_MAX_TOOL_OUTPUT_BYTES", "")
+			}
+			cmd := newAgentRunCmd(Config{})
+			flag := cmd.Flags().Lookup("max-tool-output-bytes")
+			if flag == nil {
+				t.Fatal("agent run has no --max-tool-output-bytes flag")
+			}
+			if flag.DefValue != tc.want {
+				t.Fatalf("--max-tool-output-bytes default = %q; want %q", flag.DefValue, tc.want)
+			}
+		})
+	}
+}

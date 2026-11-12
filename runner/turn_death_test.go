@@ -345,8 +345,9 @@ func TestRun_ContinueModeSilentTurnEndAfterOversizeNamesBoth(t *testing.T) {
 }
 
 // TestRun_ToolOutputOversizeTruncatesAndContinues proves the protective
-// path: an oversized tool result is truncated with a marker and the seat
-// keeps going on the bounded copy — oversize alone never fails the turn.
+// path: an oversized tool result is truncated with a marker before the
+// runner retains it, and the seat keeps going — oversize alone never
+// fails the turn.
 func TestRun_ToolOutputOversizeTruncatesAndContinues(t *testing.T) {
 	big := "command echo\n" + strings.Repeat("x", 4096) + "\nhttps://github.com/example/repo/pull/7\n"
 	res, _ := runScriptedSession(t, scriptedSession{

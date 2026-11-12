@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"reflect"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -67,6 +68,12 @@ type agentRunOpts struct {
 	worktree             string
 	preserveWT           bool
 	jsonOut              bool
+	// maxToolOutputBytes is --max-tool-output-bytes: the per-tool-result
+	// bound the runner applies before it retains or forwards a result
+	// (runner.Options.MaxToolOutputBytes). Its default comes from
+	// DONMAI_MAX_TOOL_OUTPUT_BYTES, which the daemon states from its
+	// maxToolOutputBytes setting, else runner.DefaultMaxToolOutputBytes.
+	maxToolOutputBytes int
 	// keepRecording is the standalone --keep-recording flag: a LOCAL OPERATOR
 	// decision to suppress the runner's end-of-session deletion of an
 	// interactive session's on-disk asciinema-v2 cast. It sets
@@ -202,6 +209,8 @@ func newAgentRunCmd(cfg Config) *cobra.Command {
 		"Per-session worktree parent directory (default: ~/.donmai/worktrees)")
 	cmd.Flags().BoolVar(&opts.preserveWT, "preserve-worktree", keepFailedWorktreeFromEnv(os.Getenv),
 		"Keep a failed session's worktree on disk for post-mortem recovery (default false; the daemon's keepFailedWorktrees setting answers yes for every worker it spawns; unpublished work is archived to the rescue directory before teardown either way)")
+	cmd.Flags().IntVar(&opts.maxToolOutputBytes, "max-tool-output-bytes", maxToolOutputBytesFromEnv(os.Getenv),
+		"Bound in bytes on one tool result the runner retains or forwards (audit log, activity stream, pull request scan); a larger result is truncated around a marker and the seat keeps going. The harness has already handed the full result to the model, so this bounds the runner's copy only. The daemon's maxToolOutputBytes setting answers it for every worker it spawns; zero or negative uses the runner default")
 	cmd.Flags().BoolVar(&opts.jsonOut, "json", true,
 		"Emit a single JSON line describing the terminal Result (default true)")
 	cmd.Flags().BoolVar(&opts.keepRecording, "keep-recording", false,
@@ -605,6 +614,7 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 		Logger:                    logger,
 		MaxSessionDuration:        agentRunMaxSessionDuration(detail),
 		PreserveWorktreeOnFailure: opts.preserveWT,
+		MaxToolOutputBytes:        opts.maxToolOutputBytes,
 		// Tracker transitions and diagnostic comments are workflow actions. The
 		// production worker publishes the terminal result and leaves those
 		// optional mutations to visible, authored post-session nodes.
@@ -761,6 +771,25 @@ func keepFailedWorktreeFromEnv(getenv func(string) string) bool {
 	}
 	v := strings.TrimSpace(getenv(runtimeenv.KeepFailedWorktreeEnv))
 	return v == "1" || strings.EqualFold(v, "true")
+}
+
+// maxToolOutputBytesFromEnv returns this worker's tool-output bound: the
+// --max-tool-output-bytes default when the flag is not passed explicitly.
+// The spawning daemon states DONMAI_MAX_TOOL_OUTPUT_BYTES from its
+// maxToolOutputBytes setting; an operator-exported value reaches the
+// worker the same way. Anything but a positive integer — including
+// unset — answers runner.DefaultMaxToolOutputBytes, so the flag's help
+// shows the bound the runner actually applies. getenv is os.Getenv in
+// production and a test double under test.
+func maxToolOutputBytesFromEnv(getenv func(string) string) int {
+	if getenv == nil {
+		return runner.DefaultMaxToolOutputBytes
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(getenv(runtimeenv.MaxToolOutputBytesEnv)))
+	if err != nil || n <= 0 {
+		return runner.DefaultMaxToolOutputBytes
+	}
+	return n
 }
 
 // postSessionRunningMaxAttempts bounds the eager running-post retry loop so a

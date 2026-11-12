@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1782,6 +1783,16 @@ func (d *Daemon) Start(ctx context.Context) error {
 	if cfg.KeepFailedWorktrees {
 		if _, ok := spawnerOpts.BaseEnv[runtimeenv.KeepFailedWorktreeEnv]; !ok {
 			spawnerOpts.BaseEnv[runtimeenv.KeepFailedWorktreeEnv] = "1"
+		}
+	}
+	// Carry the operator's tool-output bound the same way: a positive
+	// maxToolOutputBytes states DONMAI_MAX_TOOL_OUTPUT_BYTES, which
+	// `agent run` reads as its --max-tool-output-bytes default. Unset
+	// leaves the runner default; an embedder-composed BaseEnv keeps
+	// priority, and a work item cannot override it (host-owned).
+	if cfg.MaxToolOutputBytes > 0 {
+		if _, ok := spawnerOpts.BaseEnv[runtimeenv.MaxToolOutputBytesEnv]; !ok {
+			spawnerOpts.BaseEnv[runtimeenv.MaxToolOutputBytesEnv] = strconv.Itoa(cfg.MaxToolOutputBytes)
 		}
 	}
 	// Tell every worker this daemon spawns where this daemon actually lives.

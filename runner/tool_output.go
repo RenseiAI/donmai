@@ -16,7 +16,9 @@ const toolOutputTruncatedInfix = "[tool output truncated"
 // the pull request URL the verifier scans for) around a marker that names
 // the truncation with the original and limit sizes. Content within the
 // limit is returned unchanged. The bound is protective, never a failure:
-// the caller keeps the seat going on the truncated copy.
+// the caller keeps the seat going. It applies to the runner's own copy of
+// a harness ToolResultEvent — what the runner retains or forwards — not
+// to the result the harness already handed the model.
 //
 // The cut is rune-safe on both sides: the head shrinks and the tail's
 // start grows forward to rune boundaries, so neither slice splits a
@@ -64,8 +66,8 @@ const toolOutputTruncationWarningPrefix = "tool output exceeded"
 
 // noteToolOutputTruncation records an oversized tool result the runner
 // truncated as a post-session warning — observability, never a failure
-// — so the bound copy the seat kept going on stays visible wherever
-// warnings surface. Deduped by prefix: applyTo runs once per stream and
+// — so the truncation of the runner's retained copy stays visible
+// wherever warnings surface. Deduped by prefix: applyTo runs once per stream and
 // several streams merge onto one envelope.
 func noteToolOutputTruncation(res *Result, o streamObservation) {
 	if res == nil || !o.toolOutputTruncated {
@@ -77,5 +79,5 @@ func noteToolOutputTruncation(res *Result, o streamObservation) {
 		}
 	}
 	res.PostSessionWarnings = append(res.PostSessionWarnings,
-		fmt.Sprintf("tool output exceeded the %d-byte limit and was truncated with a marker (largest result %d bytes); the seat kept going on the bounded copy", o.toolOutputLimit, o.toolOutputBytes))
+		fmt.Sprintf("tool output exceeded the %d-byte limit and was truncated with a marker before the runner retained or forwarded it (largest result %d bytes); the seat kept going", o.toolOutputLimit, o.toolOutputBytes))
 }
