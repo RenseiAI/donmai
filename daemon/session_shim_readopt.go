@@ -232,7 +232,16 @@ func (d *Daemon) readoptSessionShimWithinFixedAttempts(
 	// Full run: the initial burst, then an unbounded hold while observable.
 	// The keepalive runs for the whole hold (not just past the budget), so a
 	// shim whose deadline is shorter than the backoff never reaps mid-hold.
-	stopKeepalive := d.startSessionShimOrphanKeepalive(registry, cfg, id, hello)
+	// When ReadoptionHeldPastWindow is set, the hold also needs it to stay true:
+	// a composing layer that stops holding the lineage on unbounded terms ends
+	// the hold (legacy HeldPastWindow contract), while a nil predicate holds
+	// while LineageLive says held.
+	stopKeepalive := d.startSessionShimOrphanKeepaliveWhile(registry, cfg, id, hello, func(ctx context.Context) bool {
+		if cfg.ReadoptionHeldPastWindow == nil {
+			return d.sessionShimLineageHeldContext(ctx, cfg, id)
+		}
+		return d.sessionShimReadoptionHeldPastWindow(ctx, cfg, id)
+	})
 	defer stopKeepalive()
 	backoffCap := policy.BackoffCap
 	if backoffCap <= 0 {
@@ -275,7 +284,16 @@ func (d *Daemon) readoptSessionShimWithinFixedAttempts(
 		// positive evidence ends the hold, and the attempt above already
 		// reports it (shim gone, lineage released, decisive answer).
 		// The loop re-checks observability through the next attempt's
-		// liveness gate rather than duplicating it here.
+		// liveness gate rather than duplicating it here. When the composing
+		// layer stops holding the lineage on unbounded terms (HeldPastWindow
+		// set and now false), the hold ends the way the bounded budget would.
+		if cfg.ReadoptionHeldPastWindow != nil && d.shims.recoveryCtx.Err() == nil &&
+			!d.sessionShimReadoptionHeldPastWindow(d.shims.recoveryCtx, cfg, id) {
+			if sessionShimIncarnationStillLive(registry, id, hello.ShimID, hello.ProcessEpoch) {
+				return readoptionAttemptsSpent
+			}
+			return readoptionLineageGone
+		}
 	}
 }
 
@@ -307,10 +325,16 @@ func (d *Daemon) readoptSessionShimWithinLivenessWindow(
 	hello shimwire.Hello,
 	reentered bool,
 ) sessionShimReadoptionDisposition {
-	// The keepalive is gated on the lineage being held (LineageLive, nil means
-	// held for a standalone daemon). It stops the moment the composing layer
-	// lets go, so a released harness reaps on its own deadline.
-	stopKeepalive := d.startSessionShimOrphanKeepalive(registry, cfg, id, hello)
+	// The keepalive is gated on the lineage being held. When HeldPastWindow is
+	// set, the conjunction (held at all AND held on unbounded terms) gates it,
+	// so the moment the composing layer lets go the extensions stop at once;
+	// with a nil predicate, LineageLive alone (nil means held) gates it.
+	stopKeepalive := d.startSessionShimOrphanKeepaliveWhile(registry, cfg, id, hello, func(ctx context.Context) bool {
+		if cfg.ReadoptionHeldPastWindow == nil {
+			return d.sessionShimLineageHeldContext(ctx, cfg, id)
+		}
+		return d.sessionShimReadoptionHeldPastWindow(ctx, cfg, id)
+	})
 	defer stopKeepalive()
 	backoffCap := policy.BackoffCap
 	if backoffCap <= 0 {
@@ -346,6 +370,16 @@ func (d *Daemon) readoptSessionShimWithinLivenessWindow(
 		// Silence while observable is not evidence: keep retrying with capped
 		// backoff. Only positive evidence ends the hold, and the attempt above
 		// already reports it (shim gone, lineage released, decisive answer).
+		// When the composing layer stops holding the lineage on unbounded
+		// terms (HeldPastWindow set and now false), the continued window ends
+		// the legacy way, through the exhaustion outcome and its hook, so a
+		// lineage held past the window still withdraws the instant the hold
+		// lifts. With a nil predicate the hold continues while LineageLive
+		// says held.
+		if cfg.ReadoptionHeldPastWindow != nil && d.shims.recoveryCtx.Err() == nil &&
+			!d.sessionShimReadoptionHeldPastWindow(d.shims.recoveryCtx, cfg, id) {
+			return d.sessionShimWindowExhausted(registry, cfg, id, hello, d.shimNow())
+		}
 	}
 }
 

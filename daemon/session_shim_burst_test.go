@@ -366,9 +366,12 @@ func TestBacklogBudgetOverrunFailsClosedHonestly(t *testing.T) {
 	if quarantined[0].Reason != sessionshim.QuarantineDurableAckTimeout {
 		t.Fatalf("quarantine reason = %q, want %q", quarantined[0].Reason, sessionshim.QuarantineDurableAckTimeout)
 	}
-	if quarantined[0].Detail != sessionShimReadoptionAttemptsSpentDetail {
-		t.Fatalf("quarantine detail = %q, want %q — the re-adoption path was never taken",
+	if !strings.HasPrefix(quarantined[0].Detail, sessionShimReadoptionAttemptsSpentDetail) {
+		t.Fatalf("quarantine detail = %q, want prefix %q — the re-adoption path was never taken",
 			quarantined[0].Detail, sessionShimReadoptionAttemptsSpentDetail)
+	}
+	if !strings.Contains(quarantined[0].Detail, "harness alive at release:") {
+		t.Fatalf("quarantine detail = %q, want it to name the harness liveness at release", quarantined[0].Detail)
 	}
 	err := daemon.WriteAdoptedSessionShimInput(id.OrgID, id.SessionID, []byte("refused\r"))
 	if err == nil || !strings.Contains(err.Error(), "is not adopted by this daemon") {
@@ -657,9 +660,12 @@ func TestDropBoundReadoptsAndNeverPublishesSocketUnreachable(t *testing.T) {
 	if quarantined.Reason != sessionshim.QuarantineDurableAckTimeout {
 		t.Fatalf("quarantine reason = %q, want %q", quarantined.Reason, sessionshim.QuarantineDurableAckTimeout)
 	}
-	if quarantined.Detail != sessionShimReadoptionAttemptsSpentDetail {
-		t.Fatalf("quarantine detail = %q, want %q — the re-adoption path was never taken",
+	if !strings.HasPrefix(quarantined.Detail, sessionShimReadoptionAttemptsSpentDetail) {
+		t.Fatalf("quarantine detail = %q, want prefix %q — the re-adoption path was never taken",
 			quarantined.Detail, sessionShimReadoptionAttemptsSpentDetail)
+	}
+	if !strings.Contains(quarantined.Detail, "harness alive at release:") {
+		t.Fatalf("quarantine detail = %q, want it to name the harness liveness at release", quarantined.Detail)
 	}
 	if !quarantined.ConsumesCapacity {
 		t.Fatal("the withdrawn lineage stopped consuming capacity; its harness is still held")
