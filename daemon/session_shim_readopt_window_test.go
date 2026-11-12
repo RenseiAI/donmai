@@ -295,11 +295,8 @@ func TestLineageLiveWindowReadoptsACarrierThatReturnsAfterTheFixedCutoff(t *test
 	}
 }
 
-// TestLineageLiveBackoffNeverExceedsTheCap pins the ceiling (see
-// DefaultSessionShimReadoptionBackoffCap). Doubling without one turns a hold
-// past the old window into three attempts and a nine-minute sleep; with the
-// cap the hold retries with capped backoff for as long as the shim is
-// observable.
+// TestLineageLiveBackoffNeverExceedsTheCap pins the ceiling. Doubling without
+// one turns a ten-minute window into three attempts and a nine-minute sleep.
 func TestLineageLiveBackoffNeverExceedsTheCap(t *testing.T) {
 	t.Parallel()
 	const (
@@ -317,38 +314,7 @@ func TestLineageLiveBackoffNeverExceedsTheCap(t *testing.T) {
 	})
 	lost := f.lostEntry(t)
 
-	// The hold never ends while the shim is observable, so run it in the
-	// background and stop it once the schedule is pinned.
-	done := make(chan sessionShimReadoptionDisposition, 1)
-	go func() {
-		done <- f.daemon.readoptSessionShimAfterControllerLoss(f.id, lost, 0)
-	}()
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		var backoffs []time.Duration
-		for _, wait := range clock.requestedWaits() {
-			if wait == keepaliveInterval {
-				continue
-			}
-			backoffs = append(backoffs, wait)
-		}
-		if len(backoffs) >= 4 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("the hold did not schedule four backoffs within 10s")
-		}
-		time.Sleep(2 * time.Millisecond)
-	}
-	f.daemon.shims.stopRecovery()
-	select {
-	case got := <-done:
-		if got != readoptionShutdown {
-			t.Fatalf("disposition = %d, want readoptionShutdown (%d)", got, readoptionShutdown)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("the hold did not stop within 10s of recovery being cancelled")
-	}
+	f.daemon.readoptSessionShimAfterControllerLoss(f.id, lost, 0)
 
 	var backoffs []time.Duration
 	for _, wait := range clock.requestedWaits() {
@@ -444,9 +410,13 @@ func TestLineageLiveStopsWhenTheLineageIsNoLongerHeld(t *testing.T) {
 // TestLineageLiveKeepaliveOutlivesAnOrphanDeadlineShorterThanTheBackoff is the
 // keepalive's reason for existing, in the one shape that cannot pass without
 // it: an orphan deadline of five seconds and a backoff of seven. Between two
-// attempts the shim's own clock would fire and reap its harness without the
-// keepalive. With it running, the lineage survives past the old window while
-// staying adopted with no quarantine and no tombstone.
+// attempts the shim's own clock fires, it reaps its harness, and the window
+// ends on a lineage that is gone — the exhaustion outcome unreachable because
+// the incarnation already left.
+//
+// With the keepalive running, the lineage survives the gap and the window ends
+// the way the amendment says it must: exhausted, with the shim still
+// observable.
 //
 // It does not run in parallel. Every other assertion here is about a value;
 // this one is about a real shim's real timer, and sharing a loaded machine with
@@ -481,43 +451,15 @@ func TestLineageLiveKeepaliveOutlivesAnOrphanDeadlineShorterThanTheBackoff(t *te
 	lost := f.lostEntry(t)
 	f.waitForOrphanArmed(t, 5*time.Second)
 
-	// The hold never ends while the shim is observable, so run it in the
-	// background and stop it once it has survived past the old window.
-	done := make(chan sessionShimReadoptionDisposition, 1)
-	go func() {
-		done <- f.daemon.readoptSessionShimAfterControllerLoss(f.id, lost, 0)
-	}()
-	// Past the old 8s window the lineage must stay adopted with no quarantine.
-	deadline := time.Now().Add(20 * time.Second)
-	for {
-		if n, _ := f.snapshot(); n >= 2 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("the hold did not attempt past the old window within 20s")
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if _, err := f.daemon.adoptedShimEntry(f.id.OrgID, f.id.SessionID); err != nil {
-		t.Fatalf("the lineage left the adopted set while the shim was still observable: %v", err)
-	}
-	if projected := f.daemon.QuarantinedSessions(); len(projected) != 0 {
-		t.Fatalf("quarantine projection = %+v while the shim was still observable, want none", projected)
+	if got := f.daemon.readoptSessionShimAfterControllerLoss(f.id, lost, 0); got != readoptionWindowExhausted {
+		t.Fatalf("disposition = %d, want readoptionWindowExhausted (%d) — the shim did not survive the window",
+			got, readoptionWindowExhausted)
 	}
 	exhausted.Lock()
 	calls := exhausted.calls
 	exhausted.Unlock()
-	if calls != 0 {
-		t.Fatalf("OnReadoptionWindowExhausted fired %d times while the shim was still observable, want none", calls)
-	}
-	f.daemon.shims.stopRecovery()
-	select {
-	case got := <-done:
-		if got != readoptionShutdown {
-			t.Fatalf("disposition = %d, want readoptionShutdown (%d)", got, readoptionShutdown)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("the hold did not stop within 10s of recovery being cancelled")
+	if calls != 1 {
+		t.Fatalf("OnReadoptionWindowExhausted fired %d times, want exactly once", calls)
 	}
 	keepalive := f.daemon.sessionShimKeepaliveObservations(f.id)
 	if keepalive.extensions == 0 {
@@ -539,10 +481,12 @@ func TestLineageLiveKeepaliveOutlivesAnOrphanDeadlineShorterThanTheBackoff(t *te
 }
 
 // TestLineageLiveWindowReachesTenMinutesUnderANinetySecondOrphanDeadline pins
-// the hold past the old ten-minute bound: the daemon keeps retrying with the
-// keepalive running while the shim stays observable, instead of exhausting at
-// the window. The window sizes the initial budget; past it the hold continues.
-// The keepalive interval is derived from the deadline rather than chosen.
+// the amendment's headline number against the deadline it is allowed to exceed.
+//
+// The window is ten minutes, the resolved orphan deadline ninety seconds, and
+// the keepalive interval is derived from the deadline rather than chosen — so
+// a deployment that tightens its deadline and forgets this policy still gets a
+// keepalive below it.
 func TestLineageLiveWindowReachesTenMinutesUnderANinetySecondOrphanDeadline(t *testing.T) {
 	t.Parallel()
 	const orphanDeadline = 90 * time.Second
@@ -574,79 +518,53 @@ func TestLineageLiveWindowReachesTenMinutesUnderANinetySecondOrphanDeadline(t *t
 	lost := f.lostEntry(t)
 	f.waitForOrphanArmed(t, 5*time.Second)
 
-	// The hold never ends while the shim is observable, so run it in the
-	// background and stop it once it has survived past the old window.
-	done := make(chan sessionShimReadoptionDisposition, 1)
-	go func() {
-		done <- f.daemon.readoptSessionShimAfterControllerLoss(f.id, lost, 0)
-	}()
-	deadline := time.Now().Add(15 * time.Second)
-	for {
-		if elapsed := clock.elapsed(started); elapsed >= defaultSessionShimReadoptionWindow-defaultSessionShimReadoptionBackoffCap {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("the hold did not survive past the old ten-minute window within 15s")
-		}
-		time.Sleep(2 * time.Millisecond)
+	if got := f.daemon.readoptSessionShimAfterControllerLoss(f.id, lost, 0); got != readoptionWindowExhausted {
+		t.Fatalf("disposition = %d, want readoptionWindowExhausted (%d)", got, readoptionWindowExhausted)
+	}
+	if elapsed := clock.elapsed(started); elapsed < defaultSessionShimReadoptionWindow-defaultSessionShimReadoptionBackoffCap {
+		t.Fatalf("the window spent %s of simulated time, want it to reach the %s it is configured for",
+			elapsed, defaultSessionShimReadoptionWindow)
 	}
 	adoptions, _ := f.snapshot()
 	if adoptions <= defaultSessionShimReadoptionAttempts {
-		t.Fatalf("durable adoption attempted %d times past the old ten-minute window, want more than the %d a fixed-attempt policy would spend",
+		t.Fatalf("durable adoption attempted %d times over a ten-minute window, want more than the %d a fixed-attempt policy would spend",
 			adoptions, defaultSessionShimReadoptionAttempts)
-	}
-	// While observable the lineage stays adopted with no quarantine and no
-	// exhaustion hook: the window no longer ends it.
-	if _, err := f.daemon.adoptedShimEntry(f.id.OrgID, f.id.SessionID); err != nil {
-		t.Fatalf("the lineage left the adopted set while the shim was still observable: %v", err)
-	}
-	if projected := f.daemon.QuarantinedSessions(); len(projected) != 0 {
-		t.Fatalf("quarantine projection = %+v while the shim was still observable, want none", projected)
 	}
 	exhausted.Lock()
 	calls := exhausted.calls
 	exhausted.Unlock()
-	if calls != 0 {
-		t.Fatalf("OnReadoptionWindowExhausted fired %d times while the shim was still observable, want none", calls)
+	if calls != 1 {
+		t.Fatalf("OnReadoptionWindowExhausted fired %d times, want exactly once", calls)
 	}
 	if keepalive := f.daemon.sessionShimKeepaliveObservations(f.id); keepalive.extensions == 0 {
-		t.Fatal("the hold ran without ever extending the shim's orphan clock")
-	}
-	f.daemon.shims.stopRecovery()
-	select {
-	case got := <-done:
-		if got != readoptionShutdown {
-			t.Fatalf("disposition = %d, want readoptionShutdown (%d)", got, readoptionShutdown)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("the hold did not stop within 10s of recovery being cancelled")
+		t.Fatal("the window ran without ever extending the shim's orphan clock")
 	}
 }
 
-// TestExhaustedWindowQuarantinesUnderItsOwnReason pins that silence alone
-// never quarantines an observable shim: past the old window/budget the lineage
-// stays adopted with no quarantine, and the terminal detail (when a withdrawal
-// finally happens on positive evidence) names the harness liveness at release.
-// Both legacy dispositions still reach socket_unreachable — the closed reason
-// registry is not this change's to extend — and the detail carried alongside
-// it is what makes "the carrier never came back" a different fact from "the
-// shim died", now with an explicit harness-alive suffix.
+// TestExhaustedWindowQuarantinesUnderItsOwnReason pins the post-window outcome
+// end to end, through the disconnect path an operator actually sees. Both
+// dispositions reach socket_unreachable — the closed reason registry is not
+// this change's to extend — and the reason carried alongside it is what makes
+// "the carrier never came back" a different fact from "the shim died".
 func TestExhaustedWindowQuarantinesUnderItsOwnReason(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
-		name   string
-		policy SessionShimReadoptionPolicy
+		name       string
+		policy     SessionShimReadoptionPolicy
+		wantDetail string
 	}{
 		{
-			name: "a lineage-live window past its old bound holds while observable",
+			name: "an exhausted lineage-live window carries its own reason",
 			policy: SessionShimReadoptionPolicy{
 				Mode: ReadoptionLineageLive, Backoff: time.Millisecond,
 				BackoffCap: time.Millisecond, Window: 50 * time.Millisecond,
 			},
+			wantDetail: sessionShimReadoptionWindowExhaustedDetail,
 		},
 		{
-			name:   "a fixed-attempt budget past its old bound holds while observable",
-			policy: SessionShimReadoptionPolicy{Attempts: 1, Backoff: time.Millisecond},
+			name:       "a spent fixed-attempt budget says so rather than reporting a death",
+			policy:     SessionShimReadoptionPolicy{Attempts: 1, Backoff: time.Millisecond},
+			wantDetail: sessionShimReadoptionAttemptsSpentDetail,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -654,37 +572,23 @@ func TestExhaustedWindowQuarantinesUnderItsOwnReason(t *testing.T) {
 			f := newReadoptFixtureWithOptions(t, readoptFixtureOptions{
 				policy: tc.policy, adoption: refusingCarrier(),
 			})
-			lost := f.lostEntry(t)
-			done := make(chan sessionShimReadoptionDisposition, 1)
-			go func() {
-				done <- f.daemon.readoptSessionShimAfterControllerLoss(f.id, lost, 0)
-			}()
-			// Past the old 1-attempt/50ms bound the lineage must stay adopted
-			// with no quarantine while the shim is observable.
-			deadline := time.Now().Add(10 * time.Second)
-			for {
-				if n, _ := f.snapshot(); n >= 3 {
-					break
-				}
-				if time.Now().After(deadline) {
-					t.Fatal("the hold did not retry past the old bound within 10s")
-				}
-				time.Sleep(2 * time.Millisecond)
+
+			f.daemon.releaseShimIfLive(f.id, f.controller, shimStreamCarrierLost)
+
+			projected := f.daemon.QuarantinedSessions()
+			if len(projected) != 1 {
+				t.Fatalf("quarantine projection = %+v, want exactly the lineage", projected)
 			}
-			if _, err := f.daemon.adoptedShimEntry(f.id.OrgID, f.id.SessionID); err != nil {
-				t.Fatalf("the lineage left the adopted set while the shim was still observable: %v", err)
+			if projected[0].Reason != sessionshim.QuarantineSocketUnreachable {
+				t.Fatalf("quarantine reason = %q, want socket_unreachable", projected[0].Reason)
 			}
-			if projected := f.daemon.QuarantinedSessions(); len(projected) != 0 {
-				t.Fatalf("quarantine projection = %+v while the shim was still observable, want none", projected)
+			if !strings.HasPrefix(projected[0].Detail, tc.wantDetail) {
+				t.Fatalf("quarantine detail = %q, want prefix %q", projected[0].Detail, tc.wantDetail)
 			}
-			f.daemon.shims.stopRecovery()
-			select {
-			case got := <-done:
-				if got != readoptionShutdown {
-					t.Fatalf("disposition = %d, want readoptionShutdown (%d)", got, readoptionShutdown)
-				}
-			case <-time.After(10 * time.Second):
-				t.Fatal("the hold did not stop within 10s of recovery being cancelled")
+			// The window or budget ended with the shim still observable, so
+			// the terminal record says the harness was alive at release.
+			if !strings.Contains(projected[0].Detail, "harness alive at release: true") {
+				t.Fatalf("quarantine detail = %q, want it to name the live harness at release", projected[0].Detail)
 			}
 		})
 	}
@@ -701,11 +605,18 @@ func TestExhaustedWindowQuarantinesUnderItsOwnReason(t *testing.T) {
 	}
 }
 
-// TestExhaustedWindowNeverStrandsTheLineage pins that a hold while observable
-// never strands the lineage: past the old window the lineage stays adopted
-// with the keepalive running, not withdrawn. When the shim is gone (positive
-// evidence), the lineage withdraws and the tombstone reconciler gives the
-// capacity back — no adopted entry with a dead shim, no capacity leak.
+// TestExhaustedWindowNeverStrandsTheLineage pins the one thing an exhausted
+// window must never do: leave the lineage adopted.
+//
+// The keepalive stops when the window does, so a retained entry's shim reaps on
+// its own deadline within minutes and writes a tombstone that nothing consumes
+// — reconcileQuarantinedTombstones iterates the QUARANTINED set, and the
+// consumer goroutine for the controller this path already closed has long since
+// returned. The daemon would go on reporting an adopted lineage whose shim is
+// gone, holding its capacity forever: a false complete-snapshot and a permanent
+// leak. So the withdrawal is unconditional, the notification runs first while
+// the lineage is still adopted, and occupancy comes back to zero on its own
+// once the shim's terminal proof lands.
 func TestExhaustedWindowNeverStrandsTheLineage(t *testing.T) {
 	const orphanDeadline = 500 * time.Millisecond
 	var notified struct {
@@ -734,51 +645,44 @@ func TestExhaustedWindowNeverStrandsTheLineage(t *testing.T) {
 		},
 	})
 
-	// Past the old window the hold keeps the lineage adopted with no
-	// quarantine and no exhaustion hook while the shim is observable.
-	lost := f.lostEntry(t)
-	done := make(chan sessionShimReadoptionDisposition, 1)
-	go func() {
-		done <- f.daemon.readoptSessionShimAfterControllerLoss(f.id, lost, 0)
-	}()
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		if n, _ := f.snapshot(); n >= 3 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("the hold did not retry past the old window within 10s")
-		}
-		time.Sleep(2 * time.Millisecond)
-	}
-	if adopted := f.daemon.AdoptedSessionShims(); len(adopted) != 1 || adopted[0] != f.id {
-		t.Fatalf("adopted set while holding = %+v, want the lineage still adopted", adopted)
-	}
-	if projected := f.daemon.QuarantinedSessions(); len(projected) != 0 {
-		t.Fatalf("quarantine projection = %+v while holding, want none", projected)
-	}
+	f.daemon.releaseShimIfLive(f.id, f.controller, shimStreamCarrierLost)
+
 	notified.Lock()
-	calls := notified.calls
+	calls, adoptedThen := notified.calls, notified.adoptedWhenNotified
 	notified.Unlock()
-	if calls != 0 {
-		t.Fatalf("OnReadoptionWindowExhausted fired %d times while holding, want none", calls)
+	if calls != 1 {
+		t.Fatalf("OnReadoptionWindowExhausted fired %d times, want exactly once", calls)
 	}
-	f.daemon.shims.stopRecovery()
-	select {
-	case got := <-done:
-		if got != readoptionShutdown {
-			t.Fatalf("disposition = %d, want readoptionShutdown (%d)", got, readoptionShutdown)
+	if len(adoptedThen) != 1 || adoptedThen[0] != f.id {
+		t.Fatalf("adopted set when the hook ran = %+v, want the lineage still adopted", adoptedThen)
+	}
+	if adopted := f.daemon.AdoptedSessionShims(); len(adopted) != 0 {
+		t.Fatalf("adopted set after an exhausted window = %+v, want the lineage withdrawn", adopted)
+	}
+	projected := f.daemon.QuarantinedSessions()
+	if len(projected) != 1 || !strings.HasPrefix(projected[0].Detail, sessionShimReadoptionWindowExhaustedDetail) {
+		t.Fatalf("quarantine projection = %+v, want the lineage quarantined under the exhausted-window reason", projected)
+	}
+
+	// The shim is no longer being extended, so it reaps on its own deadline and
+	// the tombstone reconciler — which only ever looks at the quarantined set —
+	// gives the capacity back. A retained lineage could never reach this.
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		if f.daemon.SessionShimOccupancy() == 0 {
+			return
 		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("the hold did not stop within 10s of recovery being cancelled")
+		time.Sleep(10 * time.Millisecond)
 	}
+	t.Fatalf("occupancy is still %d after the shim reaped; the lineage's terminal proof was never consumed",
+		f.daemon.SessionShimOccupancy())
 }
 
 // TestLineageMayNotReenterAWindowBeforeThePreviousDeadline pins the re-entry
 // bound against the window that GOVERNED the previous re-adoption. A lineage
-// that flaps while still held re-enters paced by one backoff (so a flapping
-// carrier costs at most one adoption revision per backoff); a lineage the
-// composing layer no longer holds is refused instead of re-adopted.
+// that flaps just outside the fixed-attempt arithmetic would otherwise re-enter
+// a fresh ten-minute window indefinitely, each cycle costing an adoption
+// revision the receiver has to re-attest.
 func TestLineageMayNotReenterAWindowBeforeThePreviousDeadline(t *testing.T) {
 	t.Parallel()
 	// The carrier accepts, so the second half returns on its first attempt: the
@@ -791,29 +695,23 @@ func TestLineageMayNotReenterAWindowBeforeThePreviousDeadline(t *testing.T) {
 	f := newReadoptFixtureWithOptions(t, readoptFixtureOptions{policy: policy})
 	lost := f.lostEntry(t)
 	// Re-adopted 90 seconds ago: outside the 60 s a fixed-attempt policy would
-	// measure against, well inside the ten minutes this one does. While the
-	// lineage is held (nil LineageLive means held for a standalone daemon) it
-	// re-enters paced by one backoff instead of being refused.
+	// measure against, well inside the ten minutes this one does.
 	lost.readoptedAtUnixNano = f.daemon.shimNow().Add(-90 * time.Second).UnixNano()
 
-	if got := f.daemon.readoptSessionShimAfterControllerLoss(f.id, lost, 0); got != readoptionSucceeded {
-		t.Fatalf("disposition = %d, want readoptionSucceeded (%d) for a held lineage re-entering inside the window", got, readoptionSucceeded)
+	if got := f.daemon.readoptSessionShimAfterControllerLoss(f.id, lost, 0); got != readoptionRefused {
+		t.Fatalf("disposition = %d, want readoptionRefused (%d) inside the governing window", got, readoptionRefused)
 	}
-	if adoptions, _ := f.snapshot(); adoptions != 1 {
-		t.Fatalf("durable adoption attempted %d times for a held re-entry, want 1", adoptions)
+	if adoptions, _ := f.snapshot(); adoptions != 0 {
+		t.Fatalf("durable adoption attempted %d times inside the previous window, want none", adoptions)
 	}
 
-	// Past the governing window, the lineage may enter a new one (fresh fixture:
-	// the first re-entry already installed a new controller, so the old lost
-	// entry is stale and would never install again).
-	f2 := newReadoptFixtureWithOptions(t, readoptFixtureOptions{policy: policy})
-	lost2 := f2.lostEntry(t)
-	lost2.readoptedAtUnixNano = f2.daemon.shimNow().Add(-11 * time.Minute).UnixNano()
-	if got := f2.daemon.readoptSessionShimAfterControllerLoss(f2.id, lost2, 0); got != readoptionSucceeded {
+	// Past the governing window, the lineage may enter a new one.
+	lost.readoptedAtUnixNano = f.daemon.shimNow().Add(-11 * time.Minute).UnixNano()
+	if got := f.daemon.readoptSessionShimAfterControllerLoss(f.id, lost, 0); got != readoptionSucceeded {
 		t.Fatalf("disposition = %d, want readoptionSucceeded (%d) after the previous window's deadline had passed",
 			got, readoptionSucceeded)
 	}
-	if adoptions, _ := f2.snapshot(); adoptions != 1 {
+	if adoptions, _ := f.snapshot(); adoptions != 1 {
 		t.Fatalf("durable adoption attempted %d times, want the one attempt the returning carrier accepted", adoptions)
 	}
 }
@@ -835,8 +733,8 @@ func TestReadoptionPolicyValidateRejectsContradictoryFields(t *testing.T) {
 		{name: "the exported lineage-live default", policy: DefaultLineageLiveSessionShimReadoptionPolicy(), valid: true},
 		{name: "fixed mode with a window", policy: SessionShimReadoptionPolicy{Window: 5 * time.Minute}},
 		// The backoff ceiling is configurable in both modes (see
-		// DefaultSessionShimReadoptionBackoffCap): a fixed hold past its budget
-		// retries with capped backoff.
+		// DefaultSessionShimReadoptionBackoffCap): it ceilings a fixed-attempt
+		// hold past its budget.
 		{name: "fixed mode with a backoff cap", policy: SessionShimReadoptionPolicy{BackoffCap: time.Second}, valid: true},
 		{name: "fixed mode with a keepalive interval", policy: SessionShimReadoptionPolicy{KeepaliveInterval: time.Second}},
 		{name: "lineage-live mode with attempts", policy: SessionShimReadoptionPolicy{Mode: ReadoptionLineageLive, Attempts: 3}},
@@ -1018,16 +916,8 @@ func TestStartupRefusesLineageLiveWithoutALineagePredicateUnderAnExternalThresho
 			},
 		},
 		{
-			// Both modes now hold past their initial budget while the shim
-			// stays observable, so fixed also extends indefinitely and needs
-			// the predicate under a declared threshold.
-			name:       "fixed-attempt mode holds past its budget, so it needs the predicate too",
-			cfg:        SessionShimConfig{Orphan: safeOrphan, Readoption: DefaultSessionShimReadoptionPolicy()},
-			wantRefusd: true,
-		},
-		{
-			name: "fixed-attempt mode with the predicate wired holds safely",
-			cfg:  SessionShimConfig{Orphan: safeOrphan, Readoption: DefaultSessionShimReadoptionPolicy(), LineageLive: live},
+			name: "fixed-attempt mode stays inside the deadline, so it needs no predicate",
+			cfg:  SessionShimConfig{Orphan: safeOrphan, Readoption: DefaultSessionShimReadoptionPolicy()},
 		},
 		{
 			name: "re-adoption disabled altogether extends nothing",

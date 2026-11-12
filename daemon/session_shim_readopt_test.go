@@ -306,52 +306,33 @@ func TestControllerLossReadoptsALiveShimBeforeQuarantining(t *testing.T) {
 // exactly what it was: a shim that cannot be re-adopted inside the bound is
 // quarantined `socket_unreachable`, capacity-charged, and published — never
 // killed, never released.
-// TestControllerLossHoldsWhenEveryReadoptionFailsWhileObservable pins the
-// outage fix: while the shim stays observable, silence alone never releases
-// the lineage. The initial burst runs, then the daemon holds past the budget
-// with capped backoff and the keepalive running instead of quarantining a
-// healthy harness. Only positive evidence (shim gone, lineage released,
-// decisive answer) ends it.
 func TestControllerLossQuarantinesWhenEveryReadoptionFails(t *testing.T) {
 	t.Parallel()
 	f := newReadoptFixture(t, SessionShimReadoptionPolicy{Attempts: 3, Backoff: 5 * time.Millisecond}, func(int) error {
 		return errors.New("carrier candidate dial refused")
 	})
 	d := f.daemon
-	lost := f.lostEntry(t)
 
-	done := make(chan sessionShimReadoptionDisposition, 1)
-	go func() {
-		done <- d.readoptSessionShimAfterControllerLoss(f.id, lost, 0)
-	}()
-	// The initial burst runs past the old 3-attempt cutoff while the shim
-	// stays observable: the lineage must stay adopted and never quarantine.
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		if n, _ := f.snapshot(); n >= 4 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("the hold did not retry past the old attempt budget within 10s")
-		}
-		time.Sleep(2 * time.Millisecond)
+	d.releaseShimIfLive(f.id, f.controller, shimStreamCarrierLost)
+
+	adoptions, batches := f.snapshot()
+	if adoptions != 3 {
+		t.Fatalf("durable adoption attempted %d times, want the policy's 3 before giving up", adoptions)
 	}
-	if _, err := d.adoptedShimEntry(f.id.OrgID, f.id.SessionID); err != nil {
-		t.Fatalf("the lineage left the adopted set while the shim was still observable: %v", err)
+	if _, err := d.adoptedShimEntry(f.id.OrgID, f.id.SessionID); err == nil {
+		t.Fatal("an unre-adoptable lineage stayed in the adopted set")
 	}
-	if projected := d.QuarantinedSessions(); len(projected) != 0 {
-		t.Fatalf("quarantine projection = %+v while the shim was still observable, want none", projected)
+	projected := d.QuarantinedSessions()
+	if len(projected) != 1 || projected[0].Reason != sessionshim.QuarantineSocketUnreachable || !projected[0].ConsumesCapacity {
+		t.Fatalf("quarantine projection = %+v, want one capacity-charged socket_unreachable lineage", projected)
 	}
-	// Ending the hold via shutdown (not via a failed re-adoption) proves the
-	// loop was holding, not finished.
-	d.shims.stopRecovery()
-	select {
-	case got := <-done:
-		if got != readoptionShutdown {
-			t.Fatalf("disposition = %d, want readoptionShutdown (%d) after recovery was cancelled mid-hold", got, readoptionShutdown)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("the hold did not stop within 10s of recovery being cancelled")
+	if len(batches) == 0 {
+		t.Fatal("the quarantine was never published")
+	}
+	last := batches[len(batches)-1]
+	if len(last.Quarantined) != 1 || last.Quarantined[0].SessionID != f.id.SessionID || len(last.Adopted) != 0 {
+		t.Fatalf("last batch = adopted:%+v quarantined:%+v, want the lineage quarantined and nothing adopted",
+			last.Adopted, last.Quarantined)
 	}
 }
 

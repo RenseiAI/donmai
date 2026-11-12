@@ -157,78 +157,31 @@ func TestHeldPastWindowWithdrawsTheMomentTheComposingLayerLetsGo(t *testing.T) {
 	}
 }
 
-// TestUnheldLineageStillWithdrawsAtWindowEnd pins that ending the hold needs
-// positive evidence: HeldPastWindow false ends the continued window through
-// the exhaustion outcome and hook, while LineageLive false ends through the
-// ordinary withdrawal. A nil predicate with the lineage held (the OSS
-// standalone default) holds past the old window with no exhaustion.
+// TestUnheldLineageStillWithdrawsAtWindowEnd pins that nothing but the
+// conjunction continues a window: an unset predicate (the OSS default), a
+// predicate answering false, and a predicate answering true for a lineage the
+// composing layer no longer holds at all (LineageLive false) all exhaust
+// exactly one window and fire the hook once.
 func TestUnheldLineageStillWithdrawsAtWindowEnd(t *testing.T) {
 	t.Parallel()
 	const window = time.Minute
-	// A nil predicate with the lineage held holds past the old window with no
-	// exhaustion: the standalone default survives an outage.
-	t.Run("no continuation predicate with lineage held holds past the window", func(t *testing.T) {
-		t.Parallel()
-		clock := newVirtualShimClock()
-		started := clock.Now()
-		var exhausted atomic.Int64
-		f := newReadoptFixtureWithOptions(t, readoptFixtureOptions{
-			policy: SessionShimReadoptionPolicy{
-				Mode: ReadoptionLineageLive, Backoff: time.Second, BackoffCap: 4 * time.Second, Window: window,
-			},
-			adoption:          refusingCarrier(),
-			clock:             clock,
-			lineageLive:       alwaysLive,
-			onWindowExhausted: func(context.Context, sessionshim.Identity) { exhausted.Add(1) },
-		})
-		lost := f.lostEntry(t)
-		done := make(chan sessionShimReadoptionDisposition, 1)
-		go func() {
-			done <- f.daemon.readoptSessionShimAfterControllerLoss(f.id, lost, 0)
-		}()
-		deadline := time.Now().Add(10 * time.Second)
-		for {
-			if elapsed := clock.elapsed(started); elapsed >= window {
-				break
-			}
-			if time.Now().After(deadline) {
-				t.Fatal("the hold did not survive past the old window within 10s")
-			}
-			time.Sleep(2 * time.Millisecond)
-		}
-		if _, err := f.daemon.adoptedShimEntry(f.id.OrgID, f.id.SessionID); err != nil {
-			t.Fatalf("the lineage left the adopted set while held: %v", err)
-		}
-		if projected := f.daemon.QuarantinedSessions(); len(projected) != 0 {
-			t.Fatalf("quarantine projection = %+v while held, want none", projected)
-		}
-		if n := exhausted.Load(); n != 0 {
-			t.Fatalf("OnReadoptionWindowExhausted fired %d times while held, want none", n)
-		}
-		f.daemon.shims.stopRecovery()
-		select {
-		case got := <-done:
-			if got != readoptionShutdown {
-				t.Fatalf("disposition = %d, want readoptionShutdown (%d)", got, readoptionShutdown)
-			}
-		case <-time.After(10 * time.Second):
-			t.Fatal("the hold did not stop within 10s of recovery being cancelled")
-		}
-	})
 	for _, tc := range []struct {
 		name string
 		// lineageLive and heldPastWindow are built against the case's clock.
 		lineageLive    func(clock *virtualShimClock, started time.Time) func(context.Context, sessionshim.Identity) bool
 		heldPastWindow func(context.Context, sessionshim.Identity) bool
-		want           sessionShimReadoptionDisposition
-		wantExhausted  int64
+		// slack is how far past the window the case may run. Zero for every
+		// case where the predicates answer the same all window long.
+		slack time.Duration
 	}{
+		{
+			name:        "no continuation predicate",
+			lineageLive: func(*virtualShimClock, time.Time) func(context.Context, sessionshim.Identity) bool { return alwaysLive },
+		},
 		{
 			name:           "the composing layer does not hold it past the window",
 			lineageLive:    func(*virtualShimClock, time.Time) func(context.Context, sessionshim.Identity) bool { return alwaysLive },
 			heldPastWindow: func(context.Context, sessionshim.Identity) bool { return false },
-			want:           readoptionWindowExhausted,
-			wantExhausted:  1,
 		},
 		{
 			name: "held past the window but no longer held at all",
@@ -236,15 +189,16 @@ func TestUnheldLineageStillWithdrawsAtWindowEnd(t *testing.T) {
 				return func(context.Context, sessionshim.Identity) bool { return clock.Now().Before(started.Add(window)) }
 			},
 			heldPastWindow: func(context.Context, sessionshim.Identity) bool { return true },
-			want:           readoptionLineageGone,
-			wantExhausted:  0,
+			// The window-end decision is taken when the next backoff no longer
+			// fits, one backoff BEFORE the deadline, while LineageLive still
+			// answered true here; the per-attempt re-check then ends it.
+			slack: 4 * time.Second,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			clock := newVirtualShimClock()
 			started := clock.Now()
-			_ = started
 			var exhausted atomic.Int64
 			f := newReadoptFixtureWithOptions(t, readoptFixtureOptions{
 				policy: SessionShimReadoptionPolicy{
@@ -258,21 +212,25 @@ func TestUnheldLineageStillWithdrawsAtWindowEnd(t *testing.T) {
 			})
 			lost := f.lostEntry(t)
 
-			if got := f.daemon.readoptSessionShimAfterControllerLoss(f.id, lost, 0); got != tc.want {
-				t.Fatalf("disposition = %d, want %d", got, tc.want)
+			if got := f.daemon.readoptSessionShimAfterControllerLoss(f.id, lost, 0); got != readoptionWindowExhausted {
+				t.Fatalf("disposition = %d, want readoptionWindowExhausted (%d)", got, readoptionWindowExhausted)
 			}
-			if n := exhausted.Load(); n != tc.wantExhausted {
-				t.Fatalf("OnReadoptionWindowExhausted fired %d times, want %d", n, tc.wantExhausted)
+			// Exactly the old bound: an unheld window must not run even one
+			// extra backoff past its own end.
+			if elapsed := clock.elapsed(started); elapsed > window+tc.slack {
+				t.Fatalf("the window ran %s, past its own %s bound", elapsed, window)
+			}
+			if n := exhausted.Load(); n != 1 {
+				t.Fatalf("OnReadoptionWindowExhausted fired %d times, want exactly once", n)
 			}
 		})
 	}
 }
 
-// TestHeldLineageLostAgainInsideTheWindowReadopts pins the re-entry guard:
-// a controller lost again inside the previous window is re-adopted — after one
-// paced backoff — when the composing layer still holds the lineage, and still
-// refused when it does not. The hold no longer needs HeldPastWindow: LineageLive
-// (nil means held for a standalone daemon) is the gate.
+// TestHeldLineageLostAgainInsideTheWindowReadopts pins the re-entry guard's
+// one exception: a controller lost again inside the previous window is
+// re-adopted — after one paced backoff — when the composing layer holds the
+// lineage past the window, and still refused when it does not.
 func TestHeldLineageLostAgainInsideTheWindowReadopts(t *testing.T) {
 	t.Parallel()
 	const backoff = 5 * time.Second
@@ -294,23 +252,21 @@ func TestHeldLineageLostAgainInsideTheWindowReadopts(t *testing.T) {
 			wantAdoptions:  1,
 		},
 		{
-			name:           "held on unbounded terms: re-adopted",
+			name:           "not held past the window: quarantined as before",
 			lineageLive:    alwaysLive,
 			heldPastWindow: func(context.Context, sessionshim.Identity) bool { return false },
-			want:           readoptionSucceeded,
-			wantAdoptions:  1,
+			want:           readoptionRefused,
 		},
 		{
-			name:           "no longer held at all: refused",
+			name:           "no longer held at all: quarantined as before",
 			lineageLive:    func(context.Context, sessionshim.Identity) bool { return false },
 			heldPastWindow: func(context.Context, sessionshim.Identity) bool { return true },
 			want:           readoptionRefused,
 		},
 		{
-			name:          "no continuation predicate with lineage held: re-adopted",
-			lineageLive:   alwaysLive,
-			want:          readoptionSucceeded,
-			wantAdoptions: 1,
+			name:        "no continuation predicate: quarantined as before",
+			lineageLive: alwaysLive,
+			want:        readoptionRefused,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
