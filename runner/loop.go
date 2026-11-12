@@ -2162,16 +2162,20 @@ tailRecovery:
 		// possibly after a tool result went over the size limit —
 		// records that cause as the terminal reason: the "still a
 		// draft" message is only for a turn that completed normally and
-		// delivered no code. The first turn's death fails here, before
-		// the delivery check, as step 12 would fail it anyway. A
-		// continuation turn's death goes through the delivery check
-		// first: when the continued pull request already carries the
-		// session's delivered code the run completes with the death as
-		// a warning, otherwise the death replaces the check's message
-		// (settleAbnormalContinuationTurn). Either way a WORK_RESULT
-		// marker alone never counts as passed for a dead turn.
+		// delivered no code. A first turn with no successful terminal
+		// result (a silent exit or a failed terminal) fails here, before
+		// the delivery check, because step 12 fails it anyway. Every
+		// other abnormal ending goes through the delivery check first:
+		// a continuation turn's death, and a first turn whose successful
+		// terminal still carries a provider or harness error, which step
+		// 12 would complete. When the continued pull request already
+		// carries the session's delivered code the run completes with
+		// the cause as a warning, otherwise the cause replaces the
+		// check's message (settleAbnormalContinuationTurn). Either way
+		// a WORK_RESULT marker alone never counts as passed for an
+		// abnormal turn.
 		abnormalMode, abnormalMessage, abnormal := abnormalContinueTurnEndCause(res, streamRes, lastTurn, qw.ContinuePullRequest.Number, r.toolOutputLimit())
-		if abnormal && !lastTurnFollowUp {
+		if abnormal && !lastTurnFollowUp && !lastTurn.terminalSuccess {
 			res.Status = "failed"
 			res.FailureMode = abnormalMode
 			res.Error = abnormalMessage

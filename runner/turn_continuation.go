@@ -220,15 +220,17 @@ func abnormalContinueTurnEndCause(res *Result, streamRes, lastTurn streamObserva
 	return "", "", false
 }
 
-// settleAbnormalContinuationTurn applies a continuation turn's abnormal
-// end after the continue-mode delivery check ran. A check that failed
-// (still a draft, no new commit, no code change, …) is replaced by the
-// turn's own cause: the contract message would hide why the turn ended.
-// A check that passed means the continued pull request already carries
-// the session's delivered code — pushed, and not a draft unless the
-// delivery policy allows one — so the run keeps its completed outcome and
-// the death rides as a post-session warning: failing delivered work would
-// send it back for a redo the pull request does not need.
+// settleAbnormalContinuationTurn applies a turn's abnormal end after the
+// continue-mode delivery check ran: a continuation turn's death, or a
+// first turn whose successful terminal still carried a provider or
+// harness error. A check that failed (still a draft, no new commit, no
+// code change, …) is replaced by the turn's own cause: the contract
+// message would hide why the turn ended. A check that passed means the
+// continued pull request already carries the session's delivered code —
+// pushed, and not a draft unless the delivery policy allows one — so the
+// run keeps its completed outcome and the cause rides as a post-session
+// warning: failing delivered work would send it back for a redo the pull
+// request does not need.
 func settleAbnormalContinuationTurn(res *Result, mode, message string) {
 	if res.Status == "failed" {
 		res.FailureMode = mode

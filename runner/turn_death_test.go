@@ -522,3 +522,64 @@ func TestRun_ContinueModeContinuationTurnDeathAfterDeliveryCompletes(t *testing.
 		t.Fatalf("PostSessionWarnings = %q; want the continuation turn's death named", res.PostSessionWarnings)
 	}
 }
+
+// TestRun_ContinueModeFirstTurnDeliveredWithProviderErrorCompletes pins a
+// first turn that delivered and then ended on a standing provider error
+// with a successful terminal result (a harness that reports the turn as
+// done with stopReason "error"). Step 12 completes such a run, so the
+// delivery check decides it: the continued pull request carries the
+// session's code, so the run completes with the provider error as a
+// warning, exactly as a continuation turn with the same ending does. Both
+// delivery paths are covered: the runner's backstop push and the agent's
+// own push.
+func TestRun_ContinueModeFirstTurnDeliveredWithProviderErrorCompletes(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		backstop bool
+		turn     verdictScriptTurn
+	}{
+		{
+			name:     "backstop push",
+			backstop: true,
+			turn: verdictScriptTurn{
+				manifest:      passedManifest,
+				text:          "WORK_RESULT:passed",
+				files:         map[string]string{"fix.go": "package fix\n"},
+				providerError: "overloaded",
+			},
+		},
+		{
+			name: "agent push",
+			turn: verdictScriptTurn{
+				manifest:      passedManifest,
+				text:          "WORK_RESULT:passed",
+				files:         map[string]string{"fix.txt": "work\n"},
+				push:          []string{"refs/heads/continued/pr-12", "refs/pull/12/head"},
+				providerError: "overloaded",
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			res, _ := runScriptedSession(t, scriptedSession{
+				workType:       "development",
+				repository:     followUpRepository,
+				continueNumber: 12,
+				skipSteering:   true,
+				backstop:       tc.backstop,
+				turns:          []verdictScriptTurn{tc.turn},
+			})
+			if res.Status != "completed" || res.FailureMode != "" {
+				t.Fatalf("Status = %q (%s: %s); want completed: the continued pull request carries the delivered code", res.Status, res.FailureMode, res.Error)
+			}
+			found := false
+			for _, w := range res.PostSessionWarnings {
+				if strings.Contains(w, "model provider error") && strings.Contains(w, "overloaded") {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("PostSessionWarnings = %q; want the provider error named", res.PostSessionWarnings)
+			}
+		})
+	}
+}
