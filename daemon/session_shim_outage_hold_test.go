@@ -343,9 +343,10 @@ func TestFixedHoldCancelMidHoldReturnsShutdown(t *testing.T) {
 }
 
 // TestFixedHoldConfigValidation pins the config gate: a fixed-attempt policy
-// may hold past its budget only when the composing layer holds the lineage on
-// unbounded terms, and the keepalive and cap fields stay refused in fixed
-// mode — the hold runs on the default cap and the derived interval.
+// holds past its budget while the shim stays observable (the backoff ceiling
+// is configurable in both modes, see DefaultSessionShimReadoptionBackoffCap),
+// and the keepalive interval stays refused in fixed mode — the hold derives
+// it from the orphan deadline.
 func TestFixedHoldConfigValidation(t *testing.T) {
 	t.Parallel()
 	orphan := sessionshim.OrphanPolicy{Deadline: 90 * time.Second, TerminationGrace: 5 * time.Second}
@@ -365,9 +366,12 @@ func TestFixedHoldConfigValidation(t *testing.T) {
 	if err := unheld.validateReadoptionAgainstOrphanPolicy(); !errors.Is(err, ErrSessionShimReadoptionPolicy) {
 		t.Fatalf("fixed hold without LineageLive validate = %v, want ErrSessionShimReadoptionPolicy", err)
 	}
+	// The backoff ceiling is configurable in both modes (see
+	// DefaultSessionShimReadoptionBackoffCap): a fixed hold past its budget
+	// retries with capped backoff, so the cap is meaningful there too.
 	capped := SessionShimReadoptionPolicy{BackoffCap: time.Second}
-	if err := capped.Validate(); !errors.Is(err, ErrSessionShimReadoptionPolicy) {
-		t.Fatalf("fixed BackoffCap Validate = %v, want ErrSessionShimReadoptionPolicy", err)
+	if err := capped.Validate(); err != nil {
+		t.Fatalf("fixed BackoffCap Validate = %v, want nil", err)
 	}
 	interval := SessionShimReadoptionPolicy{KeepaliveInterval: time.Second}
 	if err := interval.Validate(); !errors.Is(err, ErrSessionShimReadoptionPolicy) {
@@ -435,10 +439,9 @@ func TestFixedHoldDoesNotApplyToDurableAckLastLook(t *testing.T) {
 }
 
 // TestFixedHoldSkipsTheHoldWhenTheShimIsAlreadyGone pins the liveness half of
-// the hold entry: when the shim's incarnation is already gone by the time the
-// budget is spent, the hold never arms — the lineage withdraws under the
-// spent-budget outcome instead of starting a keepalive against a dead shim
-// and reporting the dead-shim detail for a budget that simply ran out.
+// the hold entry: when the shim's incarnation is already gone, the hold never
+// arms — the lineage withdraws as LineageGone (positive evidence the shim is
+// gone), never as a spent budget, and no keepalive runs against a dead shim.
 func TestFixedHoldSkipsTheHoldWhenTheShimIsAlreadyGone(t *testing.T) {
 	t.Parallel()
 	held := &heldPastWindowCounter{answer: func() bool { return true }}
@@ -466,8 +469,8 @@ func TestFixedHoldSkipsTheHoldWhenTheShimIsAlreadyGone(t *testing.T) {
 	})
 	lost := f.lostEntry(t)
 
-	if got := f.daemon.readoptSessionShimAfterControllerLoss(f.id, lost, 0); got != readoptionAttemptsSpent {
-		t.Fatalf("disposition = %d, want readoptionAttemptsSpent (%d) — a shim gone by budget end never arms the hold", got, readoptionAttemptsSpent)
+	if got := f.daemon.readoptSessionShimAfterControllerLoss(f.id, lost, 0); got != readoptionLineageGone {
+		t.Fatalf("disposition = %d, want readoptionLineageGone (%d) — a shim gone by budget end never arms the hold", got, readoptionLineageGone)
 	}
 	if adoptions, _ := f.snapshot(); adoptions != 1 {
 		t.Fatalf("durable adoption attempted %d times, want exactly 1 — no hold retries against a dead shim", adoptions)

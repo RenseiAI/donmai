@@ -541,30 +541,30 @@ func TestLineageLiveWindowReachesTenMinutesUnderANinetySecondOrphanDeadline(t *t
 	}
 }
 
-// TestExhaustedWindowQuarantinesUnderItsOwnReason pins the post-window outcome
-// end to end, through the disconnect path an operator actually sees. Both
-// dispositions reach socket_unreachable — the closed reason registry is not
-// this change's to extend — and the reason carried alongside it is what makes
-// "the carrier never came back" a different fact from "the shim died".
+// TestExhaustedWindowQuarantinesUnderItsOwnReason pins that silence alone
+// never quarantines an observable shim: past the old window/budget the lineage
+// stays adopted with no quarantine, and the terminal detail (when a withdrawal
+// finally happens on positive evidence) names the harness liveness at release.
+// Both legacy dispositions still reach socket_unreachable — the closed reason
+// registry is not this change's to extend — and the detail carried alongside
+// it is what makes "the carrier never came back" a different fact from "the
+// shim died", now with an explicit harness-alive suffix.
 func TestExhaustedWindowQuarantinesUnderItsOwnReason(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
-		name       string
-		policy     SessionShimReadoptionPolicy
-		wantDetail string
+		name   string
+		policy SessionShimReadoptionPolicy
 	}{
 		{
-			name: "an exhausted lineage-live window carries its own reason",
+			name: "a lineage-live window past its old bound holds while observable",
 			policy: SessionShimReadoptionPolicy{
 				Mode: ReadoptionLineageLive, Backoff: time.Millisecond,
 				BackoffCap: time.Millisecond, Window: 50 * time.Millisecond,
 			},
-			wantDetail: sessionShimReadoptionWindowExhaustedDetail,
 		},
 		{
-			name:       "a spent fixed-attempt budget says so rather than reporting a death",
-			policy:     SessionShimReadoptionPolicy{Attempts: 1, Backoff: time.Millisecond},
-			wantDetail: sessionShimReadoptionAttemptsSpentDetail,
+			name:   "a fixed-attempt budget past its old bound holds while observable",
+			policy: SessionShimReadoptionPolicy{Attempts: 1, Backoff: time.Millisecond},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -572,18 +572,37 @@ func TestExhaustedWindowQuarantinesUnderItsOwnReason(t *testing.T) {
 			f := newReadoptFixtureWithOptions(t, readoptFixtureOptions{
 				policy: tc.policy, adoption: refusingCarrier(),
 			})
-
-			f.daemon.releaseShimIfLive(f.id, f.controller, shimStreamCarrierLost)
-
-			projected := f.daemon.QuarantinedSessions()
-			if len(projected) != 1 {
-				t.Fatalf("quarantine projection = %+v, want exactly the lineage", projected)
+			lost := f.lostEntry(t)
+			done := make(chan sessionShimReadoptionDisposition, 1)
+			go func() {
+				done <- f.daemon.readoptSessionShimAfterControllerLoss(f.id, lost, 0)
+			}()
+			// Past the old 1-attempt/50ms bound the lineage must stay adopted
+			// with no quarantine while the shim is observable.
+			deadline := time.Now().Add(10 * time.Second)
+			for {
+				if n, _ := f.snapshot(); n >= 3 {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("the hold did not retry past the old bound within 10s")
+				}
+				time.Sleep(2 * time.Millisecond)
 			}
-			if projected[0].Reason != sessionshim.QuarantineSocketUnreachable {
-				t.Fatalf("quarantine reason = %q, want socket_unreachable", projected[0].Reason)
+			if _, err := f.daemon.adoptedShimEntry(f.id.OrgID, f.id.SessionID); err != nil {
+				t.Fatalf("the lineage left the adopted set while the shim was still observable: %v", err)
 			}
-			if projected[0].Detail != tc.wantDetail {
-				t.Fatalf("quarantine detail = %q, want %q", projected[0].Detail, tc.wantDetail)
+			if projected := f.daemon.QuarantinedSessions(); len(projected) != 0 {
+				t.Fatalf("quarantine projection = %+v while the shim was still observable, want none", projected)
+			}
+			f.daemon.shims.stopRecovery()
+			select {
+			case got := <-done:
+				if got != readoptionShutdown {
+					t.Fatalf("disposition = %d, want readoptionShutdown (%d)", got, readoptionShutdown)
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("the hold did not stop within 10s of recovery being cancelled")
 			}
 		})
 	}
@@ -727,7 +746,10 @@ func TestReadoptionPolicyValidateRejectsContradictoryFields(t *testing.T) {
 		{name: "the exported fixed default", policy: DefaultSessionShimReadoptionPolicy(), valid: true},
 		{name: "the exported lineage-live default", policy: DefaultLineageLiveSessionShimReadoptionPolicy(), valid: true},
 		{name: "fixed mode with a window", policy: SessionShimReadoptionPolicy{Window: 5 * time.Minute}},
-		{name: "fixed mode with a backoff cap", policy: SessionShimReadoptionPolicy{BackoffCap: time.Second}},
+		// The backoff ceiling is configurable in both modes (see
+		// DefaultSessionShimReadoptionBackoffCap): a fixed hold past its budget
+		// retries with capped backoff.
+		{name: "fixed mode with a backoff cap", policy: SessionShimReadoptionPolicy{BackoffCap: time.Second}, valid: true},
 		{name: "fixed mode with a keepalive interval", policy: SessionShimReadoptionPolicy{KeepaliveInterval: time.Second}},
 		{name: "lineage-live mode with attempts", policy: SessionShimReadoptionPolicy{Mode: ReadoptionLineageLive, Attempts: 3}},
 		{name: "negative window", policy: SessionShimReadoptionPolicy{Mode: ReadoptionLineageLive, Window: -time.Second}},
@@ -908,8 +930,16 @@ func TestStartupRefusesLineageLiveWithoutALineagePredicateUnderAnExternalThresho
 			},
 		},
 		{
-			name: "fixed-attempt mode stays inside the deadline, so it needs no predicate",
-			cfg:  SessionShimConfig{Orphan: safeOrphan, Readoption: DefaultSessionShimReadoptionPolicy()},
+			// Both modes now hold past their initial budget while the shim
+			// stays observable, so fixed also extends indefinitely and needs
+			// the predicate under a declared threshold.
+			name:       "fixed-attempt mode holds past its budget, so it needs the predicate too",
+			cfg:        SessionShimConfig{Orphan: safeOrphan, Readoption: DefaultSessionShimReadoptionPolicy()},
+			wantRefusd: true,
+		},
+		{
+			name: "fixed-attempt mode with the predicate wired holds safely",
+			cfg:  SessionShimConfig{Orphan: safeOrphan, Readoption: DefaultSessionShimReadoptionPolicy(), LineageLive: live},
 		},
 		{
 			name: "re-adoption disabled altogether extends nothing",
