@@ -319,6 +319,11 @@ type harnessAuthorityProjection struct {
 	// checks every written file against. omitempty keeps a plan for a work
 	// item without skills byte-identical to the pre-field projection.
 	Skills *SkillDeliveryPlan `json:"skills,omitempty"`
+	// StartInBypass binds a human-controlled session's request to start in
+	// the harness's bypass permission mode. omitempty keeps every plan
+	// compiled without the request byte-identical to the pre-field
+	// projection.
+	StartInBypass bool `json:"startInBypass,omitempty"`
 }
 
 func newHarnessAuthorityProjection(spec Spec, plan *PreparedHarness) harnessAuthorityProjection {
@@ -350,6 +355,7 @@ func newHarnessAuthorityProjection(spec Spec, plan *PreparedHarness) harnessAuth
 		PromptMode:         normalized.PromptMode,
 		ExecutionSecurity:  normalized.ExecutionSecurity,
 		Skills:             skillPlanAuthority(normalized.Skills),
+		StartInBypass:      normalized.StartInBypass,
 	}
 }
 
@@ -410,6 +416,9 @@ func authorityFieldDigests(p harnessAuthorityProjection) map[string]string {
 	}
 	if p.Skills != nil {
 		digests["skills"] = digestValue(p.Skills)
+	}
+	if p.StartInBypass {
+		digests["startInBypass"] = digestValue(p.StartInBypass)
 	}
 	return digests
 }

@@ -804,3 +804,25 @@ func TestTranslateSpec_StartInBypassAbsentKeepsSpecWire(t *testing.T) {
 		t.Fatalf("requested bypass start missing from the Spec wire shape: %s", withField)
 	}
 }
+
+// TestApplyPreparedSourceAuthorityCopiesStartInBypass pins that the prepared
+// source decides StartInBypass, like every other authority field, so the
+// spawned spec cannot drift from the compiled plan in either direction.
+func TestApplyPreparedSourceAuthorityCopiesStartInBypass(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name           string
+		source, target bool
+	}{
+		{name: "source requests, target does not", source: true},
+		{name: "target requests, source does not", target: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := applyPreparedSourceAuthority(agent.Spec{StartInBypass: tc.target}, agent.Spec{StartInBypass: tc.source}, nil)
+			if got.StartInBypass != tc.source {
+				t.Fatalf("StartInBypass = %v, want the source's %v", got.StartInBypass, tc.source)
+			}
+		})
+	}
+}

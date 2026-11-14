@@ -288,6 +288,54 @@ func TestPreflightExecutionReportsExecutionSecurity(t *testing.T) {
 	}
 }
 
+// TestPreflightExecutionRefusesMalformedStartPermissionMode pins that a
+// malformed startPermissionMode on the receipt path is the typed
+// execution_security_unresolvable refusal — the one the daemon reports as a
+// terminal failure — and never a plain decode error that would be requeued.
+// A well-formed request still reaches compilation.
+func TestPreflightExecutionRefusesMalformedStartPermissionMode(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name    string
+		mode    string
+		refused bool
+	}{
+		{name: "empty string", mode: `""`, refused: true},
+		{name: "unknown mode", mode: `"acceptEdits"`, refused: true},
+		{name: "not a string", mode: `1`, refused: true},
+		{name: "bypass", mode: `"bypass"`},
+		{name: "null", mode: `null`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			qw, registry, _ := executionSecurityReceiptWork(t, "start-mode-"+strings.ReplaceAll(tc.name, " ", "-"), nil)
+			var fields map[string]json.RawMessage
+			if err := json.Unmarshal(qw.OperationalPayload, &fields); err != nil {
+				t.Fatal(err)
+			}
+			fields["startPermissionMode"] = json.RawMessage(tc.mode)
+			detail := rawJSONForRunner(t, map[string]any{
+				"sessionId": qw.SessionID, "workerId": qw.WorkerID, "admissionReceipt": qw.AdmissionReceipt,
+				"effectiveCell": qw.EffectiveCell, "executionRuntimeBinding": qw.ExecutionRuntimeBinding,
+				"operationalPayload": fields,
+			})
+			_, _, err := decodeProviderViewPreflightWork(detail)
+			if tc.refused {
+				if agent.ExecutionSecurityErrorCode(err) != agent.ExecutionSecurityUnresolvable || !strings.Contains(err.Error(), "startPermissionMode") {
+					t.Fatalf("decode err = %v, want execution_security_unresolvable naming startPermissionMode", err)
+				}
+				if _, err := NewProviderView(registry).PreflightExecution(detail); agent.ExecutionSecurityErrorCode(err) != agent.ExecutionSecurityUnresolvable {
+					t.Fatalf("preflight err = %v, want execution_security_unresolvable", err)
+				}
+				return
+			}
+			if agent.ExecutionSecurityErrorCode(err) != "" {
+				t.Fatalf("well-formed startPermissionMode refused: %v", err)
+			}
+		})
+	}
+}
+
 // TestRun_ExecutionSecurityReportAndRefusal covers the poll lane end to end
 // on the stub harness: work without the section runs as before and records
 // no report; a stamped run records the report on the result and in the

@@ -163,3 +163,73 @@ func TestHandlePollWorkItemRefusesMalformedStampPermanently(t *testing.T) {
 		})
 	}
 }
+
+// TestHandlePollWorkItemRefusesMalformedStartPermissionModePermanently pins
+// that a claimed item whose startPermissionMode is malformed takes the
+// malformed-stamp path: it is refused before spawn, reported as a terminal
+// failure with failureMode "execution-security", the typed refusal and a
+// readable reason naming the field, and is not NACKed back onto the queue.
+// A well-formed request is accepted.
+func TestHandlePollWorkItemRefusesMalformedStartPermissionModePermanently(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		mode    string
+		refused bool
+	}{
+		{name: "empty string", mode: `""`, refused: true},
+		{name: "unknown mode", mode: `"acceptEdits"`, refused: true},
+		{name: "bypass", mode: `"bypass"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			orchestrator := &recordingOrchestrator{}
+			server := httptest.NewServer(orchestrator.handler(t))
+			t.Cleanup(server.Close)
+			d := startClaimGateDaemon(t, &stubClaimGateProvider{})
+			d.mu.Lock()
+			d.workerID, d.jwt = "worker-es", "runtime-es"
+			d.mu.Unlock()
+
+			sessionID := "start-mode-" + strings.ReplaceAll(tc.name, " ", "-")
+			if !tc.refused {
+				detail := &SessionDetail{SessionID: sessionID, OperationalPayload: json.RawMessage(`{"sessionId":"` + sessionID + `","startPermissionMode":` + tc.mode + `}`)}
+				if _, err := d.AcceptWorkWithDetail(SessionSpec{SessionID: sessionID, ProjectID: "claim-gate-project"}, detail); err != nil {
+					t.Fatalf("AcceptWorkWithDetail refused a well-formed request: %v", err)
+				}
+				return
+			}
+
+			var item PollWorkItem
+			raw := `{"sessionId":"` + sessionID + `","issueId":"issue-1","issueIdentifier":"ES-1","priority":1,"queuedAt":1,` +
+				`"startPermissionMode":` + tc.mode + `}`
+			if err := json.Unmarshal([]byte(raw), &item); err != nil {
+				t.Fatal(err)
+			}
+			err := d.handlePollWorkItem(item, server.URL)
+			if agent.ExecutionSecurityErrorCode(err) != agent.ExecutionSecurityUnresolvable {
+				t.Fatalf("handlePollWorkItem err = %v, want execution_security_unresolvable", err)
+			}
+
+			orchestrator.mu.Lock()
+			defer orchestrator.mu.Unlock()
+			if len(orchestrator.statusBodies) == 0 {
+				t.Fatal("no terminal status was reported for the refused session")
+			}
+			body := orchestrator.statusBodies[0]
+			if string(body["status"]) != `"failed"` || string(body["failureMode"]) != `"execution-security"` {
+				t.Fatalf("status body status=%s failureMode=%s", body["status"], body["failureMode"])
+			}
+			if got := string(body["executionSecurityRefusal"]); got != `{"code":"execution_security_unresolvable"}` {
+				t.Fatalf("executionSecurityRefusal = %s", got)
+			}
+			var reason struct {
+				Message string `json:"message"`
+			}
+			if err := json.Unmarshal(body["error"], &reason); err != nil || !strings.Contains(reason.Message, "startPermissionMode") {
+				t.Fatalf("terminal reason = %s (err %v), want it to name startPermissionMode", body["error"], err)
+			}
+			if orchestrator.nacks != 0 {
+				t.Fatalf("nacks = %d, want 0 (a malformed request must not be requeued)", orchestrator.nacks)
+			}
+		})
+	}
+}

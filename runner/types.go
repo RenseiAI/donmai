@@ -1,7 +1,6 @@
 package runner
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 
@@ -107,10 +106,13 @@ type QueuedWork struct {
 
 	// StartPermissionMode asks a human-controlled session to START in a
 	// wider permission mode than the harness CLI's default. The only value
-	// is [StartPermissionModeBypass]; the closed decoder
-	// (StartPermissionMode.UnmarshalJSON) refuses any other present value,
-	// so a malformed work item fails to decode exactly as a malformed
-	// executionSecurity section does. It is a request, never a grant:
+	// is [StartPermissionModeBypass]. Any other present value is refused
+	// exactly as a malformed executionSecurity section is: the daemon's
+	// pre-spawn check (agent.ExecutionSecurityFromOperationalPayload) and
+	// this field's closed decoder both return the typed
+	// execution_security_unresolvable refusal, which the daemon reports as a
+	// terminal session failure instead of requeueing the work item. JSON
+	// null reads as absent. It is a request, never a grant:
 	// translateSpec honours it only for a human-controlled session whose
 	// stamped toolApproval level is already "bypass", so it can never widen
 	// what the execution-security levels allow. It is part of the
@@ -279,24 +281,19 @@ const (
 type StartPermissionMode string
 
 // StartPermissionModeBypass asks a human-controlled session to start in the
-// harness's bypass (never-ask) permission mode.
-const StartPermissionModeBypass StartPermissionMode = "bypass"
+// harness's bypass (never-ask) permission mode. The wire literal is spelled
+// once, in agent.StartPermissionModeBypass.
+const StartPermissionModeBypass StartPermissionMode = agent.StartPermissionModeBypass
 
-// UnmarshalJSON is the closed decoder for QueuedWork.startPermissionMode.
-// A JSON null reads as absent (encoding/json's convention for scalar
-// fields); any present string other than "bypass" — the empty string
-// included — and any non-string value is refused, so an unknown mode fails
-// the work item's decode instead of being guessed at.
+// UnmarshalJSON is the closed decoder for QueuedWork.startPermissionMode. It
+// delegates to agent.ParseStartPermissionMode, the same decoder the daemon's
+// pre-spawn check runs: JSON null reads as absent, and any other value that
+// is not exactly "bypass" fails the decode with the typed
+// execution_security_unresolvable refusal.
 func (m *StartPermissionMode) UnmarshalJSON(raw []byte) error {
-	if string(bytes.TrimSpace(raw)) == "null" {
-		return nil
-	}
-	var value string
-	if err := json.Unmarshal(raw, &value); err != nil {
-		return fmt.Errorf("startPermissionMode must be a string: %w", err)
-	}
-	if mode := StartPermissionMode(value); mode != StartPermissionModeBypass {
-		return fmt.Errorf("startPermissionMode %q is not a known mode (want %q)", value, StartPermissionModeBypass)
+	value, err := agent.ParseStartPermissionMode(raw)
+	if err != nil {
+		return fmt.Errorf("startPermissionMode: %w", err)
 	}
 	*m = StartPermissionMode(value)
 	return nil

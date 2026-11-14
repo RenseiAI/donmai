@@ -617,6 +617,9 @@ func TestQueuedWorkStartPermissionModeClosedDecoder(t *testing.T) {
 				if !strings.Contains(err.Error(), "startPermissionMode") {
 					t.Fatalf("refusal does not name the field: %v", err)
 				}
+				if agent.ExecutionSecurityErrorCode(err) != agent.ExecutionSecurityUnresolvable {
+					t.Fatalf("refusal = %v, want the typed execution_security_unresolvable refusal", err)
+				}
 				return
 			}
 			if err != nil {
