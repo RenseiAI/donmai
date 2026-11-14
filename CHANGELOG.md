@@ -8,7 +8,9 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
-No unreleased changes.
+### Features
+
+- A work item can ask a human-controlled session to start in bypass permission mode with the optional `startPermissionMode` field. The only value is `"bypass"`. It is honoured only when the work item's `executionSecurity` section already stamps `toolApproval` at `"bypass"`: the Claude interactive lane then starts with `--permission-mode bypassPermissions` (it still passes `--allow-dangerously-skip-permissions`, so the operator can leave the mode), and the Muse interactive lane starts with `--approval-mode never`. Without the field, or under a stricter `toolApproval` level, or without the section, the session starts in the CLI default mode as before and the runner logs why at info level. Autonomous sessions are unchanged. The field is part of the operational payload and its digest; a work item without it projects and hashes exactly as before. Any other present value, including the empty string, fails the work item's decode the way a malformed `executionSecurity` section does; JSON `null` reads as absent.
 
 ## v0.73.7 — 2026-11-13
 

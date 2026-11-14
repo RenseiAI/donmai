@@ -1,7 +1,9 @@
 package runner
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/executioncell"
@@ -102,6 +104,22 @@ type QueuedWork struct {
 	//
 	// Wire shape: "executionSecurity" (camelCase, omitempty).
 	ExecutionSecurity *agent.ExecutionSecurity `json:"executionSecurity,omitempty"`
+
+	// StartPermissionMode asks a human-controlled session to START in a
+	// wider permission mode than the harness CLI's default. The only value
+	// is [StartPermissionModeBypass]; the closed decoder
+	// (StartPermissionMode.UnmarshalJSON) refuses any other present value,
+	// so a malformed work item fails to decode exactly as a malformed
+	// executionSecurity section does. It is a request, never a grant:
+	// translateSpec honours it only for a human-controlled session whose
+	// stamped toolApproval level is already "bypass", so it can never widen
+	// what the execution-security levels allow. It is part of the
+	// operational payload (and so of the admission digest).
+	//
+	// Wire shape: "startPermissionMode" (camelCase, omitempty). Absent is
+	// the pre-field behaviour byte-for-byte: a human-controlled session
+	// starts in the CLI default mode.
+	StartPermissionMode StartPermissionMode `json:"startPermissionMode,omitempty"`
 
 	// Branch is the working branch name the runner should use when
 	// provisioning the worktree. Empty falls back to "agent/<sessionID>".
@@ -254,6 +272,35 @@ const (
 	// fully autonomous headless run — see QueuedWork.PermissionProfile.
 	PermissionProfileAutonomous PermissionProfile = "autonomous"
 )
+
+// StartPermissionMode is the permission mode a human-controlled session
+// asks to start in — see QueuedWork.StartPermissionMode. The zero value is
+// "no request".
+type StartPermissionMode string
+
+// StartPermissionModeBypass asks a human-controlled session to start in the
+// harness's bypass (never-ask) permission mode.
+const StartPermissionModeBypass StartPermissionMode = "bypass"
+
+// UnmarshalJSON is the closed decoder for QueuedWork.startPermissionMode.
+// A JSON null reads as absent (encoding/json's convention for scalar
+// fields); any present string other than "bypass" — the empty string
+// included — and any non-string value is refused, so an unknown mode fails
+// the work item's decode instead of being guessed at.
+func (m *StartPermissionMode) UnmarshalJSON(raw []byte) error {
+	if string(bytes.TrimSpace(raw)) == "null" {
+		return nil
+	}
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return fmt.Errorf("startPermissionMode must be a string: %w", err)
+	}
+	if mode := StartPermissionMode(value); mode != StartPermissionModeBypass {
+		return fmt.Errorf("startPermissionMode %q is not a known mode (want %q)", value, StartPermissionModeBypass)
+	}
+	*m = StartPermissionMode(value)
+	return nil
+}
 
 // ResolvedProfile names the profile knobs the platform resolved for
 // this session. Mirrors F.1.1 §4 ResolvedProfile shape.

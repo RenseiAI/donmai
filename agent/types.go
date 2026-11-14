@@ -451,6 +451,16 @@ type Spec struct {
 	// authority digest.
 	ExecutionSecurity *ExecutionSecurity `json:"executionSecurity,omitempty"`
 
+	// StartInBypass asks a human-controlled (non-Autonomous) interactive
+	// session to start in the harness's bypass permission mode instead of
+	// the CLI default. The runner sets it only when the work item requested
+	// it AND the stamped toolApproval level is already "bypass"; harnesses
+	// honour it only when Autonomous is false and re-check that stamp, so it
+	// never widens what ExecutionSecurity allows. Autonomous sessions
+	// already start in bypass and ignore it. False (the zero value) is the
+	// pre-field behaviour.
+	StartInBypass bool `json:"startInBypass,omitempty"`
+
 	// RepositoryAuthority is the executor-owned per-repository filesystem
 	// policy. Nil is the legacy singular-worktree path. Providers that do not
 	// positively attest the named protocol/enforcement are denied before spawn.
