@@ -142,6 +142,12 @@ func TestSpecFieldCoverage(t *testing.T) {
 		// any stamped level this adapter cannot render. Codex renders index 0
 		// only, so nothing in the JSON-RPC translation depends on it.
 		"ExecutionSecurity",
+		// StartInBypass asks a human-controlled interactive session to start
+		// in its bypass permission mode. The codex interactive lane already
+		// runs with approvals off by default (approvals_seed.go), and this
+		// JSON-RPC translation never sees interactive specs, so there is
+		// nothing to translate.
+		"StartInBypass",
 		// DependencyPreparation is the digest-exempt post-admission install
 		// outcome: agent.ApplyPreparedHarness projects its failed/timed_out
 		// recovery handoff onto the adapted prompt surfaces after the

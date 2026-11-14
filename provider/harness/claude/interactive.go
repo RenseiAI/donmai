@@ -381,6 +381,8 @@ func (h *interactiveHandle) ActivityFlushed() <-chan struct{} { return h.activit
 //	Model              → --model <id>
 //	Effort             → --effort <level>
 //	Autonomous         → --permission-mode bypassPermissions
+//	StartInBypass      → --permission-mode bypassPermissions (non-autonomous,
+//	                   toolApproval "bypass" stamp only)
 //	AllowedTools       → --allowedTools <comma-separated>
 //	DisallowedTools    → --disallowedTools <comma-separated>
 //	SystemPromptAppend → --append-system-prompt <text>
@@ -532,9 +534,17 @@ func interactiveArgsWith(spec agent.Spec, mcpConfigPath, settingsJSON string) []
 	// The CLI only offers that mode when it was started with this flag; the
 	// session itself starts in the CLI default mode. This matches the adapter's
 	// declared rendering (execution_security.go: index 0, prompts skipped).
+	//
+	// When the work item also asked to start in bypass (Spec.StartInBypass),
+	// the session starts there instead of in the CLI default mode; the
+	// operator can still leave it from the REPL. The request is honoured only
+	// under the same bypass grant, so it never widens the stamped level.
 	if !spec.Autonomous && spec.ExecutionSecurity != nil &&
 		spec.ExecutionSecurity.Levels.ToolApproval == agent.ToolApprovalBypass {
 		argv = append(argv, "--allow-dangerously-skip-permissions")
+		if spec.StartInBypass {
+			argv = append(argv, "--permission-mode", "bypassPermissions")
+		}
 	}
 
 	// SystemPromptAppend carries the composed session instructions assembled

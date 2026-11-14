@@ -1,8 +1,12 @@
 package runner
 
 import (
+	"bytes"
+	"encoding/json"
+	"log/slog"
 	"maps"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/RenseiAI/donmai/agent"
@@ -711,5 +715,114 @@ func TestTranslateSpec_SubAgentCapZeroStillApprovesAgentMentioningCommands(t *te
 		if d := br.Evaluate(codexbridge.ApprovalRequest{Kind: codexbridge.ApprovalKindCommand, Command: cmd}); d.Action != codexbridge.ActionAcceptForSession {
 			t.Errorf("zero-cap codex session declined %q: action %s (%s)", cmd, d.Action, d.Reason)
 		}
+	}
+}
+
+// toolApprovalStamp returns a stamped executionSecurity section whose only
+// meaningful level here is toolApproval.
+func toolApprovalStamp(level agent.ExecutionSecurityLevel) *agent.ExecutionSecurity {
+	return &agent.ExecutionSecurity{Version: agent.ExecutionSecurityWireVersion, Levels: agent.ExecutionSecurityLevels{ToolApproval: level}}
+}
+
+// TestTranslateSpec_StartInBypass pins when a work item's startPermissionMode
+// request reaches agent.Spec.StartInBypass: only for a human-controlled
+// session whose stamped toolApproval level is already bypass. Every refused
+// request logs exactly one info record naming the reason; a work item that
+// never asked logs nothing.
+func TestTranslateSpec_StartInBypass(t *testing.T) {
+	t.Parallel()
+	const interactive = "interactive"
+	cases := []struct {
+		name       string
+		mode       string
+		request    StartPermissionMode
+		stamp      *agent.ExecutionSecurity
+		autonomous bool
+		want       bool
+		wantReason string
+	}{
+		{name: "interactive bypass stamp requested", mode: interactive, request: StartPermissionModeBypass, stamp: toolApprovalStamp(agent.ToolApprovalBypass), want: true},
+		{name: "interactive on the legacy autonomous-flag lane", mode: interactive, request: StartPermissionModeBypass, stamp: toolApprovalStamp(agent.ToolApprovalBypass), autonomous: true, want: true},
+		{name: "human-controlled cell (non-autonomous spec)", request: StartPermissionModeBypass, stamp: toolApprovalStamp(agent.ToolApprovalBypass), want: true},
+		{name: "autonomous session", request: StartPermissionModeBypass, stamp: toolApprovalStamp(agent.ToolApprovalBypass), autonomous: true, wantReason: "session is autonomous"},
+		{name: "deny-list stamp", mode: interactive, request: StartPermissionModeBypass, stamp: toolApprovalStamp(agent.ToolApprovalDenyList), wantReason: "toolApproval is not bypass"},
+		{name: "allow-list stamp", mode: interactive, request: StartPermissionModeBypass, stamp: toolApprovalStamp(agent.ToolApprovalAllowList), wantReason: "toolApproval is not bypass"},
+		{name: "human-approval stamp", mode: interactive, request: StartPermissionModeBypass, stamp: toolApprovalStamp(agent.ToolApprovalHumanApprovalForWrites), wantReason: "toolApproval is not bypass"},
+		{name: "no executionSecurity section", mode: interactive, request: StartPermissionModeBypass, wantReason: "work item carries no executionSecurity section"},
+		{name: "unknown value built in code", mode: interactive, request: StartPermissionMode("acceptEdits"), stamp: toolApprovalStamp(agent.ToolApprovalBypass), wantReason: "unknown startPermissionMode"},
+		{name: "field absent", mode: interactive, stamp: toolApprovalStamp(agent.ToolApprovalBypass)},
+		{name: "field absent autonomous", stamp: toolApprovalStamp(agent.ToolApprovalBypass), autonomous: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var logs bytes.Buffer
+			qw := QueuedWork{QueuedWork: prompt.QueuedWork{SessionID: "session-start-bypass", Mode: tc.mode}, StartPermissionMode: tc.request, ExecutionSecurity: tc.stamp}
+			got := translateSpec(qw, agent.Capabilities{AcceptsAllowedToolsList: true}, SpecInputs{
+				Autonomous: tc.autonomous,
+				Logger:     slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelInfo})),
+			})
+			if got.StartInBypass != tc.want {
+				t.Fatalf("Spec.StartInBypass = %v, want %v", got.StartInBypass, tc.want)
+			}
+			lines := strings.Count(logs.String(), "startPermissionMode not applied")
+			switch {
+			case tc.wantReason == "" && lines != 0:
+				t.Fatalf("unexpected refusal log: %s", logs.String())
+			case tc.wantReason != "" && lines != 1:
+				t.Fatalf("refusal logs = %d, want exactly 1: %s", lines, logs.String())
+			case tc.wantReason != "" && !strings.Contains(logs.String(), `"reason":"`+tc.wantReason+`"`):
+				t.Fatalf("refusal log does not name reason %q: %s", tc.wantReason, logs.String())
+			case tc.wantReason != "" && !strings.Contains(logs.String(), `"level":"INFO"`):
+				t.Fatalf("refusal log is not info level: %s", logs.String())
+			}
+		})
+	}
+}
+
+// TestTranslateSpec_StartInBypassAbsentKeepsSpecWire pins that a work item
+// without the field produces a Spec whose wire shape carries no trace of it,
+// so the field-absent Spec is byte-identical to the pre-field one.
+func TestTranslateSpec_StartInBypassAbsentKeepsSpecWire(t *testing.T) {
+	t.Parallel()
+	qw := QueuedWork{QueuedWork: prompt.QueuedWork{SessionID: "session-absent", Mode: "interactive"}, ExecutionSecurity: toolApprovalStamp(agent.ToolApprovalBypass)}
+	spec := translateSpec(qw, agent.Capabilities{}, SpecInputs{})
+	wire, err := json.Marshal(spec)
+	if err != nil {
+		t.Fatalf("marshal spec: %v", err)
+	}
+	if strings.Contains(string(wire), "startInBypass") {
+		t.Fatalf("field-absent work item changed the Spec wire shape: %s", wire)
+	}
+	requested := qw
+	requested.StartPermissionMode = StartPermissionModeBypass
+	withField, err := json.Marshal(translateSpec(requested, agent.Capabilities{}, SpecInputs{}))
+	if err != nil {
+		t.Fatalf("marshal spec: %v", err)
+	}
+	if !strings.Contains(string(withField), `"startInBypass":true`) {
+		t.Fatalf("requested bypass start missing from the Spec wire shape: %s", withField)
+	}
+}
+
+// TestApplyPreparedSourceAuthorityCopiesStartInBypass pins that the prepared
+// source decides StartInBypass, like every other authority field, so the
+// spawned spec cannot drift from the compiled plan in either direction.
+func TestApplyPreparedSourceAuthorityCopiesStartInBypass(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name           string
+		source, target bool
+	}{
+		{name: "source requests, target does not", source: true},
+		{name: "target requests, source does not", target: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := applyPreparedSourceAuthority(agent.Spec{StartInBypass: tc.target}, agent.Spec{StartInBypass: tc.source}, nil)
+			if got.StartInBypass != tc.source {
+				t.Fatalf("StartInBypass = %v, want the source's %v", got.StartInBypass, tc.source)
+			}
+		})
 	}
 }

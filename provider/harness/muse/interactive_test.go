@@ -601,3 +601,60 @@ exited:
 		t.Errorf("seed layers out of order in child argv:\n%s", body)
 	}
 }
+
+// TestInteractiveArgs_StartInBypass pins that a human-controlled session
+// asking to start in bypass launches with --approval-mode never only under a
+// toolApproval "bypass" stamp, that an autonomous session gets the flag once,
+// and that every other spec renders exactly as it did before the field.
+func TestInteractiveArgs_StartInBypass(t *testing.T) {
+	t.Parallel()
+	p := &Provider{}
+	grant := func(level agent.ExecutionSecurityLevel) *agent.ExecutionSecurity {
+		return &agent.ExecutionSecurity{Version: 1, Levels: agent.ExecutionSecurityLevels{ToolApproval: level}}
+	}
+	cases := []struct {
+		name string
+		spec agent.Spec
+		want []string
+	}{
+		{
+			name: "bypass stamp and request start in never-ask",
+			spec: agent.Spec{Prompt: "hi", StartInBypass: true, ExecutionSecurity: grant(agent.ToolApprovalBypass)},
+			want: []string{"--approval-mode", "never", "--", "hi"},
+		},
+		{
+			name: "bypass stamp without request keeps the CLI default",
+			spec: agent.Spec{Prompt: "hi", ExecutionSecurity: grant(agent.ToolApprovalBypass)},
+			want: []string{"--", "hi"},
+		},
+		{
+			name: "deny-list stamp ignores the request",
+			spec: agent.Spec{Prompt: "hi", StartInBypass: true, ExecutionSecurity: grant(agent.ToolApprovalDenyList)},
+			want: []string{"--", "hi"},
+		},
+		{
+			name: "allow-list stamp ignores the request",
+			spec: agent.Spec{Prompt: "hi", StartInBypass: true, ExecutionSecurity: grant(agent.ToolApprovalAllowList)},
+			want: []string{"--", "hi"},
+		},
+		{
+			name: "no section ignores the request",
+			spec: agent.Spec{Prompt: "hi", StartInBypass: true},
+			want: []string{"--", "hi"},
+		},
+		{
+			name: "autonomous session carries the flag once",
+			spec: agent.Spec{Prompt: "hi", Autonomous: true, StartInBypass: true, ExecutionSecurity: grant(agent.ToolApprovalBypass)},
+			want: []string{"--approval-mode", "never", "--", "hi"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := p.interactiveArgs(tc.spec)
+			if !slices.Equal(got, tc.want) {
+				t.Fatalf("interactiveArgs = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
