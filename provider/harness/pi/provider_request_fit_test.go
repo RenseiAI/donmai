@@ -49,9 +49,10 @@ type overflowCase struct {
 }
 
 type contextOverflowReport struct {
-	Cases      map[string]overflowCase `json:"cases"`
-	NotAnError any                     `json:"notAnError"`
-	Hook       struct {
+	Cases        map[string]overflowCase `json:"cases"`
+	NotAnError   any                     `json:"notAnError"`
+	NotAssistant any                     `json:"notAssistant"`
+	Hook         struct {
 		Registered bool    `json:"registered"`
 		Hooked     *string `json:"hooked"`
 	} `json:"hook"`
@@ -130,6 +131,34 @@ func TestProviderRequestFitsContextWindow(t *testing.T) {
 			}
 		})
 	}
+
+	// Headroom beyond a bytes/3 bound over the whole serialized payload: at
+	// least the window-scaled margin (3% of the window), for a large input,
+	// a small one, and one whose bytes sit mostly in the tool definitions.
+	reserved, _ := report.Cases["reserved"].(map[string]any)
+	wantReserved := (window*3 + 99) / 100
+	for _, name := range []string{"large", "small", "toolHeavy"} {
+		t.Run("reserved/"+name, func(t *testing.T) {
+			t.Parallel()
+			got, ok := reserved[name].(float64)
+			if !ok {
+				t.Fatalf("no fitted limit for the %s payload: %v", name, reserved[name])
+			}
+			if int(got) < wantReserved {
+				t.Errorf("%s payload: fit leaves %d tokens beyond the input bound, want at least %d", name, int(got), wantReserved)
+			}
+		})
+	}
+
+	t.Run("thinking budget that cannot fit is left to the overflow path", func(t *testing.T) {
+		t.Parallel()
+		if got, ok := intCase("tightNoThinking"); !ok || got != 1500 {
+			t.Fatalf("control: tight payload without thinking fitted to %v, want 1500", report.Cases["tightNoThinking"])
+		}
+		if got := report.Cases["tightThinking"]; got != nil {
+			t.Errorf("tight payload with a thinking budget = %v, want left as built (nil)", got)
+		}
+	})
 
 	t.Run("thinking budget stays below the fitted limit", func(t *testing.T) {
 		t.Parallel()
@@ -213,6 +242,9 @@ func TestContextOverflowWordingIsMarkedForPi(t *testing.T) {
 		t.Parallel()
 		if report.NotAnError != nil {
 			t.Errorf("a non-error message was marked: %v", report.NotAnError)
+		}
+		if report.NotAssistant != nil {
+			t.Errorf("a non-assistant message was marked: %v", report.NotAssistant)
 		}
 	})
 

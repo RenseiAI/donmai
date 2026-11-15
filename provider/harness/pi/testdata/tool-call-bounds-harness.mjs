@@ -512,6 +512,50 @@ async function fitReport() {
   cases.thinkingBudget = thinking?.thinking?.budget_tokens ?? null;
   cases.originalUntouched = original.max_tokens === PI_REQUESTED_OUTPUT;
 
+  // Headroom the fit leaves beyond a bytes/3 bound over the WHOLE serialized
+  // payload (computed here, independently of the extension's helper), for a
+  // large input, a small one, and a tool-heavy one whose bytes sit mostly in
+  // the tool definitions. pi sized each of these as window - chars/4 of the
+  // messages - 4096. The Go test asserts the headroom is at least the
+  // window-scaled margin, so the fit neither drops the margin nor counts only
+  // the messages.
+  const reserved = (payload, field) => {
+    const fitted = fittedField(fit(payload, FIT_WINDOW, FIT_WINDOW), field);
+    if (fitted === null) return null;
+    const bound = Math.ceil(Buffer.byteLength(JSON.stringify(payload), "utf8") / 3);
+    return FIT_WINDOW - bound - fitted;
+  };
+  const small = { model: "fixture-model", messages: [{ role: "user", content: proseOfLength(4000) }], max_completion_tokens: FIT_WINDOW - 1000 - 4096 };
+  const toolHeavy = {
+    model: "fixture-model",
+    messages: [{ role: "user", content: proseOfLength(4000) }],
+    tools: Array.from({ length: 300 }, (_, i) => ({
+      type: "function",
+      function: { name: `tool_${i}`, description: proseOfLength(2000), parameters: { type: "object", properties: { arg: { type: "string", description: proseOfLength(400) } } } },
+    })),
+    max_tokens: FIT_WINDOW - 1000 - 4096,
+  };
+  cases.reserved = {
+    large: reserved(incidentPayload("max_tokens"), "max_tokens"),
+    small: reserved(small, "max_completion_tokens"),
+    toolHeavy: reserved(toolHeavy, "max_tokens"),
+  };
+
+  // A thinking budget that cannot stay at Anthropic's 1024-token minimum
+  // below the fitted limit: the payload is left as built (the overflow path
+  // handles it) rather than sent with an invalid budget. The window leaves
+  // exactly 1500 output tokens: 20000 - 4096 margin - 14404 input bound. The
+  // same payload without thinking fits to 1500, so the refusal is the
+  // budget's.
+  const TIGHT_WINDOW = 20000;
+  const tight = (extra) => {
+    const base = { model: "fixture-model", messages: [{ role: "user", content: "" }], max_tokens: 5000, ...extra };
+    const pad = 14404 * 3 - Buffer.byteLength(JSON.stringify(base), "utf8");
+    return { ...base, messages: [{ role: "user", content: proseOfLength(pad) }] };
+  };
+  cases.tightNoThinking = fittedField(fit(tight(), TIGHT_WINDOW, TIGHT_WINDOW), "max_tokens");
+  cases.tightThinking = fit(tight({ thinking: { type: "enabled", budget_tokens: 4000 } }), TIGHT_WINDOW, TIGHT_WINDOW) ?? null;
+
   // The same fit through the extension's real activation: the registered
   // donmai provider gets a before_provider_request hook, and that hook leaves
   // every other provider's payload alone.
@@ -572,6 +616,7 @@ async function overflowReport() {
     cases[name] = { text, classified: mod.isContextOverflowText(text), marked: marked?.errorMessage ?? null };
   }
   const notAnError = mod.markContextOverflow({ role: "assistant", stopReason: "stop", errorMessage: OVERFLOW_TEXTS.gateway, content: [] }) ?? null;
+  const notAssistant = mod.markContextOverflow({ role: "user", stopReason: "error", errorMessage: OVERFLOW_TEXTS.gateway, content: [] }) ?? null;
   const lane = await activateLane(mod, "fixture-handshake-token");
   const hook = lane.handlers["message_end"];
   let hooked = null;
@@ -579,7 +624,7 @@ async function overflowReport() {
     const result = await hook({ type: "message_end", message: { role: "assistant", stopReason: "error", errorMessage: OVERFLOW_TEXTS.gateway, content: [] } }, {});
     hooked = result?.message?.errorMessage ?? null;
   }
-  return { cases, notAnError, hook: { registered: typeof hook === "function", hooked } };
+  return { cases, notAnError, notAssistant, hook: { registered: typeof hook === "function", hooked } };
 }
 
 const providerFit = await fitReport();
