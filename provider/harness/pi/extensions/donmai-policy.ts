@@ -85,6 +85,7 @@
 // boundary depends on it resolving (see registerSequentialTools).
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Buffer } from "node:buffer";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
@@ -375,6 +376,101 @@ function mergeRoutingCompat(base: any, routing: any): any {
   if (routing === undefined) return base;
   if (base === undefined) return routing;
   return { ...base, ...routing };
+}
+
+// --- Output limit fitted to the context window ---
+//
+// An OpenAI-compatible gateway rejected a request because its input plus the
+// requested output exceeded the model's context window, and rejected every
+// identical retry. pi sizes the output limit as min(model maxTokens,
+// contextWindow - estimate(input) - 4096), with an input estimate of
+// characters / 4. Real tokenizers count more than that, so with a maxTokens
+// equal to the window, an input of a few tens of thousands of tokens already
+// asks for more output than the window has left.
+//
+// fitOutputLimitToWindow re-derives the limit from the provider payload pi
+// built, just before it is sent (the before_provider_request hook, whose
+// return value replaces the payload): min(requested, registered maxTokens,
+// contextWindow - conservative input - margin). The input bound is the
+// serialized payload's UTF-8 size / 3, which covers the messages, the tools
+// and the system prompt, plus the JSON around them; the margin is 3% of the
+// window, at least 4096. It only ever lowers the limit. When the window leaves
+// less than MIN_FITTED_OUTPUT_TOKENS, the payload is left as built: the
+// request then fails as a context overflow, and pi compacts. Exported for the
+// scripted conformance fixture (testdata/tool-call-bounds-harness.mjs).
+const OUTPUT_LIMIT_FIELDS = ["max_tokens", "max_completion_tokens", "max_output_tokens"];
+const INPUT_BYTES_PER_TOKEN = 3;
+const MIN_OUTPUT_MARGIN_TOKENS = 4096;
+const OUTPUT_MARGIN_FRACTION = 0.03;
+const MIN_FITTED_OUTPUT_TOKENS = 1024;
+// Anthropic Messages requires an enabled thinking budget of at least 1024
+// tokens and below max_tokens.
+const MIN_THINKING_BUDGET_TOKENS = 1024;
+
+export function conservativeInputTokens(payload: unknown): number {
+  let serialized = "";
+  try {
+    serialized = JSON.stringify(payload) ?? "";
+  } catch {
+    return Number.POSITIVE_INFINITY;
+  }
+  return Math.ceil(Buffer.byteLength(serialized, "utf8") / INPUT_BYTES_PER_TOKEN);
+}
+
+export function outputMarginTokens(contextWindow: number): number {
+  return Math.max(MIN_OUTPUT_MARGIN_TOKENS, Math.ceil(contextWindow * OUTPUT_MARGIN_FRACTION));
+}
+
+export function fitOutputLimitToWindow(payload: any, contextWindow: number, maxTokens: number | undefined): any {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return undefined;
+  if (!Number.isInteger(contextWindow) || contextWindow <= 0) return undefined;
+  const field = OUTPUT_LIMIT_FIELDS.find((name) => typeof payload[name] === "number" && payload[name] > 0);
+  if (field === undefined) return undefined;
+  const requested = payload[field];
+  const available = Math.floor(contextWindow - conservativeInputTokens(payload) - outputMarginTokens(contextWindow));
+  if (!(available >= MIN_FITTED_OUTPUT_TOKENS)) return undefined;
+  const ceiling = maxTokens === undefined ? requested : Math.min(requested, maxTokens);
+  const fitted = Math.min(ceiling, available);
+  if (fitted >= requested) return undefined;
+  const next = { ...payload, [field]: fitted };
+  const budget = payload.thinking?.budget_tokens;
+  if (typeof budget === "number" && budget >= fitted) {
+    const fittedBudget = fitted - MIN_FITTED_OUTPUT_TOKENS;
+    if (fittedBudget < MIN_THINKING_BUDGET_TOKENS) return undefined;
+    next.thinking = { ...payload.thinking, budget_tokens: fittedBudget };
+  }
+  return next;
+}
+
+// --- Context-overflow wording pi does not recognize ---
+//
+// The same gateway words its overflow "exceeds the model's context window".
+// pi's own overflow patterns miss that wording, so pi neither compacted nor
+// treated the error as final: it retried the identical request. The runner's
+// classifier (internal/providerretry ContextOverflow) already reads it as an
+// overflow; CONTEXT_OVERFLOW_PATTERN is the same pattern, so both sides agree.
+// markContextOverflow appends a wording pi does recognize to a failed
+// assistant message's error text (the message_end hook, whose replacement pi
+// keeps in place before it decides between compaction and retry), so pi runs
+// its overflow recovery: compact, retry once, then stop. The provider's text
+// stays first. A rate-limit error is left alone, as pi itself never reads one
+// as an overflow. Exported for the scripted conformance fixture.
+const CONTEXT_OVERFLOW_PATTERN =
+  /prompt is too long|input is too long|context[_ ]length|context[_ ]window|maximum context|too many tokens/i;
+const PI_OVERFLOW_MARKER_PATTERN = /context[_ ]length[_ ]exceeded/i;
+const PI_NON_OVERFLOW_PATTERN = /rate limit|too many requests/i;
+const CONTEXT_OVERFLOW_MARKER = " (context_length_exceeded)";
+
+export function isContextOverflowText(text: unknown): boolean {
+  return typeof text === "string" && CONTEXT_OVERFLOW_PATTERN.test(text);
+}
+
+export function markContextOverflow(message: any): any {
+  if (message?.role !== "assistant" || message?.stopReason !== "error") return undefined;
+  const text = message.errorMessage;
+  if (!isContextOverflowText(text)) return undefined;
+  if (PI_NON_OVERFLOW_PATTERN.test(text) || PI_OVERFLOW_MARKER_PATTERN.test(text)) return undefined;
+  return { ...message, errorMessage: text + CONTEXT_OVERFLOW_MARKER };
 }
 
 // DONMAI_STATE_DIR_ENV carries the relocated per-session state root
@@ -965,7 +1061,24 @@ export default async function activate(pi: ExtensionAPI) {
       // the Go side still gates on the handshake, and tool calls stay blocked
       // until verified.
     }
+    // Fit the requested output into the registered window on every request
+    // to this provider (fitOutputLimitToWindow above). Without a registered
+    // window there is nothing to fit against, and pi's own sizing stands.
+    if (contextWindow !== undefined) {
+      pi.on("before_provider_request", (event: any, ctx: any) => {
+        const active = ctx?.model;
+        const ours = active ? active.provider === "donmai" : event?.payload?.model === model;
+        if (!ours) return undefined;
+        return fitOutputLimitToWindow(event?.payload, contextWindow, maxTokens);
+      });
+    }
   }
+  // Context-overflow wording pi does not recognize, on any provider
+  // (markContextOverflow above).
+  pi.on("message_end", (event: any) => {
+    const marked = markContextOverflow(event?.message);
+    return marked === undefined ? undefined : { message: marked };
+  });
   // Native route: the built-in provider the harness pins with --provider gets
   // the same headers as a header-only override, which keeps pi's own models
   // for it (docs/custom-provider.md, "Override Existing Provider").
