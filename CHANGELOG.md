@@ -10,6 +10,12 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 No unreleased changes.
 
+## v0.73.9 — 2026-11-16
+
+### Fixes
+
+- Fit the requested output into the context window
+
 ## v0.73.8 — 2026-11-15
 
 ### Features
