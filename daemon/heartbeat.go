@@ -15,6 +15,7 @@ import (
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/daemon/seatstate"
+	"github.com/RenseiAI/donmai/observation"
 	"github.com/RenseiAI/donmai/sessionshim"
 )
 
@@ -115,6 +116,10 @@ type HeartbeatOptions struct {
 	// GetLoad convention. Account IDs must be opaque values the platform
 	// hashes; never put an address in them.
 	GetQuota func() []agent.UsageAccount
+
+	// GetObservations returns the host-observation report for this beat.
+	// Optional, like GetQuota: nil, or a nil report, omits the key.
+	GetObservations func() *observation.Report
 
 	// GetAllowlist returns the daemon's current project allowlist entries
 	// (derived from cfg.Projects). Called every beat so a hot yaml reload
@@ -539,6 +544,9 @@ func (h *HeartbeatService) sendOneSerialized(ctx context.Context) error {
 			payload.Quota = q
 		}
 	}
+	if h.opts.GetObservations != nil {
+		payload.Observations = h.opts.GetObservations()
+	}
 
 	// Three-axis seat state rides every beat when configured. A nil
 	// callback omits the seat keys entirely (a host that does not track
@@ -744,7 +752,7 @@ func (h *HeartbeatService) projectAdmissionReport() (ProjectAdmissionReport, boo
 //
 //	{ status?, activeCount, activeInteractiveCount?, maxSessions?, load?,
 //	  allowlistHash?, allowlist?, appliedMutations?, mutationFailures?,
-//	  quota?, seats?, seatSummary? }
+//	  quota?, observations?, seats?, seatSummary? }
 //
 // activeInteractiveCount is the interactive-occupancy split of activeCount:
 // live Mode == "interactive" or legacy Mode == "interview" sessions count,
@@ -787,6 +795,9 @@ type heartbeatRequestBody struct {
 	// accounts. Omitted when the daemon reports no quota state; account
 	// IDs ride as opaque values the platform hashes.
 	Quota []agent.UsageAccount `json:"quota,omitempty"`
+	// Observations is the host-observation report beside quota. Omitted
+	// when the daemon has no quota state; it never carries a raw id.
+	Observations *observation.Report `json:"observations,omitempty"`
 	// Seats is the per-seat three-axis report (session presence, activity
 	// with its decided-by rung, resumability, plus needs-input). Nil
 	// omits the key: a host that does not track seat state sends no key
@@ -926,6 +937,7 @@ func (h *HeartbeatService) callEndpoint(
 		QuarantinedSessions:    payload.QuarantinedSessions,
 		SessionShim:            payload.SessionShim,
 		Quota:                  payload.Quota,
+		Observations:           payload.Observations,
 		Seats:                  payload.Seats,
 		SeatSummary:            payload.SeatSummary,
 	}
