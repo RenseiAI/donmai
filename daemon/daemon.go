@@ -2102,6 +2102,9 @@ func (d *Daemon) Start(ctx context.Context) error {
 			// provider and merged with turn-driven updates. Nil-safe:
 			// a host with no quota state omits the key.
 			GetQuota: d.QuotaSnapshot,
+			// Observations: the same quota state as subscription-login
+			// items; nil, and omitted, when there is no quota state.
+			GetObservations: d.ObservationReport,
 			// Phase 2c: handle platform-queued mutations.
 			OnPendingMutations: d.applyPendingMutations,
 			// Phase 2e: surface hostStatus signals (pool_deleted etc.)
