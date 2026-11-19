@@ -82,3 +82,23 @@ func TestSubscriptionLoginRefusesBadAttributes(t *testing.T) {
 		})
 	}
 }
+
+func TestSubscriptionLoginEncodesClaudeWindowIDs(t *testing.T) {
+	h, a := sampleLogin()
+	h.Definition = "anthropic-claude:max_20x"
+	a.Harness, a.Provider, a.Plan = "claude", ProviderAnthropicClaude, "max_20x"
+	a.Allowances = []Allowance{{ID: "claude", Unit: UnitPercent, Windows: []Window{
+		{ID: "five_hour", Kind: "session", Used: 54},
+		{ID: "seven_day", Kind: "weekly", Used: 18.4},
+		{ID: "seven_day_opus", Kind: "weekly", Used: 73},
+	}}}
+	out, err := json.Marshal(loginItem(t, h, a))
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	for _, id := range []string{`"five_hour"`, `"seven_day"`, `"seven_day_opus"`, `"anthropic-claude:max_20x"`} {
+		if !bytes.Contains(out, []byte(id)) {
+			t.Errorf("encoded claude item lacks %s: %s", id, out)
+		}
+	}
+}
