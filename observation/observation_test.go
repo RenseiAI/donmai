@@ -11,8 +11,7 @@ import (
 
 var checkedAt = "2026-11-19T12:00:00Z"
 
-// testKind is a kind registered only in tests, so the generic envelope is
-// exercised without depending on any real kind.
+// testKind is registered only in tests: the envelope needs no real kind.
 type testKind struct {
 	Name string `json:"name" disclosure:"public"`
 }
@@ -32,9 +31,8 @@ func (k testKind) normalize() (Attributes, error) {
 
 func sampleHeader() Header {
 	return Header{
-		ItemKey: SubscriptionLoginItemKey("openai-chatgpt", "acct-1", ""), Slot: DefaultSlot,
-		Identity: IdentityAccount, Definition: "openai-chatgpt:pro",
-		Readiness: Readiness{State: ReadinessReady, CheckedAt: checkedAt},
+		ItemKey: SubscriptionLoginItemKey("openai-chatgpt", "acct-1", ""), Slot: DefaultSlot, Identity: IdentityAccount,
+		Definition: "openai-chatgpt:pro", Readiness: Readiness{State: ReadinessReady, CheckedAt: checkedAt},
 	}
 }
 
@@ -88,7 +86,10 @@ func TestEncodeRefusesBadShapes(t *testing.T) {
 		name   string
 		mutate func(*Header)
 		attrs  Attributes
+		ok     bool
 	}{
+		{name: "underscore ids", attrs: testKind{Name: "seven_day_opus"}, ok: true},
+		{name: "underscore definition", mutate: func(h *Header) { h.Definition = "anthropic-claude:max_20x" }, ok: true},
 		{name: "uppercase itemKey", mutate: func(h *Header) { h.ItemKey = strings.ToUpper(h.ItemKey) }},
 		{name: "short itemKey", mutate: func(h *Header) { h.ItemKey = "abc" }},
 		{name: "raw path slot", mutate: func(h *Header) { h.Slot = "/home/u/.codex" }},
@@ -109,8 +110,11 @@ func TestEncodeRefusesBadShapes(t *testing.T) {
 				attrs = testKind{Name: "codex"}
 			}
 			item, err := Encode(h, attrs)
-			if err == nil {
-				t.Fatal("Encode accepted a bad shape")
+			if tt.ok != (err == nil) {
+				t.Fatalf("Encode error = %v, want ok = %v", err, tt.ok)
+			}
+			if tt.ok {
+				return
 			}
 			if _, err := json.Marshal(item); err == nil {
 				t.Fatal("a refused item still marshals")
