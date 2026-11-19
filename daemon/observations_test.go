@@ -6,12 +6,14 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/observation"
+	providerclaude "github.com/RenseiAI/donmai/provider/harness/claude"
 )
 
 var observationNow = time.Date(2026, 11, 19, 12, 0, 0, 0, time.UTC)
@@ -122,6 +124,28 @@ func TestSubscriptionLoginItemsPerSlotAndSecretFree(t *testing.T) {
 	for _, secret := range []string{codex.ID, extraHome} {
 		if strings.Contains(raw, secret) {
 			t.Errorf("observations carry %q: %s", secret, raw)
+		}
+	}
+}
+
+// TestSubscriptionLoginItemsFromRealClaudeWindows runs the claude
+// mapper's own fixture through the producer, so the real window ids
+// (five_hour, seven_day, seven_day_<model>) must encode; an encode
+// error would otherwise omit observations from every claude host.
+func TestSubscriptionLoginItemsFromRealClaudeWindows(t *testing.T) {
+	raw, err := os.ReadFile("../provider/harness/claude/testdata/t3code/usage_read.json")
+	if err != nil {
+		t.Fatalf("read claude fixture: %v", err)
+	}
+	limits, _ := providerclaude.UsageResponseToLimits(raw, "2026-11-19T11:59:00Z")
+	account := agent.UsageAccount{ID: "claude-account-hash", Provider: "claude", Limits: limits}
+	items, out := observedItems(t, []quotaSlot{{accounts: []agent.UsageAccount{account}}})
+	if len(items) != 1 {
+		t.Fatalf("items = %v, want one claude item", items)
+	}
+	for _, id := range []string{`"five_hour"`, `"seven_day"`, `"seven_day_fable"`} {
+		if !strings.Contains(out, id) {
+			t.Errorf("claude observations lack window %s: %s", id, out)
 		}
 	}
 }
