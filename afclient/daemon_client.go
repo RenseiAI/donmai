@@ -914,3 +914,26 @@ func (c *DaemonClient) SetCapacityConfig(key, value string) (*SetCapacityRespons
 	}
 	return &resp, nil
 }
+
+// HostObservations reads the daemon's current host observations without
+// scanning (GET /api/daemon/observations).
+func (c *DaemonClient) HostObservations() (*HostObservations, error) {
+	var resp HostObservations
+	if err := c.get("/api/daemon/observations", &resp); err != nil {
+		return nil, fmt.Errorf("daemon observations: %w", err)
+	}
+	return &resp, nil
+}
+
+// ScanHostObservations runs a full rescan of kinds, all kinds when empty
+// (POST /api/daemon/observations/scan). The daemon allows one a minute
+// and answers a refused scan with 429, which wraps ErrRateLimited.
+func (c *DaemonClient) ScanHostObservations(ctx context.Context, kinds []string) (*HostObservations, error) {
+	scanClient := *c.httpClient
+	scanClient.Timeout = 45 * time.Second
+	var resp HostObservations
+	if err := c.postContext(ctx, &scanClient, "/api/daemon/observations/scan", map[string][]string{"kinds": kinds}, &resp); err != nil {
+		return nil, fmt.Errorf("daemon observations scan: %w", err)
+	}
+	return &resp, nil
+}

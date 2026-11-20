@@ -129,3 +129,12 @@ func TestApplyObservationsScanMutation(t *testing.T) {
 		t.Fatal("observations.scan did not run a scan")
 	}
 }
+
+func TestObservationsReadEndpointDoesNotScan(t *testing.T) {
+	d := scanDaemon(map[string]quotaProbeFunc{"codex": codexFeed("acct-a", false)})
+	rec := httptest.NewRecorder()
+	(&Server{daemon: d}).handleObservations(rec, httptest.NewRequest(http.MethodGet, "/api/daemon/observations", nil))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"items":[]`) || !d.observationScan.lastAt.IsZero() {
+		t.Fatalf("read = %d %s (scanned %v), want 200 with an empty full report and no scan", rec.Code, rec.Body, !d.observationScan.lastAt.IsZero())
+	}
+}
