@@ -139,14 +139,27 @@ func (d *Daemon) markObservations(report *observation.Report) *ObservationScanRe
 	out := &ObservationScanResult{Report: report, Marks: []ObservationMark{}}
 	for _, it := range report.Items {
 		ref := it.Ref()
-		out.Marks = append(out.Marks, ObservationMark{Ref: ref, New: !d.observationScan.previous[ref], Enabled: d.observationEnabled(ref)})
+		out.Marks = append(out.Marks, ObservationMark{Ref: ref, New: !d.observationScan.previous[ref], Enabled: d.observationEnabled(it)})
 	}
 	return out
 }
 
-// observationEnabled is the seam for local enablement: every item is
-// enabled until local configuration can disable one.
-func (d *Daemon) observationEnabled(observation.Ref) bool { return true }
+// observationEnabled is the local enabled flag: false only when
+// daemon.yaml disables the item's (kind, slot, harness).
+func (d *Daemon) observationEnabled(it observation.Item) bool {
+	var probe struct {
+		Attributes struct {
+			Harness string `json:"harness"`
+		} `json:"attributes"`
+	}
+	raw, err := json.Marshal(it)
+	if err != nil || json.Unmarshal(raw, &probe) != nil {
+		return true
+	}
+	ref := it.Ref()
+	local, ok := d.localObservationItem(observationSlotKey{ref.Kind, ref.Slot, probe.Attributes.Harness})
+	return !ok || !local.Disabled
+}
 
 // runObservationProbes runs every probe at once and reports whether the
 // scan overran its timeout. A late probe still feeds the cache.

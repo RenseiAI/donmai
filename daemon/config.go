@@ -71,6 +71,10 @@ type Config struct {
 	Orchestrator  OrchestratorConfig   `yaml:"orchestrator"           json:"orchestrator"`
 	AutoUpdate    AutoUpdateConfig     `yaml:"autoUpdate"             json:"autoUpdate"`
 	Observability *ObservabilityConfig `yaml:"observability,omitempty" json:"observability,omitempty"`
+	// Observations narrows observed-item policy on this host: it can
+	// disable an item or raise its guard, never widen what a control
+	// plane pushed. nil = no local narrowing.
+	Observations *ObservationsConfig `yaml:"observations,omitempty" json:"observations,omitempty"`
 	// ModelAccess is the platform-synced per-machine + per-workload
 	// model-access narrowing block (P3 / ADR-2026-06-06 D5). nil = no
 	// machine narrowing => the platform ceiling holds unchanged (identity).
