@@ -22,6 +22,9 @@ const (
 	// and session mode). Committed at the matrix/ package root like the JSON
 	// artifacts so the parity test can byte-compare it.
 	FileSupport = "SUPPORT.md"
+	// FileSubscriptionProviders is the standalone subscriptionProviders
+	// catalog, the one file a control plane vendors.
+	FileSubscriptionProviders = "subscription-providers.json"
 )
 
 // Artifacts is the rendered byte content for every generated file, keyed by
@@ -124,6 +127,11 @@ func (b *Built) Render() (*Artifacts, error) {
 		return nil, fmt.Errorf("marshal capability realizations: %w", err)
 	}
 
+	subscriptionProvidersJSON, err := marshalJSON(b.Matrix.SubscriptionProviders)
+	if err != nil {
+		return nil, fmt.Errorf("marshal subscription providers: %w", err)
+	}
+
 	return &Artifacts{Files: map[string][]byte{
 		FileCapabilityMatrix:       capabilityMatrix,
 		FileHarnesses:              harnesses,
@@ -132,6 +140,7 @@ func (b *Built) Render() (*Artifacts, error) {
 		FileRegistryGen:            registry,
 		FileCapabilityRealizations: realizations,
 		FileSupport:                []byte(RenderSupportPage(b)),
+		FileSubscriptionProviders:  subscriptionProvidersJSON,
 	}}, nil
 }
 

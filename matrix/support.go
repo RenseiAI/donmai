@@ -103,6 +103,30 @@ func RenderSupportPage(built *Built) string {
 		}, " | ") + " |\n")
 	}
 	buf.WriteString(renderSupportV2Section(built))
+	buf.WriteString(renderSubscriptionProvidersSection(built.Matrix.SubscriptionProviders))
+	return buf.String()
+}
+
+// renderSubscriptionProvidersSection renders the catalog rows; "*" marks a
+// low-cap plan.
+func renderSubscriptionProvidersSection(catalog SubscriptionProviderCatalog) string {
+	var buf strings.Builder
+	buf.WriteString("\n## Subscription providers (`" + catalog.ContractABI + "`)\n\n")
+	buf.WriteString("Descriptive data and defaults; it never grants. Harnesses are a ceiling.\n")
+	buf.WriteString("An unlisted reported plan is uncatalogued. `*` marks a low-cap plan.\n\n")
+	buf.WriteString("| provider | kind | harnesses | endpoints | billing modes | plans |\n| --- | --- | --- | --- | --- | --- |\n")
+	for _, p := range catalog.Providers {
+		endpoints, plans := make([]string, len(p.Models)), make([]string, len(p.Plans))
+		for i, m := range p.Models {
+			endpoints[i] = string(m.Endpoint)
+		}
+		for i, plan := range p.Plans {
+			plans[i] = plan.Slug + map[bool]string{true: "*"}[plan.LowCap]
+		}
+		buf.WriteString(fmt.Sprintf("| %s | %s | %s | %s | %s | %s |\n", escapeCell(p.ID), escapeCell(p.Kind),
+			escapeCell(strings.ReplaceAll(strings.Trim(fmt.Sprint(p.Harnesses), "[]"), " ", ", ")), escapeCell(strings.Join(endpoints, ", ")),
+			escapeCell(strings.Join(p.BillingModes, " > ")), escapeCell(strings.Join(plans, ", "))))
+	}
 	return buf.String()
 }
 

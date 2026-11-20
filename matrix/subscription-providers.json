@@ -1,0 +1,170 @@
+{
+  "contractAbi": "subscription-providers/v1",
+  "providers": [
+    {
+      "id": "anthropic-claude",
+      "kind": "direct",
+      "displayName": "Claude",
+      "loginKinds": [
+        "subscription-login"
+      ],
+      "harnesses": [
+        "claude-code"
+      ],
+      "billingModes": [
+        "allowance",
+        "overage",
+        "api-metered"
+      ],
+      "models": [
+        {
+          "endpoint": "anthropic"
+        }
+      ],
+      "plans": [
+        {
+          "slug": "pro",
+          "displayName": "Pro",
+          "lowCap": true,
+          "allowanceUnits": [
+            "percent"
+          ],
+          "defaults": {
+            "guardPercent": 50
+          }
+        },
+        {
+          "slug": "max",
+          "displayName": "Max",
+          "lowCap": false,
+          "allowanceUnits": [
+            "percent"
+          ],
+          "defaults": {}
+        },
+        {
+          "slug": "team",
+          "displayName": "Team",
+          "lowCap": false,
+          "allowanceUnits": [
+            "percent"
+          ],
+          "defaults": {}
+        },
+        {
+          "slug": "enterprise",
+          "displayName": "Enterprise",
+          "lowCap": false,
+          "allowanceUnits": [
+            "percent"
+          ],
+          "defaults": {}
+        }
+      ]
+    },
+    {
+      "id": "openai-chatgpt",
+      "kind": "direct",
+      "displayName": "ChatGPT",
+      "loginKinds": [
+        "subscription-login"
+      ],
+      "harnesses": [
+        "codex"
+      ],
+      "billingModes": [
+        "allowance",
+        "credits"
+      ],
+      "models": [
+        {
+          "endpoint": "openai"
+        }
+      ],
+      "plans": [
+        {
+          "slug": "free",
+          "displayName": "Free",
+          "lowCap": true,
+          "allowanceUnits": [
+            "percent"
+          ],
+          "defaults": {
+            "guardPercent": 50
+          }
+        },
+        {
+          "slug": "go",
+          "displayName": "Go",
+          "lowCap": true,
+          "allowanceUnits": [
+            "percent"
+          ],
+          "defaults": {
+            "guardPercent": 50
+          }
+        },
+        {
+          "slug": "plus",
+          "displayName": "Plus",
+          "lowCap": true,
+          "allowanceUnits": [
+            "percent"
+          ],
+          "defaults": {
+            "guardPercent": 50
+          }
+        },
+        {
+          "slug": "pro",
+          "displayName": "Pro",
+          "lowCap": false,
+          "allowanceUnits": [
+            "percent"
+          ],
+          "defaults": {}
+        },
+        {
+          "slug": "team",
+          "displayName": "Team",
+          "lowCap": true,
+          "allowanceUnits": [
+            "percent"
+          ],
+          "defaults": {
+            "guardPercent": 50
+          }
+        },
+        {
+          "slug": "business",
+          "displayName": "Business",
+          "lowCap": true,
+          "allowanceUnits": [
+            "percent"
+          ],
+          "defaults": {
+            "guardPercent": 50
+          }
+        },
+        {
+          "slug": "enterprise",
+          "displayName": "Enterprise",
+          "lowCap": false,
+          "allowanceUnits": [
+            "percent"
+          ],
+          "defaults": {}
+        },
+        {
+          "slug": "edu",
+          "displayName": "Edu",
+          "lowCap": false,
+          "allowanceUnits": [
+            "percent"
+          ],
+          "defaults": {}
+        }
+      ]
+    }
+  ]
+}

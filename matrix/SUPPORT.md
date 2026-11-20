@@ -123,3 +123,13 @@ harness-native controls are separate facts.
 | stub | subagent_control.dispatchSpawnedWorkspaces | unverified |  |
 | stub | subagent_control.harnessNativeControls | unverified |  |
 | stub | token_cost_accuracy | unverified |  |
+
+## Subscription providers (`subscription-providers/v1`)
+
+Descriptive data and defaults; it never grants. Harnesses are a ceiling.
+An unlisted reported plan is uncatalogued. `*` marks a low-cap plan.
+
+| provider | kind | harnesses | endpoints | billing modes | plans |
+| --- | --- | --- | --- | --- | --- |
+| anthropic-claude | direct | claude-code | anthropic | allowance > overage > api-metered | pro*, max, team, enterprise |
+| openai-chatgpt | direct | codex | openai | allowance > credits | free*, go*, plus*, pro, team*, business*, enterprise, edu |
