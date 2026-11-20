@@ -149,11 +149,6 @@ type CapabilityMatrix struct {
 	// SubagentQualification records executed fixtures for exact cells, adapter
 	// versions and delivery inputs. Manifest subagent claims are not evidence.
 	SubagentQualification []SubagentQualificationRow `json:"subagentQualification"`
-	// SubscriptionProviders is the p1.5 additive catalog of subscription
-	// plan definitions (issuer id plus reported plan slug): compatibility
-	// ceilings and explicit definition defaults. Membership, usage and
-	// remaining quota stay host-observed and are never declared here.
-	SubscriptionProviders []SubscriptionProvider `json:"subscriptionProviders"`
 }
 
 // LegacyAlias is one (ProviderName → CellKey) row of the back-compat map,
@@ -299,7 +294,6 @@ func BuildWithSubagentFixtures(
 		Capabilities:          cloneCapabilityEligibilityRows(canonicalCapabilities),
 		ResumeQualification:   resumeQualification,
 		SubagentQualification: append([]SubagentQualificationRow{}, subagentQualification...),
-		SubscriptionProviders: cloneSubscriptionProviders(),
 	}
 
 	return &Built{

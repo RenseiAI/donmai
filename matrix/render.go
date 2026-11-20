@@ -91,9 +91,7 @@ func (b *Built) Render() (*Artifacts, error) {
 	// binaryPins is p1.1 additive (07 §8): probe-time enforcement reads
 	// its own package constants directly, so this section exists for
 	// external consumers (platform, operators bumping a pin) rather than
-	// donmai's own runtime. subscriptionProviders is the p1.5 additive
-	// seed-consumer slice of the same catalog: the generator owns it in
-	// both documents and projects identical rows here.
+	// donmai's own runtime.
 	matrixDoc := struct {
 		SchemaVersion         string                     `json:"schemaVersion"`
 		ContractABI           string                     `json:"contractAbi"`
@@ -103,8 +101,7 @@ func (b *Built) Render() (*Artifacts, error) {
 		LegacyAliases         []LegacyAlias              `json:"legacyAliases"`
 		BinaryPins            []BinaryPinRow             `json:"binaryPins"`
 		SubagentQualification []SubagentQualificationRow `json:"subagentQualification"`
-		SubscriptionProviders []SubscriptionProvider     `json:"subscriptionProviders"`
-	}{SchemaVersion, ContractABI, GeneratedFrom, b.Matrix.Cells, b.Matrix.Denylist, b.AliasMap, b.Matrix.BinaryPins, b.Matrix.SubagentQualification, b.Matrix.SubscriptionProviders}
+	}{SchemaVersion, ContractABI, GeneratedFrom, b.Matrix.Cells, b.Matrix.Denylist, b.AliasMap, b.Matrix.BinaryPins, b.Matrix.SubagentQualification}
 	matrixJSON, err := marshalJSON(matrixDoc)
 	if err != nil {
 		return nil, fmt.Errorf("marshal matrix: %w", err)
