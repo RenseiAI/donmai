@@ -149,6 +149,8 @@ type CapabilityMatrix struct {
 	// SubagentQualification records executed fixtures for exact cells, adapter
 	// versions and delivery inputs. Manifest subagent claims are not evidence.
 	SubagentQualification []SubagentQualificationRow `json:"subagentQualification"`
+	// SubscriptionProviders is validated against the axes above (also in matrix.json).
+	SubscriptionProviders []SubscriptionIssuer `json:"subscriptionProviders"`
 }
 
 // LegacyAlias is one (ProviderName → CellKey) row of the back-compat map,
@@ -268,6 +270,10 @@ func BuildWithSubagentFixtures(
 		return nil, err
 	}
 	applySubagentQualification(harnesses, cells, subagentQualification)
+	subscriptionCatalog, err := buildSubscriptionProviders(subscriptionIssuers, harnessByName, cells, endpoints)
+	if err != nil {
+		return nil, err
+	}
 
 	for i := range harnesses {
 		harnesses[i].SupportV2 = projectHarnessSupportV2(harnesses[i], cells, capabilities, subagentQualification)
@@ -294,6 +300,7 @@ func BuildWithSubagentFixtures(
 		Capabilities:          cloneCapabilityEligibilityRows(canonicalCapabilities),
 		ResumeQualification:   resumeQualification,
 		SubagentQualification: append([]SubagentQualificationRow{}, subagentQualification...),
+		SubscriptionProviders: subscriptionCatalog,
 	}
 
 	return &Built{

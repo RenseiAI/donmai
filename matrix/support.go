@@ -103,6 +103,28 @@ func RenderSupportPage(built *Built) string {
 		}, " | ") + " |\n")
 	}
 	buf.WriteString(renderSupportV2Section(built))
+	buf.WriteString(renderSubscriptionProvidersSection(built.Matrix.SubscriptionProviders))
+	return buf.String()
+}
+
+// renderSubscriptionProvidersSection renders one row per issuer plan.
+func renderSubscriptionProvidersSection(issuers []SubscriptionIssuer) string {
+	var buf strings.Builder
+	buf.WriteString("\n## Subscription providers\n\n")
+	buf.WriteString("Defaults that never grant; harnesses are a ceiling; unlisted plans are uncatalogued.\n\n")
+	buf.WriteString("| provider | kind | plan | allowance | low-cap | guard | harnesses | models | billing modes |\n| --- | --- | --- | --- | --- | --- | --- | --- | --- |\n")
+	for _, p := range issuers {
+		for _, plan := range p.Plans {
+			models := make([]string, len(plan.ReachableModels))
+			for i, m := range plan.ReachableModels {
+				models[i] = string(m.ModelProvider) + "/" + m.ModelID
+			}
+			buf.WriteString(fmt.Sprintf("| %s | %s | %s | %s | %s | %v%% | %s | %s | %s |\n", escapeCell(p.ID), escapeCell(p.Kind),
+				escapeCell(plan.Slug), escapeCell(plan.AllowanceShape), boolCell(plan.LowCap), plan.Defaults["guardPercent"],
+				escapeCell(strings.ReplaceAll(strings.Trim(fmt.Sprint(plan.CompatibleHarnesses), "[]"), " ", ", ")),
+				escapeCell(strings.Join(models, ", ")), escapeCell(strings.Join(plan.BillingModes, " > "))))
+		}
+	}
 	return buf.String()
 }
 

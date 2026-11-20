@@ -101,7 +101,8 @@ func (b *Built) Render() (*Artifacts, error) {
 		LegacyAliases         []LegacyAlias              `json:"legacyAliases"`
 		BinaryPins            []BinaryPinRow             `json:"binaryPins"`
 		SubagentQualification []SubagentQualificationRow `json:"subagentQualification"`
-	}{SchemaVersion, ContractABI, GeneratedFrom, b.Matrix.Cells, b.Matrix.Denylist, b.AliasMap, b.Matrix.BinaryPins, b.Matrix.SubagentQualification}
+		SubscriptionProviders []SubscriptionIssuer       `json:"subscriptionProviders"`
+	}{SchemaVersion, ContractABI, GeneratedFrom, b.Matrix.Cells, b.Matrix.Denylist, b.AliasMap, b.Matrix.BinaryPins, b.Matrix.SubagentQualification, b.Matrix.SubscriptionProviders}
 	matrixJSON, err := marshalJSON(matrixDoc)
 	if err != nil {
 		return nil, fmt.Errorf("marshal matrix: %w", err)
