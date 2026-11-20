@@ -455,6 +455,8 @@ func newDaemonRunCmd(cfg Config) *cobra.Command {
 				// without an installed harness simply leaves that
 				// harness unprobed. See Options.QuotaProbeBinaries.
 				QuotaProbeBinaries: ResolveQuotaProbeBinaries(),
+				// Pushed observation policy survives a restart here.
+				ObservationPolicyDir: statehome.StateDir("observation-policy"),
 			}
 			applyDaemonControlAuth(&daemonOpts, controlTokenPath(), errOut)
 			d = daemon.New(daemonOpts)

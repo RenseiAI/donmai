@@ -202,6 +202,13 @@ type Options struct {
 	// PATH for its own daemon.
 	QuotaProbeBinaries map[string]string
 
+	// ObservationPolicyDir holds each registration's last applied
+	// observations.policy push, so a restarted daemon keeps enforcing it.
+	// Empty (the default for every test and embedder that does not set it)
+	// keeps pushed policy in memory only. The production entry point
+	// (afcli/daemon_run.go) sets it under the state home.
+	ObservationPolicyDir string
+
 	// EnableSubscriptionWindowExhaustionRefusal arms the subscription-window
 	// exhaustion claim admission: the host-wide pre-claim gate consulted by
 	// claimSuspended and the per-item typed refusal in handlePollWorkItem.
@@ -777,6 +784,7 @@ func New(opts Options) *Daemon {
 			return rulesetSnapshotWireStatus(snapshotClient)
 		})
 	}
+	d.loadObservationPolicies()
 	d.state.Store(StateStopped)
 	return d
 }
