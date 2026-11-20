@@ -297,3 +297,72 @@ func TestProbeUsage_SendsNoUserTurn(t *testing.T) {
 		t.Fatalf("probed = %+v, want windows (fixture rejects user turns)", probed.Unavailable)
 	}
 }
+
+func fakeUsageCLIWithBody(t *testing.T, body string) string {
+	t.Helper()
+	if fakeCLIDispatcherErr != "" {
+		t.Fatalf("prepare fake CLI dispatcher: %s", fakeCLIDispatcherErr)
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "fake-claude-evidence.sh")
+	auth := "case \" $* \" in *\" auth status --json \"*)\n  printf '{\"loggedIn\":true}\n'\n  exit 0;;\nesac\n"
+	script := "#!/bin/sh\n" + auth +
+		"input=$(cat)\n" +
+		"case \"$input\" in *'\"subtype\":\"get_usage\"'*) ;; *) exit 25;; esac\n" +
+		`printf '{"type":"control_response","response":{"subtype":"success","response":` + body + `}}\n'` + "\n" +
+		"exit 0\n"
+	if err := writeFakeCLIFile(path+".fixture", script); err != nil {
+		t.Fatalf("write fake cli fixture: %v", err)
+	}
+	if err := os.Link(fakeCLIDispatcher, path); err != nil {
+		t.Fatalf("publish fake cli dispatcher: %v", err)
+	}
+	return path
+}
+
+func TestProbeUsagePreservesRawEvidence(t *testing.T) {
+	t.Setenv("USER", "probe-operator")
+	body := `{"subscription_type":"max","billing_mode":"allowance","account_id":"ws-shared-1","scope":"account","rate_limits_available":true,"rate_limits":{"five_hour":{"utilization":12.5,"resets_at":"2026-07-18T14:39:00Z","limit":100},"seven_day":{"utilization":62.5,"used_tokens":1250,"limit":2000,"resets_at":"2026-07-24T08:59:00+00:00"}}}`
+	_, probed, _ := ProbeUsage(t.Context(), fakeUsageCLIWithBody(t, body))
+	if probed.Unavailable != nil {
+		t.Fatalf("probed=%+v want windows", probed.Unavailable)
+	}
+	if len(probed.Evidence) != 2 {
+		t.Fatalf("evidence=%+v want five_hour+seven_day", probed.Evidence)
+	}
+	five, seven := probed.Evidence[0], probed.Evidence[1]
+	if five.Window != "five_hour" || seven.Window != "seven_day" {
+		t.Fatalf("order=%+v want five_hour then seven_day", probed.Evidence)
+	}
+	if five.Provider != "claude" || five.Plan != "max" || five.Allowance != "five_hour" || five.Account != "ws-shared-1" || five.User != "" {
+		t.Errorf("five=%+v want claude/max/ws-shared-1/no user", five)
+	}
+	if five.Unit != agent.UsageUnitPercent || five.Used != 12.5 || five.Limit == nil || *five.Limit != 100 || five.ResetsAt == nil {
+		t.Errorf("five=%+v want percent 12.5 limit 100 reset", five)
+	}
+	if five.DurationMins != nil {
+		t.Errorf("five duration=%v want absent despite display fallback", five.DurationMins)
+	}
+	if seven.Unit != agent.UsageUnitTokens || seven.Used != 1250 || seven.Limit == nil || *seven.Limit != 2000 || seven.ResetsAt == nil {
+		t.Errorf("seven=%+v want tokens 1250 limit 2000 (clamping fails)", seven)
+	}
+	if seven.Billing != agent.UsageBillingAllowance {
+		t.Errorf("billing=%q want allowance", seven.Billing)
+	}
+	bare := `{"subscription_type":"max","account_id":"ws-shared-1","rate_limits_available":true,"rate_limits":{"five_hour":{"utilization":12.5},"seven_day":{"utilization":62.5,"used_tokens":1250}}}`
+	_, probed2, _ := ProbeUsage(t.Context(), fakeUsageCLIWithBody(t, bare))
+	if len(probed2.Evidence) != 2 || probed2.Evidence[1].Limit != nil || probed2.Evidence[1].ResetsAt != nil {
+		t.Errorf("bare seven=%+v want absent limit reset (nil not zero)", probed2.Evidence)
+	}
+	if len(probed2.Windows) != 2 || probed2.Windows[0].WindowDurationMins == nil {
+		t.Errorf("display=%+v want fallback durations", probed2.Windows)
+	}
+	billOnly := `{"subscription_type":"max","billing_mode":"credits","credit_balance":0,"account_id":"ws-shared-1","rate_limits_available":true,"rate_limits":{}}`
+	_, billProbed, _ := ProbeUsage(t.Context(), fakeUsageCLIWithBody(t, billOnly))
+	if len(billProbed.Windows) != 0 || len(billProbed.Evidence) != 1 || billProbed.Evidence[0].Billing != agent.UsageBillingCredits {
+		t.Fatalf("billing-only=%+v want one credits evidence no windows", billProbed)
+	}
+	if billProbed.Evidence[0].Balance == nil || *billProbed.Evidence[0].Balance != 0 {
+		t.Fatalf("zero balance=%v want explicit zero not absent", billProbed.Evidence[0].Balance)
+	}
+}
