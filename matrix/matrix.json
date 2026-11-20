@@ -1,5 +1,5 @@
 {
-  "schemaVersion": "p1.4",
+  "schemaVersion": "p1.5",
   "contractAbi": "capability-matrix/v1",
   "generatedFrom": "donmai/matrix (go generate ./matrix/...)",
   "cells": [
@@ -510,6 +510,77 @@
       "adapterVersion": "claude-code/headless/tool-lifecycle-v1",
       "mode": "autonomous",
       "emitsSubagentEvents": true
+    }
+  ],
+  "subscriptionProviders": [
+    {
+      "id": "openai-chatgpt",
+      "kind": "direct",
+      "loginKinds": [
+        "host-session"
+      ],
+      "plans": [
+        {
+          "slug": "plus",
+          "displayName": "Plus",
+          "allowance": {
+            "type": "percentage-window"
+          },
+          "models": [
+            {
+              "modelProvider": "openai",
+              "modelId": "gpt-6-sol"
+            }
+          ],
+          "harnesses": [
+            "codex"
+          ],
+          "billingModes": [
+            "allowance",
+            "credits",
+            "overage",
+            "api-metered"
+          ],
+          "lowCap": false,
+          "guardPercent": 0,
+          "warnAtPercent": [
+            80
+          ],
+          "allowCredits": false,
+          "allowOverage": false,
+          "allowApiBilledFallback": false
+        },
+        {
+          "slug": "team",
+          "displayName": "Team",
+          "allowance": {
+            "type": "percentage-window"
+          },
+          "models": [
+            {
+              "modelProvider": "openai",
+              "modelId": "gpt-6-sol"
+            }
+          ],
+          "harnesses": [
+            "codex"
+          ],
+          "billingModes": [
+            "allowance",
+            "credits",
+            "overage",
+            "api-metered"
+          ],
+          "lowCap": true,
+          "guardPercent": 50,
+          "warnAtPercent": [
+            80
+          ],
+          "allowCredits": false,
+          "allowOverage": false,
+          "allowApiBilledFallback": false
+        }
+      ]
     }
   ]
 }
