@@ -110,6 +110,11 @@ func (d *Daemon) applyOneMutation(m PendingMutation) error {
 	if m.Op == "pool.deleted" {
 		return d.applyPoolDeleted(m)
 	}
+	// observations.scan touches no yaml and runs probes for up to the scan
+	// timeout, so it too stays outside the config lock.
+	if m.Op == observationsScanOp {
+		return d.applyObservationsScan(m)
+	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.config == nil {

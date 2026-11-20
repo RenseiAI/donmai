@@ -50,6 +50,7 @@ var mutatingControlRoutes = []controlRoute{
 	{path: kitSourceRoutePrefix + "source-unknown/enable"},
 	{path: kitSourceRoutePrefix + "source-unknown/disable"},
 	{path: "/api/daemon/workareas/archive-unknown/restore"},
+	{path: "/api/daemon/observations/scan"},
 }
 
 // postControl issues a POST against the test server, attaching bearer when
