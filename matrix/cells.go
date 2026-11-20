@@ -46,7 +46,10 @@ import (
 // and the SUPPORT.md v2 section from the same in-memory rows). Values are
 // evidence-derived with missing proof as `unverified`; no runtime, route,
 // auth, or provider behavior changes.
-const SchemaVersion = "p1.4"
+//
+// p1.4 -> p1.5: additive `subscriptionProviders` catalog in
+// capability-matrix.json and matrix.json. Release metadata only.
+const SchemaVersion = "p1.5"
 
 // ContractABI pins the matrix-document contract version (distinct from the
 // per-manifest harness/v2 and model-endpoint/v1 ABIs).

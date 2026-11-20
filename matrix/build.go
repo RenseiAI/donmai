@@ -149,6 +149,10 @@ type CapabilityMatrix struct {
 	// SubagentQualification records executed fixtures for exact cells, adapter
 	// versions and delivery inputs. Manifest subagent claims are not evidence.
 	SubagentQualification []SubagentQualificationRow `json:"subagentQualification"`
+	// SubscriptionProviders is the subscription catalog (release metadata
+	// only, never a runtime permission) derived from
+	// subscriptionIssuerDeclarations.
+	SubscriptionProviders []SubscriptionProviderRow `json:"subscriptionProviders"`
 }
 
 // LegacyAlias is one (ProviderName → CellKey) row of the back-compat map,
@@ -184,6 +188,7 @@ type Built struct {
 	canonicalRealizations          []CapabilityRealizationEvidenceRow
 	canonicalCapabilities          []CapabilityEligibilityRow
 	canonicalSubagentQualification []SubagentQualificationRow
+	canonicalSubscriptionProviders []SubscriptionProviderRow
 }
 
 // Build harvests the manifests, validates every hand-authored cell against
@@ -218,6 +223,18 @@ func BuildWithSubagentFixtures(
 	ctx context.Context,
 	realizationSources []CapabilityRealizationEvidenceSource,
 	subagentSources []SubagentFixtureSource,
+) (*Built, error) {
+	return buildWithSubscriptionDeclarations(ctx, realizationSources, subagentSources, subscriptionIssuerDeclarations())
+}
+
+// buildWithSubscriptionDeclarations runs the Build pipeline with a
+// caller-supplied declaration set (production declarations by default;
+// fixture-local declarations in tests) through the production Render.
+func buildWithSubscriptionDeclarations(
+	ctx context.Context,
+	realizationSources []CapabilityRealizationEvidenceSource,
+	subagentSources []SubagentFixtureSource,
+	subscriptionDecls []subscriptionIssuerDeclaration,
 ) (*Built, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -273,8 +290,13 @@ func BuildWithSubagentFixtures(
 		harnesses[i].SupportV2 = projectHarnessSupportV2(harnesses[i], cells, capabilities, subagentQualification)
 	}
 
+	subscriptions, err := buildSubscriptionProviders(cells, subscriptionDecls)
+	if err != nil {
+		return nil, err
+	}
 	canonicalRealizations := cloneCapabilityRealizationEvidenceRows(realizations)
 	canonicalCapabilities := cloneCapabilityEligibilityRows(capabilities)
+	canonicalSubscriptions := cloneSubscriptionProviders(subscriptions)
 	m := CapabilityMatrix{
 		SchemaVersion: SchemaVersion,
 		ContractABI:   ContractABI,
@@ -294,6 +316,7 @@ func BuildWithSubagentFixtures(
 		Capabilities:          cloneCapabilityEligibilityRows(canonicalCapabilities),
 		ResumeQualification:   resumeQualification,
 		SubagentQualification: append([]SubagentQualificationRow{}, subagentQualification...),
+		SubscriptionProviders: cloneSubscriptionProviders(canonicalSubscriptions),
 	}
 
 	return &Built{
@@ -306,6 +329,7 @@ func BuildWithSubagentFixtures(
 		canonicalRealizations:          canonicalRealizations,
 		canonicalCapabilities:          canonicalCapabilities,
 		canonicalSubagentQualification: append([]SubagentQualificationRow{}, subagentQualification...),
+		canonicalSubscriptionProviders: canonicalSubscriptions,
 	}, nil
 }
 

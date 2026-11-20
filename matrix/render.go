@@ -56,6 +56,9 @@ func (b *Built) Render() (*Artifacts, error) {
 		!reflect.DeepEqual(b.Matrix.Capabilities, capabilities) {
 		return nil, fmt.Errorf("render matrix: capability realization mirrors do not match canonical evidence")
 	}
+	if !reflect.DeepEqual(b.Matrix.SubscriptionProviders, b.canonicalSubscriptionProviders) {
+		return nil, fmt.Errorf("render matrix: subscription catalog does not match canonical declaration")
+	}
 	canonicalMatrix := b.Matrix
 	canonicalMatrix.Realizations = cloneCapabilityRealizationEvidenceRows(b.canonicalRealizations)
 	canonicalMatrix.Capabilities = cloneCapabilityEligibilityRows(capabilities)
@@ -101,7 +104,8 @@ func (b *Built) Render() (*Artifacts, error) {
 		LegacyAliases         []LegacyAlias              `json:"legacyAliases"`
 		BinaryPins            []BinaryPinRow             `json:"binaryPins"`
 		SubagentQualification []SubagentQualificationRow `json:"subagentQualification"`
-	}{SchemaVersion, ContractABI, GeneratedFrom, b.Matrix.Cells, b.Matrix.Denylist, b.AliasMap, b.Matrix.BinaryPins, b.Matrix.SubagentQualification}
+		SubscriptionProviders []SubscriptionProviderRow  `json:"subscriptionProviders"`
+	}{SchemaVersion, ContractABI, GeneratedFrom, b.Matrix.Cells, b.Matrix.Denylist, b.AliasMap, b.Matrix.BinaryPins, b.Matrix.SubagentQualification, b.canonicalSubscriptionProviders}
 	matrixJSON, err := marshalJSON(matrixDoc)
 	if err != nil {
 		return nil, fmt.Errorf("marshal matrix: %w", err)
