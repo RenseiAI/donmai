@@ -908,3 +908,50 @@ func TruncateHeadlessFailureTail(s string) string {
 	}
 	return s
 }
+
+// HostObservations is the daemon's host-observation report plus one local
+// mark per item, as GET /api/daemon/observations and
+// POST /api/daemon/observations/scan return it.
+type HostObservations struct {
+	Report HostObservationReport `json:"report"`
+	Marks  []HostObservationMark `json:"marks"`
+}
+
+// HostObservationReport is the read side of the observation report.
+type HostObservationReport struct {
+	Version   int                   `json:"version"`
+	ScannedAt string                `json:"scannedAt"`
+	Full      bool                  `json:"full"`
+	Kinds     []string              `json:"kinds"`
+	Items     []HostObservationItem `json:"items"`
+}
+
+// HostObservationItem is one observed item; Attributes is the kind's
+// closed attribute object, decoded per kind.
+type HostObservationItem struct {
+	Kind       string               `json:"kind"`
+	ItemKey    string               `json:"itemKey"`
+	Slot       string               `json:"slot"`
+	Identity   string               `json:"identity"`
+	Definition string               `json:"definition,omitempty"`
+	Scopes     []string             `json:"scopes,omitempty"`
+	Readiness  ObservationReadiness `json:"readiness"`
+	Attributes json.RawMessage      `json:"attributes"`
+}
+
+// ObservationReadiness is an item's latest readiness check.
+type ObservationReadiness struct {
+	State     string   `json:"state"`
+	Reasons   []string `json:"reasons"`
+	CheckedAt string   `json:"checkedAt"`
+}
+
+// HostObservationMark is the host-local view of one item: New when it
+// was absent from the previous completed scan of its kind.
+type HostObservationMark struct {
+	Kind    string `json:"kind"`
+	ItemKey string `json:"itemKey"`
+	Slot    string `json:"slot"`
+	New     bool   `json:"new"`
+	Enabled bool   `json:"enabled"`
+}

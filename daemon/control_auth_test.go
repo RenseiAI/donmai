@@ -161,6 +161,7 @@ func TestControlAuth_ReadOnlyRoutesOpenWithoutToken(t *testing.T) {
 		{"/api/daemon/doctor", http.StatusOK},
 		{"/api/daemon/pool/stats", http.StatusOK},
 		{"/api/daemon/capabilities", http.StatusOK},
+		{"/api/daemon/observations", http.StatusOK},
 		{"/healthz", http.StatusOK},
 		{"/api/daemon/sessions", http.StatusOK},
 		{"/api/daemon/sessions/sess-read", http.StatusOK},

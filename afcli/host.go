@@ -62,6 +62,7 @@ func newHostCmdWithFactory(factory daemonClientFactory, ds func() afclient.DataS
 	cmd.AddCommand(newWorkareaCmd(ds))
 	cmd.AddCommand(newProjectCmd(cfg))
 	cmd.AddCommand(newHostWatchCmd())
+	cmd.AddCommand(newHostObservationsCmd(defaultHostObservationsClient))
 
 	return cmd
 }

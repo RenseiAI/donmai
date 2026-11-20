@@ -343,3 +343,12 @@ func TestHeartbeat_SendsTheScanReportWithItsAcknowledgementUntilAccepted(t *test
 		t.Fatalf("after acceptance: applied %v observations %+v, want neither", after.AppliedMutations, after.Observations)
 	}
 }
+
+func TestObservationsReadEndpointDoesNotScan(t *testing.T) {
+	d := scanDaemon(map[string]quotaProbeFunc{"codex": codexFeed("acct-a", false)})
+	rec := httptest.NewRecorder()
+	(&Server{daemon: d}).handleObservations(rec, httptest.NewRequest(http.MethodGet, "/api/daemon/observations", nil))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"items":[]`) || !d.observationScan.lastAt.IsZero() {
+		t.Fatalf("read = %d %s (scanned %v), want 200 with an empty full report and no scan", rec.Code, rec.Body, !d.observationScan.lastAt.IsZero())
+	}
+}
