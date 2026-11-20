@@ -34,7 +34,7 @@ func (d *Daemon) ObservationReport() *observation.Report {
 		return nil
 	}
 	slots := append([]quotaSlot{{accounts: d.quota.snapshot()}}, d.extraQuotaSlots()...)
-	report, err := subscriptionLoginReport(slots, time.Now())
+	report, err := subscriptionLoginReport(slots, time.Now(), false)
 	if err != nil {
 		slog.Warn("daemon: subscription-login observations omitted", "err", err)
 		return nil
@@ -47,12 +47,13 @@ func (d *Daemon) ObservationReport() *observation.Report {
 func (d *Daemon) extraQuotaSlots() []quotaSlot { return nil }
 
 // subscriptionLoginReport builds one item per (harness, slot). It returns
-// nil, nil when no slot holds quota state.
-func subscriptionLoginReport(slots []quotaSlot, now time.Time) (*observation.Report, error) {
+// nil, nil when no slot holds quota state. timedOut marks a scan whose
+// probes overran: every item then reports readiness unknown.
+func subscriptionLoginReport(slots []quotaSlot, now time.Time, timedOut bool) (*observation.Report, error) {
 	var items []observation.Item
 	for _, slot := range slots {
 		for _, account := range slot.accounts {
-			item, err := subscriptionLoginItem(slot.configHome, account, now)
+			item, err := subscriptionLoginItem(slot.configHome, account, now, timedOut)
 			if err != nil {
 				return nil, err
 			}
@@ -73,7 +74,7 @@ func subscriptionLoginReport(slots []quotaSlot, now time.Time) (*observation.Rep
 // item. A probed account id keys the item by account; otherwise, and for
 // muse, whose fixed id names a host session rather than an account, the
 // item is host-scoped. The raw id never leaves this function unhashed.
-func subscriptionLoginItem(configHome string, account agent.UsageAccount, now time.Time) (observation.Item, error) {
+func subscriptionLoginItem(configHome string, account agent.UsageAccount, now time.Time, timedOut bool) (observation.Item, error) {
 	harness := account.Provider
 	provider := subscriptionProviders[harness]
 	slot := observation.SlotFor(harness, configHome)
@@ -92,6 +93,11 @@ func subscriptionLoginItem(configHome string, account agent.UsageAccount, now ti
 		if !check.OK {
 			header.Readiness.State = observation.ReadinessUnavailable
 			header.Readiness.Reasons = []string{"login_refused"}
+		}
+	}
+	if timedOut {
+		header.Readiness = observation.Readiness{
+			State: observation.ReadinessUnknown, Reasons: []string{"scan_timeout"}, CheckedAt: now.UTC().Format(time.RFC3339),
 		}
 	}
 	plan := strings.ToLower(account.Plan)

@@ -580,6 +580,10 @@ type Daemon struct {
 	// stopped by Stop.
 	quotaPoller *quotaPoller
 
+	// observationScan bounds host-observation rescans and remembers the
+	// last two completed scans for the new marks.
+	observationScan observationScanner
+
 	// credentials is the single refresher every lane draws its worker identity
 	// from, constructed in Start once registration has produced one. A durable-
 	// session composition that lands after startup re-declares this daemon's

@@ -136,9 +136,19 @@ func (h Header) normalize() (Header, error) {
 // Item is one encoded observed item. Only Encode produces one; the zero
 // Item refuses to marshal.
 type Item struct {
-	kind string
-	raw  json.RawMessage
+	ref Ref
+	raw json.RawMessage
 }
+
+// Ref names one item: its kind, itemKey and slot.
+type Ref struct {
+	Kind    string `json:"kind"`
+	ItemKey string `json:"itemKey"`
+	Slot    string `json:"slot"`
+}
+
+// Ref returns the item's reference.
+func (i Item) Ref() Ref { return i.ref }
 
 // MarshalJSON emits the bytes Encode validated.
 func (i Item) MarshalJSON() ([]byte, error) {
@@ -176,7 +186,7 @@ func Encode(h Header, attrs Attributes) (Item, error) {
 	if err != nil {
 		return Item{}, fmt.Errorf("observation: encode %s item: %w", kind, err)
 	}
-	return Item{kind: kind, raw: raw}, nil
+	return Item{ref: Ref{Kind: kind, ItemKey: header.ItemKey, Slot: header.Slot}, raw: raw}, nil
 }
 
 // Report is one host-observation report. Full means the report is a
@@ -203,8 +213,8 @@ func NewReport(scannedAt time.Time, full bool, kinds []string, items []Item) (*R
 		covered[k] = true
 	}
 	for _, it := range items {
-		if len(it.raw) == 0 || !covered[it.kind] {
-			return nil, fmt.Errorf("observation: item of kind %q is not covered by the report", it.kind)
+		if len(it.raw) == 0 || !covered[it.ref.Kind] {
+			return nil, fmt.Errorf("observation: item of kind %q is not covered by the report", it.ref.Kind)
 		}
 	}
 	return &Report{

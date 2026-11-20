@@ -33,7 +33,7 @@ func quotaAccount(harness, id string, ok *bool, used ...float64) agent.UsageAcco
 // observedItems decodes a report's items into generic maps.
 func observedItems(t *testing.T, slots []quotaSlot) ([]map[string]any, string) {
 	t.Helper()
-	report, err := subscriptionLoginReport(slots, observationNow)
+	report, err := subscriptionLoginReport(slots, observationNow, false)
 	if err != nil {
 		t.Fatalf("subscriptionLoginReport: %v", err)
 	}
@@ -151,7 +151,7 @@ func TestSubscriptionLoginItemsFromRealClaudeWindows(t *testing.T) {
 }
 
 func TestSubscriptionLoginReportOmittedWithoutQuota(t *testing.T) {
-	if report, err := subscriptionLoginReport([]quotaSlot{{}}, observationNow); report != nil || err != nil {
+	if report, err := subscriptionLoginReport([]quotaSlot{{}}, observationNow, false); report != nil || err != nil {
 		t.Fatalf("report = %v, err = %v, want nil, nil", report, err)
 	}
 	if got := (&Daemon{}).ObservationReport(); got != nil {
