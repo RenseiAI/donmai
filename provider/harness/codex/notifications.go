@@ -115,7 +115,14 @@ func mapWarning(method string, params json.RawMessage, state *mapperState, raw a
 			state.model = p.To
 		}
 	case "turn/moderationMetadata":
-		subtype, message = "codex_moderation", "Codex turn moderation: "+string(p.Metadata)
+		// Routine metadata (nothing blocked) arrives every turn and carries
+		// no reader-facing signal; only a block is worth a notice, and never
+		// as the raw classifier JSON.
+		blocked := moderationBlocks(p.Metadata)
+		if len(blocked) == 0 {
+			return nil
+		}
+		subtype, message = "codex_moderation", "Codex moderation blocked: "+strings.Join(blocked, ", ")
 	case "model/safetyBuffering/updated":
 		subtype, message = "codex_safety_buffering", "Codex safety buffering for "+p.Model+": "+strings.Join(p.Reasons, ", ")
 	}

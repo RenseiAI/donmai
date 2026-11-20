@@ -85,7 +85,7 @@ func TestNotificationStreamWarningsAndProgress(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct{ method, params, subtype, content string }{
 		{"model/rerouted", `{"fromModel":"first","toModel":"second","reason":"safety"}`, "codex_model_rerouted", "second"},
-		{"turn/moderationMetadata", `{"metadata":{"review":true}}`, "codex_moderation", "review"},
+		{"turn/moderationMetadata", `{"metadata":{"prompt":{"cyber_security":{"outputs":[{"is_blocked":true}]}}}}`, "codex_moderation", "Codex moderation blocked: prompt/cyber_security"},
 		{"model/safetyBuffering/updated", `{"model":"first","reasons":["review"]}`, "codex_safety_buffering", "review"},
 		{"item/fileChange/outputDelta", `{"delta":"patch output"}`, "codex_progress", "patch output"},
 		{"item/fileChange/patchUpdated", `{"changes":[{"path":"file.go","diff":"+added"}]}`, "codex_progress", "+added"},
