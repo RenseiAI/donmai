@@ -227,11 +227,22 @@ func claudeSeatUser(scope, userID *string) string {
 	return *userID
 }
 
-// UsageResponseToLimits maps one usage read; explicit billing or account
-// evidence still projects when no percentage window is present.
+// UsageResponseToLimits maps one usage read onto the shared limits
+// snapshot. Percentages on the response are already 0–100. It also
+// yields the scoped-bucket names the response carried, for the event
+// mapper to reuse. An unavailable read reports the account as
+// unsupported: an account with no subscription windows never reports
+// them.
+//
+// Availability matches the pre-evidence mapper exactly: it depends
+// only on rate_limits_available and whether the windows payload parses.
+// Meter evidence rides on top without changing Unavailable, so a read
+// with windows but no display rows stays supported with empty windows
+// (as before) and a read with no windows payload stays unsupported
+// (as before).
 func UsageResponseToLimits(raw []byte, checkedAt string) (agent.UsageLimits, ScopedLimitNames) {
 	var resp UsageResponse
-	if err := json.Unmarshal(raw, &resp); err != nil || resp.Available == nil || !*resp.Available {
+	if err := json.Unmarshal(raw, &resp); err != nil || resp.Available == nil || !*resp.Available || len(resp.Windows) == 0 {
 		return agent.MakeUnavailableUsageLimits(checkedAt, agent.UsageUnavailableUnsupported, ""), ScopedLimitNames{}
 	}
 	var plan string
@@ -248,10 +259,8 @@ func UsageResponseToLimits(raw []byte, checkedAt string) (agent.UsageLimits, Sco
 	}
 	user := claudeSeatUser(resp.Scope, resp.UserID)
 	var windows map[string]json.RawMessage
-	if len(resp.Windows) > 0 {
-		if err := json.Unmarshal(resp.Windows, &windows); err != nil {
-			return agent.MakeUnavailableUsageLimits(checkedAt, agent.UsageUnavailableUnsupported, ""), ScopedLimitNames{}
-		}
+	if err := json.Unmarshal(resp.Windows, &windows); err != nil {
+		return agent.MakeUnavailableUsageLimits(checkedAt, agent.UsageUnavailableUnsupported, ""), ScopedLimitNames{}
 	}
 	if windows == nil {
 		windows = map[string]json.RawMessage{}
@@ -298,6 +307,19 @@ func UsageResponseToLimits(raw []byte, checkedAt string) (agent.UsageLimits, Sco
 				if names.OverageIncluded == "" {
 					names.OverageIncluded = e.DisplayName
 				}
+				var sunit agent.UsageObservedUnit
+				var sused float64
+				switch {
+				case e.UsedTokens != nil:
+					sunit, sused = agent.UsageUnitTokens, *e.UsedTokens
+				default:
+					sunit, sused = agent.UsageUnitPercent, *e.Utilization
+				}
+				var sresets *string
+				if iso := isoFromString(ptrOrEmpty(e.ResetsAt)); iso != "" {
+					sresets = &iso
+				}
+				evidence = append(evidence, agent.UsageMeterEvidence{Provider: "claude", Plan: plan, Allowance: "model_scoped", Window: scopedWindowID(e.DisplayName), Account: account, User: user, Unit: sunit, Used: sused, Limit: e.Limit, ResetsAt: sresets, Billing: billing, Balance: resp.CreditBalance})
 			}
 		}
 	}
@@ -307,7 +329,7 @@ func UsageResponseToLimits(raw []byte, checkedAt string) (agent.UsageLimits, Sco
 			limits.Evidence = []agent.UsageMeterEvidence{{Provider: "claude", Plan: plan, Account: account, User: user, Billing: billing, Balance: resp.CreditBalance}}
 			return limits, names
 		}
-		return agent.MakeUnavailableUsageLimits(checkedAt, agent.UsageUnavailableUnsupported, ""), ScopedLimitNames{}
+		return agent.MakeUsageLimits(checkedAt, out), names
 	}
 	limits := agent.MakeUsageLimits(checkedAt, out)
 	limits.Evidence = evidence

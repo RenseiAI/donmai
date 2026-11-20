@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -397,6 +398,50 @@ func TestProbeQuotaBillingModes(t *testing.T) {
 	}
 	if probed.ResetCredits == nil || probed.ResetCredits.AvailableCount != 2 {
 		t.Errorf("reset credits=%+v want count 2 riding along", probed.ResetCredits)
+	}
+}
+
+// TestProbeQuotaEvidenceGuards pins the two evidence fences at the
+// production entry point and mapper: a non-main allowance never yields
+// rows or evidence, and a non-finite token amount never yields an
+// evidence row.
+func TestProbeQuotaEvidenceGuards(t *testing.T) {
+	t.Parallel()
+	spark := map[string]any{"accountId": "acct-guards-1", "rateLimits": map[string]any{"limitId": "spark", "planType": "plus", "primary": map[string]any{"usedPercent": 90, "windowDurationMins": 300}, "secondary": map[string]any{"usedPercent": 90, "windowDurationMins": 10080}}}
+	p, _, cleanup := startQuotaProbeFake(t, spark, false)
+	t.Cleanup(cleanup)
+	_, _, probed := p.ProbeQuota(t.Context())
+	if len(probed.Windows) != 0 {
+		t.Errorf("spark windows=%+v want no rows (non-main allowance never counts)", probed.Windows)
+	}
+	if len(probed.Evidence) != 0 {
+		t.Errorf("spark evidence=%+v want none (LimitID guard keeps the main bucket only)", probed.Evidence)
+	}
+	nan := math.NaN()
+	inf := math.Inf(1)
+	for _, tc := range []struct {
+		name   string
+		tokens float64
+	}{
+		{name: "nan", tokens: nan},
+		{name: "inf", tokens: inf},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			toks := tc.tokens
+			got := RateLimitsToLimits(&RateLimitSnapshot{
+				LimitID:   strPtr("codex"),
+				PlanType:  strPtr("promax"),
+				Primary:   &RateLimitWindow{UsedPercent: 10, UsedTokens: &toks, WindowDurationMins: minsPtr(300)},
+				Secondary: &RateLimitWindow{UsedPercent: 20, WindowDurationMins: minsPtr(10080)},
+			}, nil, nil, rateLimitsTestCheckedAt)
+			if len(got.Windows) != 2 {
+				t.Fatalf("windows=%+v want both display rows (guard only drops evidence)", got.Windows)
+			}
+			if len(got.Evidence) != 1 || got.Evidence[0].Window != "secondary" {
+				t.Fatalf("evidence=%+v want only the secondary row (non-finite tokens skipped)", got.Evidence)
+			}
+		})
 	}
 }
 

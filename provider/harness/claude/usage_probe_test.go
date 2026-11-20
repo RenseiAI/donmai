@@ -409,3 +409,135 @@ func TestProbeUsageSeatScopeAndSerialization(t *testing.T) {
 		t.Fatal("wire carries evidence; want it excluded")
 	}
 }
+
+// TestProbeUsageAvailabilityMatchesBase pins the pre-evidence availability
+// decision at the production entry point: it depends only on
+// rate_limits_available and the windows payload, never on evidence or
+// metadata. Empty windows stay supported with no rows (as before) and
+// a missing windows payload stays unsupported (as before), so a later
+// streamed window is not dropped for a valid login.
+func TestProbeUsageAvailabilityMatchesBase(t *testing.T) {
+	t.Setenv("USER", "probe-operator")
+	for _, tc := range []struct {
+		name          string
+		body          string
+		wantSupported bool
+		wantWindows   int
+	}{
+		{
+			name:          "empty object no metadata",
+			body:          `{"rate_limits_available":true,"rate_limits":{}}`,
+			wantSupported: true,
+			wantWindows:   0,
+		},
+		{
+			name:          "empty object with subscription",
+			body:          `{"subscription_type":"pro","rate_limits_available":true,"rate_limits":{}}`,
+			wantSupported: true,
+			wantWindows:   0,
+		},
+		{
+			name:          "all null no metadata",
+			body:          `{"rate_limits_available":true,"rate_limits":{"five_hour":{"utilization":null},"seven_day":{"utilization":null}}}`,
+			wantSupported: true,
+			wantWindows:   0,
+		},
+		{
+			name:          "all null with account",
+			body:          `{"account_id":"ws-1","rate_limits_available":true,"rate_limits":{"five_hour":{"utilization":null},"seven_day":{"utilization":null}}}`,
+			wantSupported: true,
+			wantWindows:   0,
+		},
+		{
+			name:          "omitted no metadata",
+			body:          `{"rate_limits_available":true}`,
+			wantSupported: false,
+		},
+		{
+			name:          "omitted with subscription",
+			body:          `{"subscription_type":"pro","rate_limits_available":true}`,
+			wantSupported: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, probed, _ := ProbeUsage(t.Context(), fakeUsageCLIWithBody(t, tc.body))
+			if tc.wantSupported && probed.Unavailable != nil {
+				t.Fatalf("probed=%+v want supported empty windows", probed.Unavailable)
+			}
+			if !tc.wantSupported && (probed.Unavailable == nil || probed.Unavailable.Reason != agent.UsageUnavailableUnsupported) {
+				t.Fatalf("probed=%+v want unsupported", probed)
+			}
+			if tc.wantSupported && len(probed.Windows) != tc.wantWindows {
+				t.Fatalf("windows=%+v want %d rows", probed.Windows, tc.wantWindows)
+			}
+			if tc.wantSupported {
+				update := RateLimitEventToUpdate(&RateLimitInfo{Status: "allowed", RateLimitType: "seven_day", Utilization: float64Ptr(0.5)}, ScopedLimitNames{}, probed.CheckedAt)
+				merged := agent.ApplyUsageLimitsUpdate(&probed, *update, probed.CheckedAt)
+				if len(merged.Windows) != 1 {
+					t.Fatalf("streamed windows=%+v want 1 (update must not be dropped)", merged.Windows)
+				}
+				if check := agent.UsageAuthCheckAfterProbe(agent.UsageHarnessClaude, &probed, mustTime(t, probed.CheckedAt)); check == nil || !check.OK {
+					t.Fatalf("auth=%+v want ok:true for a valid login", check)
+				}
+			} else {
+				update := RateLimitEventToUpdate(&RateLimitInfo{Status: "allowed", RateLimitType: "seven_day", Utilization: float64Ptr(0.5)}, ScopedLimitNames{}, probed.CheckedAt)
+				merged := agent.ApplyUsageLimitsUpdate(&probed, *update, probed.CheckedAt)
+				if merged != &probed && len(merged.Windows) != 0 {
+					t.Fatalf("streamed windows=%+v want dropped on unsupported snapshot", merged.Windows)
+				}
+				if check := agent.UsageAuthCheckAfterProbe(agent.UsageHarnessClaude, &probed, mustTime(t, probed.CheckedAt)); check == nil || check.OK {
+					t.Fatalf("auth=%+v want ok:false for an unsupported account", check)
+				}
+			}
+		})
+	}
+}
+
+func mustTime(t *testing.T, iso string) (out time.Time) {
+	t.Helper()
+	var err error
+	for _, layout := range []string{time.RFC3339Nano, time.RFC3339} {
+		if out, err = time.Parse(layout, iso); err == nil {
+			return out
+		}
+	}
+	t.Fatalf("bad checkedAt %q", iso)
+	return out
+}
+
+// TestProbeUsageScopedEvidence pins the model-scoped allowance at the
+// production entry point: the recorded Fable row draws a display row and
+// a matching evidence row, so a future evidence consumer does not
+// under-report scoped allowances.
+func TestProbeUsageScopedEvidence(t *testing.T) {
+	t.Setenv("USER", "probe-operator")
+	body := `{"subscription_type":"max","account_id":"ws-shared-1","rate_limits_available":true,"rate_limits":{"five_hour":{"utilization":54,"resets_at":"2026-07-18T14:39:00Z"},"seven_day":{"utilization":18.4,"resets_at":"2026-07-24T08:59:00+00:00"},"model_scoped":[{"display_name":"Fable","utilization":73,"resets_at":"2026-07-24T08:59:00Z"},{"display_name":"Ghost","utilization":null}]}}`
+	_, probed, names := ProbeUsage(t.Context(), fakeUsageCLIWithBody(t, body))
+	if probed.Unavailable != nil {
+		t.Fatalf("probed=%+v want windows", probed.Unavailable)
+	}
+	if names.OverageIncluded != "Fable" {
+		t.Fatalf("scoped names=%+v want Fable", names)
+	}
+	foundDisplay := false
+	for _, w := range probed.Windows {
+		if w.ID == "seven_day_fable" && w.UsedPercent == 73 {
+			foundDisplay = true
+		}
+	}
+	if !foundDisplay {
+		t.Fatalf("windows=%+v want the seven_day_fable display row at 73", probed.Windows)
+	}
+	var scoped *agent.UsageMeterEvidence
+	for i := range probed.Evidence {
+		if probed.Evidence[i].Window == "seven_day_fable" {
+			scoped = &probed.Evidence[i]
+		}
+	}
+	if scoped == nil {
+		t.Fatalf("evidence=%+v want a model_scoped row for Fable", probed.Evidence)
+	}
+	if scoped.Provider != "claude" || scoped.Allowance != "model_scoped" || scoped.Unit != agent.UsageUnitPercent || scoped.Used != 73 || scoped.Account != "ws-shared-1" || scoped.ResetsAt == nil {
+		t.Errorf("scoped=%+v want claude/model_scoped percent 73 with account and reset", *scoped)
+	}
+}
