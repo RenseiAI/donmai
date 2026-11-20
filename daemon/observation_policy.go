@@ -103,6 +103,17 @@ func (d *Daemon) applyObservationsPolicy(registration string, m PendingMutation)
 	if err != nil {
 		return fmt.Errorf("%s: %w", observationsPolicyOp, err)
 	}
+	// The push is enforced even when it cannot be persisted; the failed
+	// ack makes the control plane push again.
+	persistErr := d.persistObservationPolicy(registration, m.Params)
+	d.setObservationPolicy(registration, items)
+	if persistErr != nil {
+		return fmt.Errorf("%s: %w", observationsPolicyOp, persistErr)
+	}
+	return nil
+}
+
+func (d *Daemon) setObservationPolicy(registration string, items map[observationSlotKey]observationPolicyItem) {
 	p := &d.observationPolicies
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -110,7 +121,6 @@ func (d *Daemon) applyObservationsPolicy(registration string, m PendingMutation)
 		p.byRegistration = map[string]map[observationSlotKey]observationPolicyItem{}
 	}
 	p.byRegistration[registration] = items
-	return nil
 }
 
 // effectiveObservationPolicy returns registration's policy for key after
