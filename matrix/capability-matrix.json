@@ -1,5 +1,5 @@
 {
-  "schemaVersion": "p1.4",
+  "schemaVersion": "p1.5",
   "contractAbi": "capability-matrix/v1",
   "generatedFrom": "donmai/matrix (go generate ./matrix/...)",
   "harnesses": [
@@ -2576,6 +2576,71 @@
       "adapterVersion": "claude-code/headless/tool-lifecycle-v1",
       "mode": "autonomous",
       "emitsSubagentEvents": true
+    }
+  ],
+  "subscriptionProviders": [
+    {
+      "id": "openai",
+      "kind": "direct",
+      "loginKinds": [
+        "chatgpt"
+      ],
+      "plans": [
+        {
+          "slug": "team",
+          "displayName": "Team",
+          "allowanceShape": "rolling",
+          "lowCap": true,
+          "defaults": {
+            "guardPercent": 50,
+            "warnAtPercent": [
+              80
+            ],
+            "allowCredits": false,
+            "allowOverage": false,
+            "allowApiBilledFallback": false
+          },
+          "reachableModels": [
+            {
+              "modelProvider": "openai",
+              "modelId": "gpt-6-sol"
+            }
+          ],
+          "compatibleHarnesses": [
+            "codex"
+          ],
+          "billingModes": [
+            "allowance"
+          ]
+        },
+        {
+          "slug": "plus",
+          "displayName": "Plus",
+          "allowanceShape": "rolling",
+          "lowCap": false,
+          "defaults": {
+            "guardPercent": 0,
+            "warnAtPercent": [
+              80
+            ],
+            "allowCredits": false,
+            "allowOverage": false,
+            "allowApiBilledFallback": false
+          },
+          "reachableModels": [
+            {
+              "modelProvider": "openai",
+              "modelId": "gpt-6-sol"
+            }
+          ],
+          "compatibleHarnesses": [
+            "codex"
+          ],
+          "billingModes": [
+            "allowance"
+          ]
+        }
+      ]
     }
   ]
 }
