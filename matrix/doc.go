@@ -18,7 +18,6 @@
 //	harnesses.json           — the harness rows
 //	endpoints.json           — the model-endpoint rows
 //	matrix.json              — cells + denylist + legacy aliases
-//	subscription-providers.json — the subscriptionProviders catalog
 //	registry_gen.go          — the legacy ProviderName → cell alias map (Go)
 //
 // These are committed artifacts gated by the CI parity test (parity_test.go),

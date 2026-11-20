@@ -6,90 +6,69 @@ import (
 	"regexp"
 	"slices"
 	"sort"
+	"strings"
 
 	"github.com/RenseiAI/donmai/agent"
 )
 
-// SubscriptionProvidersContractABI pins the catalog contract a deployment
-// vendors (subscription-providers.json) and parses exactly.
-const SubscriptionProvidersContractABI = "subscription-providers/v1"
-
-// SubscriptionProviderCatalog lists the companies or gateways that issue and
-// bill a login. It describes and supplies defaults; it never grants. A
-// deployment may add rows, set defaults and narrow harnesses, never widen them.
-type SubscriptionProviderCatalog struct {
-	ContractABI string                 `json:"contractAbi"`
-	Providers   []SubscriptionProvider `json:"providers"`
-}
-
-// SubscriptionProvider is one catalog row.
-type SubscriptionProvider struct {
-	ID          string   `json:"id"`
-	Kind        string   `json:"kind"`
-	DisplayName string   `json:"displayName"`
-	LoginKinds  []string `json:"loginKinds"`
-	// Harnesses is the compatibility CEILING (matrix harness ids).
-	Harnesses []agent.HarnessName `json:"harnesses"`
-	// BillingModes is what happens past the included allowance, in order.
-	BillingModes []string                    `json:"billingModes"`
-	Models       []SubscriptionProviderModel `json:"models"`
-	Plans        []SubscriptionPlan          `json:"plans"`
-}
-
-// SubscriptionProviderModel is a matrix endpoint company the provider reaches.
-type SubscriptionProviderModel struct {
-	Endpoint agent.Company `json:"endpoint"`
-	ModelIDs []string      `json:"modelIds,omitempty"`
+// SubscriptionIssuer is one subscriptionProviders row: a company or gateway
+// that issues and bills a login. It describes and supplies defaults, never
+// grants; a deployment may add rows and narrow harnesses, never widen them.
+type SubscriptionIssuer struct {
+	ID          string             `json:"id"`
+	Kind        string             `json:"kind"`
+	DisplayName string             `json:"displayName"`
+	LoginKinds  []string           `json:"loginKinds"`
+	Plans       []SubscriptionPlan `json:"plans"`
 }
 
 // SubscriptionPlan is matched by the slug the scanner reports; an unmatched
 // plan is uncatalogued and takes the kind's built-in defaults.
 type SubscriptionPlan struct {
-	Slug           string         `json:"slug"`
-	DisplayName    string         `json:"displayName"`
-	LowCap         bool           `json:"lowCap"`
-	AllowanceUnits []string       `json:"allowanceUnits"`
-	Defaults       map[string]any `json:"defaults"`
+	Slug            string           `json:"slug"`
+	DisplayName     string           `json:"displayName"`
+	AllowanceShape  string           `json:"allowanceShape"`
+	LowCap          bool             `json:"lowCap"`
+	ReachableModels []ReachableModel `json:"reachableModels"`
+	// CompatibleHarnesses is the compatibility CEILING (matrix harness ids).
+	CompatibleHarnesses []agent.HarnessName `json:"compatibleHarnesses"`
+	BillingModes        []string            `json:"billingModes"`
+	Defaults            map[string]any      `json:"defaults"`
 }
 
-// guard50 is the low-cap default (keep half of each window unused).
-func guard50() map[string]any { return map[string]any{"guardPercent": 50} }
+// ReachableModel is a (matrix endpoint company, model id) pair a plan reaches.
+type ReachableModel struct {
+	ModelProvider agent.Company `json:"modelProvider"`
+	ModelID       string        `json:"modelId"`
+}
 
-// subscriptionProviders lists providers a matrix harness signs in with (a
+// issuerSpec is the hand-authored input; plans share its harnesses, billing
+// modes and endpoints. Model ids come from the matrix; monthly marks plans the
+// codex adapter reads as one monthly window.
+type issuerSpec struct {
+	id, kind, name         string
+	harnesses              []agent.HarnessName
+	billingModes           []string
+	endpoints              []agent.Company
+	plans, lowCap, monthly []string
+}
+
+// subscriptionIssuers lists issuers a matrix harness signs in with (a
 // host-session cell); gateways join once the matrix realizes them.
-var subscriptionProviders = []SubscriptionProvider{
+var subscriptionIssuers = []issuerSpec{
 	{
-		ID: "openai-chatgpt", Kind: "direct", DisplayName: "ChatGPT",
-		LoginKinds:   []string{"subscription-login"},
-		Harnesses:    []agent.HarnessName{agent.HarnessCodex},
-		BillingModes: []string{"allowance", "credits"},
-		Models:       []SubscriptionProviderModel{{Endpoint: agent.CompanyOpenAI}},
+		id: "openai-chatgpt", kind: "direct", name: "ChatGPT",
+		harnesses: []agent.HarnessName{agent.HarnessCodex}, billingModes: []string{"allowance", "credits"}, endpoints: []agent.Company{agent.CompanyOpenAI},
 		// Slugs are the planType values the codex rate-limit read reports.
-		Plans: []SubscriptionPlan{
-			{Slug: "free", DisplayName: "Free", LowCap: true, AllowanceUnits: []string{"percent"}, Defaults: guard50()},
-			{Slug: "go", DisplayName: "Go", LowCap: true, AllowanceUnits: []string{"percent"}, Defaults: guard50()},
-			{Slug: "plus", DisplayName: "Plus", LowCap: true, AllowanceUnits: []string{"percent"}, Defaults: guard50()},
-			{Slug: "pro", DisplayName: "Pro", AllowanceUnits: []string{"percent"}},
-			{Slug: "team", DisplayName: "Team", LowCap: true, AllowanceUnits: []string{"percent"}, Defaults: guard50()},
-			{Slug: "business", DisplayName: "Business", LowCap: true, AllowanceUnits: []string{"percent"}, Defaults: guard50()},
-			{Slug: "enterprise", DisplayName: "Enterprise", AllowanceUnits: []string{"percent"}},
-			{Slug: "edu", DisplayName: "Edu", AllowanceUnits: []string{"percent"}},
-		},
+		plans:  []string{"free", "go", "plus", "pro", "team", "business", "enterprise", "edu"},
+		lowCap: []string{"free", "go", "plus", "team", "business"}, monthly: []string{"free", "go"},
 	},
 	{
-		ID: "anthropic-claude", Kind: "direct", DisplayName: "Claude",
-		LoginKinds:   []string{"subscription-login"},
-		Harnesses:    []agent.HarnessName{agent.HarnessClaudeCode},
-		BillingModes: []string{"allowance", "overage", "api-metered"},
-		Models:       []SubscriptionProviderModel{{Endpoint: agent.CompanyAnthropic}},
+		id: "anthropic-claude", kind: "direct", name: "Claude",
+		harnesses: []agent.HarnessName{agent.HarnessClaudeCode}, billingModes: []string{"allowance", "overage", "api-metered"}, endpoints: []agent.Company{agent.CompanyAnthropic},
 		// No scanner reports a Claude plan yet. Matching is by reported slug,
 		// so these rows apply once one does; any other slug is uncatalogued.
-		Plans: []SubscriptionPlan{
-			{Slug: "pro", DisplayName: "Pro", LowCap: true, AllowanceUnits: []string{"percent"}, Defaults: guard50()},
-			{Slug: "max", DisplayName: "Max", AllowanceUnits: []string{"percent"}},
-			{Slug: "team", DisplayName: "Team", AllowanceUnits: []string{"percent"}},
-			{Slug: "enterprise", DisplayName: "Enterprise", AllowanceUnits: []string{"percent"}},
-		},
+		plans: []string{"pro", "max", "team", "enterprise"}, lowCap: []string{"pro"},
 	},
 }
 
@@ -98,126 +77,158 @@ var (
 	providerKinds       = []string{"direct", "gateway"}
 	providerLoginKinds  = []string{"subscription-login"}
 	providerBillingMode = []string{"allowance", "credits", "overage", "api-metered"}
-	planAllowanceUnits  = []string{"percent", "tokens"}
+	planDefaultFields   = []string{"allowApiBilledFallback", "allowCredits", "allowOverage", "guardPercent", "warnAtPercent"}
 )
 
-// buildSubscriptionProviders validates the declared catalog against the
-// matrix and returns it sorted by provider id, plans in declared order.
-func buildSubscriptionProviders(declared []SubscriptionProvider, harnessByName map[agent.HarnessName]HarnessRow, cells []HarnessEndpointCell, endpoints []EndpointRow) (SubscriptionProviderCatalog, error) {
+// buildSubscriptionProviders expands the specs into per-plan rows, derives
+// model ids from the matrix, validates, and sorts by issuer id.
+func buildSubscriptionProviders(specs []issuerSpec, harnessByName map[agent.HarnessName]HarnessRow, cells []HarnessEndpointCell, endpoints []EndpointRow) ([]SubscriptionIssuer, error) {
 	endpointByCompany := map[agent.Company]EndpointRow{}
 	for _, e := range endpoints {
 		endpointByCompany[e.Company] = e
 	}
-	seen := map[string]bool{}
-	out := make([]SubscriptionProvider, 0, len(declared))
-	for _, p := range declared {
-		if seen[p.ID] {
-			return SubscriptionProviderCatalog{}, fmt.Errorf("subscription provider %q: duplicate id", p.ID)
+	out := make([]SubscriptionIssuer, 0, len(specs))
+	for _, s := range specs {
+		models, err := deriveReachableModels(s.endpoints, s.harnesses, cells, endpointByCompany)
+		if err != nil {
+			return nil, fmt.Errorf("subscription provider %q: %w", s.id, err)
 		}
-		seen[p.ID] = true
-		if err := validateSubscriptionProvider(p, harnessByName, cells, endpointByCompany); err != nil {
-			return SubscriptionProviderCatalog{}, fmt.Errorf("subscription provider %q: %w", p.ID, err)
+		issuer := SubscriptionIssuer{ID: s.id, Kind: s.kind, DisplayName: s.name, LoginKinds: []string{"subscription-login"}, Plans: []SubscriptionPlan{}}
+		for _, slug := range s.plans {
+			lowCap := slices.Contains(s.lowCap, slug)
+			shape := map[bool]string{false: "percent windows", true: "monthly percent"}[slices.Contains(s.monthly, slug)]
+			guard := map[bool]int{true: 50}[lowCap] // low-cap: keep half of each window unused
+			issuer.Plans = append(issuer.Plans, SubscriptionPlan{
+				Slug: slug, DisplayName: strings.ToUpper(slug[:1]) + slug[1:], AllowanceShape: shape, LowCap: lowCap,
+				ReachableModels: slices.Clone(models), CompatibleHarnesses: slices.Clone(s.harnesses), BillingModes: slices.Clone(s.billingModes),
+				Defaults: map[string]any{"guardPercent": guard, "warnAtPercent": []int{80}, "allowCredits": false, "allowOverage": false, "allowApiBilledFallback": false},
+			})
 		}
-		out = append(out, cloneSubscriptionProvider(p))
+		out = append(out, issuer)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
-	return SubscriptionProviderCatalog{ContractABI: SubscriptionProvidersContractABI, Providers: out}, nil
+	return out, validateSubscriptionProviders(out, harnessByName, cells, endpointByCompany)
 }
 
-func validateSubscriptionProvider(p SubscriptionProvider, harnessByName map[agent.HarnessName]HarnessRow, cells []HarnessEndpointCell, endpointByCompany map[agent.Company]EndpointRow) error {
+// deriveReachableModels takes each endpoint's models served on the harnesses'
+// host-session hosts, else all its declared ids; it never invents ids.
+func deriveReachableModels(endpoints []agent.Company, harnesses []agent.HarnessName, cells []HarnessEndpointCell, endpointByCompany map[agent.Company]EndpointRow) ([]ReachableModel, error) {
+	var out []ReachableModel
+	for _, e := range endpoints {
+		var hosts []agent.ServingHost
+		for _, c := range cells {
+			if c.Endpoint == e && slices.Contains(harnesses, c.Harness) && slices.Contains(c.AuthModes, agent.AuthHostSession) {
+				hosts = append(hosts, c.Host)
+			}
+		}
+		var served, all []ReachableModel
+		for _, m := range endpointByCompany[e].Models {
+			all = append(all, ReachableModel{ModelProvider: e, ModelID: m.ID})
+			if slices.ContainsFunc(m.Hosts, func(h agent.ServingHost) bool { return slices.Contains(hosts, h) }) {
+				served = append(served, ReachableModel{ModelProvider: e, ModelID: m.ID})
+			}
+		}
+		if len(served) == 0 {
+			served = all
+		}
+		if len(served) == 0 {
+			return nil, fmt.Errorf("endpoint %q declares no model ids to reach", e)
+		}
+		out = append(out, served...)
+	}
+	return out, nil
+}
+
+func validateSubscriptionProviders(issuers []SubscriptionIssuer, harnessByName map[agent.HarnessName]HarnessRow, cells []HarnessEndpointCell, endpointByCompany map[agent.Company]EndpointRow) error {
+	for i, p := range issuers {
+		err := validateSubscriptionIssuer(p, harnessByName, cells, endpointByCompany)
+		if slices.ContainsFunc(issuers[:i], func(o SubscriptionIssuer) bool { return o.ID == p.ID }) {
+			err = fmt.Errorf("duplicate id")
+		}
+		if err != nil {
+			return fmt.Errorf("subscription provider %q: %w", p.ID, err)
+		}
+	}
+	return nil
+}
+
+func validateSubscriptionIssuer(p SubscriptionIssuer, harnessByName map[agent.HarnessName]HarnessRow, cells []HarnessEndpointCell, endpointByCompany map[agent.Company]EndpointRow) error {
 	if !catalogSlugPattern.MatchString(p.ID) {
 		return fmt.Errorf("id must match %s", catalogSlugPattern)
 	}
-	if !slices.Contains(providerKinds, p.Kind) {
-		return fmt.Errorf("kind %q not in %v", p.Kind, providerKinds)
+	if err := checkVocab("kind", []string{p.Kind}, providerKinds); err != nil {
+		return err
 	}
-	if p.DisplayName == "" {
-		return fmt.Errorf("displayName is empty")
+	if p.DisplayName == "" || len(p.Plans) == 0 {
+		return fmt.Errorf("displayName and at least one plan are required")
 	}
 	if err := checkVocab("loginKinds", p.LoginKinds, providerLoginKinds); err != nil {
 		return err
 	}
-	if err := checkVocab("billingModes", p.BillingModes, providerBillingMode); err != nil {
-		return err
-	}
-	if p.BillingModes[0] != "allowance" {
-		return fmt.Errorf("billingModes must start with %q", "allowance")
-	}
-	var reached []agent.Company
-	for _, m := range p.Models {
-		reached = append(reached, m.Endpoint)
-	}
-	if err := checkVocab("models endpoint", reached, slices.Sorted(maps.Keys(endpointByCompany))); err != nil {
-		return fmt.Errorf("%w: endpoints must be matrix endpoint companies", err)
-	}
-	for _, m := range p.Models {
-		for _, id := range m.ModelIDs {
-			if !slices.ContainsFunc(endpointByCompany[m.Endpoint].Models, func(d agent.ModelDesc) bool { return d.ID == id }) {
-				return fmt.Errorf("model id %q is not declared by endpoint %q", id, m.Endpoint)
-			}
+	for i, plan := range p.Plans {
+		if !catalogSlugPattern.MatchString(plan.Slug) || slices.ContainsFunc(p.Plans[:i], func(o SubscriptionPlan) bool { return o.Slug == plan.Slug }) {
+			return fmt.Errorf("plan slug %q must be unique and match %s", plan.Slug, catalogSlugPattern)
 		}
-	}
-	if err := checkVocab("harnesses", p.Harnesses, slices.Sorted(maps.Keys(harnessByName))); err != nil {
-		return fmt.Errorf("%w: harnesses must be matrix harness ids", err)
-	}
-	for _, h := range p.Harnesses { // two-axis validity: a host-session cell on a reached endpoint
-		if !slices.ContainsFunc(cells, func(c HarnessEndpointCell) bool {
-			return c.Harness == h && slices.Contains(reached, c.Endpoint) && slices.Contains(c.AuthModes, agent.AuthHostSession)
-		}) {
-			return fmt.Errorf("harness %q has no host-session cell on the provider's endpoints", h)
-		}
-	}
-	slugs := map[string]bool{}
-	for _, plan := range p.Plans {
-		if !catalogSlugPattern.MatchString(plan.Slug) {
-			return fmt.Errorf("plan slug %q must match %s", plan.Slug, catalogSlugPattern)
-		}
-		if slugs[plan.Slug] {
-			return fmt.Errorf("plan slug %q listed twice", plan.Slug)
-		}
-		slugs[plan.Slug] = true
-		if err := validateSubscriptionPlan(plan); err != nil {
+		if err := validateSubscriptionPlan(plan, harnessByName, cells, endpointByCompany); err != nil {
 			return fmt.Errorf("plan %q: %w", plan.Slug, err)
 		}
 	}
 	return nil
 }
 
-func validateSubscriptionPlan(plan SubscriptionPlan) error {
-	if plan.DisplayName == "" {
-		return fmt.Errorf("displayName is empty")
+func validateSubscriptionPlan(plan SubscriptionPlan, harnessByName map[agent.HarnessName]HarnessRow, cells []HarnessEndpointCell, endpointByCompany map[agent.Company]EndpointRow) error {
+	if plan.DisplayName == "" || plan.AllowanceShape == "" || len(plan.ReachableModels) == 0 {
+		return fmt.Errorf("displayName, allowanceShape and reachableModels are required")
 	}
-	if err := checkVocab("allowanceUnits", plan.AllowanceUnits, planAllowanceUnits); err != nil {
+	if err := checkVocab("billingModes", plan.BillingModes, providerBillingMode); err != nil {
 		return err
 	}
-	for key, value := range plan.Defaults {
-		switch key {
-		case "guardPercent":
-			if v, ok := value.(int); !ok || v < 0 || v > 100 {
-				return fmt.Errorf("default guardPercent must be an integer 0-100, got %v", value)
-			}
-		case "allowCredits", "allowOverage", "allowApiBilledFallback":
-			if _, ok := value.(bool); !ok {
-				return fmt.Errorf("default %s must be a boolean, got %v", key, value)
-			}
-		case "warnAtPercent":
-			list, ok := value.([]int)
-			if !ok {
-				return fmt.Errorf("default warnAtPercent must be a list of integers, got %v", value)
-			}
-			for _, v := range list {
-				if v < 0 || v > 100 {
-					return fmt.Errorf("default warnAtPercent entry %d outside 0-100", v)
-				}
-			}
-		case "enabled":
-			return fmt.Errorf("enabled is never a default: enablement is set explicitly per login")
-		default:
-			return fmt.Errorf("default %q is not a subscription-login policy field", key)
+	if plan.BillingModes[0] != "allowance" {
+		return fmt.Errorf("billingModes must start with %q", "allowance")
+	}
+	for i, m := range plan.ReachableModels {
+		if !slices.ContainsFunc(endpointByCompany[m.ModelProvider].Models, func(d agent.ModelDesc) bool { return d.ID == m.ModelID }) {
+			return fmt.Errorf("model %q is not declared by matrix endpoint %q", m.ModelID, m.ModelProvider)
+		}
+		if slices.Contains(plan.ReachableModels[:i], m) {
+			return fmt.Errorf("reachable model %v listed twice", m)
 		}
 	}
-	if _, ok := plan.Defaults["guardPercent"]; plan.LowCap && !ok {
-		return fmt.Errorf("lowCap plan must set a guardPercent default")
+	if err := checkVocab("compatibleHarnesses", plan.CompatibleHarnesses, slices.Sorted(maps.Keys(harnessByName))); err != nil {
+		return fmt.Errorf("%w: harnesses must be matrix harness ids", err)
+	}
+	for _, h := range plan.CompatibleHarnesses { // two-axis validity: a host-session cell on a reached endpoint
+		if !slices.ContainsFunc(cells, func(c HarnessEndpointCell) bool {
+			return c.Harness == h && slices.Contains(c.AuthModes, agent.AuthHostSession) &&
+				slices.ContainsFunc(plan.ReachableModels, func(m ReachableModel) bool { return m.ModelProvider == c.Endpoint })
+		}) {
+			return fmt.Errorf("harness %q has no host-session cell on the plan's endpoints", h)
+		}
+	}
+	return validatePlanDefaults(plan)
+}
+
+// validatePlanDefaults requires exactly the five subscription-login policy
+// fields, typed and in range; enablement is never a default.
+func validatePlanDefaults(plan SubscriptionPlan) error {
+	if _, ok := plan.Defaults["enabled"]; ok {
+		return fmt.Errorf("enabled is never a default: enablement is set explicitly per login")
+	}
+	if keys := slices.Sorted(maps.Keys(plan.Defaults)); !slices.Equal(keys, planDefaultFields) {
+		return fmt.Errorf("defaults must set exactly %v, got %v", planDefaultFields, keys)
+	}
+	guard, okGuard := plan.Defaults["guardPercent"].(int)
+	warn, okWarn := plan.Defaults["warnAtPercent"].([]int)
+	if outOfRange := func(v int) bool { return v < 0 || v > 100 }; !okGuard || !okWarn || outOfRange(guard) || slices.ContainsFunc(warn, outOfRange) {
+		return fmt.Errorf("guardPercent and warnAtPercent entries must be integers 0-100")
+	}
+	for _, key := range planDefaultFields[:3] {
+		if _, ok := plan.Defaults[key].(bool); !ok {
+			return fmt.Errorf("default %s must be a boolean", key)
+		}
+	}
+	if plan.LowCap && guard == 0 {
+		return fmt.Errorf("lowCap plan needs a guardPercent above 0")
 	}
 	return nil
 }
@@ -228,7 +239,7 @@ func checkVocab[T ~string](field string, values, vocab []T) error {
 		return fmt.Errorf("%s is empty", field)
 	}
 	for i, v := range values {
-		if !slices.Contains(vocab, v) {
+		if v == "" || !slices.Contains(vocab, v) {
 			return fmt.Errorf("%s value %q not in %v", field, v, vocab)
 		}
 		if slices.Contains(values[:i], v) {
@@ -236,21 +247,4 @@ func checkVocab[T ~string](field string, values, vocab []T) error {
 		}
 	}
 	return nil
-}
-
-// cloneSubscriptionProvider copies a row so the built catalog cannot mutate
-// the declared data, rendering absent defaults as {} rather than null.
-func cloneSubscriptionProvider(p SubscriptionProvider) SubscriptionProvider {
-	p.LoginKinds, p.Harnesses, p.BillingModes = slices.Clone(p.LoginKinds), slices.Clone(p.Harnesses), slices.Clone(p.BillingModes)
-	p.Models, p.Plans = slices.Clone(p.Models), append([]SubscriptionPlan{}, p.Plans...)
-	for i := range p.Models {
-		p.Models[i].ModelIDs = slices.Clone(p.Models[i].ModelIDs)
-	}
-	for i := range p.Plans {
-		p.Plans[i].AllowanceUnits = slices.Clone(p.Plans[i].AllowanceUnits)
-		if p.Plans[i].Defaults = maps.Clone(p.Plans[i].Defaults); p.Plans[i].Defaults == nil {
-			p.Plans[i].Defaults = map[string]any{}
-		}
-	}
-	return p
 }

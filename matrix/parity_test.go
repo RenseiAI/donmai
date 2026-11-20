@@ -43,7 +43,7 @@ func buildArtifacts(t *testing.T) *Artifacts {
 // byte-identical to the committed artifacts. If this fails, run `make generate`.
 func TestParity_ByteIdenticalToFreshGenerate(t *testing.T) {
 	arts := buildArtifacts(t)
-	for _, name := range []string{FileCapabilityMatrix, FileHarnesses, FileEndpoints, FileMatrix, FileRegistryGen, FileCapabilityRealizations, FileSupport, FileSubscriptionProviders} {
+	for _, name := range []string{FileCapabilityMatrix, FileHarnesses, FileEndpoints, FileMatrix, FileRegistryGen, FileCapabilityRealizations, FileSupport} {
 		want, err := os.ReadFile(name)
 		if err != nil {
 			t.Fatalf("read committed %s: %v (did you run `make generate`?)", name, err)

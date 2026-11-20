@@ -47,8 +47,8 @@ import (
 // evidence-derived with missing proof as `unverified`; no runtime, route,
 // auth, or provider behavior changes.
 //
-// p1.4 -> p1.5: additive `subscriptionProviders` catalog section (also
-// subscription-providers.json and SUPPORT.md); it grants nothing.
+// p1.4 -> p1.5: additive `subscriptionProviders` array in capability-matrix.json,
+// matrix.json and SUPPORT.md; descriptive data and defaults that grant nothing.
 const SchemaVersion = "p1.5"
 
 // ContractABI pins the matrix-document contract version (distinct from the

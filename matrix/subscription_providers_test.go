@@ -12,85 +12,102 @@ import (
 	"github.com/RenseiAI/donmai/agent"
 )
 
-type spRows = []SubscriptionProvider
+type spRows = []SubscriptionIssuer
 
-// TestSubscriptionProviders_Rules mutates one valid row per rule and requires
-// generation to refuse it.
+// TestSubscriptionProviders_Rules mutates one valid built row per rule and
+// requires validation to refuse it.
 func TestSubscriptionProviders_Rules(t *testing.T) {
 	built, err := Build()
 	if err != nil {
 		t.Fatalf("Build(): %v", err)
 	}
 	harnessByName := map[agent.HarnessName]HarnessRow{}
+	endpointByCompany := map[agent.Company]EndpointRow{}
 	for _, h := range built.Harnesses {
 		harnessByName[h.Name] = h
 	}
-	base := func() SubscriptionProvider { return cloneSubscriptionProvider(subscriptionProviders[0]) }
+	for _, e := range built.Endpoints {
+		endpointByCompany[e.Company] = e
+	}
+	fresh := func() spRows {
+		rows, err := buildSubscriptionProviders(subscriptionIssuers, harnessByName, built.Matrix.Cells, built.Endpoints)
+		if err != nil {
+			t.Fatalf("declared catalog refused: %v", err)
+		}
+		return rows
+	}
+	plan := func(p *spRows) *SubscriptionPlan { return &(*p)[1].Plans[0] } // openai-chatgpt "free" (low-cap)
+	openai := func(p *spRows) *SubscriptionIssuer { return &(*p)[1] }
 	cases := []struct {
 		name   string
-		mutate func(spRows) spRows
+		mutate func(*spRows)
 		want   string
 	}{
-		{"valid", func(p spRows) spRows { return p }, ""},
-		{"harness not in matrix", func(p spRows) spRows { p[0].Harnesses = append(p[0].Harnesses, "nope"); return p }, `harnesses value "nope" not in`},
-		{"harness listed twice", func(p spRows) spRows { p[0].Harnesses = append(p[0].Harnesses, p[0].Harnesses[0]); return p }, "listed twice"},
-		{"harness without host-session cell", func(p spRows) spRows { p[0].Harnesses = append(p[0].Harnesses, agent.HarnessPi); return p }, `harness "pi" has no host-session cell`},
-		{"endpoint not in matrix", func(p spRows) spRows { p[0].Models[0].Endpoint = "nope"; return p }, `models endpoint value "nope" not in`},
-		{"unknown model id", func(p spRows) spRows { p[0].Models[0].ModelIDs = []string{"nope"}; return p }, `model id "nope" is not declared`},
-		{"lowCap without guardPercent", func(p spRows) spRows { p[0].Plans[0].Defaults = map[string]any{}; return p }, "lowCap plan must set a guardPercent default"},
-		{"enabled default", func(p spRows) spRows { p[0].Plans[0].Defaults["enabled"] = true; return p }, "enabled is never a default"},
-		{"unknown default key", func(p spRows) spRows { p[0].Plans[0].Defaults["burst"] = 1; return p }, `default "burst" is not a subscription-login policy field`},
-		{"guardPercent out of range", func(p spRows) spRows { p[0].Plans[0].Defaults["guardPercent"] = 101; return p }, "guardPercent must be an integer 0-100"},
-		{"warnAtPercent out of range", func(p spRows) spRows { p[0].Plans[0].Defaults["warnAtPercent"] = []int{80, 120}; return p }, "entry 120 outside 0-100"},
-		{"non-boolean allow flag", func(p spRows) spRows { p[0].Plans[0].Defaults["allowCredits"] = "yes"; return p }, "allowCredits must be a boolean"},
-		{"duplicate plan slug", func(p spRows) spRows { p[0].Plans = append(p[0].Plans, p[0].Plans[0]); return p }, "listed twice"},
-		{"uppercase plan slug", func(p spRows) spRows { p[0].Plans[0].Slug = "Plus"; return p }, `plan slug "Plus" must match`},
-		{"duplicate provider id", func(p spRows) spRows { return append(p, base()) }, "duplicate id"},
-		{"bad provider id", func(p spRows) spRows { p[0].ID = "-openai"; return p }, "id must match"},
-		{"unknown kind", func(p spRows) spRows { p[0].Kind = "reseller"; return p }, `kind "reseller"`},
-		{"billing mode outside vocab", func(p spRows) spRows { p[0].BillingModes = append(p[0].BillingModes, "prepaid"); return p }, `billingModes value "prepaid"`},
-		{"billing modes not allowance first", func(p spRows) spRows { p[0].BillingModes = []string{"credits", "allowance"}; return p }, `must start with "allowance"`},
-		{"unknown login kind", func(p spRows) spRows { p[0].LoginKinds = []string{"forge-identity"}; return p }, `loginKinds value "forge-identity"`},
-		{"unknown allowance unit", func(p spRows) spRows { p[0].Plans[0].AllowanceUnits = []string{"credits"}; return p }, `allowanceUnits value "credits"`},
+		{"valid", func(*spRows) {}, ""},
+		{"harness not in matrix", func(p *spRows) { plan(p).CompatibleHarnesses = append(plan(p).CompatibleHarnesses, "nope") }, `compatibleHarnesses value "nope" not in`},
+		{"harness without host-session cell", func(p *spRows) { plan(p).CompatibleHarnesses = append(plan(p).CompatibleHarnesses, agent.HarnessPi) }, `harness "pi" has no host-session cell`},
+		{"model id not on endpoint", func(p *spRows) { plan(p).ReachableModels[0].ModelID = "nope" }, `model "nope" is not declared by matrix endpoint "openai"`},
+		{"model provider not in matrix", func(p *spRows) { plan(p).ReachableModels[0].ModelProvider = "nope" }, `model "gpt-6-sol" is not declared by matrix endpoint "nope"`},
+		{"duplicate reachable model", func(p *spRows) { plan(p).ReachableModels = append(plan(p).ReachableModels, plan(p).ReachableModels[0]) }, "listed twice"},
+		{"lowCap with guard 0", func(p *spRows) { plan(p).Defaults["guardPercent"] = 0 }, "lowCap plan needs a guardPercent above 0"},
+		{"enabled default", func(p *spRows) { plan(p).Defaults["enabled"] = true }, "enabled is never a default"},
+		{"missing default field", func(p *spRows) { delete(plan(p).Defaults, "allowOverage") }, "defaults must set exactly"},
+		{"unknown default key", func(p *spRows) { plan(p).Defaults["burst"] = 1 }, "defaults must set exactly"},
+		{"guardPercent out of range", func(p *spRows) { plan(p).Defaults["guardPercent"] = 101 }, "must be integers 0-100"},
+		{"warnAtPercent out of range", func(p *spRows) { plan(p).Defaults["warnAtPercent"] = []int{80, 120} }, "must be integers 0-100"},
+		{"non-boolean allow flag", func(p *spRows) { plan(p).Defaults["allowCredits"] = "no" }, "allowCredits must be a boolean"},
+		{"duplicate plan slug", func(p *spRows) { openai(p).Plans = append(openai(p).Plans, openai(p).Plans[0]) }, `plan slug "free" must be unique`},
+		{"duplicate issuer id", func(p *spRows) { *p = append(*p, (*p)[0]) }, "duplicate id"},
+		{"uppercase plan slug", func(p *spRows) { plan(p).Slug = "Free" }, `plan slug "Free" must be unique and match`},
+		{"bad issuer id", func(p *spRows) { openai(p).ID = "-openai" }, "id must match"},
+		{"unknown kind", func(p *spRows) { openai(p).Kind = "reseller" }, `kind value "reseller"`},
+		{"no plans", func(p *spRows) { openai(p).Plans = []SubscriptionPlan{} }, "at least one plan"},
+		{"blank allowance shape", func(p *spRows) { plan(p).AllowanceShape = "" }, "allowanceShape"},
+		{"billing mode outside vocab", func(p *spRows) { plan(p).BillingModes = append(plan(p).BillingModes, "prepaid") }, `billingModes value "prepaid"`},
+		{"billing modes not allowance first", func(p *spRows) { plan(p).BillingModes = []string{"credits", "allowance"} }, `must start with "allowance"`},
+		{"unknown login kind", func(p *spRows) { openai(p).LoginKinds = []string{"forge-identity"} }, `loginKinds value "forge-identity"`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := buildSubscriptionProviders(tc.mutate(spRows{base()}), harnessByName, built.Matrix.Cells, built.Endpoints)
+			rows := fresh()
+			tc.mutate(&rows)
+			err := validateSubscriptionProviders(rows, harnessByName, built.Matrix.Cells, endpointByCompany)
 			if tc.want == "" && err != nil {
-				t.Fatalf("valid row refused: %v", err)
+				t.Fatalf("valid rows refused: %v", err)
 			}
 			if tc.want != "" && (err == nil || !strings.Contains(err.Error(), tc.want)) {
 				t.Fatalf("err = %v; want it to contain %q", err, tc.want)
 			}
 		})
 	}
+	t.Run("endpoint with no model ids", func(t *testing.T) {
+		empty := map[agent.Company]EndpointRow{agent.CompanyOpenAI: {Company: agent.CompanyOpenAI}}
+		if _, err := deriveReachableModels([]agent.Company{agent.CompanyOpenAI}, []agent.HarnessName{agent.HarnessCodex}, built.Matrix.Cells, empty); err == nil {
+			t.Fatal("derivation invented model ids for an endpoint that declares none")
+		}
+	})
 }
 
-// TestSubscriptionProviders_StandaloneMatchesMatrixSection pins the vendored file to the matrix section.
-func TestSubscriptionProviders_StandaloneMatchesMatrixSection(t *testing.T) {
-	standalone, err1 := os.ReadFile(FileSubscriptionProviders)
-	raw, err2 := os.ReadFile(FileCapabilityMatrix)
-	if err := errors.Join(err1, err2); err != nil {
-		t.Fatalf("read artifacts: %v", err)
+// TestSubscriptionProviders_MatrixJSONMatchesFullDocument pins the vendored
+// matrix.json array to the capability-matrix.json section and to the platform
+// sync check: a non-empty array where every issuer has plans, with no nulls.
+func TestSubscriptionProviders_MatrixJSONMatchesFullDocument(t *testing.T) {
+	var arrays [2]bytes.Buffer
+	for i, name := range []string{FileMatrix, FileCapabilityMatrix} {
+		raw, err := os.ReadFile(name)
+		var doc struct {
+			SubscriptionProviders json.RawMessage `json:"subscriptionProviders"`
+		}
+		if err := errors.Join(err, json.Unmarshal(raw, &doc), json.Compact(&arrays[i], doc.SubscriptionProviders)); err != nil {
+			t.Fatalf("decode %s subscriptionProviders: %v", name, err)
+		}
 	}
-	var doc struct {
-		SubscriptionProviders json.RawMessage `json:"subscriptionProviders"`
+	if arrays[0].String() != arrays[1].String() {
+		t.Fatalf("%s subscriptionProviders differs from %s", FileMatrix, FileCapabilityMatrix)
 	}
-	var a, b bytes.Buffer
-	if err := json.Unmarshal(raw, &doc); err != nil || json.Compact(&a, standalone) != nil || json.Compact(&b, doc.SubscriptionProviders) != nil {
-		t.Fatalf("decode artifacts: %v", err)
-	}
-	if a.String() != b.String() {
-		t.Fatalf("%s differs from the capability-matrix subscriptionProviders section", FileSubscriptionProviders)
-	}
-	if bytes.Contains(standalone, []byte("null")) {
-		t.Errorf("%s renders a null field; absent collections must be [] or {}", FileSubscriptionProviders)
-	}
-	var catalog SubscriptionProviderCatalog
-	if err := json.Unmarshal(standalone, &catalog); err != nil || catalog.ContractABI != SubscriptionProvidersContractABI || len(catalog.Providers) == 0 {
-		t.Fatalf("catalog = %+v, err %v; want contract %q with rows", catalog, err, SubscriptionProvidersContractABI)
-	}
-	if !slices.IsSortedFunc(catalog.Providers, func(a, b SubscriptionProvider) int { return strings.Compare(a.ID, b.ID) }) {
-		t.Errorf("providers are not sorted by id")
+	var issuers []SubscriptionIssuer
+	err := json.Unmarshal(arrays[0].Bytes(), &issuers)
+	if err != nil || len(issuers) == 0 || bytes.Contains(arrays[0].Bytes(), []byte("null")) || slices.ContainsFunc(issuers, func(p SubscriptionIssuer) bool { return len(p.Plans) == 0 }) {
+		t.Fatalf("subscriptionProviders = %s (err %v); want a non-empty array, every issuer with plans, no nulls", arrays[0].String(), err)
 	}
 }
