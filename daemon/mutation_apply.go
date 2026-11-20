@@ -121,6 +121,9 @@ func (d *Daemon) applyOneMutation(m PendingMutation) error {
 	if m.Op == observationsScanOp {
 		return d.applyObservationsScan(m)
 	}
+	if m.Op == observationsPolicyOp {
+		return d.applyObservationsPolicy(primaryObservationRegistration, m)
+	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.config == nil {
