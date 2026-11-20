@@ -123,10 +123,21 @@ func threadStartParams(spec agent.Spec) map[string]any {
 	return params
 }
 
-// turnStartParams builds the JSON-RPC params for `turn/start`. The
-// legacy TS sets `threadId`, `input`, `cwd`, `approvalPolicy`,
-// `model`, optional `reasoningEffort`, and optional `sandboxPolicy`
-// (the rich form). We keep that shape verbatim.
+// turnStartParams builds the JSON-RPC params for `turn/start`:
+// `threadId`, `input`, `cwd`, `approvalPolicy`, `model`, optional
+// `effort`, and optional `sandboxPolicy` (the rich form).
+//
+// Spec.Effort rides as `effort` — TurnStartParams.effort, "Override the
+// reasoning effort for this turn and subsequent turns". It is the request key
+// in every release checked (codex-cli 0.58.0 through 0.170.0); no release reads
+// `reasoningEffort` on a request. That name is a RESPONSE field (thread/start,
+// thread/resume and Thread report the configured effort under it); sent on
+// turn/start it is an unknown field the app-server drops without an error,
+// so the turn silently runs at the model's default effort. Only `effort` is
+// sent: a second `reasoningEffort` key would reach no reader and would hide
+// this class of bug again.
+// testdata/protocol-inventory.json vendors the request param names so
+// TestCodexRequestParamDrift refuses any key the installed CLI does not read.
 //
 // Spec.ResponseSchema (the one-shot lane's structured-output schema)
 // rides as `outputSchema` — TurnStartParams.outputSchema, "Optional
@@ -151,7 +162,7 @@ func turnStartParams(threadID string, spec agent.Spec, input []map[string]any) m
 		"model":          resolveModel(spec),
 	}
 	if spec.Effort != "" {
-		params["reasoningEffort"] = string(spec.Effort)
+		params["effort"] = string(spec.Effort)
 	}
 	if policy := resolveSandboxPolicy(spec); policy != nil {
 		params["sandboxPolicy"] = policy

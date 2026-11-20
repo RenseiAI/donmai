@@ -41,7 +41,7 @@
 //   - NeedsPermissionConfig    : true (approval bridge consumes it)
 //   - SupportsCodeIntelligenceEnforcement : false (no canUseTool callback)
 //   - EmitsSubagentEvents      : false (Codex has no Anthropic Task tool)
-//   - SupportsReasoningEffort  : true (turn/start.reasoningEffort)
+//   - SupportsReasoningEffort  : true (turn/start.effort)
 //   - ToolPermissionFormat     : "codex"
 //   - SupportsTurnInputContext : true. Codex re-includes session-level
 //     developer/base instructions in the model prompt on every turn,
