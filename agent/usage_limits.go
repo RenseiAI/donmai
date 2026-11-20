@@ -103,19 +103,26 @@ type UsageUnavailable struct {
 type UsageObservedUnit string
 
 const (
+	// UsageUnitPercent marks an observed amount as a 0–100 percentage share.
 	UsageUnitPercent UsageObservedUnit = "percent"
-	UsageUnitTokens  UsageObservedUnit = "tokens"
+	// UsageUnitTokens marks an observed amount as an explicit token count.
+	UsageUnitTokens UsageObservedUnit = "tokens"
 )
 
 // UsageBillingMode is the observed mode paying for an allowance.
 type UsageBillingMode string
 
 const (
-	UsageBillingUnknown   UsageBillingMode = "unknown"
+	// UsageBillingUnknown marks an allowance whose paying mode is missing or unrecognized.
+	UsageBillingUnknown UsageBillingMode = "unknown"
+	// UsageBillingAllowance marks an allowance paid by the subscription itself.
 	UsageBillingAllowance UsageBillingMode = "allowance"
-	UsageBillingCredits   UsageBillingMode = "credits"
-	UsageBillingOverage   UsageBillingMode = "overage"
-	UsageBillingAPI       UsageBillingMode = "api"
+	// UsageBillingCredits marks an allowance paid from a prepaid credit balance.
+	UsageBillingCredits UsageBillingMode = "credits"
+	// UsageBillingOverage marks an allowance paid as overage beyond the subscription.
+	UsageBillingOverage UsageBillingMode = "overage"
+	// UsageBillingAPI marks an allowance metered through the usage API.
+	UsageBillingAPI UsageBillingMode = "api"
 )
 
 // ParseUsageBillingMode maps an explicit provider value; missing or

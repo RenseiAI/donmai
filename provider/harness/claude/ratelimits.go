@@ -208,6 +208,7 @@ type modelScopedWindowJSON struct {
 	Limit       *float64 `json:"limit,omitempty"`
 }
 
+// UsageResponse is the structural view of one get_usage control answer.
 type UsageResponse struct {
 	Available        *bool           `json:"rate_limits_available"`
 	Windows          json.RawMessage `json:"rate_limits"`
@@ -269,12 +270,14 @@ func UsageResponseToLimits(raw []byte, checkedAt string) (agent.UsageLimits, Sco
 		if w.Utilization != nil {
 			out = append(out, makeClaudeWindow(id, *w.Utilization, isoFromString(ptrOrEmpty(w.ResetsAt))))
 		}
-		unit, used := agent.UsageUnitPercent, 0.0
-		if w.UsedTokens != nil {
+		var unit agent.UsageObservedUnit
+		var used float64
+		switch {
+		case w.UsedTokens != nil:
 			unit, used = agent.UsageUnitTokens, *w.UsedTokens
-		} else if w.Utilization != nil {
+		case w.Utilization != nil:
 			unit, used = agent.UsageUnitPercent, *w.Utilization
-		} else {
+		default:
 			continue
 		}
 		var resets *string

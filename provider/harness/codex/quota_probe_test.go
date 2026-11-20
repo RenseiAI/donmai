@@ -20,9 +20,10 @@ type quotaProbeFakeServer struct {
 	stdin  *io.PipeReader
 	stdout *io.PipeWriter
 	read   map[string]any
+	reads  atomic.Int64
 }
 
-func startQuotaProbeFake(t *testing.T, read map[string]any, refuse bool) (*Provider, func()) {
+func startQuotaProbeFake(t *testing.T, read map[string]any, refuse bool) (*Provider, *atomic.Int64, func()) {
 	t.Helper()
 	stdinReader, stdinWriter := io.Pipe()
 	stdoutReader, stdoutWriter := io.Pipe()
@@ -43,6 +44,7 @@ func startQuotaProbeFake(t *testing.T, read map[string]any, refuse bool) (*Provi
 			case "initialize":
 				writeQuotaProbeLine(t, fs.stdout, map[string]any{"jsonrpc": "2.0", "id": idRaw, "result": map[string]any{}})
 			case "account/rateLimits/read":
+				fs.reads.Add(1)
 				if refuse {
 					writeQuotaProbeLine(t, fs.stdout, map[string]any{
 						"jsonrpc": "2.0", "id": idRaw,
@@ -65,7 +67,7 @@ func startQuotaProbeFake(t *testing.T, read map[string]any, refuse bool) (*Provi
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	return p, func() {
+	return p, &fs.reads, func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = p.Shutdown(ctx)
@@ -97,7 +99,7 @@ func TestProvider_ProbeQuota(t *testing.T) {
 			"primary":  map[string]any{"usedPercent": 1, "resetsAt": float64(1791646860), "windowDurationMins": 10080},
 		},
 	}
-	p, cleanup := startQuotaProbeFake(t, read, false)
+	p, _, cleanup := startQuotaProbeFake(t, read, false)
 	defer cleanup()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -124,7 +126,7 @@ func TestProvider_ProbeQuota(t *testing.T) {
 func TestProvider_ProbeQuotaRefusalIsAnswered(t *testing.T) {
 	t.Parallel()
 
-	p, cleanup := startQuotaProbeFake(t, nil, true)
+	p, _, cleanup := startQuotaProbeFake(t, nil, true)
 	defer cleanup()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -265,9 +267,12 @@ func TestProvider_ProbeQuotaProjectsHostLogin(t *testing.T) {
 func TestProbeQuotaPreservesRawEvidence(t *testing.T) {
 	t.Parallel()
 	full := map[string]any{"accountId": "acct-evidence-1", "rateLimits": map[string]any{"limitId": "codex", "planType": "promax", "primary": map[string]any{"usedPercent": 12.5, "resetsAt": float64(1791646860), "windowDurationMins": 300, "limit": float64(100)}, "secondary": map[string]any{"usedPercent": 62.5, "usedTokens": float64(1250), "limit": float64(2000), "resetsAt": float64(1791646860), "windowDurationMins": 10080}}}
-	p, cleanup := startQuotaProbeFake(t, full, false)
+	p, reads, cleanup := startQuotaProbeFake(t, full, false)
 	defer cleanup()
 	account, plan, probed := p.ProbeQuota(t.Context())
+	if reads.Load() != 1 {
+		t.Fatalf("reads=%d want exactly one quota read per probe", reads.Load())
+	}
 	if probed.Unavailable != nil {
 		t.Fatalf("probed=%+v want windows", probed.Unavailable)
 	}
@@ -288,9 +293,12 @@ func TestProbeQuotaPreservesRawEvidence(t *testing.T) {
 		t.Errorf("secondary=%+v want codex bucket tokens 1250 limit 2000 (clamp fails)", sec)
 	}
 	bare := map[string]any{"accountId": "acct-evidence-1", "rateLimits": map[string]any{"limitId": "codex", "planType": "promax", "primary": map[string]any{"usedPercent": 12.5}, "secondary": map[string]any{"usedPercent": 62.5, "usedTokens": float64(1250)}}}
-	p2, cleanup2 := startQuotaProbeFake(t, bare, false)
+	p2, reads2, cleanup2 := startQuotaProbeFake(t, bare, false)
 	defer cleanup2()
 	_, _, probed2 := p2.ProbeQuota(t.Context())
+	if reads2.Load() != 1 {
+		t.Fatalf("bare reads=%d want exactly one quota read per probe", reads2.Load())
+	}
 	if len(probed2.Evidence) != 2 || probed2.Evidence[1].Limit != nil || probed2.Evidence[1].ResetsAt != nil || probed2.Evidence[1].DurationMins != nil {
 		t.Errorf("bare secondary=%+v want absent limit reset duration (nil, not zero)", probed2.Evidence)
 	}
@@ -304,10 +312,10 @@ func TestProbeQuotaPerReadTotalsSeatAndSerialization(t *testing.T) {
 	mk := func(tokens float64, scope, user string) map[string]any {
 		return map[string]any{"accountId": "acct-shared-1", "rateLimits": map[string]any{"limitId": "codex", "planType": "promax", "secondary": map[string]any{"usedPercent": 62.5, "usedTokens": tokens, "limit": float64(2000), "windowDurationMins": 10080}, "scope": scope, "userId": user}}
 	}
-	p1, c1 := startQuotaProbeFake(t, mk(450, "", ""), false)
+	p1, _, c1 := startQuotaProbeFake(t, mk(450, "", ""), false)
 	defer c1()
 	_, _, first := p1.ProbeQuota(t.Context())
-	p2, c2 := startQuotaProbeFake(t, mk(725, "", ""), false)
+	p2, _, c2 := startQuotaProbeFake(t, mk(725, "", ""), false)
 	defer c2()
 	_, _, second := p2.ProbeQuota(t.Context())
 	if len(first.Evidence) != 1 || first.Evidence[0].Used != 450 || first.Evidence[0].Account != "acct-shared-1" {
@@ -316,16 +324,16 @@ func TestProbeQuotaPerReadTotalsSeatAndSerialization(t *testing.T) {
 	if len(second.Evidence) != 1 || second.Evidence[0].Used != 725 {
 		t.Fatalf("second=%+v want own total 725 not 1175", second.Evidence)
 	}
-	pa, ca := startQuotaProbeFake(t, mk(10, "seat", "user-a"), false)
+	pa, _, ca := startQuotaProbeFake(t, mk(10, "seat", "user-a"), false)
 	defer ca()
-	pb, cb := startQuotaProbeFake(t, mk(10, "seat", "user-b"), false)
+	pb, _, cb := startQuotaProbeFake(t, mk(10, "seat", "user-b"), false)
 	defer cb()
 	_, _, la := pa.ProbeQuota(t.Context())
 	_, _, lb := pb.ProbeQuota(t.Context())
 	if la.Evidence[0].User == lb.Evidence[0].User || la.Evidence[0].User != "user-a" {
 		t.Fatalf("seat users=%q/%q want distinct user-a/user-b", la.Evidence[0].User, lb.Evidence[0].User)
 	}
-	pacct, cacct := startQuotaProbeFake(t, mk(10, "account", "user-a"), false)
+	pacct, _, cacct := startQuotaProbeFake(t, mk(10, "account", "user-a"), false)
 	defer cacct()
 	_, _, lacc := pacct.ProbeQuota(t.Context())
 	if lacc.Evidence[0].User != "" {
@@ -371,8 +379,8 @@ func TestProbeQuotaBillingModes(t *testing.T) {
 				snap["creditBalance"] = *tc.bal
 			}
 			read := map[string]any{"accountId": "acct-bill-1", "rateLimits": snap}
-			p, cleanup := startQuotaProbeFake(t, read, false)
-			defer cleanup()
+			p, _, cleanup := startQuotaProbeFake(t, read, false)
+			t.Cleanup(cleanup)
 			_, _, probed := p.ProbeQuota(t.Context())
 			ev := probed.Evidence[0]
 			if ev.Billing != tc.want || (tc.bal == nil) != (ev.Balance == nil) || (tc.bal != nil && *ev.Balance != *tc.bal) {
@@ -381,8 +389,8 @@ func TestProbeQuotaBillingModes(t *testing.T) {
 		})
 	}
 	// Reset credits alone never establish a monetary balance or prepaid mode.
-	p, cleanup := startQuotaProbeFake(t, map[string]any{"accountId": "acct-bill-1", "rateLimits": map[string]any{"limitId": "codex", "planType": "promax", "primary": map[string]any{"usedPercent": 10, "windowDurationMins": 300}}, "rateLimitResetCredits": map[string]any{"availableCount": 2}}, false)
-	defer cleanup()
+	p, _, cleanup := startQuotaProbeFake(t, map[string]any{"accountId": "acct-bill-1", "rateLimits": map[string]any{"limitId": "codex", "planType": "promax", "primary": map[string]any{"usedPercent": 10, "windowDurationMins": 300}}, "rateLimitResetCredits": map[string]any{"availableCount": 2}}, false)
+	t.Cleanup(cleanup)
 	_, _, probed := p.ProbeQuota(t.Context())
 	if probed.Evidence[0].Billing != agent.UsageBillingUnknown || probed.Evidence[0].Balance != nil {
 		t.Errorf("reset-credits evidence=%+v want unknown with no balance", probed.Evidence[0])

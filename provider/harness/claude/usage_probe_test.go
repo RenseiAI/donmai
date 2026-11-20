@@ -2,6 +2,7 @@ package claude
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -364,5 +365,47 @@ func TestProbeUsagePreservesRawEvidence(t *testing.T) {
 	}
 	if billProbed.Evidence[0].Balance == nil || *billProbed.Evidence[0].Balance != 0 {
 		t.Fatalf("zero balance=%v want explicit zero not absent", billProbed.Evidence[0].Balance)
+	}
+}
+
+// TestProbeUsageSeatScopeAndSerialization pins the seat discriminator
+// at the production entry point: two seat-scoped reads in one
+// workspace keep their own users and totals, an account-scoped read
+// drops a supplied user, and the projection stays off the wire.
+func TestProbeUsageSeatScopeAndSerialization(t *testing.T) {
+	t.Setenv("USER", "probe-operator")
+	seatA := `{"subscription_type":"max","account_id":"ws-shared-1","scope":"seat","user_id":"user-a","rate_limits_available":true,"rate_limits":{"seven_day":{"utilization":62.5,"used_tokens":450,"limit":2000,"resets_at":"2026-07-24T08:59:00+00:00"}}}`
+	seatB := `{"subscription_type":"max","account_id":"ws-shared-1","scope":"seat","user_id":"user-b","rate_limits_available":true,"rate_limits":{"seven_day":{"utilization":62.5,"used_tokens":725,"limit":2000,"resets_at":"2026-07-24T08:59:00+00:00"}}}`
+	_, la, _ := ProbeUsage(t.Context(), fakeUsageCLIWithBody(t, seatA))
+	_, lb, _ := ProbeUsage(t.Context(), fakeUsageCLIWithBody(t, seatB))
+	if len(la.Evidence) != 1 || len(lb.Evidence) != 1 {
+		t.Fatalf("evidence=%+v/%+v want one row each", la.Evidence, lb.Evidence)
+	}
+	if la.Evidence[0].User != "user-a" || lb.Evidence[0].User != "user-b" {
+		t.Fatalf("seat users=%q/%q want distinct user-a/user-b", la.Evidence[0].User, lb.Evidence[0].User)
+	}
+	if la.Evidence[0].Used != 450 || lb.Evidence[0].Used != 725 {
+		t.Fatalf("seat totals=%v/%v want each read's own total 450/725", la.Evidence[0].Used, lb.Evidence[0].Used)
+	}
+	if la.Evidence[0].Account != "ws-shared-1" || lb.Evidence[0].Account != "ws-shared-1" {
+		t.Fatalf("seat accounts=%q/%q want the shared workspace", la.Evidence[0].Account, lb.Evidence[0].Account)
+	}
+	acctBody := `{"subscription_type":"max","account_id":"ws-shared-1","scope":"account","user_id":"user-a","rate_limits_available":true,"rate_limits":{"seven_day":{"utilization":62.5,"used_tokens":450}}}`
+	_, lacc, _ := ProbeUsage(t.Context(), fakeUsageCLIWithBody(t, acctBody))
+	if len(lacc.Evidence) != 1 || lacc.Evidence[0].User != "" {
+		t.Fatalf("account-scoped evidence=%+v want the supplied user dropped", lacc.Evidence)
+	}
+	raw, _ := json.Marshal(la)
+	rawLegacy, _ := json.Marshal(agent.MakeUsageLimits(la.CheckedAt, la.Windows))
+	if string(raw) != string(rawLegacy) {
+		t.Fatal("wire differs from legacy rows; evidence must be excluded")
+	}
+	var wire map[string]any
+	_ = json.Unmarshal(raw, &wire)
+	if _, ok := wire["Evidence"]; ok {
+		t.Fatal("wire carries Evidence; want it excluded")
+	}
+	if _, ok := wire["evidence"]; ok {
+		t.Fatal("wire carries evidence; want it excluded")
 	}
 }
