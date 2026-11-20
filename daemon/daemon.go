@@ -3023,6 +3023,11 @@ func (d *Daemon) handlePollWorkItem(item PollWorkItem, orchestratorURL string) e
 	if quotaErr := d.quotaClaimAdmission(spec); quotaErr != nil {
 		return d.nackRejectedClaim(item, quotaErr, orchestratorURL)
 	}
+	// Observation viability under the registration's pushed policy; a
+	// registration with no pushed policy passes through.
+	if obsErr := d.ObservationClaimAdmission(primaryObservationRegistration, spec, time.Now()); obsErr != nil {
+		return d.nackRejectedClaim(item, obsErr, orchestratorURL)
+	}
 
 	// Advertise worker capabilities only when a provider is wired, so the nil
 	// case builds a byte-identical SessionDetail (no capability option).

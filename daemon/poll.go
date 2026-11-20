@@ -1223,11 +1223,16 @@ func NackRejectedWork(
 	if quotaExhausted != nil && !validQuotaExhaustedClaimAttempt(item) {
 		quotaExhausted = nil
 	}
+	// The observation refusal reuses the quota report's claim-attempt proof.
+	observationUnavailable := observationUnavailableReportForError(acceptErr)
+	if observationUnavailable != nil && !validQuotaExhaustedClaimAttempt(item) {
+		observationUnavailable = nil
+	}
 	reason := fmt.Sprintf("accept work failed: %v", acceptErr)
 	if permanentDenial != nil {
 		reason = preSpawnPermanentDenialReason
 	}
-	return callNackEndpoint(
+	return callNackEndpointTyped(
 		ctx,
 		client,
 		orchestratorURL,
@@ -1239,6 +1244,7 @@ func NackRejectedWork(
 		quotaExhausted,
 		permanentDenial,
 		acceptDefectNackReasonForError(acceptErr),
+		observationUnavailable,
 		item,
 	)
 }
@@ -1259,6 +1265,22 @@ func callNackEndpoint(
 	quotaExhausted *subscriptionWindowExhaustedReport,
 	permanentDenial *preSpawnPermanentDenialReport,
 	acceptDefect *acceptDefectNackReason,
+	work *PollWorkItem,
+) error {
+	return callNackEndpointTyped(ctx, client, orchestratorURL, sessionID, workerID, runtimeJWT, reason,
+		receiptPreflightReason, quotaExhausted, permanentDenial, acceptDefect, nil, work)
+}
+
+// callNackEndpointTyped is callNackEndpoint plus the observation refusal.
+func callNackEndpointTyped(
+	ctx context.Context,
+	client *http.Client,
+	orchestratorURL, sessionID, workerID, runtimeJWT, reason string,
+	receiptPreflightReason *receiptPreflightNackReason,
+	quotaExhausted *subscriptionWindowExhaustedReport,
+	permanentDenial *preSpawnPermanentDenialReport,
+	acceptDefect *acceptDefectNackReason,
+	observationUnavailable *observationUnavailableReport,
 	work *PollWorkItem,
 ) error {
 	if sessionID == "" {
@@ -1287,6 +1309,7 @@ func callNackEndpoint(
 		SubscriptionExhausted   *subscriptionWindowExhaustedReport `json:"subscriptionWindowExhausted,omitempty"`
 		PreSpawnPermanentDenial *preSpawnPermanentDenialReport     `json:"preSpawnPermanentDenial,omitempty"`
 		AcceptDefect            *acceptDefectNackReason            `json:"acceptDefect,omitempty"`
+		ObservationUnavailable  *observationUnavailableReport      `json:"observationUnavailable,omitempty"`
 		Work                    *PollWorkItem                      `json:"work"`
 	}{
 		WorkerID:                workerID,
@@ -1296,6 +1319,7 @@ func callNackEndpoint(
 		SubscriptionExhausted:   quotaExhausted,
 		PreSpawnPermanentDenial: permanentDenial,
 		AcceptDefect:            acceptDefect,
+		ObservationUnavailable:  observationUnavailable,
 		Work:                    work,
 	}
 	buf, err := json.Marshal(body)
