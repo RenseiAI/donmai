@@ -261,10 +261,17 @@ func (c SessionCard) streamingIndicator(now time.Time, plain bool) string {
 	if c.streamingAt.IsZero() || now.Sub(c.streamingAt) >= streamStallAfter {
 		return ""
 	}
-	if plain {
-		return "streaming · "
+	label := "streaming"
+	if tool := cleanText(c.progressTool); tool != "" {
+		label = "running " + tool
+		if !plain && c.progressElapsed >= 1 {
+			label += fmt.Sprintf(" %.0fs", c.progressElapsed)
+		}
 	}
-	return streamFrames[c.streamTicks%len(streamFrames)] + " streaming · "
+	if plain {
+		return label + " · "
+	}
+	return streamFrames[c.streamTicks%len(streamFrames)] + " " + label + " · "
 }
 
 // activitySegments renders the last-activity row: how long ago the session

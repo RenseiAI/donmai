@@ -160,7 +160,9 @@ func summarizeEvent(ev TailEvent) (kind, summary string) {
 		}
 		return "tool_result", truncateRunes(collapseWS(name+" → "+status), maxStreamSummary)
 	case agent.ToolProgressEvent:
-		return "tool_progress", truncateRunes(fmt.Sprintf("%s (%.0fs)", e.ToolName, e.ElapsedSeconds), maxStreamSummary)
+		// Progress ticks drive the card's activity indicator; one line per
+		// tick would bury the stream.
+		return "", ""
 	case agent.UsageEvent:
 		msg := strings.TrimSpace(e.Message)
 		if msg == "" {
@@ -201,9 +203,18 @@ func summarizeEvent(ev TailEvent) (kind, summary string) {
 // them; stream progress instead drives the card's streaming indicator.
 func contentFreeSubtype(subtype string) bool {
 	switch subtype {
-	case agent.SystemSubtypeStreamProgress,
-		agent.SystemSubtypeModelIdentity,
-		agent.SystemSubtypeGenerationID:
+	case agent.SystemSubtypeModelIdentity, agent.SystemSubtypeGenerationID:
+		return true
+	}
+	return livenessSubtype(subtype)
+}
+
+// livenessSubtype reports a progress tick: the model's stream deltas and a
+// running command's output deltas ("command_progress", "codex_progress").
+// Each advances the card indicator and never prints.
+func livenessSubtype(subtype string) bool {
+	switch subtype {
+	case agent.SystemSubtypeStreamProgress, "command_progress", "codex_progress":
 		return true
 	}
 	return false

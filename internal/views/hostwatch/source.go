@@ -112,6 +112,11 @@ type SessionCard struct {
 	// streamingAt is the latest such signal; zero means not streaming.
 	streamTicks int
 	streamingAt time.Time
+	// progressTool and progressElapsed name the running tool while its
+	// progress ticks drive the indicator; empty when the ticks are
+	// model-stream deltas.
+	progressTool    string
+	progressElapsed float64
 }
 
 // EventsPath returns the absolute path to this card's events.jsonl, or ""
