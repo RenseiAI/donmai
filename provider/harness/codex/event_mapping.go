@@ -429,10 +429,7 @@ func mapItem(method string, params json.RawMessage, raw any, states ...*mapperSt
 			Error struct {
 				Message string `json:"message"`
 			} `json:"error"`
-			Changes []struct {
-				Path string `json:"path"`
-				Kind string `json:"kind"`
-			} `json:"changes"`
+			Changes []fileUpdateChange `json:"changes"`
 		} `json:"item"`
 	}
 	_ = json.Unmarshal(params, &p)
@@ -495,17 +492,10 @@ func mapItem(method string, params json.RawMessage, raw any, states ...*mapperSt
 
 	case "fileChange":
 		if isCompleted {
-			content := ""
-			for i, ch := range p.Item.Changes {
-				if i > 0 {
-					content += "\n"
-				}
-				content += ch.Kind + ": " + ch.Path
-			}
 			return []agent.Event{agent.ToolResultEvent{
 				ToolName:  "file_change",
 				ToolUseID: p.Item.ID,
-				Content:   content,
+				Content:   fileChangeContent(p.Item.Changes),
 				IsError:   p.Item.Status == "failed",
 				Raw:       raw,
 			}}

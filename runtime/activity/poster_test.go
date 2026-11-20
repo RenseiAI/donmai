@@ -1513,3 +1513,59 @@ func TestAppliedReasoningEffortStopDrains(t *testing.T) {
 		t.Fatalf("drained applied contexts = %q, want exactly [appliedReasoningEffort=high]", got)
 	}
 }
+
+// TestAnonymousToolResultTakesItsCallName pins the result naming: a harness
+// that reports a result by id alone (Claude stream-json) posts the result
+// under its call's tool name, and an MCP content-part array posts as text.
+func TestAnonymousToolResultTakesItsCallName(t *testing.T) {
+	t.Parallel()
+	type wire struct {
+		Activity struct {
+			Content    string `json:"content"`
+			ToolName   string `json:"toolName"`
+			ToolOutput string `json:"toolOutput"`
+		} `json:"activity"`
+	}
+	var mu sync.Mutex
+	var bodies []wire
+	srv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/activity") {
+			raw, _ := io.ReadAll(r.Body)
+			var b wire
+			_ = json.Unmarshal(raw, &b)
+			mu.Lock()
+			bodies = append(bodies, b)
+			mu.Unlock()
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+	p, err := activity.New(activity.Config{SessionID: "s1", WorkerID: "w1", BaseURL: srv.URL, HTTPClient: srv.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = p.Stop() })
+	p.Send(context.Background(), agent.ToolUseEvent{ToolName: "mcp__docs__search", ToolUseID: "tu_1", Input: map[string]any{"query": "q"}})
+	p.Send(context.Background(), agent.ToolResultEvent{ToolUseID: "tu_1", Content: `[{"type":"text","text":"hit one"}]`})
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		n := len(bodies)
+		mu.Unlock()
+		if n >= 2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(bodies) != 2 {
+		t.Fatalf("expected 2 activity posts; got %d", len(bodies))
+	}
+	res := bodies[1].Activity
+	if res.ToolName != "mcp__docs__search" || res.Content != "mcp__docs__search result" || res.ToolOutput != "hit one" {
+		t.Fatalf("result activity = %+v; want the call's name and decoded text output", res)
+	}
+}

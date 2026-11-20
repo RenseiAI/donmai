@@ -330,6 +330,12 @@ type Poster struct {
 	toolUseStartTimes sync.Map
 }
 
+// toolCallStart is one in-flight call: when it started and its tool name.
+type toolCallStart struct {
+	at   time.Time
+	name string
+}
+
 // New validates cfg and returns a non-started Poster. Returns an error
 // when SessionID or BaseURL is missing.
 func New(cfg Config) (*Poster, error) {
@@ -410,13 +416,20 @@ func (p *Poster) Send(_ context.Context, ev agent.Event) {
 	switch e := ev.(type) {
 	case agent.ToolUseEvent:
 		if e.ToolUseID != "" {
-			p.toolUseStartTimes.Store(e.ToolUseID, now)
+			p.toolUseStartTimes.Store(e.ToolUseID, toolCallStart{at: now, name: e.ToolName})
 		}
 	case agent.ToolResultEvent:
 		if e.ToolUseID != "" {
 			if startAny, ok := p.toolUseStartTimes.LoadAndDelete(e.ToolUseID); ok {
-				if start, ok := startAny.(time.Time); ok {
-					durationMs = now.Sub(start).Milliseconds()
+				if start, ok := startAny.(toolCallStart); ok {
+					durationMs = now.Sub(start.at).Milliseconds()
+					// Some harnesses (Claude stream-json) report a result by
+					// id alone; name it after its call so the platform row is
+					// not an anonymous "tool result".
+					if e.ToolName == "" {
+						e.ToolName = start.name
+						ev = e
+					}
 				}
 			}
 		}
@@ -742,7 +755,7 @@ func mapEvent(ev agent.Event, ts time.Time, providerName string, durationMs int6
 		out.ToolUseID = e.ToolUseID
 		out.IsError = e.IsError
 		out.DurationMs = durationMs
-		out.ToolOutput = truncateMiddle(e.Content, toolOutputCap)
+		out.ToolOutput = truncateMiddle(present.OutputText(e.Content), toolOutputCap)
 		return out, true
 
 	case agent.ResultEvent:
