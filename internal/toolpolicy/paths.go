@@ -11,6 +11,9 @@ import (
 // Paths is one side's compiled path rules for one tool family.
 type Paths struct {
 	rules []*regexp.Regexp
+	// bases holds each rule's literal directory: the part of its glob before
+	// the first wildcard ("/" for a rule that covers every path).
+	bases []string
 }
 
 var matchEveryPath = regexp.MustCompile(`(?s)^.*$`)
@@ -36,20 +39,35 @@ func CompilePaths(patterns []string, family func(name string) bool, side Side, r
 			continue
 		}
 		if !scoped {
-			p.rules = append(p.rules, matchEveryPath)
+			p.rules, p.bases = append(p.rules, matchEveryPath), append(p.bases, "/")
 			continue
 		}
-		re, err := compilePathGlob(arg, side, root, home)
+		re, base, err := compilePathGlob(arg, side, root, home)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("%q: %w", raw, err))
 			if side == Deny {
-				p.rules = append(p.rules, matchEveryPath)
+				p.rules, p.bases = append(p.rules, matchEveryPath), append(p.bases, "/")
 			}
 			continue
 		}
-		p.rules = append(p.rules, re)
+		p.rules, p.bases = append(p.rules, re), append(p.bases, base)
 	}
 	return p, errs
+}
+
+// Under reports whether dir is a rule's literal directory or one of its
+// ancestors, so a tool that walks dir could reach paths the rule matches.
+func (p Paths) Under(dir, root string) bool {
+	if !filepath.IsAbs(dir) && root != "" {
+		dir = filepath.Join(root, dir)
+	}
+	dir = filepath.Clean(dir)
+	for _, base := range p.bases {
+		if base == dir || dir == "/" || strings.HasPrefix(base, dir+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 // Len reports how many path rules compiled.
@@ -63,36 +81,53 @@ func (p Paths) Match(path, root string) bool {
 	return matchesAny(p.rules, filepath.Clean(path))
 }
 
-func compilePathGlob(glob string, side Side, root, home string) (*regexp.Regexp, error) {
+func compilePathGlob(glob string, side Side, root, home string) (*regexp.Regexp, string, error) {
 	switch {
 	case glob == "" || strings.ContainsFunc(glob, func(r rune) bool { return r < 0x20 || r == 0x7f }):
-		return nil, errors.New("empty path or control character")
+		return nil, "", errors.New("empty path or control character")
 	case glob == "~" || strings.HasPrefix(glob, "~/"):
 		if home == "" {
-			return nil, errors.New("no home directory to expand ~ against")
+			return nil, "", errors.New("no home directory to expand ~ against")
 		}
 		glob = escapeGlob(home) + glob[1:]
 	case strings.HasPrefix(glob, "~"):
-		return nil, errors.New("only ~/ home paths are supported")
+		return nil, "", errors.New("only ~/ home paths are supported")
 	case strings.HasPrefix(glob, "//"):
 		glob = glob[1:]
 	case strings.HasPrefix(glob, "/"):
 	case root == "":
-		return nil, errors.New("relative path pattern without a root")
+		return nil, "", errors.New("relative path pattern without a root")
 	case side == Deny && !strings.Contains(glob, "/"):
 		glob = escapeGlob(root) + "/**/" + glob
 	default:
 		glob = escapeGlob(root) + "/" + glob
 	}
-	body, err := globRegexp(filepath.Clean(glob))
+	glob = filepath.Clean(glob)
+	body, err := globRegexp(glob)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	tail := `$`
 	if side == Deny {
 		tail = `(?:/.*)?$`
 	}
-	return regexp.Compile(`^` + body + tail)
+	re, err := regexp.Compile(`^` + body + tail)
+	return re, literalDir(glob), err
+}
+
+// literalDir is the unescaped part of a glob before its first wildcard, cut
+// back to a whole directory.
+func literalDir(glob string) string {
+	var b strings.Builder
+	for i := 0; i < len(glob); i++ {
+		if glob[i] == '\\' && i+1 < len(glob) {
+			i++
+		} else if strings.IndexByte("*?[{", glob[i]) >= 0 {
+			return filepath.Dir(b.String() + "x")
+		}
+		b.WriteByte(glob[i])
+	}
+	return b.String()
 }
 
 // escapeGlob makes a literal directory safe to prefix to a glob.

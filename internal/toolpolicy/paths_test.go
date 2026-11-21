@@ -93,3 +93,18 @@ func TestPathFailsClosed(t *testing.T) {
 		}
 	}
 }
+
+// TestPathUnder: a tool walking dir can reach a rule's paths when dir is the
+// rule's literal directory or one of its ancestors.
+func TestPathUnder(t *testing.T) {
+	t.Parallel()
+	rules, _ := CompilePaths([]string{"Read(/srv/**/.env*)", "Read(/w/secret/*.key)", `Read(/x\*y/k)`}, readFamily, Deny, "/w", "/h")
+	for dir, want := range map[string]bool{
+		"/": true, "/srv": true, "/w": true, "/w/secret": true, "/x*y": true, "/x*y/k": true,
+		"/srv/a": false, "/w/src": false, "/x": false, "src": false, ".": true,
+	} {
+		if got := rules.Under(dir, "/w"); got != want {
+			t.Errorf("Under(%q) = %v, want %v", dir, got, want)
+		}
+	}
+}

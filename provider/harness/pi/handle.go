@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
@@ -1252,6 +1253,11 @@ func resolveInputPath(cwd string, input map[string]any) string {
 	p := stringField(input, "path", "file", "filename")
 	if p == "" {
 		return ""
+	}
+	// A "~/" path is the home directory, never a "~" directory under cwd:
+	// judging it as the latter would put a home read inside the worktree.
+	if home, err := os.UserHomeDir(); err == nil && (p == "~" || strings.HasPrefix(p, "~/")) {
+		p = home + p[1:]
 	}
 	if !filepath.IsAbs(p) && cwd != "" {
 		p = filepath.Join(cwd, p)
