@@ -323,11 +323,41 @@ func TestNewSpawnPlan_SandboxLevels(t *testing.T) {
 	}
 }
 
+// TestNewSpawnPlan_EffortPropagatesToTurn pins the turn/start wire key for
+// Spec.Effort. The app-server reads TurnStartParams.effort; an unknown key
+// such as reasoningEffort is dropped without an error and the turn runs at the
+// model's default effort, so the legacy key must never come back.
 func TestNewSpawnPlan_EffortPropagatesToTurn(t *testing.T) {
 	t.Parallel()
-	plan := NewSpawnPlan(agent.Spec{Cwd: "/tmp", Effort: agent.EffortHigh})
-	if plan.TurnStart["reasoningEffort"] != "high" {
-		t.Fatalf("expected reasoningEffort=high, got %v", plan.TurnStart["reasoningEffort"])
+	cases := []struct {
+		effort agent.EffortLevel
+		want   string // "" => no effort key at all
+	}{
+		{effort: agent.EffortLow, want: "low"},
+		{effort: agent.EffortMedium, want: "medium"},
+		{effort: agent.EffortHigh, want: "high"},
+		{effort: agent.EffortXHigh, want: "xhigh"},
+		{effort: agent.EffortMax, want: "max"},
+		{effort: ""},
+	}
+	for _, tc := range cases {
+		plan := NewSpawnPlan(agent.Spec{Cwd: "/tmp", Effort: tc.effort})
+		got, ok := plan.TurnStart["effort"]
+		if tc.want == "" {
+			if ok {
+				t.Errorf("effort unset: turn/start carries effort=%v, want no key", got)
+			}
+		} else if !ok || got != tc.want {
+			t.Errorf("effort %q: turn/start effort = %v (present=%t), want %q", tc.effort, got, ok, tc.want)
+		}
+		if legacy, ok := plan.TurnStart["reasoningEffort"]; ok {
+			t.Errorf("effort %q: turn/start carries reasoningEffort=%v, a key the app-server ignores", tc.effort, legacy)
+		}
+		for _, key := range []string{"effort", "reasoningEffort"} {
+			if v, ok := plan.ThreadStart[key]; ok {
+				t.Errorf("effort %q: thread/start carries %s=%v; effort is a turn/start param", tc.effort, key, v)
+			}
+		}
 	}
 }
 
