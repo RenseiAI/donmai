@@ -139,7 +139,7 @@ func newHandle(p *Provider, spec agent.Spec, plan SpawnPlan, opts HandleOptions)
 	}
 	return &Handle{
 		provider:         p,
-		bridge:           NewApprovalBridge(spec.PermissionConfig),
+		bridge:           newApprovalBridgeAt(spec.PermissionConfig, spec.Cwd),
 		spec:             spec,
 		plan:             plan,
 		rpcTimeout:       opts.RPCTimeout,

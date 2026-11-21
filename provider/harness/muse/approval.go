@@ -1,10 +1,13 @@
 package muse
 
 import (
+	"log/slog"
+	"os"
 	"regexp"
 	"strings"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/internal/toolpolicy"
 )
 
 // ApprovalAction is the bridge verdict for one inbound approval request.
@@ -121,6 +124,21 @@ type ApprovalBridge struct {
 	denyFiles    bool
 	hasAllowlist bool
 
+	// denyAllCommands is a bare Bash deny: no shell command is approved.
+	// denyAllFiles / allowAllFiles are a bare Edit/Write deny or allow, which
+	// cover every file access. They are flags, not match-all regexes, because
+	// the regex lists are shared with commands and generic tool targets.
+	denyAllCommands bool
+	denyAllFiles    bool
+	allowAllFiles   bool
+
+	// denyPaths are the scoped path denies of every read and write tool
+	// ("Read(~/.ssh/**)", "Edit(docs/**)"), compiled by internal/toolpolicy
+	// with relative patterns anchored at root. A file-access approval does
+	// not say whether it reads or writes, so either kind of deny applies.
+	denyPaths toolpolicy.Paths
+	root      string
+
 	// autoApprove is the default when no pattern matches. True unless
 	// the Spec sets DefaultDecision deny/prompt (autonomous fleets
 	// cannot answer prompts, so prompt reads as decline-by-default).
@@ -131,11 +149,30 @@ type ApprovalBridge struct {
 // ready-to-use bridge. A nil config produces a bridge that runs the
 // built-in safety deny rules and otherwise auto-approves.
 func NewApprovalBridge(cfg *agent.PermissionConfig) *ApprovalBridge {
-	br := &ApprovalBridge{config: cfg, autoApprove: true}
+	return newApprovalBridgeAt(cfg, "")
+}
+
+// newApprovalBridgeAt is NewApprovalBridge with relative path denies anchored
+// at root. Without a root, a relative path deny denies every file access.
+func newApprovalBridgeAt(cfg *agent.PermissionConfig, root string) *ApprovalBridge {
+	br := &ApprovalBridge{config: cfg, autoApprove: true, root: root}
 	if cfg != nil {
+		home, _ := os.UserHomeDir()
+		var errs []error
+		br.denyPaths, errs = toolpolicy.CompilePaths(cfg.DisallowPatterns, isPathToolName, toolpolicy.Deny, root, home)
+		if len(errs) > 0 {
+			slog.Warn("muse: path denies that cannot be compiled deny every file access", "errors", errs)
+		}
 		br.hasAllowlist = len(cfg.AllowPatterns) > 0
 		br.allowRegexes, br.allowFiles = compilePatterns(cfg.AllowPatterns)
 		br.denyRegexes, br.denyFiles = compilePatterns(cfg.DisallowPatterns)
+		for _, p := range cfg.DisallowPatterns {
+			br.denyAllCommands = br.denyAllCommands || strings.EqualFold(strings.TrimSpace(p), "Bash")
+			br.denyAllFiles = br.denyAllFiles || isBareFileTool(p)
+		}
+		for _, p := range cfg.AllowPatterns {
+			br.allowAllFiles = br.allowAllFiles || isBareFileTool(p)
+		}
 		switch strings.ToLower(cfg.DefaultDecision) {
 		case "deny", "prompt":
 			br.autoApprove = false
@@ -181,6 +218,9 @@ func (b *ApprovalBridge) evaluateCommand(cmd string) ApprovalDecision {
 			return ApprovalDecision{Action: ActionDecline, Reason: deny.reason}
 		}
 	}
+	if b.denyAllCommands {
+		return ApprovalDecision{Action: ActionDecline, Reason: "shell commands are denied"}
+	}
 	for _, re := range b.denyRegexes {
 		if re.MatchString(cmd) {
 			return ApprovalDecision{Action: ActionDecline, Reason: "matched disallow pattern"}
@@ -205,6 +245,12 @@ func (b *ApprovalBridge) evaluateFileAccess(path string) ApprovalDecision {
 	if path == "" {
 		return ApprovalDecision{Action: ActionDecline, Reason: "empty file approval is never auto-approved"}
 	}
+	if b.denyAllFiles {
+		return ApprovalDecision{Action: ActionDecline, Reason: "file changes are denied"}
+	}
+	if b.denyPaths.Match(path, b.root) {
+		return ApprovalDecision{Action: ActionDecline, Reason: "path matches a disallow pattern"}
+	}
 	if b.denyFiles {
 		for _, re := range b.denyRegexes {
 			if re.MatchString(path) {
@@ -213,6 +259,9 @@ func (b *ApprovalBridge) evaluateFileAccess(path string) ApprovalDecision {
 		}
 	}
 	if b.allowFiles && b.hasAllowlist {
+		if b.allowAllFiles {
+			return ApprovalDecision{Action: ActionAllow}
+		}
 		for _, re := range b.allowRegexes {
 			if re.MatchString(path) {
 				return ApprovalDecision{Action: ActionAllow}
@@ -271,6 +320,10 @@ func compilePatterns(patterns []string) ([]*regexp.Regexp, bool) {
 		if p == "" {
 			continue
 		}
+		if isBareFileTool(p) {
+			files = true
+			continue
+		}
 		if isFileChangeTool(p) {
 			files = true
 		}
@@ -295,17 +348,42 @@ func isFileChangeTool(pattern string) bool {
 		strings.HasPrefix(lower, "patch(") || strings.HasPrefix(lower, "file(")
 }
 
-// bashPermissionPattern converts "Bash(prefix:glob)" into a regexp body.
+// isPathToolName reports a read or write tool whose scoped pattern names a
+// path, in the Claude grammar or this bridge's own Patch/File names.
+func isPathToolName(name string) bool {
+	for _, n := range []string{"Read", "Grep", "Glob", "LS", "Write", "Edit", "MultiEdit", "NotebookEdit", "Patch", "File"} {
+		if strings.EqualFold(n, name) {
+			return true
+		}
+	}
+	return false
+}
+
+// isBareFileTool reports a bare file-change tool name, which covers every
+// file access.
+func isBareFileTool(pattern string) bool {
+	switch strings.ToLower(strings.TrimSpace(pattern)) {
+	case "edit", "write", "multiedit", "notebookedit":
+		return true
+	}
+	return false
+}
+
+// bashPermissionPattern converts a Claude "Bash(...)" pattern into a regexp
+// body: "prefix:*" is the prefix up to a word boundary, anything else a glob
+// anchored at the start. Only a trailing ":*" is special; a ":" elsewhere is
+// literal. (Keeping only the text after the first ":" turned "git:*" into
+// "^.*", which approved every command as an allow.)
 func bashPermissionPattern(pattern string) (string, bool) {
 	lower := strings.ToLower(pattern)
 	if !strings.HasPrefix(lower, "bash(") || !strings.HasSuffix(pattern, ")") {
 		return "", false
 	}
-	inner := pattern[len("Bash(") : len(pattern)-1]
-	if i := strings.Index(inner, ":"); i >= 0 {
-		inner = inner[i+1:]
+	inner := strings.TrimSpace(pattern[len("Bash(") : len(pattern)-1])
+	if prefix, ok := strings.CutSuffix(inner, ":*"); ok {
+		return "^" + globToRegexpBody(strings.TrimSpace(prefix)) + `(?:\s|$)`, true
 	}
-	return "^" + globToRegexpBody(strings.TrimSpace(inner)), true
+	return "^" + globToRegexpBody(inner), true
 }
 
 // globToRegexp converts a glob pattern to an anchored regexp.
