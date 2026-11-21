@@ -117,6 +117,12 @@ type HeartbeatOptions struct {
 	// hashes; never put an address in them.
 	GetQuota func() []agent.UsageAccount
 
+	// DrainDeferredAcks returns mutation acknowledgements that completed
+	// outside a heartbeat response (a deferred observations.scan). It runs
+	// before GetObservations, so an acknowledgement rides a beat whose
+	// report already reflects the work it acknowledges.
+	DrainDeferredAcks func() (applied []string, failures []HeartbeatMutationFailure)
+
 	// GetObservations returns the host-observation report for this beat.
 	// Optional, like GetQuota: nil, or a nil report, omits the key.
 	GetObservations func() *observation.Report
@@ -542,6 +548,14 @@ func (h *HeartbeatService) sendOneSerialized(ctx context.Context) error {
 	if h.opts.GetQuota != nil {
 		if q := h.opts.GetQuota(); len(q) > 0 {
 			payload.Quota = q
+		}
+	}
+	if h.opts.DrainDeferredAcks != nil {
+		if applied, failures := h.opts.DrainDeferredAcks(); len(applied) > 0 || len(failures) > 0 {
+			h.mu.Lock()
+			h.pendingApplied = append(h.pendingApplied, applied...)
+			h.pendingFailures = append(h.pendingFailures, failures...)
+			h.mu.Unlock()
 		}
 	}
 	if h.opts.GetObservations != nil {

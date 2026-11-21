@@ -2108,7 +2108,8 @@ func (d *Daemon) Start(ctx context.Context) error {
 			GetQuota: d.QuotaSnapshot,
 			// Observations: the same quota state as subscription-login
 			// items; nil, and omitted, when there is no quota state.
-			GetObservations: d.ObservationReport,
+			DrainDeferredAcks: d.drainDeferredScanAcks,
+			GetObservations:   d.ObservationReport,
 			// Phase 2c: handle platform-queued mutations.
 			OnPendingMutations: d.applyPendingMutations,
 			// Phase 2e: surface hostStatus signals (pool_deleted etc.)

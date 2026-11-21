@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -122,10 +124,118 @@ func TestApplyObservationsScanMutation(t *testing.T) {
 		{ID: "m2", Op: observationsScanOp},
 		{ID: "m3", Op: observationsScanOp, Params: json.RawMessage(`{"kinds":["bogus"]}`)},
 	})
-	if strings.Join(applied, ",") != "m1,m2" || len(failures) != 1 || failures[0].ID != "m3" {
-		t.Fatalf("applied = %v failures = %v, want m1,m2 applied and m3 failed", applied, failures)
+	// m1 runs a scan and is acknowledged. m2 arrives inside the rate-limit
+	// window: it is deferred, never acknowledged against m1's scan.
+	if strings.Join(applied, ",") != "m1" || len(failures) != 1 || failures[0].ID != "m3" {
+		t.Fatalf("applied = %v failures = %v, want m1 applied, m2 deferred and m3 failed", applied, failures)
 	}
 	if d.observationScan.lastAt.IsZero() || d.quota.snapshot() == nil {
 		t.Fatal("observations.scan did not run a scan")
+	}
+}
+
+// countingFeed counts the scans that probed.
+func countingFeed(calls *atomic.Int32) quotaProbeFunc {
+	feed := codexFeed("acct-a", false)
+	return func(ctx context.Context, q *quotaState) {
+		calls.Add(1)
+		feed(ctx, q)
+	}
+}
+
+// waitDrained polls the deferred acknowledgements until one arrives.
+func waitDrained(t *testing.T, d *Daemon) ([]string, []HeartbeatMutationFailure) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if applied, failures := d.drainDeferredScanAcks(); len(applied) > 0 || len(failures) > 0 {
+			return applied, failures
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("no deferred acknowledgement arrived")
+	return nil, nil
+}
+
+func TestObservationsScanMutation_DeferredBehindAnInFlightScan(t *testing.T) {
+	var calls atomic.Int32
+	d := scanDaemon(map[string]quotaProbeFunc{"codex": countingFeed(&calls)})
+	d.observationScan.minInterval = 20 * time.Millisecond
+	d.observationScan.mu.Lock()
+	d.observationScan.inFlight = true
+	d.observationScan.mu.Unlock()
+	applied, failures := d.applyPendingMutations(context.Background(), []PendingMutation{{ID: "m1", Op: observationsScanOp}})
+	if len(applied) != 0 || len(failures) != 0 {
+		t.Fatalf("applied = %v failures = %v, want the scan deferred while another is in flight", applied, failures)
+	}
+	if acks, _ := d.drainDeferredScanAcks(); len(acks) != 0 {
+		t.Fatalf("acknowledged %v before any scan ran for the request", acks)
+	}
+	d.observationScan.mu.Lock()
+	d.observationScan.inFlight = false
+	d.observationScan.mu.Unlock()
+	acks, fails := waitDrained(t, d)
+	if strings.Join(acks, ",") != "m1" || len(fails) != 0 {
+		t.Fatalf("drained %v %v, want m1 acknowledged after its own scan", acks, fails)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("scans = %d, want one fresh scan run for the deferred request", calls.Load())
+	}
+}
+
+func TestObservationsScanMutation_DeferredInsideTheRateWindow(t *testing.T) {
+	var calls atomic.Int32
+	d := scanDaemon(map[string]quotaProbeFunc{"codex": countingFeed(&calls)})
+	d.observationScan.minInterval = 150 * time.Millisecond
+	if _, err := d.ScanObservations(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+	applied, failures := d.applyPendingMutations(context.Background(), []PendingMutation{{ID: "m2", Op: observationsScanOp}})
+	if len(applied) != 0 || len(failures) != 0 {
+		t.Fatalf("applied = %v failures = %v, want the scan deferred inside the rate window", applied, failures)
+	}
+	acks, fails := waitDrained(t, d)
+	if strings.Join(acks, ",") != "m2" || len(fails) != 0 {
+		t.Fatalf("drained %v %v, want m2 acknowledged after its own scan", acks, fails)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("scans = %d, want the earlier scan plus one fresh scan for m2", calls.Load())
+	}
+}
+
+func TestHeartbeat_DrainsDeferredAcksBeforeBuildingObservations(t *testing.T) {
+	var order []string
+	bodies := make(chan []byte, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		buf, _ := io.ReadAll(r.Body)
+		bodies <- buf
+		_ = json.NewEncoder(w).Encode(map[string]any{"acknowledged": true})
+	}))
+	t.Cleanup(srv.Close)
+	hs := NewHeartbeatService(HeartbeatOptions{
+		WorkerID: "wkr_obs", Hostname: "h", OrchestratorURL: srv.URL, RuntimeJWT: "runtime.jwt.value", IntervalSeconds: 1,
+		GetActiveCount: func() int { return 0 }, GetMaxCount: func() int { return 1 },
+		GetStatus: func() RegistrationStatus { return RegistrationIdle },
+		DrainDeferredAcks: func() ([]string, []HeartbeatMutationFailure) {
+			order = append(order, "drain")
+			return []string{"m9"}, nil
+		},
+		GetObservations: func() *observation.Report {
+			order = append(order, "observations")
+			return nil
+		},
+	})
+	hs.sendOne(context.Background())
+	var decoded struct {
+		AppliedMutations []string `json:"appliedMutations"`
+	}
+	if err := json.Unmarshal(<-bodies, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(order, ",") != "drain,observations" {
+		t.Fatalf("order = %v, want the deferred acks drained before the observations report is built", order)
+	}
+	if strings.Join(decoded.AppliedMutations, ",") != "m9" {
+		t.Fatalf("appliedMutations = %v, want m9 in the same beat", decoded.AppliedMutations)
 	}
 }
