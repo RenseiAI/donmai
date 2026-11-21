@@ -58,7 +58,9 @@ type Attributes interface {
 
 // registry is the closed kind registry, added to by ADR, never by config.
 // Each attribute struct tags every field with its `disclosure` class.
-var registry = map[string]Attributes{}
+var registry = map[string]Attributes{
+	KindSubscriptionLogin: SubscriptionLogin{},
+}
 
 // Readiness is an item's latest readiness check.
 type Readiness struct {
