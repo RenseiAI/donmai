@@ -39,10 +39,18 @@ prefix_rule(pattern=["zsh"], decision="prompt", justification="denied by the ses
 func TestDenyTranslationCodexParams(t *testing.T) {
 	t.Parallel()
 	noShell := map[string]any{"features": map[string]any{"shell_tool": false}}
+	profile := func(extends string, fs map[string]any) map[string]any {
+		p := map[string]any{"filesystem": fs, "network": map[string]any{"enabled": true}}
+		if extends != "" {
+			p["extends"] = extends
+		}
+		return map[string]any{"permissions": map[string]any{codexDenyProfileID: p}}
+	}
 	for _, tc := range []struct {
 		name       string
 		spec       agent.Spec
 		config     map[string]any
+		profile    bool
 		rules      string
 		statuses   []DenyStatus
 		wantNotice bool
@@ -63,7 +71,13 @@ prefix_rule(pattern=["pnpm"], decision="forbidden", justification="denied by the
 			statuses: []DenyStatus{DenyApplied},
 		},
 		{name: "a mid-pattern wildcard disables the shell tool", spec: denySpec(agent.SandboxWorkspaceWrite, "Bash(git * --force)"), config: noShell, statuses: []DenyStatus{DenyApproximated}, wantNotice: true},
-		{name: "path denies are reported until rendered", spec: denySpec(agent.SandboxWorkspaceWrite, "Read(~/.ssh/**)"), statuses: []DenyStatus{DenyUnsupported}, wantNotice: true},
+		{
+			name: "path denies extend the workspace profile", spec: denySpec(agent.SandboxWorkspaceWrite, "Read(~/.ssh/**)", "Read(/srv/**/.env*)", "Edit(docs/**)", "Write(//etc/hosts)"),
+			config: profile(":workspace", map[string]any{"/w": "write", "~/.ssh/**": "none", "/srv/**/.env*": "none", "/w/docs/**": "read", "/etc/hosts": "read"}), profile: true,
+			statuses: []DenyStatus{DenyApplied, DenyApplied, DenyApplied, DenyApplied},
+		},
+		{name: "a read deny beats a write deny on the same path", spec: denySpec(agent.SandboxReadOnly, "Read(/s/**)", "Edit(/s/**)"), config: profile(":read-only", map[string]any{"/s/**": "none"}), profile: true, statuses: []DenyStatus{DenyApplied, DenyApplied}},
+		{name: "full access writes the root and keeps the deny", spec: denySpec(agent.SandboxFullAccess, "Read(/tmp/secret*)"), config: profile("", map[string]any{":root": "write", "/tmp/secret*": "none"}), profile: true, statuses: []DenyStatus{DenyApplied}},
 		{name: "tool names Codex lacks are reported", spec: denySpec(agent.SandboxWorkspaceWrite, "AskUserQuestion", "Edit"), statuses: []DenyStatus{DenyUnsupported, DenyApproximated}, wantNotice: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -77,6 +91,16 @@ prefix_rule(pattern=["pnpm"], decision="forbidden", justification="denied by the
 			}
 			if got, _ := plan.ThreadResume["config"].(map[string]any); !reflect.DeepEqual(got, tc.config) {
 				t.Errorf("thread/resume config = %#v, want %#v", got, tc.config)
+			}
+			for method, params := range map[string]map[string]any{"thread/start": plan.ThreadStart, "thread/resume": plan.ThreadResume, "turn/start": plan.TurnStart} {
+				if got := params["permissions"] == codexDenyProfileID; got != tc.profile {
+					t.Errorf("%s selects the deny profile = %v, want %v", method, got, tc.profile)
+				}
+			}
+			_, sandbox := plan.ThreadStart["sandbox"]
+			_, sandboxPolicy := plan.TurnStart["sandboxPolicy"]
+			if sandbox == tc.profile || sandboxPolicy == tc.profile {
+				t.Errorf("legacy sandbox params present = %v/%v alongside profile = %v", sandbox, sandboxPolicy, tc.profile)
 			}
 			if plan.ExecPolicyRules != tc.rules {
 				t.Errorf("rules =\n%s\nwant\n%s", plan.ExecPolicyRules, tc.rules)
@@ -92,6 +116,32 @@ prefix_rule(pattern=["pnpm"], decision="forbidden", justification="denied by the
 				t.Errorf("warning notice = %v, want %v", got, tc.wantNotice)
 			}
 		})
+	}
+}
+
+// TestDenyTranslationFailsClosed pins the denies Codex would silently ignore.
+func TestDenyTranslationFailsClosed(t *testing.T) {
+	t.Parallel()
+	for _, deny := range []string{"Read(~/.{ssh,aws}/**)", "Read(/s/[ab.key)", "Read(~other/.ssh)", "Read", "Read(:root)"} {
+		plan := NewSpawnPlan(denySpec(agent.SandboxWorkspaceWrite, deny))
+		if !errors.Is(plan.DenyErr, ErrDenyUntranslatable) {
+			t.Errorf("%s: DenyErr = %v, want ErrDenyUntranslatable", deny, plan.DenyErr)
+		}
+	}
+	if _, err := translateDenies(agent.Spec{PermissionConfig: &agent.PermissionConfig{DisallowPatterns: []string{"Read(docs/**)"}}}); !errors.Is(err, ErrDenyUntranslatable) {
+		t.Errorf("relative path without cwd: err = %v", err)
+	}
+}
+
+// TestSpawnRefusesUntranslatableDenyBeforeStart: the app-server never starts.
+func TestSpawnRefusesUntranslatableDenyBeforeStart(t *testing.T) {
+	p, _ := codexEnvProbe(t)
+	_, err := p.Spawn(t.Context(), denySpec(agent.SandboxWorkspaceWrite, "Read(~/.{ssh,aws}/**)"))
+	if !errors.Is(err, agent.ErrSpawnFailed) || !errors.Is(err, ErrDenyUntranslatable) {
+		t.Fatalf("Spawn err = %v, want ErrSpawnFailed wrapping ErrDenyUntranslatable", err)
+	}
+	if p.started {
+		t.Fatal("app-server started for a refused deny list")
 	}
 }
 

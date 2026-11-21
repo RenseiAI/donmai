@@ -3,6 +3,7 @@ package codex
 import (
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -24,13 +25,16 @@ import (
 //     "forbidden" in the private CODEX_HOME's rules directory. An exact command
 //     becomes a "prompt" rule, so the bridge's exact match decides it instead
 //     of a prefix rule blocking every longer command;
-//   - a path deny (Read(...), Edit(...)) is reported unsupported for now.
+//   - a path deny becomes a "none" (read) or "read" (write) entry of a
+//     permission profile that extends the built-in profile for the sandbox
+//     level, selected on thread/start, thread/resume and turn/start.
 //
 // Checked against codex-cli 0.170.0: exec_command leaves the tool list
 // `codex debug prompt-input` renders under features.shell_tool=false; `codex
 // execpolicy check` evaluates the rule file; a rule file that fails to parse
 // is skipped whole with only a configWarning, which is why the tokens are
-// restricted below; and the app-server validates the thread config.
+// restricted below; `codex sandbox -P` refuses reads and writes through the
+// profile entries; and the app-server echoes the selected profile.
 //
 // Residual risk, which no Codex setting closes:
 //   - prefix rules match tokens, so "git push*" does not block "git pushx",
@@ -42,6 +46,9 @@ import (
 //     the bridge can unwrap them; a script Codex does not split never asks;
 //   - a write deny of a bare Edit/Write name only reaches the bridge, and
 //     Codex does not ask about patches inside the writable roots;
+//   - a full-access session with path denies runs under the Codex sandbox
+//     with the whole disk writable (":danger-full-access" cannot be
+//     extended), not unsandboxed;
 //   - tool names Codex has no tool for (AskUserQuestion, WebFetch, MCP tool
 //     names) are reported unsupported.
 
@@ -72,7 +79,10 @@ var ErrDenyUntranslatable = errors.New("codex: tool-permission deny cannot be en
 // carries every deny Codex enforces only approximately or not at all.
 const SystemSubtypeToolPermissionTranslation = "tool_permission_translation"
 
-const codexDenyRulesFile = "donmai-deny.rules"
+const (
+	codexDenyProfileID = "donmai-deny"
+	codexDenyRulesFile = "donmai-deny.rules"
+)
 
 // commandWrapperPrograms run their arguments as another command. Each gets a
 // "prompt" rule whenever a command deny exists, so the bridge sees the line.
@@ -86,6 +96,7 @@ type execRule struct {
 type denyPlan struct {
 	disableShell bool
 	rules        []execRule
+	paths        map[string]string // Codex filesystem path or glob -> profile access
 	report       []DenyTranslation
 }
 
@@ -97,7 +108,7 @@ func translateDenies(spec agent.Spec) (denyPlan, error) {
 		return plan, nil
 	}
 	for _, raw := range spec.PermissionConfig.DisallowPatterns {
-		line, err := plan.add(strings.TrimSpace(raw))
+		line, err := plan.add(strings.TrimSpace(raw), spec.Cwd)
 		if err != nil {
 			return denyPlan{}, fmt.Errorf("%w: %q: %w", ErrDenyUntranslatable, raw, err)
 		}
@@ -112,7 +123,7 @@ func translateDenies(spec agent.Spec) (denyPlan, error) {
 	return plan, nil
 }
 
-func (p *denyPlan) add(pattern string) (DenyTranslation, error) {
+func (p *denyPlan) add(pattern, cwd string) (DenyTranslation, error) {
 	name, arg, scoped := splitToolPattern(pattern)
 	switch {
 	case name == "Bash" && (!scoped || arg == "" || arg == "*"):
@@ -121,7 +132,23 @@ func (p *denyPlan) add(pattern string) (DenyTranslation, error) {
 	case name == "Bash":
 		return p.addCommand(arg), nil
 	case scoped && (name == "Read" || isFileChangeTool(name)):
-		return DenyTranslation{Status: DenyUnsupported, Note: "path denies are not rendered into Codex yet"}, nil
+		path, err := codexDenyPath(arg, cwd)
+		if err != nil {
+			return DenyTranslation{}, err
+		}
+		access := "read" // a write deny keeps the path readable
+		if name == "Read" {
+			access = "none"
+		}
+		if p.paths == nil {
+			p.paths = map[string]string{}
+		}
+		if p.paths[path] != "none" {
+			p.paths[path] = access
+		}
+		return DenyTranslation{Status: DenyApplied, Mechanism: "permissions." + codexDenyProfileID + ".filesystem"}, nil
+	case name == "Read":
+		return DenyTranslation{}, errors.New("a deny of every read has no Codex rendering")
 	case isFileChangeTool(name):
 		return DenyTranslation{Status: DenyApproximated, Mechanism: "approval bridge", Note: "Codex does not ask about patches inside the writable roots"}, nil
 	}
@@ -150,16 +177,69 @@ func (p *denyPlan) addCommand(arg string) DenyTranslation {
 
 func isControl(r rune) bool { return r < 0x20 || r == 0x7f }
 
+// codexDenyPath renders a Claude path pattern as a Codex filesystem key, which
+// must be absolute or start with "~/". Codex reads a brace set or an unclosed
+// character class as literal text, so such a deny would protect nothing.
+func codexDenyPath(glob, cwd string) (string, error) {
+	switch {
+	case glob == "":
+		return "", errors.New("empty path pattern")
+	case strings.ContainsAny(glob, "{}") || strings.ContainsFunc(glob, isControl):
+		return "", errors.New("brace sets and control characters have no Codex glob form")
+	case strings.Count(glob, "[") != strings.Count(glob, "]"):
+		return "", errors.New("unbalanced character class")
+	case strings.HasPrefix(glob, "~/"):
+		return "~/" + strings.TrimPrefix(filepath.Clean(glob[2:]), "/"), nil
+	case strings.HasPrefix(glob, "~") || strings.HasPrefix(glob, ":"):
+		return "", errors.New("only ~/ home paths are supported")
+	case filepath.IsAbs(glob):
+		return filepath.Clean(glob), nil
+	case cwd == "":
+		return "", errors.New("relative path pattern without a working directory")
+	}
+	return filepath.Join(cwd, glob), nil
+}
+
 // threadConfig is the thread/start and thread/resume `config` override.
-func (p denyPlan) threadConfig() map[string]any {
+func (p denyPlan) threadConfig(spec agent.Spec) map[string]any {
 	config := map[string]any{}
 	if p.disableShell {
 		config["features"] = map[string]any{"shell_tool": false}
+	}
+	if len(p.paths) > 0 {
+		config["permissions"] = map[string]any{codexDenyProfileID: p.permissionProfile(spec)}
 	}
 	if len(config) == 0 {
 		return nil
 	}
 	return config
+}
+
+// permissionProfile keeps the legacy sandbox level's meaning and adds the deny
+// entries. Entries are written last, so a deny on a writable root wins.
+func (p denyPlan) permissionProfile(spec agent.Spec) map[string]any {
+	filesystem := map[string]any{}
+	profile := map[string]any{"filesystem": filesystem, "network": map[string]any{"enabled": true}}
+	switch resolveSandboxMode(spec) {
+	case "danger-full-access":
+		filesystem[":root"] = "write"
+	case "workspace-write":
+		profile["extends"] = ":workspace"
+		for _, root := range sandboxWritableRoots(spec) {
+			if root != "" {
+				filesystem[root] = "write"
+			}
+		}
+	case "read-only":
+		profile["extends"] = ":read-only"
+	default:
+		profile["extends"] = ":read-only"
+		delete(profile, "network")
+	}
+	for path, access := range p.paths {
+		filesystem[path] = access
+	}
+	return profile
 }
 
 // execPolicyRules renders the rule file staged into CODEX_HOME/rules.

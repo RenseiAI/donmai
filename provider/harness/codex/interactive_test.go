@@ -368,7 +368,7 @@ func TestBuildInteractiveLaunch_ReasoningEffort(t *testing.T) {
 		if !ok || got != tc.want {
 			t.Errorf("effort %q: model_reasoning_effort override = %q (present=%t), want %q: %q", tc.effort, got, ok, tc.want, launch.argv)
 		}
-		headless := turnStartParams("t", agent.Spec{Effort: tc.effort}, nil)["effort"]
+		headless := turnStartParams("t", agent.Spec{Effort: tc.effort}, nil, denyPlan{})["effort"]
 		if headless != tc.want {
 			t.Errorf("effort %q: headless turn/start effort = %v, interactive override = %q", tc.effort, headless, got)
 		}

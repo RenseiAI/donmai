@@ -301,7 +301,7 @@ func (h *Handle) start(ctx context.Context, plan SpawnPlan, resumeThreadID strin
 		h.idMu.Lock()
 		h.threadID = resumeThreadID
 		h.idMu.Unlock()
-		params := threadResumeParams(resumeThreadID, denyPlan{})
+		params := threadResumeParams(resumeThreadID, h.spec, denyPlan{})
 		maps.Copy(params, plan.ThreadResume)
 		params["threadId"] = resumeThreadID
 		if _, err := h.client.RequestWithRetry(ctx, "thread/resume", params, h.rpcTimeout); err != nil {
