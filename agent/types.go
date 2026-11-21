@@ -1129,6 +1129,56 @@ type TurnManifest struct {
 	// repository. Absent retains schemaVersion 1 semantics: scalar artifacts
 	// apply to the selected repository.
 	Repositories *[]TurnManifestRepository `json:"repositories,omitempty"`
+
+	// Findings is the structured per-finding breakdown of a review (the
+	// control plane's review-findings contract). Optional. Each element is
+	// decoded tolerantly — a malformed finding never fails the manifest —
+	// and the runner normalizes, orders (blocking first) and bounds the list
+	// before posting (runner.NormalizeManifestFindings).
+	Findings []TurnManifestFinding `json:"findings,omitempty"`
+}
+
+// TurnManifestFinding is one review finding. JSON names match the control
+// plane's finding contract: category and severity are what it keys on; id
+// (B1, B2, …), title and fix are the gate row; path and line locate it.
+type TurnManifestFinding struct {
+	ID       string `json:"id,omitempty"`
+	Category string `json:"category,omitempty"`
+	Severity string `json:"severity,omitempty"`
+	Kind     string `json:"kind,omitempty"`
+	Path     string `json:"path,omitempty"`
+	Line     int    `json:"line,omitempty"`
+	Blocking *bool  `json:"blocking,omitempty"`
+	Title    string `json:"title,omitempty"`
+	Fix      string `json:"fix,omitempty"`
+}
+
+// UnmarshalJSON decodes a finding tolerantly: each field keeps its value
+// only when it has the expected JSON type, so one malformed field (a string
+// line number, a numeric title) drops that field rather than failing the
+// whole agent-written manifest. It never returns an error.
+func (f *TurnManifestFinding) UnmarshalJSON(data []byte) error {
+	var raw map[string]json.RawMessage
+	*f = TurnManifestFinding{}
+	if json.Unmarshal(data, &raw) != nil {
+		return nil
+	}
+	str := func(key string) string {
+		var s string
+		_ = json.Unmarshal(raw[key], &s)
+		return s
+	}
+	f.ID, f.Category, f.Severity, f.Kind = str("id"), str("category"), str("severity"), str("kind")
+	f.Path, f.Title, f.Fix = str("path"), str("title"), str("fix")
+	var line float64
+	if json.Unmarshal(raw["line"], &line) == nil && line >= 1 && line == float64(int(line)) {
+		f.Line = int(line)
+	}
+	var blocking bool
+	if v, ok := raw["blocking"]; ok && json.Unmarshal(v, &blocking) == nil {
+		f.Blocking = &blocking
+	}
+	return nil
 }
 
 // TurnManifestRepository is one per-repository additive manifest member.

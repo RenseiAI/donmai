@@ -152,6 +152,7 @@ const manifestSchema = `{
     "pullRequestUrl": { "type": "string" },
     "pullRequest": false,
     "commitSha": { "type": "string" },
+    "findings": { "type": "array" },
     "repositories": {
       "type": "array",
       "items": {
@@ -232,6 +233,7 @@ func ParseManifest(worktreePath string) (*TurnManifest, error) {
 	if err := validateManifestRepositories(manifestRepositoryEntries(&m)); err != nil {
 		return nil, err
 	}
+	m.Findings = NormalizeManifestFindings(m.Findings)
 	return &m, nil
 }
 
@@ -299,6 +301,7 @@ func ParseInlineManifest(finalMessage string) (*TurnManifest, error) {
 	if err := validateManifestRepositories(manifestRepositoryEntries(&m)); err != nil {
 		return nil, ErrNoInlineManifest
 	}
+	m.Findings = NormalizeManifestFindings(m.Findings)
 	return &m, nil
 }
 
