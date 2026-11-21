@@ -57,40 +57,43 @@ func drainActivitySpawnResult(t *testing.T, h *interactiveHandle) (moments []str
 }
 
 // readSettingsJSON polls for the fake child's argv dump and returns the
-// --settings JSON value.
+// --settings JSON value. The fake writes argv while this polls, so a read
+// may see the --settings flag before its value line is complete; it keeps
+// polling until the value line is newline-terminated and decodes.
 func readSettingsJSON(t *testing.T, workdir string) map[string]any {
 	t.Helper()
 	path := filepath.Join(workdir, "argv.txt")
-	var raw []byte
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		var err error
-		raw, err = os.ReadFile(path) //nolint:gosec // test-owned fixture
-		if err == nil && strings.Contains(string(raw), "--settings") {
-			break
+		raw, err := os.ReadFile(path) //nolint:gosec // test-owned fixture
+		if err == nil {
+			if decoded, ok := settingsFromArgv(raw); ok {
+				return decoded
+			}
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("fake child never wrote a complete argv.txt with --settings: %v %q", err, raw)
+			t.Fatalf("fake child never wrote a complete argv.txt with --settings JSON: %v %q", err, raw)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	// The fake echoes one argv element per line; --settings JSON is one line.
-	lines := strings.Split(strings.TrimSuffix(string(raw), "\n"), "\n")
-	idx := -1
-	for i, line := range lines {
-		if line == "--settings" && i+1 < len(lines) {
-			idx = i + 1
-			break
+}
+
+// settingsFromArgv decodes the --settings value from an argv dump (one
+// element per line), reporting false until that value line is complete.
+func settingsFromArgv(raw []byte) (map[string]any, bool) {
+	lines := strings.Split(string(raw), "\n")
+	// The last element follows the final newline: it is torn or empty.
+	for i := 0; i+2 < len(lines); i++ {
+		if lines[i] != "--settings" {
+			continue
 		}
+		var decoded map[string]any
+		if err := json.Unmarshal([]byte(lines[i+1]), &decoded); err != nil {
+			return nil, false
+		}
+		return decoded, true
 	}
-	if idx < 0 {
-		t.Fatalf("child argv carries no --settings: %q", raw)
-	}
-	var decoded map[string]any
-	if err := json.Unmarshal([]byte(lines[idx]), &decoded); err != nil {
-		t.Fatalf("settings JSON is not JSON: %v\n%s", err, lines[idx])
-	}
-	return decoded
+	return nil, false
 }
 
 // hookCommand extracts the first hook command for event from a decoded
@@ -395,14 +398,28 @@ func TestSpawnInteractive_ActivityTelemetryDeliveredBeforeDone(t *testing.T) {
 	}
 }
 
+// stopOnExitFakeScript is gateFakeScript, except that on release the fake
+// runs the hook command the test left in stop-cmd and then exits at once,
+// the way the CLI fires Stop on its way out. The relay line is written
+// before the child exits, but after the last per-tick sweep the tailer
+// could have run.
+const stopOnExitFakeScript = `printf '%s\n' "$@" > "$PWD/argv.txt"
+while [ ! -e "$PWD/gate" ]; do sleep 0.05; done
+/bin/sh -c "$(cat "$PWD/stop-cmd")"
+`
+
 // TestSpawnInteractive_ActivityStopFlushReachesTerminal pins K7: the final
 // relay flush delivers moments written after the last per-tick sweep. The
-// fake idles past at least one tick, the test fires the installed Stop
-// telemetry command and releases the child immediately, and the stop moment
-// must still arrive before the terminal ResultEvent.
+// fake fires the installed Stop telemetry command as it exits, and the
+// stop moment must still arrive before the terminal ResultEvent. ptycli
+// runs the session cleanup concurrently with that final flush; the seam
+// below holds the flush back so the cleanup always finishes first, and the
+// relay file must survive it.
 func TestSpawnInteractive_ActivityStopFlushReachesTerminal(t *testing.T) {
+	finalActivitySweepDelay.Store(int64(300 * time.Millisecond))
+	t.Cleanup(func() { finalActivitySweepDelay.Store(0) })
 	workdir := t.TempDir()
-	p := newFakeInteractiveProvider(t, gateFakeScript)
+	p := newFakeInteractiveProvider(t, stopOnExitFakeScript)
 	h, err := p.Spawn(context.Background(), agent.Spec{
 		Prompt:      "hello",
 		Cwd:         workdir,
@@ -418,11 +435,8 @@ func TestSpawnInteractive_ActivityStopFlushReachesTerminal(t *testing.T) {
 	}
 	settings := readSettingsJSON(t, workdir)
 	cmd := stopTelemetryCommand(t, settings)
-	// Settle past at least one per-tick sweep so the fire below lands
-	// after the last tick: only the final flush can deliver it.
-	time.Sleep(1200 * time.Millisecond)
-	if out, err := exec.CommandContext(t.Context(), "/bin/sh", "-c", cmd).CombinedOutput(); err != nil { //nolint:gosec // test executes the harness's own relay command
-		t.Fatalf("fire installed Stop telemetry hook: %s: %v", out, err)
+	if err := os.WriteFile(filepath.Join(workdir, "stop-cmd"), []byte(cmd), 0o600); err != nil {
+		t.Fatal(err)
 	}
 	openActivityGate(t, workdir)
 	moments, terminal := drainActivitySpawnResult(t, wrapper)
