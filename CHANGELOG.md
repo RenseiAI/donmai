@@ -10,6 +10,12 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 No unreleased changes.
 
+## v0.73.11 — 2026-11-21
+
+### Features
+
+- Handle event model v2 kinds
+
 ## v0.73.10 — 2026-11-21
 
 ### Features
