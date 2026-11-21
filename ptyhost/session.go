@@ -552,6 +552,18 @@ func (s *Session) TryWriteNotice(p []byte) (bool, error) {
 	return true, nil
 }
 
+// AlternateScreenActive reports whether the child is driving the alternate
+// screen buffer (a full-screen UI where every byte is a command). It is the
+// observable half of the modal input state: a push notice must refuse while
+// it holds. Pull delivery never touches the terminal so it never consults
+// this; an inline application-level modal is invisible here by construction.
+func (s *Session) AlternateScreenActive() bool {
+	if s == nil {
+		return false
+	}
+	return s.altActive.Load()
+}
+
 // declaredNotice renders the session's declared mechanism for an error
 // message, distinguishing "the manifest said none" from "the manifest said
 // nothing" — an omission and a refusal are different defects to chase.

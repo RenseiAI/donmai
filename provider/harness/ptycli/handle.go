@@ -417,6 +417,17 @@ func (h *Handle) InteractiveSession() agent.InteractiveSession { return h.sess }
 // bare terminal never stall session end for the long grace.
 func (h *Handle) HasTerminalCost() bool { return h != nil && h.terminalCost != nil }
 
+// AlternateScreenActive reports whether the child is driving the alternate
+// screen. It forwards the PTY host's own observable modal state so the
+// runner's readiness read can report modal for push delivery without
+// screen-scraping. Pull delivery never consults it.
+func (h *Handle) AlternateScreenActive() bool {
+	if h == nil || h.sess == nil {
+		return false
+	}
+	return h.sess.AlternateScreenActive()
+}
+
 // EmitMarker is a passthrough convenience to the underlying
 // ptyhost.Session.EmitMarker so the P5-WS6 suspend/resume seam does not need
 // a type assertion to agent.InteractiveCapable before calling it. Suspend
