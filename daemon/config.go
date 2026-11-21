@@ -570,6 +570,24 @@ type AutoUpdateConfig struct {
 	// upgrade refuses without a swap until the operator sets this
 	// alongside the signer allowlist.
 	CDNBase string `yaml:"cdnBase,omitempty" json:"cdnBase,omitempty"`
+
+	// ManagedTrust is the explicit local opt-in for coordinator-managed
+	// update trust. When Enabled the daemon accepts signer/root rotations
+	// delivered over the heartbeat channel for the already configured
+	// coordinator (Orchestrator.URL). The managed signer/root pair is a
+	// REPLACEMENT for the local Signers/TrustRootPath, never a union.
+	// Disabled (zero value) ignores remote trust projections and keeps
+	// local verification behavior.
+	ManagedTrust ManagedUpdateTrustConfig `yaml:"managedTrust,omitempty" json:"managedTrust,omitempty"`
+}
+
+// ManagedUpdateTrustConfig is the explicit local opt-in for
+// coordinator-managed update trust. Authorization requires Enabled plus
+// an already configured coordinator URL; the heartbeat channel that
+// carries the projection is that coordinator's, so no additional
+// coordinator identity travels in the projection itself.
+type ManagedUpdateTrustConfig struct {
+	Enabled bool `yaml:"enabled,omitempty" json:"enabled,omitempty"`
 }
 
 // UpdateSigner pins one identity trusted to sign release binaries.

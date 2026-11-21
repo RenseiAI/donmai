@@ -719,6 +719,17 @@ type Daemon struct {
 	// a restart plus redelivery to run a second swap.
 	hostUpgradeDurableBroken bool
 	hostUpgradeDurableError  string
+
+	// managedTrustMu synchronizes managed update-trust replacement with
+	// verification so the updater sees either the complete old pair or
+	// the complete new pair. Writers (heartbeat projection application)
+	// take the write lock; verifier derivation takes the read lock and
+	// copies the active pointer before building the verifier outside it.
+	managedTrustMu            sync.RWMutex
+	managedTrustActive        *managedUpdateTrustPolicy
+	managedTrustBlocked       bool
+	managedTrustBlockedReason string
+	managedTrustLoaded        bool
 }
 
 // New constructs a Daemon. Call Start() to bring it online.
@@ -2104,6 +2115,8 @@ func (d *Daemon) Start(ctx context.Context) error {
 			GetQuota: d.QuotaSnapshot,
 			// Phase 2c: handle platform-queued mutations.
 			OnPendingMutations: d.applyPendingMutations,
+			// Managed update trust: heartbeat-carried signer/root rotation.
+			OnManagedUpdateTrust: d.applyManagedUpdateTrustProjection,
 			// Phase 2e: surface hostStatus signals (pool_deleted etc.)
 			// to af daemon stats. The latest observed status is stored
 			// in d.hostStatus; callers read via Daemon.HostStatus().
@@ -4103,6 +4116,7 @@ func (a *updateAttempt) run(ctx context.Context) (*UpdateResult, error) {
 		CurrentVersion: d.EffectiveVersion(),
 		Config:         cfg.AutoUpdate,
 		CDNBase:        effectiveUpdateCDNBase(cfg.AutoUpdate),
+		Verifier:       d.managedUpdateVerifier(cfg.AutoUpdate),
 		SkipExit:       true, // HTTP-driven update: caller decides to exit.
 	})
 	return updater.RunUpdate(ctx)
