@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -437,7 +438,19 @@ func (h *Handle) handleNotification(n notification) bool {
 			// before this notification; read it before Events closes.
 			h.tail.drain(h.emit)
 			if err := h.releaseMCPConfig(); err != nil {
-				h.emit(mcpCleanupErrorEvent())
+				if ev.Kind() == agent.EventResult && mcpCleanupContained(err) {
+					// The turn already finished and its result is real; the
+					// failed clear is contained (Provider poisoned, writer
+					// stopped, home handled by the owner). Report the result
+					// and surface the cleanup failure as a warning instead of
+					// discarding a completed turn.
+					slog.Warn("codex: isolated MCP config cleanup failed after the turn completed; provider quarantined",
+						"threadId", h.SessionID(), "err", err)
+					h.emit(mcpCleanupWarningEvent(err))
+					h.emit(ev)
+				} else {
+					h.emit(mcpCleanupErrorEvent())
+				}
 			} else {
 				h.emit(ev)
 			}
@@ -446,6 +459,16 @@ func (h *Handle) handleNotification(n notification) bool {
 		h.emit(ev)
 	}
 	return false
+}
+
+// mcpCleanupWarningEvent reports a contained cleanup failure. The detail is
+// the bounded release error (codexMCPConfigFailureDetail never carries config
+// values), so the cause is visible without leaking the session's MCP config.
+func mcpCleanupWarningEvent(err error) agent.SystemEvent {
+	return agent.SystemEvent{
+		Subtype: "codex_warning",
+		Message: "codex isolated MCP configuration cleanup failed after the turn completed; the app-server config is quarantined: " + err.Error(),
+	}
 }
 
 func mcpCleanupErrorEvent() agent.ErrorEvent {

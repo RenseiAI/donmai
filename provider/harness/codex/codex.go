@@ -757,7 +757,7 @@ func (p *Provider) acquireMCPConfig(ctx context.Context, mcpConfig map[string]an
 					p.mcpConfigKnown = false
 					if err := p.config.remove(); err != nil {
 						p.mcpPoisoned = true
-						releaseErr = codexMCPApplicationError("destroy isolated MCP config after app-server exit")
+						releaseErr = &mcpCleanupError{err: codexMCPApplicationError("destroy isolated MCP config after app-server exit")}
 					}
 					return
 				}
@@ -767,8 +767,16 @@ func (p *Provider) acquireMCPConfig(ctx context.Context, mcpConfig map[string]an
 				if err != nil {
 					p.mcpConfigKnown = false
 					p.mcpPoisoned = true
-					_ = p.config.remove()
-					releaseErr = codexMCPApplicationError("clear isolated MCP config: " + codexMCPConfigFailureDetail(err))
+					// The poison already refuses every later lease. remove() then
+					// stops the app-server writer (no live MCP client keeps this
+					// session's server credentials) and destroys or retains the
+					// private home under the normal retention rule. Only a clean
+					// remove contains the failure; anything else stays fatal.
+					removeErr := p.config.remove()
+					releaseErr = &mcpCleanupError{
+						err:       codexMCPApplicationError("clear isolated MCP config: " + codexMCPConfigFailureDetail(err)),
+						contained: removeErr == nil,
+					}
 				} else {
 					empty, _ := json.Marshal(map[string]any{})
 					p.mcpConfigDigest = sha256.Sum256(empty)
@@ -803,7 +811,7 @@ func (p *Provider) applyMCPConfig(ctx context.Context, desired map[string]any, c
 		return errors.New("isolated Codex config boundary is missing")
 	}
 	if err := p.config.validate(); err != nil {
-		return err
+		return &mcpBoundaryError{err: err}
 	}
 	params := map[string]any{
 		"filePath":         p.config.configPath,
@@ -891,6 +899,10 @@ func codexMCPConfigFailureDetail(err error) string {
 	if errors.As(err, &activationDeadline) {
 		return activationDeadline.Error()
 	}
+	var boundary *mcpBoundaryError
+	if errors.As(err, &boundary) {
+		return "isolated config boundary rejected: " + boundary.reason()
+	}
 	var rpc *RPCError
 	if errors.As(err, &rpc) {
 		method := "config RPC"
@@ -906,6 +918,49 @@ func codexMCPConfigFailureDetail(err error) string {
 		return "isolated config activation deadline exceeded"
 	}
 	return "isolated config activation verification failed"
+}
+
+// mcpBoundaryError marks a release or apply that the private config
+// boundary refused before any RPC was sent (home or config mode widened,
+// symlink swap, parent or host-auth identity change). Its reason is safe to
+// surface: boundary errors never carry config values.
+type mcpBoundaryError struct{ err error }
+
+func (e *mcpBoundaryError) Error() string { return e.err.Error() }
+func (e *mcpBoundaryError) Unwrap() error { return e.err }
+
+// reason keeps only the leading clause of the boundary error (for example
+// "isolated Codex home mode is 0750, want 0700") so wrapped path errors never
+// reach the event stream.
+func (e *mcpBoundaryError) reason() string {
+	msg := e.err.Error()
+	if i := strings.Index(msg, ": "); i >= 0 {
+		msg = msg[:i]
+	}
+	const maxReason = 120
+	if runes := []rune(msg); len(runes) > maxReason {
+		msg = string(runes[:maxReason]) + "..."
+	}
+	return msg
+}
+
+// mcpCleanupError is the final-release failure. contained reports that the
+// failure left nothing reusable or live behind: the Provider is poisoned for
+// every later lease, and the private home's owner removal (which first stops
+// the app-server writer) succeeded. A contained failure after a completed turn
+// is reported as a warning next to the turn's result; an uncontained one keeps
+// replacing the result with the terminal mcp_cleanup_failed error.
+type mcpCleanupError struct {
+	err       error
+	contained bool
+}
+
+func (e *mcpCleanupError) Error() string { return e.err.Error() }
+func (e *mcpCleanupError) Unwrap() error { return e.err }
+
+func mcpCleanupContained(err error) bool {
+	var cleanup *mcpCleanupError
+	return errors.As(err, &cleanup) && cleanup.contained
 }
 
 func codexMCPApplicationError(detail string) *agent.ToolAdaptationError {
