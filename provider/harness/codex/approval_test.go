@@ -224,3 +224,39 @@ func TestParseApprovalRequest_FilePathShape(t *testing.T) {
 		t.Fatalf("unexpected: %+v", got)
 	}
 }
+
+// TestApprovalBridge_CommandDenyForms pins each Claude command-deny form and
+// the compound and wrapped spellings a prefix deny must still catch.
+func TestApprovalBridge_CommandDenyForms(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		deny     string
+		declined []string
+		accepted []string
+	}{
+		{deny: "Bash", declined: []string{"ls", "go test ./..."}},
+		{
+			deny: "Bash(git push*)",
+			declined: []string{
+				"git push origin main", "cd x && git push", "bash -c 'git push'", "env FOO=1 git push",
+				`/bin/zsh -lc "cd x && git push"`, "echo y | xargs git push", "nohup git push &", "a=$(git push)",
+			},
+			accepted: []string{"git status", `grep -rn "git push" docs`},
+		},
+		{deny: "Bash(pnpm *)", declined: []string{"pnpm", "pnpm install"}, accepted: []string{"pnpmx"}},
+		{deny: "Bash(env)", declined: []string{"env", "cd x; env"}, accepted: []string{"env FOO=1 make"}},
+		{deny: "Read(/srv/**/.env*)", accepted: []string{"cat Read/srv/x/.env"}},
+	} {
+		br := NewApprovalBridge(&agent.PermissionConfig{DisallowPatterns: []string{tc.deny}})
+		for _, cmd := range tc.declined {
+			if got := br.Evaluate(ApprovalRequest{Kind: ApprovalKindCommand, Command: cmd}); got.Action != ActionDecline {
+				t.Errorf("%s: %q = %s, want decline", tc.deny, cmd, got.Action)
+			}
+		}
+		for _, cmd := range tc.accepted {
+			if got := br.Evaluate(ApprovalRequest{Kind: ApprovalKindCommand, Command: cmd}); got.Action == ActionDecline {
+				t.Errorf("%s: %q declined (%s), want accept", tc.deny, cmd, got.Reason)
+			}
+		}
+	}
+}

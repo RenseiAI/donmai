@@ -187,10 +187,15 @@ func (b *ApprovalBridge) evaluateCommand(cmd string) ApprovalDecision {
 		}
 	}
 
-	// 2. User-supplied disallow.
+	// 2. User-supplied disallow, against the whole line and against every
+	// command it chains or wraps, so "cd x && git push" or "env git push"
+	// cannot slip past a "git push" prefix.
+	segments := append([]string{cmd}, commandSegments(cmd)...)
 	for _, re := range b.denyRegexes {
-		if re.MatchString(cmd) {
-			return ApprovalDecision{Action: ActionDecline, Reason: "command matches disallow pattern: " + re.String()}
+		for _, segment := range segments {
+			if re.MatchString(segment) {
+				return ApprovalDecision{Action: ActionDecline, Reason: "command matches disallow pattern: " + re.String()}
+			}
 		}
 	}
 
@@ -249,6 +254,11 @@ func compilePatterns(patterns []string) ([]*regexp.Regexp, bool) {
 			files = true
 			continue
 		}
+		// Path-scoped Read/Edit patterns are not command text; Codex enforces
+		// them through the deny permission profile (deny_translation.go).
+		if name, _, scoped := splitToolPattern(strings.TrimSpace(p)); scoped && (name == "Read" || isFileChangeTool(name)) {
+			continue
+		}
 		if commandPattern, ok := bashPermissionPattern(p); ok {
 			out = append(out, regexp.MustCompile(commandPattern))
 			continue
@@ -275,8 +285,20 @@ func isFileChangeTool(pattern string) bool {
 	}
 }
 
+// splitToolPattern splits "Name(arg)" into its parts; a bare name is unscoped.
+func splitToolPattern(pattern string) (name, arg string, scoped bool) {
+	open := strings.IndexByte(pattern, '(')
+	if open <= 0 || !strings.HasSuffix(pattern, ")") {
+		return pattern, "", false
+	}
+	return pattern[:open], strings.TrimSpace(pattern[open+1 : len(pattern)-1]), true
+}
+
 func bashPermissionPattern(pattern string) (string, bool) {
 	pattern = strings.TrimSpace(pattern)
+	if pattern == "Bash" {
+		return `(?s)^.*$`, true
+	}
 	if !strings.HasPrefix(pattern, "Bash(") || !strings.HasSuffix(pattern, ")") {
 		return "", false
 	}
@@ -288,7 +310,43 @@ func bashPermissionPattern(pattern string) (string, bool) {
 		prefix := strings.TrimSpace(strings.TrimSuffix(inner, ":*"))
 		return `^` + regexp.QuoteMeta(prefix) + `(?:\s|$)`, true
 	}
+	// "git push*" is a plain string prefix; "pnpm *" ends at a word.
+	if prefix, ok := strings.CutSuffix(inner, "*"); ok {
+		if trimmed := strings.TrimSpace(prefix); trimmed != prefix {
+			return `^` + regexp.QuoteMeta(trimmed) + `(?:\s|$)`, true
+		}
+		return `^` + regexp.QuoteMeta(prefix), true
+	}
 	return `^` + regexp.QuoteMeta(inner) + `$`, true
+}
+
+// commandSeparators split a shell line where a new command starts.
+var commandSeparators = regexp.MustCompile("&&|\\|\\||[;|&\n()`]|\\$\\(")
+
+// commandWrappers match leading words that run the rest of the line as a
+// command: VAR=value, env, command, exec, nohup, time, nice, timeout, xargs,
+// eval, and a shell's -c flag, each optionally by absolute path and with flags.
+var commandWrappers = regexp.MustCompile(`^(?:(?:[A-Za-z_][A-Za-z0-9_]*=\S*|(?:\S*/)?(?:env|command|exec|nohup|time|nice|xargs|eval)(?:\s+-\S+(?:\s+\d+)?)*|(?:\S*/)?timeout(?:\s+-\S+)*\s+\S+|(?:\S*/)?(?:ba|z|da|k)?sh(?:\s+-\S+)*\s+-[A-Za-z]*c)\s+)+`)
+
+// commandSegments returns each command a shell line chains or wraps, with
+// wrappers and quotes stripped. It over-splits quoted text, which can only
+// decline more, never less.
+func commandSegments(cmd string) []string {
+	var out []string
+	for _, part := range commandSeparators.Split(cmd, -1) {
+		part = strings.TrimSpace(part)
+		for {
+			next := strings.TrimSpace(strings.Trim(strings.TrimSpace(commandWrappers.ReplaceAllString(part, "")), `'"`))
+			if next == part {
+				break
+			}
+			part = next
+		}
+		if part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
 }
 
 // parseApprovalRequest extracts the kind+payload from a JSON-RPC
