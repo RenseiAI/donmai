@@ -18,6 +18,8 @@ func TestCodexNotificationsPostTypedActivities(t *testing.T) {
 		{"codex_model_rerouted", "warning"},
 		{"codex_moderation", "warning"},
 		{"codex_safety_buffering", "warning"},
+		{"codex_safety_buffering_started", "warning"},
+		{"codex_safety_buffering_ended", "warning"},
 		{"codex_progress", "progress"},
 		{"codex_error", "error"},
 		{"codex_warning", "warning"},
