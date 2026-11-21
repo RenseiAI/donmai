@@ -776,7 +776,7 @@ func mapEvent(ev agent.Event, ts time.Time, providerName string, durationMs int6
 			out.Type = "error"
 			out.Content = e.Message
 			return out, true
-		case "codex_warning", "codex_model_rerouted", "codex_moderation", "codex_safety_buffering":
+		case "codex_warning", "codex_model_rerouted", "codex_moderation", "codex_safety_buffering", "codex_safety_buffering_started", "codex_safety_buffering_ended":
 			out.Type = "warning"
 			out.Content = e.Message
 			return out, true
