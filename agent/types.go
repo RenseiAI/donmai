@@ -550,6 +550,11 @@ type Spec struct {
 	// never set it.
 	ResponseSchema json.RawMessage `json:"responseSchema,omitempty"`
 
+	// Instructions carries the harness-neutral intents of the interaction
+	// contract (plan mode, approvals, tool policy). Nil means none; each
+	// adapter's TranslateInstructions reports how it honours each one.
+	Instructions *Instructions `json:"instructions,omitempty"`
+
 	// Interactive requests spawn-under-PTY with a live interactive
 	// session surface (interactive-attach-v1; see agent/interactive.go).
 	// Honored only by harnesses whose manifest declares PTY transport
