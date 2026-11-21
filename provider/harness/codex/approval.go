@@ -199,10 +199,18 @@ func (b *ApprovalBridge) evaluateCommand(cmd string) ApprovalDecision {
 		}
 	}
 
-	// 3. User-supplied allow (if present, gates everything else).
+	// 3. User-supplied allow (if present, gates everything else). The whole
+	// line must match an allow, as it always had to, AND so must every command
+	// it chains: a "git" allow must not cover "git status && rm -rf src". The
+	// chained commands keep their wrappers, so unwrapping can never widen an
+	// allow either.
 	if len(b.allowRegexes) > 0 {
-		for _, re := range b.allowRegexes {
-			if re.MatchString(cmd) {
+		if matchesAny(b.allowRegexes, cmd) {
+			allowed := true
+			for _, chained := range chainedCommands(cmd) {
+				allowed = allowed && matchesAny(b.allowRegexes, chained)
+			}
+			if allowed {
 				return ApprovalDecision{Action: ActionAcceptForSession}
 			}
 		}
@@ -254,8 +262,8 @@ func compilePatterns(patterns []string) ([]*regexp.Regexp, bool) {
 			files = true
 			continue
 		}
-		// Path-scoped Read/Edit patterns are not command text; Codex enforces
-		// them through the deny permission profile (deny_translation.go).
+		// Path-scoped Read/Edit patterns are not command text: compiled as a
+		// command regex they either failed or matched nothing meaningful.
 		if name, _, scoped := splitToolPattern(strings.TrimSpace(p)); scoped && (name == "Read" || isFileChangeTool(name)) {
 			continue
 		}
@@ -326,15 +334,37 @@ var commandSeparators = regexp.MustCompile("&&|\\|\\||[;|&\n()`]|\\$\\(")
 // commandWrappers match leading words that run the rest of the line as a
 // command: VAR=value, env, command, exec, nohup, time, nice, timeout, xargs,
 // eval, and a shell's -c flag, each optionally by absolute path and with flags.
-var commandWrappers = regexp.MustCompile(`^(?:(?:[A-Za-z_][A-Za-z0-9_]*=\S*|(?:\S*/)?(?:env|command|exec|nohup|time|nice|xargs|eval)(?:\s+-\S+(?:\s+\d+)?)*|(?:\S*/)?timeout(?:\s+-\S+)*\s+\S+|(?:\S*/)?(?:ba|z|da|k)?sh(?:\s+-\S+)*\s+-[A-Za-z]*c)\s+)+`)
+var commandWrappers = regexp.MustCompile(`^(?:(?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|\S*)|(?:\S*/)?(?:env|command|exec|nohup|time|nice|xargs|eval)(?:\s+-\S+(?:\s+\d+)?)*|(?:\S*/)?timeout(?:\s+-\S+)*\s+\S+|(?:\S*/)?(?:ba|z|da|k)?sh(?:\s+-\S+)*\s+-[A-Za-z]*c)\s+)+`)
 
-// commandSegments returns each command a shell line chains or wraps, with
-// wrappers and quotes stripped. It over-splits quoted text, which can only
-// decline more, never less.
-func commandSegments(cmd string) []string {
+// chainedCommands splits a shell line into the commands it chains, untouched.
+// It over-splits quoted text, which can only make a deny match more and an
+// allow match less.
+func chainedCommands(cmd string) []string {
 	var out []string
 	for _, part := range commandSeparators.Split(cmd, -1) {
-		part = strings.TrimSpace(part)
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
+}
+
+func matchesAny(res []*regexp.Regexp, s string) bool {
+	for _, re := range res {
+		if re.MatchString(s) {
+			return true
+		}
+	}
+	return false
+}
+
+// commandSegments returns each command a shell line chains or wraps, with
+// wrappers and quotes stripped and runs of whitespace collapsed, for deny
+// matching only.
+func commandSegments(cmd string) []string {
+	var out []string
+	for _, part := range chainedCommands(cmd) {
+		part = strings.Join(strings.Fields(part), " ")
 		for {
 			next := strings.TrimSpace(strings.Trim(strings.TrimSpace(commandWrappers.ReplaceAllString(part, "")), `'"`))
 			if next == part {
