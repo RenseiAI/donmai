@@ -106,6 +106,11 @@ type HarnessCaps struct {
 	// SupportsReadOnlySelectedCWD means the executor can run from a
 	// selected read-only repository without implicitly granting its CWD write.
 	SupportsReadOnlySelectedCWD bool `json:"supportsReadOnlySelectedCwd,omitempty"`
+	// ContextPackProtocols is the exact negotiated-document protocol set this
+	// harness/executor binding has proved. Missing means [] and a pack carrier
+	// is refused before any document is visible: advertisement matches only
+	// the executor path that actually materializes the contract.
+	ContextPackProtocols []string `json:"contextPackProtocols,omitempty"`
 
 	// NoticeDelivery declares the mechanism — if any — by which a message
 	// can be delivered INTO an already-running session on this harness.

@@ -1035,7 +1035,7 @@ func (r *Runner) run(ctx context.Context, qw QueuedWork, admission *HarnessAdmis
 						archiveReference = lease.ArchiveReference
 						res.TerminalArchiveReference = archiveReference
 					}
-					body, bodyErr := r.poster.PrepareTerminalStatusBodyWithOptions(context.Background(), qw.SessionID, res.Result, result.PostOptions{TerminalWorkareaLease: leaseProjection, TerminalArchiveReference: archiveReference})
+					body, bodyErr := r.poster.PrepareTerminalStatusBodyWithOptions(context.Background(), qw.SessionID, res.Result, result.PostOptions{TerminalWorkareaLease: leaseProjection, TerminalArchiveReference: archiveReference, ContextPack: res.ContextPack})
 					if bodyErr != nil {
 						leaseErr := fmt.Errorf("runner: encode immutable terminal status body: %w", bodyErr)
 						markTerminalLeaseFailure(res, leaseErr)
@@ -1123,7 +1123,7 @@ func (r *Runner) run(ctx context.Context, qw QueuedWork, admission *HarnessAdmis
 	// loop would send the same terminal twice if the runner died before
 	// the first send.
 	if r.shimSeat != nil && res.Status != "" && !leasePrepared {
-		standaloneBody, bodyErr := r.poster.PrepareTerminalStatusBody(context.Background(), qw.SessionID, res.Result, leaseProjection)
+		standaloneBody, bodyErr := r.poster.PrepareTerminalStatusBodyWithOptions(context.Background(), qw.SessionID, res.Result, result.PostOptions{TerminalWorkareaLease: leaseProjection, ContextPack: res.ContextPack})
 		if bodyErr != nil {
 			r.logger.Warn("standalone terminal status body not persisted; sending without replay",
 				"sessionId", qw.SessionID, "err", bodyErr)
@@ -1167,7 +1167,7 @@ func (r *Runner) run(ctx context.Context, qw QueuedWork, admission *HarnessAdmis
 	if leasePrepared || standalonePrepared {
 		postOutcome = r.poster.PostPreparedOutcome(postCtx, qw.SessionID, res.Result, preparedStatusBody)
 	} else {
-		postOutcome = r.poster.PostWithOptionsOutcome(postCtx, qw.SessionID, res.Result, result.PostOptions{})
+		postOutcome = r.poster.PostWithOptionsOutcome(postCtx, qw.SessionID, res.Result, result.PostOptions{ContextPack: res.ContextPack})
 	}
 	postCancel()
 	if standalonePrepared && postOutcome.StatusObserved() {
