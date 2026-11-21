@@ -38,6 +38,12 @@ type Handle struct {
 	idMu     sync.RWMutex
 	threadID string
 
+	// settingsMu orders the effective-settings echo after the InitEvent:
+	// thread/start's response and the thread/started notification race.
+	settingsMu      sync.Mutex
+	initEmitted     bool
+	pendingSettings *agent.EffectiveSettingsEvent
+
 	events   chan agent.Event
 	notifyCh chan notification
 
@@ -331,6 +337,9 @@ func (h *Handle) start(ctx context.Context, plan SpawnPlan, resumeThreadID strin
 		h.threadID = resp.Thread.ID
 		h.idMu.Unlock()
 		h.client.Subscribe(resp.Thread.ID, provisionalSub)
+		if settings, ok := effectiveSettings(h.spec, raw); ok {
+			h.queueSettings(settings)
+		}
 		if h.spec.SessionName != "" {
 			if _, err := h.client.RequestWithRetry(ctx, "thread/name/set", map[string]any{
 				"threadId": resp.Thread.ID,
@@ -444,6 +453,9 @@ func (h *Handle) handleNotification(n notification) bool {
 			return true
 		}
 		h.emit(ev)
+		if ev.Kind() == agent.EventInit {
+			h.initDone()
+		}
 	}
 	return false
 }
@@ -603,4 +615,30 @@ func emptyToUnknown(s string) string {
 		return "unknown"
 	}
 	return s
+}
+
+// queueSettings emits the effective-settings echo now if the InitEvent is
+// out, else holds it until initDone.
+func (h *Handle) queueSettings(ev agent.EffectiveSettingsEvent) {
+	h.settingsMu.Lock()
+	ready := h.initEmitted
+	if !ready {
+		h.pendingSettings = &ev
+	}
+	h.settingsMu.Unlock()
+	if ready {
+		h.emit(ev)
+	}
+}
+
+// initDone marks the InitEvent emitted and releases a held echo.
+func (h *Handle) initDone() {
+	h.settingsMu.Lock()
+	h.initEmitted = true
+	pending := h.pendingSettings
+	h.pendingSettings = nil
+	h.settingsMu.Unlock()
+	if pending != nil {
+		h.emit(*pending)
+	}
 }
