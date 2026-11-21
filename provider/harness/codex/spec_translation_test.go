@@ -98,6 +98,10 @@ func TestSpecFieldCoverage(t *testing.T) {
 		// is the zero value. Registered here (the static coverage mirror) so
 		// this guard rail stays green; NewSpawnPlan is unchanged.
 		"Endpoint",
+		// AuthMode selects which credential surface a harness child may see.
+		// The codex child's credential is decided by its own CODEX_HOME and
+		// env composition (codex.go), never a JSON-RPC param.
+		"AuthMode",
 		// Interactive (W4, interactive-attach-v1) is INTENTIONALLY IGNORED by
 		// NewSpawnPlan/this JSON-RPC translation layer: Provider.Spawn
 		// (codex.go) branches on Spec.Interactive != nil BEFORE NewSpawnPlan
