@@ -10,6 +10,22 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 No unreleased changes.
 
+## v0.73.10 — 2026-11-21
+
+### Features
+
+- Event model v2 kinds and item ids
+
+### Fixes
+
+- Send reasoning effort as turn/start effort
+
+### Chores
+
+- Publish subscription plan definitions in capability catalog
+- Withdraw the flat subscription plan catalog
+- SubscriptionProviders catalog section
+
 ## v0.73.9 — 2026-11-16
 
 ### Fixes
