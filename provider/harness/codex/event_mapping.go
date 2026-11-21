@@ -173,20 +173,13 @@ func mapNotification(method string, params json.RawMessage, state *mapperState, 
 		return []agent.Event{agent.StreamProgressEvent()}
 
 	case "item/commandExecution/outputDelta":
+		// Output deltas are liveness for the running command, keyed by its
+		// item id; the final output arrives on item/completed.
 		var p struct {
-			Delta  string `json:"delta"`
-			Output string `json:"output"`
+			ItemID string `json:"itemId"`
 		}
 		_ = json.Unmarshal(params, &p)
-		text := p.Delta
-		if text == "" {
-			text = p.Output
-		}
-		return []agent.Event{agent.SystemEvent{
-			Subtype: "command_progress",
-			Message: stripANSI(text),
-			Raw:     raw,
-		}}
+		return []agent.Event{agent.ToolProgressEvent{ToolName: "shell", ItemID: p.ItemID, Raw: raw}}
 
 	// ─── Diff / plan ──────────────────────────────────────────────
 	case "turn/diff/updated":
@@ -197,11 +190,7 @@ func mapNotification(method string, params json.RawMessage, state *mapperState, 
 		return []agent.Event{agent.SystemEvent{Subtype: "diff_updated", Message: p.Diff, Raw: raw}}
 
 	case "turn/plan/updated":
-		var p struct {
-			Plan json.RawMessage `json:"plan"`
-		}
-		_ = json.Unmarshal(params, &p)
-		return []agent.Event{agent.SystemEvent{Subtype: "plan_updated", Message: string(p.Plan), Raw: raw}}
+		return mapPlanUpdated(params, raw)
 
 	case "error", "warning":
 		return mapDiagnostic(method, params)
@@ -215,21 +204,19 @@ func mapNotification(method string, params json.RawMessage, state *mapperState, 
 		bufferReasoning(method, params, state)
 		return []agent.Event{agent.StreamProgressEvent()}
 	case "item/fileChange/outputDelta", "item/fileChange/patchUpdated", "item/plan/delta":
+		// Patch and plan deltas are progress on their item, never rows; the
+		// completed item carries the content.
 		var p struct {
-			Delta   string          `json:"delta"`
-			Changes json.RawMessage `json:"changes"`
+			ItemID string `json:"itemId"`
 		}
 		if json.Unmarshal(params, &p) != nil {
 			return nil
 		}
-		text := stripANSI(p.Delta)
-		if method == "item/fileChange/patchUpdated" {
-			text = string(p.Changes)
+		tool := "file_change"
+		if method == "item/plan/delta" {
+			tool = "plan"
 		}
-		if text == "" {
-			return nil
-		}
-		return []agent.Event{agent.SystemEvent{Subtype: "codex_progress", Message: text, Raw: raw}}
+		return []agent.Event{agent.ToolProgressEvent{ToolName: tool, ItemID: p.ItemID, Raw: raw}}
 	default:
 		countIgnored(state, method)
 		slog.Debug("Unrecognized Codex notification", "method", method)
@@ -464,10 +451,7 @@ func mapItem(method string, params json.RawMessage, raw any, states ...*mapperSt
 		// a partial summary) for every reasoning item.
 		if isCompleted {
 			if msg := reasoningText(p.Item.Summary); msg != "" || reasoningText(p.Item.Content) != "" {
-				if msg == "" {
-					msg = reasoningText(p.Item.Content)
-				}
-				return []agent.Event{agent.SystemEvent{Subtype: "reasoning", Message: msg, Raw: raw}}
+				return []agent.Event{agent.ReasoningEvent{ItemID: p.Item.ID, Summary: msg, Text: reasoningText(p.Item.Content), Raw: raw}}
 			}
 		}
 		return nil
@@ -543,10 +527,18 @@ func mapItem(method string, params json.RawMessage, raw any, states ...*mapperSt
 		}
 		return nil
 
+	// Plan and web-search items emit once, on completion; started carries
+	// nothing the completed item lacks.
 	case "plan":
+		if !isCompleted {
+			return nil
+		}
 		return []agent.Event{agent.SystemEvent{Subtype: "plan", Message: p.Item.Text, Raw: raw}}
 
 	case "webSearch":
+		if !isCompleted {
+			return nil
+		}
 		return []agent.Event{agent.SystemEvent{Subtype: "web_search", Message: "Web search: " + p.Item.Text, Raw: raw}}
 
 	case "contextCompaction":
@@ -650,4 +642,32 @@ func calculateCostUSD(freshInputTokens, cachedInputTokens, outputTokens int64, m
 	return (float64(freshInputTokens)/1_000_000)*pricing.input +
 		(float64(cachedInputTokens)/1_000_000)*pricing.cachedInput +
 		(float64(outputTokens)/1_000_000)*pricing.output
+}
+
+// mapPlanUpdated maps turn/plan/updated to the whole current plan. Codex
+// sends `plan: [{step, status}]` with status pending | inProgress | completed.
+func mapPlanUpdated(params json.RawMessage, raw any) []agent.Event {
+	var p struct {
+		TurnID      string `json:"turnId"`
+		Explanation string `json:"explanation"`
+		Plan        []struct {
+			Step   string `json:"step"`
+			Status string `json:"status"`
+		} `json:"plan"`
+	}
+	if json.Unmarshal(params, &p) != nil || len(p.Plan) == 0 {
+		return nil
+	}
+	steps := make([]agent.PlanStep, 0, len(p.Plan))
+	for _, s := range p.Plan {
+		status := agent.PlanStepPending
+		switch s.Status {
+		case "inProgress", "in_progress":
+			status = agent.PlanStepInProgress
+		case "completed":
+			status = agent.PlanStepCompleted
+		}
+		steps = append(steps, agent.PlanStep{Text: s.Step, Status: status})
+	}
+	return []agent.Event{agent.PlanEvent{ItemID: "plan", Explanation: p.Explanation, Steps: steps, Raw: raw}}
 }

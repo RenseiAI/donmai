@@ -325,8 +325,8 @@ func TestMapItem_ReasoningStarted_Dropped(t *testing.T) {
 	}
 }
 
-// Chain guard: a COMPLETED reasoning item must map to
-// SystemEvent{Subtype: "reasoning"}, and the shared activity poster must
+// Chain guard: a COMPLETED reasoning item must map to a typed
+// ReasoningEvent, and the shared activity poster must
 // forward exactly that event as a type=thought payload. Companion to
 // TestMapNotification_ReasoningDelta_StreamProgress above, which pins that
 // per-token deltas carry no content (the content-free stream-progress
@@ -345,15 +345,12 @@ func TestMapItem_ReasoningCompleted_PostsThoughtActivity(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("expected 1 event, got %d", len(got))
 	}
-	se, ok := got[0].(agent.SystemEvent)
+	se, ok := got[0].(agent.ReasoningEvent)
 	if !ok {
-		t.Fatalf("expected SystemEvent, got %T", got[0])
+		t.Fatalf("expected ReasoningEvent, got %T", got[0])
 	}
-	if se.Subtype != "reasoning" {
-		t.Fatalf("expected subtype=reasoning, got %q", se.Subtype)
-	}
-	if se.Message != "inspecting the failing test first" {
-		t.Fatalf("unexpected message: %q", se.Message)
+	if se.Summary != "inspecting the failing test first" || se.ItemID != "r-1" {
+		t.Fatalf("unexpected reasoning: %#v", se)
 	}
 
 	// Second hop: push the mapped event through a real activity poster and
