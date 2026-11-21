@@ -27,6 +27,7 @@ import (
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/daemon/seatstate"
+	"github.com/RenseiAI/donmai/observation"
 	"github.com/RenseiAI/donmai/runner/access"
 	"github.com/RenseiAI/donmai/runtime/workarea"
 	"github.com/RenseiAI/donmai/sessionshim"
@@ -451,6 +452,11 @@ type HeartbeatPayload struct {
 	// from the wire body) otherwise. Account IDs ride as opaque values
 	// the platform hashes — the payload never carries an address.
 	Quota []agent.UsageAccount `json:"quota,omitempty"`
+
+	// Observations is the subscription-login observation report built
+	// from the same quota state. Populated from
+	// HeartbeatOptions.GetObservations; nil omits it.
+	Observations *observation.Report `json:"observations,omitempty"`
 
 	// Seats is the per-seat three-axis report for this beat: session
 	// presence, activity with its decided-by rung, resumability, plus
