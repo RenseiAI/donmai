@@ -580,6 +580,10 @@ type Daemon struct {
 	// stopped by Stop.
 	quotaPoller *quotaPoller
 
+	// observationScan bounds host-observation rescans and remembers the
+	// last two completed scans for the new marks.
+	observationScan observationScanner
+
 	// credentials is the single refresher every lane draws its worker identity
 	// from, constructed in Start once registration has produced one. A durable-
 	// session composition that lands after startup re-declares this daemon's
@@ -2104,7 +2108,8 @@ func (d *Daemon) Start(ctx context.Context) error {
 			GetQuota: d.QuotaSnapshot,
 			// Observations: the same quota state as subscription-login
 			// items; nil, and omitted, when there is no quota state.
-			GetObservations: d.ObservationReport,
+			DrainDeferredAcks: d.drainDeferredScanAcks,
+			GetObservations:   d.ObservationReport,
 			// Phase 2c: handle platform-queued mutations.
 			OnPendingMutations: d.applyPendingMutations,
 			// Phase 2e: surface hostStatus signals (pool_deleted etc.)
