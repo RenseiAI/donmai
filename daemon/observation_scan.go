@@ -67,16 +67,38 @@ type observationScanner struct {
 	previous    map[observation.Ref]bool
 	latest      map[observation.Ref]bool
 
-	// Acknowledgements of deferred observations.scan mutations, drained into
-	// the heartbeat before it builds its observations report.
+	// The observations.scan mutation queue: requests run in arrival order,
+	// one at a time, each as a fresh scan. queued holds every id that is
+	// queued, running or awaiting its acknowledgement, and recent holds ids
+	// acknowledged in the last observationScanRecentTTL, so a redelivered id
+	// never starts a second scan.
+	queue   []observationScanRequest
+	queued  map[string]bool
+	recent  map[string]time.Time
+	working bool
+
+	// Completed requests' acknowledgements and the exact report of the scan
+	// that answered them, drained into the heartbeat before it builds its
+	// observations report.
 	ackMu       sync.Mutex
 	ackApplied  []string
 	ackFailures []HeartbeatMutationFailure
+	ackReport   *observation.Report
 }
 
-// observationScanDeferAttempts bounds how often a deferred scan retries
-// after losing the slot to another scan.
-const observationScanDeferAttempts = 5
+// observationScanRequest is one queued observations.scan mutation.
+type observationScanRequest struct {
+	id    string
+	kinds []string
+}
+
+// A queued request waits at most observationScanQueueDeadline for its slot
+// (a running scan plus the rate window), then fails. Acknowledged ids are
+// remembered for observationScanRecentTTL to absorb redelivery.
+const (
+	observationScanQueueDeadline = 10 * time.Minute
+	observationScanRecentTTL     = 10 * time.Minute
+)
 
 func (s *observationScanner) interval() time.Duration {
 	if s.minInterval > 0 {
@@ -188,17 +210,17 @@ func checkObservationKinds(kinds []string) error {
 }
 
 // errObservationScanDeferred reports that an observations.scan mutation is
-// not acknowledged in this beat: a scan was already in flight or ran inside
-// the rate-limit window, so a fresh scan runs later and acknowledges then.
-var errObservationScanDeferred = errors.New("observations.scan deferred until a fresh scan completes")
+// not acknowledged in this beat: it is queued, and its acknowledgement rides
+// the first beat built after its scan completes.
+var errObservationScanDeferred = errors.New("observations.scan queued until its scan completes")
 
-// applyObservationsScan handles the observations.scan host mutation. The
-// mutation is acknowledged only in the heartbeat that carries the report of
-// a scan run for it. A scan that completes here is acknowledged by the next
-// beat, whose report already reflects it. A scan already in flight, or one
-// that ran inside the rate-limit window, never answers the request: the scan
-// is deferred, and its acknowledgement rides the first beat built after the
-// deferred scan completes.
+// applyObservationsScan queues the observations.scan host mutation. Every
+// request is answered by a fresh scan run for it, in arrival order: a scan
+// already in flight, or one that ran inside the rate-limit window, never
+// answers it. The acknowledgement is sent with the exact report of that scan,
+// an empty full report included, on the first beat built after it completes.
+// A redelivered id that is queued, running, awaiting acknowledgement or
+// recently acknowledged starts no second scan.
 func (d *Daemon) applyObservationsScan(m PendingMutation) error {
 	var params struct {
 		Kinds []string `json:"kinds"`
@@ -208,38 +230,88 @@ func (d *Daemon) applyObservationsScan(m PendingMutation) error {
 			return fmt.Errorf("%s decode params: %w", observationsScanOp, err)
 		}
 	}
-	_, err := d.ScanObservations(context.Background(), params.Kinds)
-	var limited *observationScanLimitedError
-	if errors.As(err, &limited) {
-		go d.runDeferredObservationsScan(m.ID, params.Kinds)
-		return errObservationScanDeferred
-	}
-	if err != nil {
+	if err := checkObservationKinds(params.Kinds); err != nil {
 		return fmt.Errorf("%s: %w", observationsScanOp, err)
 	}
-	return nil
-}
-
-// runDeferredObservationsScan waits for the scan slot, runs a fresh scan and
-// queues the mutation's acknowledgement, or its failure, for the next beat.
-func (d *Daemon) runDeferredObservationsScan(id string, kinds []string) {
 	s := &d.observationScan
-	var err error
-	for attempt := 0; attempt < observationScanDeferAttempts; attempt++ {
-		time.Sleep(s.waitForSlot())
-		_, err = d.ScanObservations(context.Background(), kinds)
-		var limited *observationScanLimitedError
-		if !errors.As(err, &limited) {
-			break
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	for id, at := range s.recent {
+		if now.Sub(at) > observationScanRecentTTL {
+			delete(s.recent, id)
 		}
 	}
-	s.ackMu.Lock()
-	defer s.ackMu.Unlock()
-	if err != nil {
-		s.ackFailures = append(s.ackFailures, HeartbeatMutationFailure{ID: id, Error: fmt.Sprintf("%s: %v", observationsScanOp, err)})
-		return
+	if s.queued[m.ID] {
+		return errObservationScanDeferred
 	}
-	s.ackApplied = append(s.ackApplied, id)
+	if _, ok := s.recent[m.ID]; ok {
+		return errObservationScanDeferred
+	}
+	if s.queued == nil {
+		s.queued = map[string]bool{}
+	}
+	s.queued[m.ID] = true
+	s.queue = append(s.queue, observationScanRequest{id: m.ID, kinds: params.Kinds})
+	if !s.working {
+		s.working = true
+		go d.runObservationScanQueue()
+	}
+	return errObservationScanDeferred
+}
+
+// runObservationScanQueue runs queued requests in order until the queue is
+// empty. Each request waits for the scan slot (a running scan, then the rate
+// window) and runs its own scan; the per-kind probe timeout applies once that
+// scan starts.
+func (d *Daemon) runObservationScanQueue() {
+	s := &d.observationScan
+	for {
+		s.mu.Lock()
+		if len(s.queue) == 0 {
+			s.working = false
+			s.mu.Unlock()
+			return
+		}
+		req := s.queue[0]
+		s.mu.Unlock()
+		result, err := d.scanWhenSlotOpens(req.kinds, time.Now().Add(observationScanQueueDeadline))
+		s.ackMu.Lock()
+		if err != nil {
+			s.ackFailures = append(s.ackFailures, HeartbeatMutationFailure{ID: req.id, Error: fmt.Sprintf("%s: %v", observationsScanOp, err)})
+		} else {
+			s.ackApplied = append(s.ackApplied, req.id)
+			s.ackReport = result.Report
+		}
+		s.ackMu.Unlock()
+		s.mu.Lock()
+		s.queue = s.queue[1:]
+		delete(s.queued, req.id)
+		if s.recent == nil {
+			s.recent = map[string]time.Time{}
+		}
+		s.recent[req.id] = time.Now()
+		s.mu.Unlock()
+	}
+}
+
+// scanWhenSlotOpens waits for the scan slot and runs one scan, retrying when
+// another caller takes the slot first, until deadline.
+func (d *Daemon) scanWhenSlotOpens(kinds []string, deadline time.Time) (*ObservationScanResult, error) {
+	s := &d.observationScan
+	for {
+		wait := s.waitForSlot()
+		if time.Now().Add(wait).After(deadline) {
+			return nil, fmt.Errorf("observation scan slot not available within %s", observationScanQueueDeadline)
+		}
+		time.Sleep(wait)
+		result, err := d.ScanObservations(context.Background(), kinds)
+		var limited *observationScanLimitedError
+		if errors.As(err, &limited) {
+			continue
+		}
+		return result, err
+	}
 }
 
 // waitForSlot is how long until a new scan may start.
@@ -258,25 +330,33 @@ func (s *observationScanner) waitForSlot() time.Duration {
 	return 0
 }
 
-// drainDeferredScanAcks hands the heartbeat the acknowledgements of deferred
-// scans that have completed. The heartbeat drains before it builds its
-// observations report, so an acknowledgement never rides a report that
-// predates its scan.
-func (d *Daemon) drainDeferredScanAcks() ([]string, []HeartbeatMutationFailure) {
+// drainDeferredScanAcks hands the heartbeat the acknowledgements of completed
+// scan requests and the exact report of the latest such scan (nil when none
+// completed). The heartbeat drains before it builds its observations report
+// and sends that report, an empty full report included, with the
+// acknowledgements.
+func (d *Daemon) drainDeferredScanAcks() ([]string, []HeartbeatMutationFailure, *observation.Report) {
 	s := &d.observationScan
 	s.ackMu.Lock()
 	defer s.ackMu.Unlock()
-	applied, failures := s.ackApplied, s.ackFailures
-	s.ackApplied, s.ackFailures = nil, nil
-	return applied, failures
+	applied, failures, report := s.ackApplied, s.ackFailures, s.ackReport
+	s.ackApplied, s.ackFailures, s.ackReport = nil, nil, nil
+	return applied, failures, report
 }
 
 func (s *Server) handleObservationScan(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Kinds []string `json:"kinds"`
 	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096))
+	if err := dec.Decode(&body); err != nil && !errors.Is(err, io.EOF) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid scan request: " + err.Error()})
+		return
+	}
+	// One optional JSON object, then end of input: trailing data is refused
+	// before any scan starts, so a malformed request never takes the slot.
+	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid scan request: trailing data after the JSON object"})
 		return
 	}
 	result, err := s.daemon.ScanObservations(r.Context(), body.Kinds)

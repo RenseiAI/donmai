@@ -121,7 +121,7 @@ type HeartbeatOptions struct {
 	// outside a heartbeat response (a deferred observations.scan). It runs
 	// before GetObservations, so an acknowledgement rides a beat whose
 	// report already reflects the work it acknowledges.
-	DrainDeferredAcks func() (applied []string, failures []HeartbeatMutationFailure)
+	DrainDeferredAcks func() (applied []string, failures []HeartbeatMutationFailure, report *observation.Report)
 
 	// GetObservations returns the host-observation report for this beat.
 	// Optional, like GetQuota: nil, or a nil report, omits the key.
@@ -248,6 +248,10 @@ type HeartbeatService struct {
 	// so they re-ride the next attempt.
 	pendingApplied  []string
 	pendingFailures []HeartbeatMutationFailure
+	// pendingScanReport is the exact report of the scan that answered the
+	// pending observations.scan acknowledgements. It rides every beat, in
+	// place of the generic report, until a successful POST confirms them.
+	pendingScanReport *observation.Report
 
 	// shimProjection / shimAcknowledged are the session-shim hooks, seeded from
 	// opts and REPLACEABLE afterwards (SetSessionShimProjection). A daemon whose
@@ -551,14 +555,22 @@ func (h *HeartbeatService) sendOneSerialized(ctx context.Context) error {
 		}
 	}
 	if h.opts.DrainDeferredAcks != nil {
-		if applied, failures := h.opts.DrainDeferredAcks(); len(applied) > 0 || len(failures) > 0 {
+		if applied, failures, report := h.opts.DrainDeferredAcks(); len(applied) > 0 || len(failures) > 0 || report != nil {
 			h.mu.Lock()
 			h.pendingApplied = append(h.pendingApplied, applied...)
 			h.pendingFailures = append(h.pendingFailures, failures...)
+			if report != nil {
+				h.pendingScanReport = report
+			}
 			h.mu.Unlock()
 		}
 	}
-	if h.opts.GetObservations != nil {
+	h.mu.Lock()
+	sentScanReport := h.pendingScanReport
+	h.mu.Unlock()
+	if sentScanReport != nil {
+		payload.Observations = sentScanReport
+	} else if h.opts.GetObservations != nil {
 		payload.Observations = h.opts.GetObservations()
 	}
 
@@ -629,6 +641,7 @@ func (h *HeartbeatService) sendOneSerialized(ctx context.Context) error {
 		// Successful POST — drop the ACKs we just confirmed, then process
 		// the platform's response (hostStatus + pendingMutations).
 		h.dropConfirmedAcks(ackApplied, ackFailures)
+		h.dropConfirmedScanReport(sentScanReport)
 		h.handleHeartbeatResponse(ctx, resp)
 		if payload.SessionShim != nil && onSessionShimAcknowledged != nil {
 			onSessionShimAcknowledged(cloneSessionShimHeartbeatProjection(*payload.SessionShim))
@@ -681,6 +694,7 @@ func (h *HeartbeatService) sendOneSerialized(ctx context.Context) error {
 			return validationErr
 		}
 		h.dropConfirmedAcks(ackApplied, ackFailures)
+		h.dropConfirmedScanReport(sentScanReport)
 		h.handleHeartbeatResponse(ctx, retryResp)
 		return nil
 	}
@@ -1011,6 +1025,19 @@ func validateHeartbeatSessionShimResponse(
 		return errors.New("heartbeat response did not exactly echo the session shim projection")
 	}
 	return nil
+}
+
+// dropConfirmedScanReport clears the pending scan report once a beat that
+// carried it was accepted, unless a newer scan replaced it meanwhile.
+func (h *HeartbeatService) dropConfirmedScanReport(sent *observation.Report) {
+	if sent == nil {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.pendingScanReport == sent {
+		h.pendingScanReport = nil
+	}
 }
 
 // dropConfirmedAcks removes the ACK entries the platform just accepted
