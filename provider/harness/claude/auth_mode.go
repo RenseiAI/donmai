@@ -51,6 +51,8 @@ func usesHostLogin(mode agent.AuthMode) bool {
 //	                      inherited copy (a supervisor-declared injection
 //	                      included) nor a spec copy reaches the CLI. The
 //	                      CLI then uses the host's subscription login.
+//	                      The routing pin is empty too (pinnedRoutingEnv),
+//	                      so no --settings layer restates a stripped name.
 //	byok, metered,        unchanged: the declared credential rides the
 //	shared, ""            trusted layers, and the inherited-env blocklist
 //	                      (runtime/env) keeps any undeclared ambient copy out.

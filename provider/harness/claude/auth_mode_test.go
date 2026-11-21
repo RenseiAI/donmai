@@ -1,6 +1,9 @@
 package claude
 
 import (
+	"context"
+	"os"
+	"path/filepath"
 	"runtime"
 	"testing"
 	"time"
@@ -154,4 +157,108 @@ func TestApplyAuthMode_DoesNotMutateInputEnv(t *testing.T) {
 	if len(unset) != len(hostLoginStrippedEnv) {
 		t.Errorf("unset names = %v, want %v", unset, hostLoginStrippedEnv)
 	}
+}
+
+// hostLoginRoutingScript is a fake claude CLI that records, per turn, the
+// Bedrock switch it sees in its process env and on its --settings layer
+// (the CLI's winning layer), plus the API key, into $PWD/<turn>.txt.
+const hostLoginRoutingScript = `
+settings_env=""
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "--settings" ]; then
+    settings_env="$arg"
+  fi
+  prev="$arg"
+done
+case " $* " in
+  *' --resume '*) out="resume.txt";;
+  *) out="spawn.txt";;
+esac
+pinned=$(printf '%s' "$settings_env" | python3 -c 'import json,sys
+try:
+    env = json.loads(sys.stdin.read()).get("env", {})
+except Exception:
+    env = {}
+print(env.get("CLAUDE_CODE_USE_BEDROCK", "unset"))' 2>/dev/null)
+[ -n "$pinned" ] || pinned=unset
+printf 'process=%s settings=%s key=%s' "${CLAUDE_CODE_USE_BEDROCK-unset}" "$pinned" "${ANTHROPIC_API_KEY-unset}" > "$PWD/$out"
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"sess-host-login-1"}'
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"usage":{}}'
+`
+
+// TestProvider_HostLoginStripSurvivesRoutingPin covers the routing pin: an
+// ambient Bedrock setup always carries a region name, and a region name made
+// the pin read the Bedrock switch back from the parent process onto the
+// CLI's winning --settings layer, routing a host-session session to Bedrock
+// despite the strip. The switch must be absent from the process env AND the
+// --settings layer on the fresh spawn, on an Inject --resume turn, and on a
+// Provider.Resume restore.
+//
+// Not parallel: the inherited layer is the real process environment.
+func TestProvider_HostLoginStripSurvivesRoutingPin(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake CLI uses /bin/sh; skip on windows")
+	}
+	t.Setenv("CLAUDE_CODE_USE_BEDROCK", "1")
+	t.Setenv("AWS_REGION", "us-east-1")
+	t.Setenv("ANTHROPIC_API_KEY", "declared-platform-key")
+	t.Setenv(runtimeenv.InjectedEnvKeysVar, "ANTHROPIC_API_KEY")
+
+	cli := writeFakeCLI(t, "fake-claude-host-login-routing.sh", "#!/bin/sh\n"+hostLoginRoutingScript)
+	p, err := New(Options{Binary: cli, LookPath: func(string) (string, error) { return cli, nil }})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	const want = "process=unset settings=unset key=unset"
+	// The runner composes the worker's own env into Spec.Env, so an ambient
+	// Bedrock setup arrives on the spec layer too.
+	spec := func(workdir string) agent.Spec {
+		return agent.Spec{
+			Prompt:   "first turn",
+			Cwd:      workdir,
+			AuthMode: agent.AuthHostSession,
+			Env:      map[string]string{"CLAUDE_CODE_USE_BEDROCK": "1", "AWS_REGION": "us-east-1"},
+		}
+	}
+	read := func(t *testing.T, workdir, file string) string {
+		t.Helper()
+		raw, err := os.ReadFile(filepath.Join(workdir, file))
+		if err != nil {
+			t.Fatalf("fake CLI wrote no %s: %v", file, err)
+		}
+		return string(raw)
+	}
+
+	t.Run("spawn and inject", func(t *testing.T) {
+		workdir := t.TempDir()
+		h, err := p.Spawn(t.Context(), spec(workdir))
+		if err != nil {
+			t.Fatalf("Spawn: %v", err)
+		}
+		t.Cleanup(func() { _ = h.Stop(context.Background()) })
+		waitForHeadlessTerminal(t, h)
+		if err := h.Inject(t.Context(), "steer this turn"); err != nil {
+			t.Fatalf("Inject: %v", err)
+		}
+		waitForHeadlessTerminal(t, h)
+		for _, file := range []string{"spawn.txt", "resume.txt"} {
+			if got := read(t, workdir, file); got != want {
+				t.Errorf("%s: child saw %q, want %q", file, got, want)
+			}
+		}
+	})
+
+	t.Run("resume", func(t *testing.T) {
+		workdir := t.TempDir()
+		h, err := p.Resume(t.Context(), "sess-host-login-1", spec(workdir))
+		if err != nil {
+			t.Fatalf("Resume: %v", err)
+		}
+		t.Cleanup(func() { _ = h.Stop(context.Background()) })
+		waitForHeadlessTerminal(t, h)
+		if got := read(t, workdir, "resume.txt"); got != want {
+			t.Errorf("Resume: child saw %q, want %q", got, want)
+		}
+	})
 }
