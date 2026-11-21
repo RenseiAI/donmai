@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"math"
+	"sync/atomic"
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
@@ -138,10 +139,20 @@ func (t *interactiveUsageTailer) flushBoth(emit func(agent.Event)) {
 	if ev, ok := t.sweepSidecarCost(); ok {
 		emit(ev)
 	}
+	if d := finalActivitySweepDelay.Load(); d > 0 {
+		time.Sleep(time.Duration(d))
+	}
 	for _, ev := range sweepActivityRelay(t.activity) {
 		emit(ev)
 	}
 }
+
+// finalActivitySweepDelay holds the final relay sweep back, in
+// nanoseconds; zero outside tests. Tests widen it to prove the relay file
+// outlives the session's PTY cleanup, which ptycli runs concurrently with
+// this flush. Atomic because tailers of earlier sessions may still be
+// flushing while a test sets it.
+var finalActivitySweepDelay atomic.Int64
 
 // flush sweeps until nothing is pending, bounded by
 // interactiveUsageMaxFinalSweeps.
