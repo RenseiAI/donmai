@@ -116,7 +116,7 @@ func TestCodexRequestParamDrift(t *testing.T) {
 	}
 	plan := NewSpawnPlan(spec)
 	denied := spec
-	denied.PermissionConfig = &agent.PermissionConfig{DisallowPatterns: []string{"Bash"}}
+	denied.PermissionConfig = &agent.PermissionConfig{DisallowPatterns: []string{"Bash", "Read(~/.ssh/**)"}}
 	deniedPlan := NewSpawnPlan(denied)
 	for _, request := range []struct {
 		method string
@@ -124,9 +124,10 @@ func TestCodexRequestParamDrift(t *testing.T) {
 		must   []string
 	}{
 		{method: "thread/start", params: plan.ThreadStart, must: []string{"baseInstructions", "developerInstructions", "sandbox"}},
-		{method: "turn/start", params: turnStartParams("thread-1", spec, plan.PromptInput), must: []string{"effort", "sandboxPolicy", "outputSchema"}},
-		{method: "thread/start", params: deniedPlan.ThreadStart, must: []string{"config"}},
-		{method: "thread/resume", params: deniedPlan.ThreadResume, must: []string{"threadId", "config"}},
+		{method: "turn/start", params: turnStartParams("thread-1", spec, plan.PromptInput, denyPlan{}), must: []string{"effort", "sandboxPolicy", "outputSchema"}},
+		{method: "thread/start", params: deniedPlan.ThreadStart, must: []string{"config", "permissions"}},
+		{method: "thread/resume", params: deniedPlan.ThreadResume, must: []string{"threadId", "config", "permissions"}},
+		{method: "turn/start", params: deniedPlan.TurnStart, must: []string{"permissions"}},
 	} {
 		known := inventory.RequestParams[request.method]
 		if len(known) == 0 {

@@ -64,10 +64,7 @@ func resolveSandboxMode(spec agent.Spec) string {
 // turn/start sandbox object. Mirrors resolveSandboxPolicy in the
 // legacy TS.
 func resolveSandboxPolicy(spec agent.Spec) map[string]any {
-	writableRoots := []string{spec.Cwd}
-	if spec.RepositoryAuthority != nil {
-		writableRoots = append([]string(nil), spec.RepositoryAuthority.MutablePaths...)
-	}
+	writableRoots := sandboxWritableRoots(spec)
 	switch spec.SandboxLevel {
 	case agent.SandboxReadOnly:
 		return map[string]any{"type": "readOnly", "networkAccess": true}
@@ -88,6 +85,14 @@ func resolveSandboxPolicy(spec agent.Spec) map[string]any {
 		}
 	}
 	return nil
+}
+
+// sandboxWritableRoots is the writable-root set of the workspace-write level.
+func sandboxWritableRoots(spec agent.Spec) []string {
+	if spec.RepositoryAuthority != nil {
+		return append([]string(nil), spec.RepositoryAuthority.MutablePaths...)
+	}
+	return []string{spec.Cwd}
 }
 
 // resolveApprovalPolicy mirrors resolveApprovalPolicy in the legacy TS.
@@ -117,22 +122,31 @@ func threadStartParams(spec agent.Spec, deny denyPlan) map[string]any {
 	if spec.SystemPromptAppend != "" {
 		params["developerInstructions"] = spec.SystemPromptAppend
 	}
-	if config := deny.threadConfig(); config != nil {
-		params["config"] = config
-	}
-	if mode := resolveSandboxMode(spec); mode != "" {
-		params["sandbox"] = mode
+	addDenyParams(params, spec, deny)
+	if _, profile := params["permissions"]; !profile {
+		if mode := resolveSandboxMode(spec); mode != "" {
+			params["sandbox"] = mode
+		}
 	}
 	return params
 }
 
-// threadResumeParams builds the JSON-RPC params for `thread/resume`. A resumed
-// thread does not inherit the thread/start config, so it is sent again.
-func threadResumeParams(threadID string, deny denyPlan) map[string]any {
-	params := map[string]any{"threadId": threadID, "personality": "pragmatic"}
-	if config := deny.threadConfig(); config != nil {
+// addDenyParams adds the deny translation's thread config and, when it carries
+// path denies, selects its permission profile (which Codex refuses alongside
+// `sandbox`). thread/resume needs both again: it does not inherit them.
+func addDenyParams(params map[string]any, spec agent.Spec, deny denyPlan) {
+	if config := deny.threadConfig(spec); config != nil {
 		params["config"] = config
 	}
+	if len(deny.paths) > 0 {
+		params["permissions"] = codexDenyProfileID
+	}
+}
+
+// threadResumeParams builds the JSON-RPC params for `thread/resume`.
+func threadResumeParams(threadID string, spec agent.Spec, deny denyPlan) map[string]any {
+	params := map[string]any{"threadId": threadID, "personality": "pragmatic"}
+	addDenyParams(params, spec, deny)
 	return params
 }
 
@@ -166,7 +180,7 @@ func threadResumeParams(threadID string, deny denyPlan) map[string]any {
 //
 // The first turn's input carries the Spec.Prompt; resume + steering
 // flows reuse this builder with a different input slice.
-func turnStartParams(threadID string, spec agent.Spec, input []map[string]any) map[string]any {
+func turnStartParams(threadID string, spec agent.Spec, input []map[string]any, deny denyPlan) map[string]any {
 	params := map[string]any{
 		"threadId":       threadID,
 		"input":          input,
@@ -177,7 +191,10 @@ func turnStartParams(threadID string, spec agent.Spec, input []map[string]any) m
 	if spec.Effort != "" {
 		params["effort"] = string(spec.Effort)
 	}
-	if policy := resolveSandboxPolicy(spec); policy != nil {
+	// A legacy sandboxPolicy would replace the deny profile for the turn.
+	if len(deny.paths) > 0 {
+		params["permissions"] = codexDenyProfileID
+	} else if policy := resolveSandboxPolicy(spec); policy != nil {
 		params["sandboxPolicy"] = policy
 	}
 	if len(spec.ResponseSchema) > 0 {
@@ -341,14 +358,14 @@ func NewSpawnPlan(spec agent.Spec) SpawnPlan {
 	plan := SpawnPlan{
 		MCPConfig:       mcpServersConfig(spec.MCPServers),
 		ThreadStart:     threadStartParams(spec, deny),
-		ThreadResume:    threadResumeParams("", deny),
+		ThreadResume:    threadResumeParams("", spec, deny),
 		PromptInput:     promptInput(spec),
 		DenyReport:      deny.report,
 		DenyErr:         denyErr,
 		ExecPolicyRules: deny.execPolicyRules(),
 		denyNotice:      deny.notice(),
 	}
-	plan.TurnStart = turnStartParams("", spec, plan.PromptInput)
+	plan.TurnStart = turnStartParams("", spec, plan.PromptInput, deny)
 
 	plan.IgnoredFields = ignoredSpecFields(spec)
 	return plan
@@ -420,7 +437,7 @@ func ignoredSpecFields(spec agent.Spec) []SpecFieldNote {
 	if spec.PermissionConfig != nil {
 		notes = append(notes, SpecFieldNote{
 			Field:  "PermissionConfig",
-			Reason: "consumed by the approval bridge (approval.go) and translated into Codex exec-policy rules and thread config (deny_translation.go)",
+			Reason: "consumed by the approval bridge (approval.go) and translated into Codex exec-policy rules, thread config and a permission profile (deny_translation.go)",
 		})
 	}
 

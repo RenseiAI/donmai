@@ -16,7 +16,7 @@ import (
 
 // TestIntegration_RealCodexAcceptsDenyTranslation checks the produced params
 // against the installed app-server, which validates the whole thread config
-// (features.shell_tool included),
+// (features.shell_tool and the permission profile),
 // and the staged rule file against Codex's own exec-policy evaluator. Neither
 // step reaches a model.
 func TestIntegration_RealCodexAcceptsDenyTranslation(t *testing.T) {
@@ -25,7 +25,7 @@ func TestIntegration_RealCodexAcceptsDenyTranslation(t *testing.T) {
 		t.Fatalf("requires codex on PATH: %v", err)
 	}
 	cwd := t.TempDir()
-	spec := denySpec(agent.SandboxWorkspaceWrite, "Bash(git push*)", "Bash(env)", "Bash(git * --force)")
+	spec := denySpec(agent.SandboxWorkspaceWrite, "Bash(git push*)", "Bash(env)", "Bash(git * --force)", "Read(~/.ssh/**)", "Edit(docs/**)")
 	spec.Cwd = cwd
 	plan := NewSpawnPlan(spec)
 	if plan.DenyErr != nil {
@@ -49,8 +49,18 @@ func TestIntegration_RealCodexAcceptsDenyTranslation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("thread/start refused the deny translation: %v", err)
 	}
-	if !json.Valid(raw) {
-		t.Fatalf("thread/start response is not JSON: %s", raw)
+	var started struct {
+		Profile struct {
+			ID      string `json:"id"`
+			Extends string `json:"extends"`
+		} `json:"activePermissionProfile"`
+		Sandbox map[string]any `json:"sandbox"`
+	}
+	if err := json.Unmarshal(raw, &started); err != nil {
+		t.Fatal(err)
+	}
+	if started.Profile.ID != codexDenyProfileID || started.Profile.Extends != ":workspace" || started.Sandbox["networkAccess"] != true {
+		t.Fatalf("app-server echoed profile %+v sandbox %v", started.Profile, started.Sandbox)
 	}
 
 	rules := filepath.Join(p.config.home, "rules", codexDenyRulesFile)
