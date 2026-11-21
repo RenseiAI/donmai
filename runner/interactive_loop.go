@@ -562,6 +562,14 @@ func (r *Runner) dispatchInteractive(
 				handleEvents = nil
 				continue
 			}
+			// Any handle event is a sign of session life (a turn ending,
+			// transcript tail activity, a quota update): while a notice
+			// sits on the pull channel it resets the queue's idle clock,
+			// so a working session never trips the needs-operator bound
+			// no matter how long its turn runs. An idle session emits
+			// nothing, and the clock trips instead of holding the slot
+			// to the long cap.
+			notices.noteActivity()
 			// Sparse quota updates merge onto the daemon's probe
 			// snapshot like the headless lane's; they carry no
 			// transcript content, so only the quota hook observes

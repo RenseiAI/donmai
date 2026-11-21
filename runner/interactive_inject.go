@@ -102,6 +102,23 @@ const (
 	// still matters.
 	interactiveNoticePullMaxPolls = 450
 
+	// interactiveNoticeIdlePolls bounds how long ONE notice may sit on a PULL
+	// channel with NO sign of session life before it is reported as needing
+	// an operator.
+	//
+	// A poll that follows real session activity (a turn ending, transcript
+	// events reaching the supervisor) is a session doing work: the notice
+	// waits for the next turn end under the long pull cap above. A poll with
+	// no activity behind it is a session likely idle at an empty prompt — a
+	// state the Stop hook has already fired for and will never fire out of
+	// on its own, so the message waits until a human interacts. Reporting
+	// needs-operator at 60 × interactiveNoticeRetry (≈2 minutes) hands the
+	// producer a typed receipt while the fact still matters, instead of
+	// holding the slot for the full 15-minute cap and then reporting a
+	// generic unconsumed wait. The threshold sits past the refusal cap (30)
+	// so a busy session's ordinary minute of work never reads as idle.
+	interactiveNoticeIdlePolls = 60
+
 	// interactiveNoticeTruncated marks a notice clipped to the canonical-mode
 	// input bound. The full text remains wherever it was durably queued.
 	interactiveNoticeTruncated = " …[truncated]"
@@ -161,6 +178,17 @@ const (
 	// discarded, the session was parked on a modal so no turn ever ended, or
 	// the session went idle at an empty prompt where Stop has already fired.
 	noticeDeadNotConsumed = "not-consumed"
+
+	// noticeDeadNeedsOperator — the notice was offered on a pull channel and
+	// sat with no sign of session life for interactiveNoticeIdlePolls. The
+	// session is likely idle at an empty prompt, where the hook that would
+	// collect the message has already fired and will not fire again until a
+	// human interacts. The receipt tells the producer an operator nudge —
+	// not another silent wait — is what will move the message. It reports
+	// which happened by construction: this reason means idle-needs-operator,
+	// while noticeDeadNotConsumed means the session stayed busy past the
+	// long cap without ever collecting the offer.
+	noticeDeadNeedsOperator = "needs-operator"
 )
 
 // noticeChannelDrivenByRunner reports whether THIS build can actually push a
@@ -382,6 +410,12 @@ type interactiveNoticeQueue struct {
 	// yet been collected from. Deliberately not the same counter as attempts —
 	// see interactiveNoticePullMaxPolls.
 	polls int
+	// idlePolls counts consecutive polls with no sign of session life (no
+	// handle event reached the supervisor since the last reset). It is the
+	// idle detector: noteActivity resets it, so a working session never
+	// trips the idle bound no matter how long its turn runs, while an idle
+	// session trips it after interactiveNoticeIdlePolls of silence.
+	idlePolls int
 	// offered records that the pull channel has custody, so the offer is not
 	// rewritten on every poll.
 	offered bool
@@ -406,13 +440,25 @@ func (q *interactiveNoticeQueue) undelivered(buffered int) int {
 // hold parks a payload in the slot.
 func (q *interactiveNoticeQueue) hold(text, deliveryID string) {
 	q.text, q.deliveryID = text, deliveryID
-	q.attempts, q.polls, q.offered = 0, 0, false
+	q.attempts, q.polls, q.idlePolls, q.offered = 0, 0, 0, false
 }
 
 // clear frees the slot.
 func (q *interactiveNoticeQueue) clear() {
 	q.text, q.deliveryID = "", ""
-	q.attempts, q.polls, q.offered = 0, 0, false
+	q.attempts, q.polls, q.idlePolls, q.offered = 0, 0, 0, false
+}
+
+// noteActivity records one sign of session life while a notice is held: a
+// handle event reached the supervisor, so the session is working, not idle.
+// It resets the idle clock without touching the long pull cap, which keeps
+// bounding the total wait. Calls with nothing held are no-ops, so the
+// supervisor can invoke it unconditionally on every event.
+func (q *interactiveNoticeQueue) noteActivity() {
+	if q.idle() {
+		return
+	}
+	q.idlePolls = 0
 }
 
 // deadLetter reports the held payload as undeliverable and frees the slot.
@@ -528,6 +574,25 @@ func (q *interactiveNoticeQueue) attemptPull(
 	}
 
 	q.polls++
+	q.idlePolls++
+	if q.idlePolls >= interactiveNoticeIdlePolls {
+		// No sign of session life for the idle bound: no turn ended, no
+		// transcript event reached the supervisor. The session is likely
+		// idle at an empty prompt, where the Stop hook has already fired
+		// and will not fire again until a human interacts — so holding to
+		// the long cap only delays the typed receipt the producer needs
+		// to nudge an operator. Withdraw first (same reason as the cap:
+		// a message reported dead must not stay collectable).
+		retracted, rerr := nch.Retract()
+		detail := fmt.Sprintf("offered but with no session activity for %d polls over ~%s; "+
+			"the session is likely idle at an empty prompt where the hook has already fired — "+
+			"needs operator (retracted=%v)",
+			q.polls, time.Duration(q.polls)*interactiveNoticeRetry, retracted)
+		if rerr != nil {
+			detail += fmt.Sprintf("; retract failed: %v", rerr)
+		}
+		return q.deadLetter(r, qw, res, noticeDeadNeedsOperator, detail)
+	}
 	if q.polls < interactiveNoticePullMaxPolls {
 		return noticeHeld
 	}

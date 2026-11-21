@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/RenseiAI/donmai/agent"
 )
@@ -283,5 +284,130 @@ func TestRenderContent(t *testing.T) {
 		if got := renderContent(tc.res); got != tc.want {
 			t.Errorf("%s: renderContent = %q, want %q", tc.name, got, tc.want)
 		}
+	}
+}
+
+// hangServer is a Streamable HTTP MCP server that answers the initialize
+// handshake (assigning a session id) and then never answers the hung method:
+// the handler blocks until the client's request context ends. hangDelete
+// additionally hangs the session DELETE so Close's bound is exercised.
+type hangServer struct {
+	hungMethod string
+	hangDelete bool
+}
+
+func (h hangServer) handler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			if h.hangDelete {
+				<-r.Context().Done()
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		var req struct {
+			ID     *int64          `json:"id"`
+			Method string          `json:"method"`
+			Params json.RawMessage `json:"params"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if req.ID == nil { // notification
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		if req.Method == h.hungMethod {
+			<-r.Context().Done()
+			return
+		}
+		if req.Method == "initialize" {
+			w.Header().Set(sessionIDHeader, "sess-hung")
+		}
+		writeRPC(w, false, map[string]any{"jsonrpc": "2.0", "id": *req.ID, "result": map[string]any{}})
+	}
+}
+
+// TestHTTPClient_TimeoutsAgainstNeverAnsweringServer pins the transport
+// bound: every client call runs under an explicit client timeout, and Close
+// runs under its own bound, so a server that never answers cannot stall the
+// CLI. Each case dials (except the handshake case, where the dial itself
+// hangs) and drives one operation against a server that hangs exactly that
+// operation.
+func TestHTTPClient_TimeoutsAgainstNeverAnsweringServer(t *testing.T) {
+	t.Parallel()
+
+	const clientBound = 150 * time.Millisecond
+	const closeBound = 150 * time.Millisecond
+
+	tests := []struct {
+		name string
+		// hungMethod is the JSON-RPC method the server never answers.
+		// "initialize" hangs the Dial handshake itself.
+		hungMethod string
+		hangDelete bool
+		op         string // "dial" | "list" | "call" | "close"
+	}{
+		{name: "dial handshake", hungMethod: "initialize", op: "dial"},
+		{name: "tools/list", hungMethod: "tools/list", op: "list"},
+		{name: "tools/call", hungMethod: "tools/call", op: "call"},
+		{name: "close delete", hangDelete: true, op: "close"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			srv := httptest.NewServer(hangServer{hungMethod: tc.hungMethod, hangDelete: tc.hangDelete}.handler())
+			t.Cleanup(srv.Close)
+			cfg := agent.MCPServerConfig{Name: "hung", Type: "http", URL: srv.URL}
+			dial := func() (Client, error) {
+				return dialHTTPTimeout(context.Background(), cfg, clientBound, closeBound)
+			}
+
+			if tc.op == "dial" {
+				start := time.Now()
+				if _, err := dial(); err == nil {
+					t.Fatal("Dial against a never-answering server succeeded; want a timeout error")
+				}
+				if elapsed := time.Since(start); elapsed > 10*time.Second {
+					t.Fatalf("Dial took %v against a never-answering server; want the explicit client timeout", elapsed)
+				}
+				return
+			}
+
+			c, err := dial()
+			if err != nil {
+				t.Fatalf("Dial: %v", err)
+			}
+			t.Cleanup(func() { _ = c.Close() })
+
+			switch tc.op {
+			case "list":
+				start := time.Now()
+				if _, err := c.ListTools(context.Background()); err == nil {
+					t.Fatal("ListTools against a never-answering server succeeded; want a timeout error")
+				}
+				if elapsed := time.Since(start); elapsed > 10*time.Second {
+					t.Fatalf("ListTools took %v; want the explicit client timeout", elapsed)
+				}
+			case "call":
+				start := time.Now()
+				if _, err := c.CallTool(context.Background(), "echo", nil); err == nil {
+					t.Fatal("CallTool against a never-answering server succeeded; want a timeout error")
+				}
+				if elapsed := time.Since(start); elapsed > 10*time.Second {
+					t.Fatalf("CallTool took %v; want the explicit client timeout", elapsed)
+				}
+			case "close":
+				start := time.Now()
+				if err := c.Close(); err != nil {
+					t.Fatalf("Close: %v", err)
+				}
+				if elapsed := time.Since(start); elapsed > 10*time.Second {
+					t.Fatalf("Close took %v against a never-answering DELETE; want the explicit close bound", elapsed)
+				}
+			}
+		})
 	}
 }
