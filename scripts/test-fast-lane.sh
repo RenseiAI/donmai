@@ -61,6 +61,7 @@ export GIT_CONFIG_GLOBAL="${temp_dir}/gitconfig"
 export GIT_CONFIG_NOSYSTEM=1
 unset MAKEFLAGS GOFLAGS GH_TOKEN
 export FAST_LANE_POLL_SECONDS=1 FAST_LANE_RUN_WAIT_SECONDS=2 FAST_LANE_CASK_WAIT_SECONDS=2
+export FAST_LANE_READBACK_SECONDS=0
 
 mkdir -p "${temp_dir}/bin"
 cat >"${temp_dir}/bin/gh" <<'FAKE_GH'
@@ -171,7 +172,10 @@ case "${method} ${endpoint}" in
     echo '{}' ;;
   "GET repos/RenseiAI/donmai/commits/"*"/status")
     sha="${endpoint%/status}"; sha="${sha##*/}"
-    if [[ -f "$d/status-$sha" ]]; then
+    if [[ -f "$d/empty-status-reads" && "$(cat "$d/empty-status-reads")" -gt 0 ]]; then
+      echo $(( $(cat "$d/empty-status-reads") - 1 )) >"$d/empty-status-reads"
+      jq -cn --arg sha "$sha" '{sha:$sha,statuses:[]}'
+    elif [[ -f "$d/status-$sha" ]]; then
       state="$(sed -n 's/^state=//p' "$d/status-$sha")"
       context="$(sed -n 's/^context=//p' "$d/status-$sha")"
       jq -cn --arg sha "$sha" --arg s "$state" --arg c "$context" '{sha:$sha,statuses:[{context:$c,state:$s}]}'
@@ -939,6 +943,26 @@ if [[ "${code}" != 1 ]] || ! grep -Fq 'FAST_LANE was turned off before tagging v
   fail_case "exit ${code}, want 1 because the switch went off" "${fx}/out"
 elif [[ -n "$(origin_tag v0.1.1)" ]]; then
   fail_case 'a tag was created after the switch went off' "${fx}/out"
+else
+  pass_case
+fi
+
+case_name='ship: the attestation read-back retries past an empty combined status'
+new_fixture
+printf '3\n' >"${FAKE_GH_DIR}/empty-status-reads"
+run_subject "${wt}" ship
+if [[ "${code}" != 0 ]]; then
+  fail_case "exit ${code}, want 0 once a later read shows success" "${fx}/out"
+else
+  pass_case
+fi
+
+case_name='ship: a status that never shows fails with the read-back message'
+new_fixture
+printf '1000\n' >"${FAKE_GH_DIR}/empty-status-reads"
+run_subject "${wt}" ship
+if [[ "${code}" == 0 ]] || ! grep -Fq "reads back ''" "${fx}/out"; then
+  fail_case "exit ${code}, want the read-back failure" "${fx}/out"
 else
   pass_case
 fi
