@@ -478,6 +478,9 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 	if err := p.checkAlive(); err != nil {
 		return nil, err
 	}
+	if _, err := resolveCyberAccessProgram(spec); err != nil {
+		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
+	}
 	if err := validateCodexCLIMCPServers(spec.MCPServers); err != nil {
 		return nil, fmt.Errorf("%w: codex configure mcp servers: %w", agent.ErrSpawnFailed, persistHeadlessMCPApplicationDenial(spec, err))
 	}
@@ -525,6 +528,9 @@ func (p *Provider) Resume(ctx context.Context, sessionID string, spec agent.Spec
 	spec = ready
 	if err := p.checkAlive(); err != nil {
 		return nil, err
+	}
+	if _, err := resolveCyberAccessProgram(spec); err != nil {
+		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
 	}
 	if err := validateCodexCLIMCPServers(spec.MCPServers); err != nil {
 		return nil, fmt.Errorf("%w: codex configure mcp servers: %w", agent.ErrSpawnFailed, persistHeadlessMCPApplicationDenial(spec, err))

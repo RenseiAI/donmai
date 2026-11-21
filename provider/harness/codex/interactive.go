@@ -752,6 +752,9 @@ func buildInteractiveLaunch(spec agent.Spec) (interactiveLaunch, error) {
 // lookup injected, so the hooks policy can be table-tested without mutating
 // process state (t.Setenv forbids the t.Parallel this package uses throughout).
 func buildInteractiveLaunchEnv(spec agent.Spec, getenv func(string) string) (interactiveLaunch, error) {
+	if err := interactiveCyberAccessRefusal(spec); err != nil {
+		return interactiveLaunch{}, err
+	}
 	env := cloneInteractiveEnv(spec.Env)
 	var args []string
 	hooks, err := codexHooksPolicy(getenv)
