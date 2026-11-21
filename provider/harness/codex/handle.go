@@ -73,6 +73,11 @@ type Handle struct {
 	mcpRelease   func() error
 	mcpOnce      sync.Once
 	mcpErr       error
+	// terminal is set once the forwarder has the session's terminal event.
+	// From then on the forwarder alone delivers the outcome: the final MCP
+	// release can stop the app-server, and the resulting client close must
+	// not fail this handle over the result it is about to emit.
+	terminal atomic.Bool
 	// stopErr records the terminal-stop shutdown acknowledgement: any
 	// turn/interrupt or thread/unsubscribe failure (timeout, rejection,
 	// transport error) proves the owned writers may still be live. It is
@@ -195,6 +200,11 @@ func (h *Handle) Stop(ctx context.Context) error {
 // crashes. Safe to call concurrently with Stop / forward; close
 // ordering is enforced by the eventsClosed flag (see emit / closeEvents).
 func (h *Handle) failNow(err error) {
+	if h.terminal.Load() {
+		// The forwarder already holds this session's terminal event and
+		// owns its delivery and close (see handleNotification).
+		return
+	}
 	cleanupErr := h.releaseMCPConfig()
 	// emit is safe under concurrent close: it short-circuits when
 	// eventsClosed is already set. Posting BEFORE we close lets the
@@ -437,14 +447,25 @@ func (h *Handle) handleNotification(n notification) bool {
 			// The turn's last token_count lands in the rollout moments
 			// before this notification; read it before Events closes.
 			h.tail.drain(h.emit)
+			// Leave the provider's live set before the final release. On a
+			// failed clear the release stops the app-server process, and its
+			// exit closes the client; onClientClose then fails every
+			// registered handle. This handle already has its terminal event,
+			// so that close must not race an mcp_cleanup_failed error (and an
+			// Events close) ahead of the outcome emitted below.
+			h.terminal.Store(true)
+			if h.provider != nil {
+				h.provider.unregisterHandle(h)
+			}
 			if err := h.releaseMCPConfig(); err != nil {
 				if ev.Kind() == agent.EventResult && mcpCleanupContained(err) {
 					// The turn already finished and its result is real; the
 					// failed clear is contained (Provider poisoned, writer
-					// stopped, home handled by the owner). Report the result
-					// and surface the cleanup failure as a warning instead of
-					// discarding a completed turn.
-					slog.Warn("codex: isolated MCP config cleanup failed after the turn completed; provider quarantined",
+					// stopped, home removed or retained by the owner's
+					// retention rule). Report the result and surface the
+					// cleanup failure as a warning instead of discarding a
+					// completed turn.
+					slog.Warn("codex: isolated MCP config cleanup failed after the turn completed; app-server stopped, provider refuses new sessions",
 						"threadId", h.SessionID(), "err", err)
 					h.emit(mcpCleanupWarningEvent(err))
 					h.emit(ev)
@@ -467,7 +488,7 @@ func (h *Handle) handleNotification(n notification) bool {
 func mcpCleanupWarningEvent(err error) agent.SystemEvent {
 	return agent.SystemEvent{
 		Subtype: "codex_warning",
-		Message: "codex isolated MCP configuration cleanup failed after the turn completed; the app-server config is quarantined: " + err.Error(),
+		Message: "codex isolated MCP configuration cleanup failed after the turn completed; the app-server was stopped and this provider refuses new sessions: " + err.Error(),
 	}
 }
 

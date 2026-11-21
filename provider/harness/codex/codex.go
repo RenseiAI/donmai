@@ -945,11 +945,16 @@ func (e *mcpBoundaryError) reason() string {
 }
 
 // mcpCleanupError is the final-release failure. contained reports that the
-// failure left nothing reusable or live behind: the Provider is poisoned for
-// every later lease, and the private home's owner removal (which first stops
-// the app-server writer) succeeded. A contained failure after a completed turn
-// is reported as a warning next to the turn's result; an uncontained one keeps
-// replacing the result with the terminal mcp_cleanup_failed error.
+// failure left nothing live or reusable behind: the Provider is poisoned for
+// every later lease, and the private home's owner removal succeeded, which
+// first stops the app-server writer (no running MCP client keeps the
+// session's server credentials). Owner removal follows the normal retention
+// rule: a home holding resumable session state is kept (only cache/ is
+// removed), so its config.toml stays on disk exactly as it would after any
+// other session end; contained never claims that file was scrubbed. A
+// contained failure after a completed turn is reported as a warning next to
+// the turn's result; an uncontained one keeps replacing the result with the
+// terminal mcp_cleanup_failed error.
 type mcpCleanupError struct {
 	err       error
 	contained bool
