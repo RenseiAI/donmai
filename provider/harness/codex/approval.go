@@ -130,8 +130,8 @@ func NewApprovalBridge(cfg *agent.PermissionConfig) *ApprovalBridge {
 	br := &ApprovalBridge{config: cfg, autoApprove: true}
 	if cfg != nil {
 		br.hasAllowlist = len(cfg.AllowPatterns) > 0
-		br.allowRegexes, br.allowFiles = compilePatterns(cfg.AllowPatterns)
-		br.denyRegexes, br.denyFiles = compilePatterns(cfg.DisallowPatterns)
+		br.allowRegexes, br.allowFiles = compilePatterns(cfg.AllowPatterns, false)
+		br.denyRegexes, br.denyFiles = compilePatterns(cfg.DisallowPatterns, true)
 		switch strings.ToLower(cfg.DefaultDecision) {
 		case "deny":
 			br.autoApprove = false
@@ -204,7 +204,9 @@ func (b *ApprovalBridge) evaluateCommand(cmd string) ApprovalDecision {
 	// it chains: a "git" allow must not cover "git status && rm -rf src". The
 	// chained commands keep their wrappers, so unwrapping can never widen an
 	// allow either.
-	if len(b.allowRegexes) > 0 {
+	// Any explicit allowlist gates commands, even one with no shell entry:
+	// a card that allows only Read(...) or Edit authorizes no command.
+	if b.hasAllowlist {
 		if matchesAny(b.allowRegexes, cmd) {
 			allowed := true
 			for _, chained := range chainedCommands(cmd) {
@@ -254,21 +256,31 @@ func (b *ApprovalBridge) evaluateFileChange(path, cwd string) ApprovalDecision {
 	return ApprovalDecision{Action: ActionDecline, Reason: "default decision is deny"}
 }
 
-func compilePatterns(patterns []string) ([]*regexp.Regexp, bool) {
+// compilePatterns compiles one side of a PermissionConfig. Denies and allows
+// differ wherever a reading could widen an allow:
+//   - bare "Bash" declines every command, but as an allow it keeps the legacy
+//     raw-regex meaning it always had on this bridge;
+//   - a path-scoped Read/Edit/Write pattern and any other tool name (Read,
+//     WebFetch, mcp__x__y) authorizes no command; as a deny, a tool name keeps
+//     its legacy raw-regex meaning, which can only decline more.
+func compilePatterns(patterns []string, deny bool) ([]*regexp.Regexp, bool) {
 	out := make([]*regexp.Regexp, 0, len(patterns))
 	files := false
 	for _, p := range patterns {
+		p = strings.TrimSpace(p)
 		if isFileChangeTool(p) {
 			files = true
 			continue
 		}
-		// Path-scoped Read/Edit patterns are not command text: compiled as a
-		// command regex they either failed or matched nothing meaningful.
-		if name, _, scoped := splitToolPattern(strings.TrimSpace(p)); scoped && (name == "Read" || isFileChangeTool(name)) {
+		name, _, scoped := splitToolPattern(p)
+		if scoped && (name == "Read" || isFileChangeTool(name)) {
 			continue
 		}
-		if commandPattern, ok := bashPermissionPattern(p); ok {
+		if commandPattern, ok := bashPermissionPattern(p); ok && (deny || p != "Bash") {
 			out = append(out, regexp.MustCompile(commandPattern))
+			continue
+		}
+		if !deny && p != "Bash" && toolNamePattern.MatchString(p) {
 			continue
 		}
 		// PermissionConfig patterns are user-supplied. Compile with
@@ -283,6 +295,10 @@ func compilePatterns(patterns []string) ([]*regexp.Regexp, bool) {
 	}
 	return out, files
 }
+
+// toolNamePattern matches a harness tool name, bare or scoped ("Read",
+// "WebFetch(domain:x)", "mcp__server__tool"), as opposed to a raw regex.
+var toolNamePattern = regexp.MustCompile(`^(?:[A-Z][A-Za-z0-9]*|mcp__[A-Za-z0-9_*-]+)(?:\(.*\))?$`)
 
 func isFileChangeTool(pattern string) bool {
 	switch strings.TrimSpace(pattern) {
@@ -328,24 +344,57 @@ func bashPermissionPattern(pattern string) (string, bool) {
 	return `^` + regexp.QuoteMeta(inner) + `$`, true
 }
 
-// commandSeparators split a shell line where a new command starts.
-var commandSeparators = regexp.MustCompile("&&|\\|\\||[;|&\n()`]|\\$\\(")
-
 // commandWrappers match leading words that run the rest of the line as a
 // command: VAR=value, env, command, exec, nohup, time, nice, timeout, xargs,
 // eval, and a shell's -c flag, each optionally by absolute path and with flags.
 var commandWrappers = regexp.MustCompile(`^(?:(?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|\S*)|(?:\S*/)?(?:env|command|exec|nohup|time|nice|xargs|eval)(?:\s+-\S+(?:\s+\d+)?)*|(?:\S*/)?timeout(?:\s+-\S+)*\s+\S+|(?:\S*/)?(?:ba|z|da|k)?sh(?:\s+-\S+)*\s+-[A-Za-z]*c)\s+)+`)
 
-// chainedCommands splits a shell line into the commands it chains, untouched.
-// It over-splits quoted text, which can only make a deny match more and an
-// allow match less.
+// chainedCommands splits a shell line into the commands it runs, untouched.
+// It splits at unquoted &&, ||, ;, |, &, newlines and parentheses, and at
+// $( and backticks even inside double quotes, where a substitution still
+// runs. Quoted text is never split, so 'one;two' stays one argument.
 func chainedCommands(cmd string) []string {
 	var out []string
-	for _, part := range commandSeparators.Split(cmd, -1) {
-		if part = strings.TrimSpace(part); part != "" {
+	var cur strings.Builder
+	flush := func() {
+		if part := strings.TrimSpace(cur.String()); part != "" {
 			out = append(out, part)
 		}
+		cur.Reset()
 	}
+	var quote byte
+	for i := 0; i < len(cmd); i++ {
+		c := cmd[i]
+		switch {
+		case quote == '\'':
+			cur.WriteByte(c)
+			if c == '\'' {
+				quote = 0
+			}
+		case c == '\\' && i+1 < len(cmd):
+			cur.WriteByte(c)
+			cur.WriteByte(cmd[i+1])
+			i++
+		case c == '`' || (c == '$' && i+1 < len(cmd) && cmd[i+1] == '('):
+			flush()
+			if c == '$' {
+				i++
+			}
+		case quote == '"':
+			cur.WriteByte(c)
+			if c == '"' {
+				quote = 0
+			}
+		case c == '\'' || c == '"':
+			quote = c
+			cur.WriteByte(c)
+		case strings.IndexByte(";&|()\n", c) >= 0:
+			flush()
+		default:
+			cur.WriteByte(c)
+		}
+	}
+	flush()
 	return out
 }
 
@@ -358,25 +407,56 @@ func matchesAny(res []*regexp.Regexp, s string) bool {
 	return false
 }
 
-// commandSegments returns each command a shell line chains or wraps, with
-// wrappers and quotes stripped and runs of whitespace collapsed, for deny
-// matching only.
+// commandSegments returns, for deny matching only, each command a shell line
+// chains or wraps: wrappers stripped, a quoted -c/eval program parsed as its
+// own shell line, and each command also with runs of whitespace collapsed.
 func commandSegments(cmd string) []string {
+	return unwrapCommands(cmd, 0)
+}
+
+func unwrapCommands(line string, depth int) []string {
 	var out []string
-	for _, part := range chainedCommands(cmd) {
-		part = strings.Join(strings.Fields(part), " ")
-		for {
-			next := strings.TrimSpace(strings.Trim(strings.TrimSpace(commandWrappers.ReplaceAllString(part, "")), `'"`))
-			if next == part {
-				break
-			}
+	for _, part := range chainedCommands(line) {
+		for next := strings.TrimSpace(commandWrappers.ReplaceAllString(part, "")); next != part; next = strings.TrimSpace(commandWrappers.ReplaceAllString(part, "")) {
 			part = next
 		}
-		if part != "" {
-			out = append(out, part)
+		out = append(out, part)
+		if collapsed := strings.Join(strings.Fields(part), " "); collapsed != part {
+			out = append(out, collapsed)
+		}
+		if program, ok := leadingQuotedWord(part); ok && depth < 4 {
+			out = append(out, unwrapCommands(program, depth+1)...)
 		}
 	}
 	return out
+}
+
+// leadingQuotedWord returns the content of a leading '...' or "..." word, the
+// form a shell -c or eval program takes once its wrapper is stripped.
+func leadingQuotedWord(s string) (string, bool) {
+	if len(s) < 2 || (s[0] != '\'' && s[0] != '"') {
+		return "", false
+	}
+	if s[0] == '\'' {
+		end := strings.IndexByte(s[1:], '\'')
+		if end < 0 {
+			return "", false
+		}
+		return s[1 : 1+end], true
+	}
+	var b strings.Builder
+	for i := 1; i < len(s); i++ {
+		switch {
+		case s[i] == '\\' && i+1 < len(s) && strings.IndexByte("\"\\$`", s[i+1]) >= 0:
+			b.WriteByte(s[i+1])
+			i++
+		case s[i] == '"':
+			return b.String(), true
+		default:
+			b.WriteByte(s[i])
+		}
+	}
+	return "", false
 }
 
 // parseApprovalRequest extracts the kind+payload from a JSON-RPC

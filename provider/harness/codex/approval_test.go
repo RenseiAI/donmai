@@ -1,6 +1,8 @@
 package codex
 
 import (
+	"regexp"
+	"strings"
 	"testing"
 
 	"github.com/RenseiAI/donmai/agent"
@@ -293,6 +295,103 @@ func TestApprovalBridge_AllowNeverCoversAChainedCommand(t *testing.T) {
 		for _, cmd := range tc.declined {
 			if got := br.Evaluate(ApprovalRequest{Kind: ApprovalKindCommand, Command: cmd}); got.Action != ActionDecline {
 				t.Errorf("%s: %q = %s, want decline", tc.allow, cmd, got.Action)
+			}
+		}
+	}
+}
+
+// TestApprovalBridge_PolicyForms pins how each allow/deny form reaches a
+// command: legacy allow meanings are never widened, non-shell allows authorize
+// no command, and quoted text is never split.
+func TestApprovalBridge_PolicyForms(t *testing.T) {
+	t.Parallel()
+	printfExact := `Bash(printf '%s\n' 'one;two')`
+	for _, tc := range []struct {
+		name string
+		cfg  agent.PermissionConfig
+		cmd  string
+		want ApprovalAction
+	}{
+		// A bare Bash allow keeps its legacy meaning; it does not become allow-all.
+		{"bare Bash allow under default deny", agent.PermissionConfig{AllowPatterns: []string{"Bash"}, DefaultDecision: "deny"}, "git status", ActionDecline},
+		// Non-shell allows authorize no command, even when none compiles to a rule.
+		{"scoped Read allow only", agent.PermissionConfig{AllowPatterns: []string{"Read(/srv/docs)"}}, "git status", ActionDecline},
+		{"bare tool-name allow", agent.PermissionConfig{AllowPatterns: []string{"Read"}}, "cat Readme", ActionDecline},
+		{"Edit-only allow", agent.PermissionConfig{AllowPatterns: []string{"Edit"}}, "ls", ActionDecline},
+		{"MCP tool allow", agent.PermissionConfig{AllowPatterns: []string{"mcp__docs__search"}}, "mcp__docs__search", ActionDecline},
+		{"raw regex allow still works", agent.PermissionConfig{AllowPatterns: []string{`^pnpm\s`}}, "pnpm test", ActionAcceptForSession},
+		// Quoted separators are one argument, for allows and denies alike.
+		{"exact allow with a quoted ;", agent.PermissionConfig{AllowPatterns: []string{printfExact}}, `printf '%s\n' 'one;two'`, ActionAcceptForSession},
+		{"prefix allow with a quoted ;", agent.PermissionConfig{AllowPatterns: []string{"Bash(git *)"}}, `git commit -m "a; b && c"`, ActionAcceptForSession},
+		{"exact deny through bash -c", agent.PermissionConfig{DisallowPatterns: []string{printfExact}}, `bash -c "printf '%s\n' 'one;two'"`, ActionDecline},
+		{"exact deny through eval", agent.PermissionConfig{DisallowPatterns: []string{printfExact}}, `eval "printf '%s\n' 'one;two'"`, ActionDecline},
+		{"exact deny through nested wrappers", agent.PermissionConfig{DisallowPatterns: []string{"Bash(git push*)"}}, `sh -c 'env FOO=1 bash -lc "cd x; git push"'`, ActionDecline},
+		{"quoted deny text is not a command", agent.PermissionConfig{DisallowPatterns: []string{"Bash(env)"}}, `echo 'check; env'`, ActionAcceptForSession},
+		// A substitution runs even inside double quotes.
+		{"substitution in double quotes vs allow", agent.PermissionConfig{AllowPatterns: []string{"Bash(git *)"}}, `git log "$(id)"`, ActionDecline},
+		{"substitution in double quotes vs deny", agent.PermissionConfig{DisallowPatterns: []string{"Bash(curl*)"}}, `echo "$(curl x)" && ls`, ActionDecline},
+		{"command after a quoted substitution", agent.PermissionConfig{DisallowPatterns: []string{"Bash(rm:*)"}}, `echo "$(date)" && rm y`, ActionDecline},
+		{"substitution in single quotes is text", agent.PermissionConfig{AllowPatterns: []string{"Bash(echo *)"}}, `echo '$(id)'`, ActionAcceptForSession},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := tc.cfg
+			if got := NewApprovalBridge(&cfg).Evaluate(ApprovalRequest{Kind: ApprovalKindCommand, Command: tc.cmd}); got.Action != tc.want {
+				t.Errorf("%q = %s (%s), want %s", tc.cmd, got.Action, got.Reason, tc.want)
+			}
+		})
+	}
+}
+
+// legacyAllowAccepts is the allow stage as it stood before the Claude-grammar
+// fix, kept as an oracle: whole-line match against patterns compiled the old way.
+func legacyAllowAccepts(pattern, cmd string, defaultAllow bool) bool {
+	var res []*regexp.Regexp
+	switch inner, ok := strings.CutPrefix(pattern, "Bash("); {
+	case isFileChangeTool(pattern):
+	case ok && strings.HasSuffix(inner, ")"):
+		inner = strings.TrimSpace(strings.TrimSuffix(inner, ")"))
+		expr := `^` + regexp.QuoteMeta(inner) + `$`
+		if inner == "" || inner == "*" {
+			expr = `(?s)^.*$`
+		} else if prefix, colon := strings.CutSuffix(inner, ":*"); colon {
+			expr = `^` + regexp.QuoteMeta(strings.TrimSpace(prefix)) + `(?:\s|$)`
+		}
+		res = append(res, regexp.MustCompile(expr))
+	default:
+		if re, err := regexp.Compile(pattern); err == nil {
+			res = append(res, re)
+		}
+	}
+	if len(res) == 0 {
+		return defaultAllow
+	}
+	return res[0].MatchString(cmd)
+}
+
+// TestApprovalBridge_AllowNeverWiderThanLegacy: for every allow form whose
+// meaning predates this bridge's grammar fix, nothing is accepted that the
+// legacy allow stage declined. (The "prefix*" forms matched only their literal
+// text before and are deliberately given Claude's prefix meaning.)
+func TestApprovalBridge_AllowNeverWiderThanLegacy(t *testing.T) {
+	t.Parallel()
+	patterns := []string{
+		"Bash", "Bash(*)", "Bash()", "Bash(git:*)", "Bash(git status)", `Bash(printf '%s\n' 'one;two')`,
+		`^pnpm\s`, `^git status$`, `git`, "Read", "Read(/srv/docs)", "Edit", "Edit(docs/**)", "WebFetch", "mcp__docs__search", "(",
+	}
+	commands := []string{
+		"git status", "git status && rm -rf src", "git status; git status", "git log $(id)", "git log `id`",
+		"pnpm test", "pnpm test | sh", "echo Bash", "Bash", "cat Readme", "Read/srv/docs", "env FOO=1 git status",
+		`printf '%s\n' 'one;two'`, `bash -c "git status"`, "ls", "mcp__docs__search", "rm -rf src",
+	}
+	for _, defaultDecision := range []string{"allow", "deny"} {
+		for _, pattern := range patterns {
+			br := NewApprovalBridge(&agent.PermissionConfig{AllowPatterns: []string{pattern}, DefaultDecision: defaultDecision})
+			for _, cmd := range commands {
+				got := br.Evaluate(ApprovalRequest{Kind: ApprovalKindCommand, Command: cmd})
+				if got.Action != ActionDecline && !legacyAllowAccepts(pattern, cmd, defaultDecision == "allow") {
+					t.Errorf("default %s, allow %q: %q = %s, but the legacy allow stage declined it", defaultDecision, pattern, cmd, got.Action)
+				}
 			}
 		}
 	}
