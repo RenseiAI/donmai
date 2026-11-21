@@ -182,11 +182,11 @@ func (d *Daemon) hostUpgradeSourceConfigured() bool {
 	if d.runPreparedUpdate != nil {
 		return true
 	}
-	cfg := d.Config()
-	if cfg == nil {
+	if d == nil {
 		return false
 	}
-	return strings.TrimSpace(effectiveUpdateCDNBase(cfg.AutoUpdate)) != ""
+	base, _ := d.EffectiveUpdateCDNBase()
+	return strings.TrimSpace(base) != ""
 }
 
 // hostUpgradeConsentDeadline returns the wall-clock deadline after which the
@@ -863,19 +863,20 @@ func (d *Daemon) executeHostUpgrade(ctx context.Context) (*UpdateResult, error) 
 	if cfg == nil {
 		return nil, fmt.Errorf("no config loaded")
 	}
+	effective := d.EffectiveAutoUpdateConfig()
 	if d.runPreparedUpdate != nil {
-		return d.runPreparedUpdate(ctx, cfg.AutoUpdate, d.EffectiveVersion())
+		return d.runPreparedUpdate(ctx, effective, d.EffectiveVersion())
 	}
 	// Fail closed when the production updater has no source to check: with
 	// no configured CDN base the updater would report already-up-to-date
 	// without contacting any release, which must never become an applied ACK.
-	cdnBase := effectiveUpdateCDNBase(cfg.AutoUpdate)
-	if strings.TrimSpace(cdnBase) == "" {
+	cdnBase := strings.TrimSpace(effective.CDNBase)
+	if cdnBase == "" {
 		return &UpdateResult{Updated: false, Version: d.EffectiveVersion(), Reason: "update-source-not-configured"}, fmt.Errorf("host.upgrade refused: update source is not configured")
 	}
 	updater := NewUpdater(UpdaterOptions{
 		CurrentVersion: d.EffectiveVersion(),
-		Config:         cfg.AutoUpdate,
+		Config:         effective,
 		CDNBase:        cdnBase,
 		SkipExit:       true,
 	})
