@@ -1066,7 +1066,7 @@ func isKnownEvent(event EventKind) bool {
 	case EventInit, EventSystem, EventAssistantText, EventLlmCall, EventToolUse, EventToolResult, EventToolProgress, EventUsage, EventSubagent, EventResult, EventError:
 		return true
 	default:
-		return false
+		return isV2Kind(event)
 	}
 }
 
