@@ -156,6 +156,7 @@ func translateSpecWithToolPolicy(qw QueuedWork, caps agent.Capabilities, in Spec
 		InitialContext:     in.InitialContext,
 		ProviderConfig:     copyProviderConfig(qw.ResolvedProfile.ProviderConfig),
 		Endpoint:           copyEndpointBinding(qw.ResolvedProfile.Endpoint),
+		AuthMode:           qw.ResolvedProfile.AuthMode,
 		StartInBypass:      resolveStartInBypass(qw, in),
 	}
 

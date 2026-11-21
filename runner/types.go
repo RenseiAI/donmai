@@ -348,6 +348,13 @@ type ResolvedProfile struct {
 
 	// Endpoint is the resolved serving binding forwarded to agent.Spec.
 	Endpoint *agent.EndpointBinding `json:"endpoint,omitempty"`
+
+	// AuthMode is the auth mode the control plane resolved for this session,
+	// taken from the session detail's resolved profile and forwarded to
+	// agent.Spec.AuthMode. It is deliberately excluded from JSON ("-"): it is
+	// never read from the operational payload, so the canonical payload
+	// projection (and every admission digest over it) stays byte-identical.
+	AuthMode agent.AuthMode `json:"-"`
 }
 
 // interactiveRunMode is the QueuedWork.Mode value that activates the
