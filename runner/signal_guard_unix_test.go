@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/internal/testexec"
 )
 
 // guardTestTools skips the test unless the guard's fixed tool search path
@@ -66,36 +67,24 @@ func guardTestEnv(layout signalGuardLayout, worktree string, extra map[string]st
 	return out
 }
 
-// writeTestExecFile durably installs one executable test stub: the bytes
-// are written, synced, and closed before chmod, so a concurrent exec
-// never observes ETXTBSY (text file busy) under load.
+// writeTestExecFile installs one executable test stub through the shared
+// fork-guarded writer: holding the fork lock across the write guarantees
+// no concurrent fork can inherit the still-open descriptor, so a later
+// exec never observes ETXTBSY (text file busy) under load.
 func writeTestExecFile(t *testing.T, path string, data []byte) {
 	t.Helper()
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
-	if err != nil {
-		t.Fatalf("create %s: %v", path, err)
-	}
-	if _, err := f.Write(data); err != nil {
-		_ = f.Close()
+	if err := testexec.WriteFile(path, data, 0o755); err != nil { //nolint:gosec // G306: test stub must carry the exec bit.
 		t.Fatalf("write %s: %v", path, err)
-	}
-	if err := f.Sync(); err != nil {
-		_ = f.Close()
-		t.Fatalf("sync %s: %v", path, err)
-	}
-	if err := f.Close(); err != nil {
-		t.Fatalf("close %s: %v", path, err)
-	}
-	if err := os.Chmod(path, 0o755); err != nil { //nolint:gosec // G306: test stub must carry the exec bit.
-		t.Fatalf("chmod %s: %v", path, err)
 	}
 }
 
 // startGuardSleeper starts `sleep 300` with argv[0] set to name and cwd
 // dir, and waits for the child's readiness signal on a pipe: the shell
 // writes one word to the inherited fd before execing sleep, so when the
-// parent reads it the sleeper process exists with its final distinctive
-// command line and the guard's own pgrep form can match it. exec -a gives
+// parent reads it the sleeper exists and the exec follows immediately.
+// The parent then closes the pipe and probes the pid before returning,
+// by which time the exec has normally completed and the guard's own
+// pgrep form can match the final distinctive command line. exec -a gives
 // the process a distinctive command line on every platform; the process
 // NAME used for name matching is calibrated per platform with
 // guardSleeperComm. On Linux the comm stays the executed basename

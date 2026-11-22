@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"syscall"
 
 	"github.com/RenseiAI/donmai/tempown"
 )
@@ -72,12 +73,17 @@ type signalGuardLayout struct {
 	degraded bool
 }
 
-// writeSignalGuardFile durably installs one executable guard shim: the
-// content is written, synced to storage, and closed before the mode is
-// set and the caller can exec it. Closing (and syncing) before exec
-// avoids ETXTBSY (text file busy) when the shim is executed immediately
-// after install under load.
+// writeSignalGuardFile installs one executable guard shim. The write
+// descriptor's whole lifetime is guarded by the fork lock: Linux refuses
+// execve of a file any process still holds open for writing (ETXTBSY),
+// and a concurrent fork in another goroutine would inherit the still-open
+// descriptor, so closing (and syncing) before exec alone does not suffice.
+// Holding the read side across open, write, sync and close guarantees no
+// forked child can inherit the writer, and the shim execs immediately
+// once the lock is released.
 func writeSignalGuardFile(path string, data []byte) error {
+	syscall.ForkLock.RLock()
+	defer syscall.ForkLock.RUnlock()
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600) //nolint:gosec // G304: path is the runner-owned guard dir from MkdirTemp, not user input.
 	if err != nil {
 		return fmt.Errorf("runner: create signal guard script: %w", err)
