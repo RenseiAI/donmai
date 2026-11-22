@@ -16,6 +16,7 @@ import (
 // host with no logins.
 func TestObservationScanStandaloneListener(t *testing.T) {
 	_, srv, cleanup := mustStartDaemonWith(t, func(o *Options) {
+		o.SkipRegistration = true
 		o.RequireControlToken = true
 		o.ControlToken = testControlToken
 	})
@@ -128,6 +129,7 @@ func TestObservationScanStandaloneListener(t *testing.T) {
 // the IPv6 loopback bind the CLI reaches with a raw `--host ::1`.
 func TestObservationScanStandaloneListenerIPv6(t *testing.T) {
 	_, srv, cleanup := mustStartDaemonWith(t, func(o *Options) {
+		o.SkipRegistration = true
 		o.HTTPHost = "::1"
 		o.RequireControlToken = true
 		o.ControlToken = testControlToken
