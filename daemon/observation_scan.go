@@ -331,11 +331,12 @@ func (d *Daemon) applyObservationsScan(m PendingMutation, registration string) e
 			delete(s.done, k)
 		}
 	}
-	if s.stopped {
-		return fmt.Errorf("%s: %v", observationsScanOp, errObservationScanCancelled)
-	}
-	// The dedupe check runs before parameter validation, so a redelivered
-	// id never re-reports a validation failure differently. An id with a
+	// The dedupe check runs before the stop refusal, so stop refuses only
+	// new ids: a redelivered id that is queued, undrained, or done already
+	// has its one outcome decided, and a fresh cancellation would report it
+	// a second, contradicting way in the same beat. It also runs before
+	// parameter validation, so a redelivered id never re-reports a
+	// validation failure differently. An id with a
 	// completed but undrained batch is absorbed the same way: its
 	// acknowledgement is already decided and awaits only its own
 	// registration's heartbeat handoff, so it must not start a second scan.
@@ -350,6 +351,9 @@ func (d *Daemon) applyObservationsScan(m PendingMutation, registration string) e
 			return errors.New(outcome.errText)
 		}
 		return errObservationScanDeferred
+	}
+	if s.stopped {
+		return fmt.Errorf("%s: %v", observationsScanOp, errObservationScanCancelled)
 	}
 	var params struct {
 		Kinds []string `json:"kinds"`

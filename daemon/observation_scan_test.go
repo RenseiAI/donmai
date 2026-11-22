@@ -1070,3 +1070,184 @@ func TestObservationsScanMutation_HandedOffSuccessAbsorbsToPreserveReportFidelit
 		t.Fatalf("scans = %d, want no second scan for the redelivery", calls.Load())
 	}
 }
+
+// waitScanOutcome waits until the scan for id has recorded its outcome
+// without draining its acknowledgement batch.
+func waitScanOutcome(t *testing.T, d *Daemon, id string) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		d.observationScan.mu.Lock()
+		_, ok := d.observationScan.done[observationScanKey{id: id}]
+		d.observationScan.mu.Unlock()
+		if ok {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("scan for %s did not complete", id)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestObservationsScanMutation_StopRefusesOnlyNewIDs pins that daemon stop
+// refuses only ids it has never seen: a redelivered id that is queued or
+// completed-but-undrained keeps its single decided outcome instead of
+// gaining a second, contradicting cancellation failure.
+func TestObservationsScanMutation_StopRefusesOnlyNewIDs(t *testing.T) {
+	tests := []struct {
+		name string
+		// queued keeps the scan slot busy so the request is still queued
+		// when the daemon stops; otherwise the scan completes first.
+		queued       bool
+		wantApplied  []string
+		wantFailures int
+	}{
+		{name: "completed undrained id is absorbed", wantApplied: []string{"m1"}},
+		{name: "queued id gets exactly one cancellation", queued: true, wantFailures: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var calls atomic.Int32
+			d := scanDaemon(map[string]quotaProbeFunc{"codex": countingFeed(&calls)})
+			d.observationScan.minInterval = time.Millisecond
+			if tt.queued {
+				d.observationScan.mu.Lock()
+				d.observationScan.inFlight = true
+				d.observationScan.mu.Unlock()
+			}
+			if applied, failures := d.applyPendingMutations(context.Background(), []PendingMutation{{ID: "m1", Op: observationsScanOp}}); len(applied) != 0 || len(failures) != 0 {
+				t.Fatalf("applied = %v failures = %v, want the request queued", applied, failures)
+			}
+			if !tt.queued {
+				waitScanOutcome(t, d, "m1")
+			}
+			d.cancelObservationScans()
+			var gotApplied []string
+			var gotFailures []HeartbeatMutationFailure
+			applied, failures := d.applyPendingMutations(context.Background(), []PendingMutation{{ID: "m1", Op: observationsScanOp}})
+			gotApplied = append(gotApplied, applied...)
+			gotFailures = append(gotFailures, failures...)
+			batch := drainOneScanBatch(t, d)
+			gotApplied = append(gotApplied, batch.applied...)
+			gotFailures = append(gotFailures, batch.failures...)
+			// Let the worker finish, then confirm nothing else is owed.
+			deadline := time.Now().Add(3 * time.Second)
+			for {
+				d.observationScan.mu.Lock()
+				working := d.observationScan.working
+				d.observationScan.mu.Unlock()
+				if !working {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("scan worker did not exit after stop")
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			for {
+				applied, failures, _ := d.drainDeferredScanAcks()
+				if len(applied) == 0 && len(failures) == 0 {
+					break
+				}
+				gotApplied = append(gotApplied, applied...)
+				gotFailures = append(gotFailures, failures...)
+			}
+			if strings.Join(gotApplied, ",") != strings.Join(tt.wantApplied, ",") {
+				t.Fatalf("applied = %v, want %v", gotApplied, tt.wantApplied)
+			}
+			if len(gotFailures) != tt.wantFailures {
+				t.Fatalf("failures = %v, want %d", gotFailures, tt.wantFailures)
+			}
+			for _, f := range gotFailures {
+				if f.ID != "m1" || !strings.Contains(f.Error, "stopping") {
+					t.Fatalf("failure = %+v, want a stop cancellation for m1", f)
+				}
+			}
+			if !tt.queued && calls.Load() != 1 {
+				t.Fatalf("scans = %d, want the single original scan", calls.Load())
+			}
+		})
+	}
+}
+
+// TestHeartbeat_StopNeverReportsAScanBothAppliedAndFailed drives the real
+// heartbeat wire across daemon stop: two scans complete, the daemon stops
+// before the second batch is handed off, and the control plane redelivers
+// the second id. No beat may list one id as both applied and failed, and
+// the redelivered id is acknowledged exactly once, as applied.
+func TestHeartbeat_StopNeverReportsAScanBothAppliedAndFailed(t *testing.T) {
+	var calls atomic.Int32
+	d := scanDaemon(map[string]quotaProbeFunc{"codex": countingFeed(&calls)})
+	d.observationScan.minInterval = time.Millisecond
+	if applied, failures := d.applyPendingMutations(context.Background(), []PendingMutation{
+		{ID: "scan-0", Op: observationsScanOp},
+		{ID: "scan-1", Op: observationsScanOp},
+	}); len(applied) != 0 || len(failures) != 0 {
+		t.Fatalf("applied = %v failures = %v, want both requests queued", applied, failures)
+	}
+	waitScanOutcome(t, d, "scan-0")
+	waitScanOutcome(t, d, "scan-1")
+	// What Daemon.Stop runs before the heartbeat stops.
+	d.cancelObservationScans()
+
+	bodies := make(chan []byte, 8)
+	var beats atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		buf, _ := io.ReadAll(r.Body)
+		bodies <- buf
+		resp := map[string]any{"acknowledged": true}
+		if beats.Add(1) == 1 {
+			// scan-1 is not yet acknowledged, so the control plane
+			// redelivers it.
+			resp["pendingMutations"] = []PendingMutation{{ID: "scan-1", Op: observationsScanOp}}
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	t.Cleanup(srv.Close)
+	hs := NewHeartbeatService(HeartbeatOptions{
+		WorkerID: "wkr_obs", Hostname: "h", OrchestratorURL: srv.URL, RuntimeJWT: "runtime.jwt.value", IntervalSeconds: 1,
+		GetActiveCount: func() int { return 0 }, GetMaxCount: func() int { return 1 },
+		GetStatus:          func() RegistrationStatus { return RegistrationIdle },
+		DrainDeferredAcks:  d.drainDeferredScanAcks,
+		OnPendingMutations: d.applyPendingMutations,
+		GetObservations:    func() *observation.Report { return nil },
+	})
+	type wireBeat struct {
+		AppliedMutations []string                   `json:"appliedMutations"`
+		MutationFailures []HeartbeatMutationFailure `json:"mutationFailures"`
+	}
+	applied := map[string]int{}
+	failed := map[string]int{}
+	for i := 1; i <= 3; i++ {
+		hs.sendOne(context.Background())
+		var beat wireBeat
+		select {
+		case buf := <-bodies:
+			if err := json.Unmarshal(buf, &beat); err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("beat %d: no heartbeat arrived", i)
+		}
+		inBeat := map[string]bool{}
+		for _, id := range beat.AppliedMutations {
+			inBeat[id] = true
+			applied[id]++
+		}
+		for _, f := range beat.MutationFailures {
+			if inBeat[f.ID] {
+				t.Fatalf("beat %d lists %s as both applied and failed: applied=%v failures=%v", i, f.ID, beat.AppliedMutations, beat.MutationFailures)
+			}
+			failed[f.ID]++
+		}
+	}
+	for _, id := range []string{"scan-0", "scan-1"} {
+		if applied[id] != 1 || failed[id] != 0 {
+			t.Fatalf("%s: applied %d failed %d times, want exactly one applied acknowledgement", id, applied[id], failed[id])
+		}
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("scans = %d, want one scan per request", calls.Load())
+	}
+}
