@@ -297,6 +297,12 @@ func (d *Daemon) applyObservationsScan(m PendingMutation) error {
 		return fmt.Errorf("%s requires an id", observationsScanOp)
 	}
 	s := &d.observationScan
+	// Snapshot the undrained batches before taking mu: drain takes ackMu
+	// before mu, so nesting the check inside mu would invert the order.
+	// A redelivery answered here is always safe to defer: the pending
+	// batch will acknowledge it on its handoff, or the handoff will have
+	// refreshed its outcome by the next redelivery.
+	undrained := s.hasUndrainedBatch(m.ID)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now()
@@ -309,8 +315,14 @@ func (d *Daemon) applyObservationsScan(m PendingMutation) error {
 		return fmt.Errorf("%s: %v", observationsScanOp, errObservationScanCancelled)
 	}
 	// The dedupe check runs before parameter validation, so a redelivered
-	// id never re-reports a validation failure differently.
+	// id never re-reports a validation failure differently. An id with a
+	// completed but undrained batch is absorbed the same way: its
+	// acknowledgement is already decided and awaits only its heartbeat
+	// handoff, so it must not start a second scan.
 	if s.queued[m.ID] {
+		return errObservationScanDeferred
+	}
+	if undrained {
 		return errObservationScanDeferred
 	}
 	if outcome, ok := s.done[m.ID]; ok {
@@ -350,6 +362,26 @@ func (d *Daemon) applyObservationsScan(m PendingMutation) error {
 		go d.runObservationScanQueue()
 	}
 	return errObservationScanDeferred
+}
+
+// hasUndrainedBatch reports whether a completed scan's batch for id still
+// awaits its heartbeat handoff. The caller must not hold observationScan.mu.
+func (s *observationScanner) hasUndrainedBatch(id string) bool {
+	s.ackMu.Lock()
+	defer s.ackMu.Unlock()
+	for _, batch := range s.ackBatches {
+		for _, appliedID := range batch.applied {
+			if appliedID == id {
+				return true
+			}
+		}
+		for _, failure := range batch.failures {
+			if failure.ID == id {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // recordScanOutcomeLocked remembers a terminal outcome for replay on
@@ -557,12 +589,19 @@ func (d *Daemon) drainDeferredScanAcks() ([]string, []HeartbeatMutationFailure, 
 		if outcome, ok := s.done[id]; ok {
 			outcome.at = now
 			s.done[id] = outcome
+		} else {
+			// The outcome was TTL-pruned while the batch awaited its
+			// handoff: re-record it so a later redelivery replays instead
+			// of starting a second scan for an already-answered id.
+			s.recordScanOutcomeLocked(id, nil, now)
 		}
 	}
 	for _, failure := range batch.failures {
 		if outcome, ok := s.done[failure.ID]; ok {
 			outcome.at = now
 			s.done[failure.ID] = outcome
+		} else {
+			s.recordScanOutcomeLocked(failure.ID, errors.New(failure.Error), now)
 		}
 	}
 	return batch.applied, batch.failures, batch.report

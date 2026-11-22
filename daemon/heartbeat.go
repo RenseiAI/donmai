@@ -582,10 +582,15 @@ func (h *HeartbeatService) sendOneSerialized(ctx context.Context) error {
 	}
 	h.mu.Lock()
 	sentScanReport := h.pendingScanReport
+	// A pending scan failure batch carries no report of its own: while it
+	// awaits confirmation the beat omits observations instead of
+	// substituting the generic snapshot, so the failure acknowledgement
+	// never rides a report its scan did not produce.
+	scanFailuresPending := h.pendingScanUnacked && sentScanReport == nil && len(h.pendingFailures) > 0
 	h.mu.Unlock()
 	if sentScanReport != nil {
 		payload.Observations = sentScanReport
-	} else if h.opts.GetObservations != nil {
+	} else if !scanFailuresPending && h.opts.GetObservations != nil {
 		payload.Observations = h.opts.GetObservations()
 	}
 
