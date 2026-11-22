@@ -149,6 +149,17 @@ func (d *Daemon) ScanObservations(ctx context.Context, kinds []string) (*Observa
 	return d.markObservations(report), nil
 }
 
+// ObservationsNow returns the current report and marks without scanning.
+func (d *Daemon) ObservationsNow() (*ObservationScanResult, error) {
+	report, err := d.observationReport(time.Now(), false)
+	if err != nil {
+		return nil, err
+	}
+	d.observationScan.mu.Lock()
+	defer d.observationScan.mu.Unlock()
+	return d.markObservations(report), nil
+}
+
 // observationReport is a full report over every quota slot; it is empty,
 // not nil, when no slot holds quota state.
 func (d *Daemon) observationReport(now time.Time, timedOut bool) (*observation.Report, error) {
@@ -342,6 +353,15 @@ func (d *Daemon) drainDeferredScanAcks() ([]string, []HeartbeatMutationFailure, 
 	applied, failures, report := s.ackApplied, s.ackFailures, s.ackReport
 	s.ackApplied, s.ackFailures, s.ackReport = nil, nil, nil
 	return applied, failures, report
+}
+
+func (s *Server) handleObservations(w http.ResponseWriter, _ *http.Request) {
+	result, err := s.daemon.ObservationsNow()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
 }
 
 func (s *Server) handleObservationScan(w http.ResponseWriter, r *http.Request) {

@@ -25,12 +25,15 @@ import (
 //   - installed providers and kits
 //   - project admission
 //   - the local live-session dashboard
+//   - observed host state (host observations)
 var wantHostLeaves = []string{
 	// lifecycle
 	"doctor", "drain", "evict", "install", "logs", "pause", "resume", "run",
 	"set", "setup", "stats", "status", "stop", "uninstall", "update",
 	// pool / providers / kits / projects / dashboard
 	"kit", "project", "provider", "watch", "workarea",
+	// observed host state
+	"observations",
 }
 
 // wantDaemonAliasLeaves pins what the hidden `daemon` alias forwards. It is the
