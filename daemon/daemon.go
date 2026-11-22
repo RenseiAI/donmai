@@ -584,6 +584,10 @@ type Daemon struct {
 	// last two completed scans for the new marks.
 	observationScan observationScanner
 
+	// observationPolicies holds each registration's pushed observed-item
+	// policy (observations.policy), applied at claim time.
+	observationPolicies observationPolicies
+
 	// credentials is the single refresher every lane draws its worker identity
 	// from, constructed in Start once registration has produced one. A durable-
 	// session composition that lands after startup re-declares this daemon's
