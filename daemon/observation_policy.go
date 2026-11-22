@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"sync"
@@ -159,7 +160,10 @@ func (d *Daemon) localObservationItem(key observationSlotKey) (LocalObservationI
 // ApplyObservationMutations returns the observations.* mutation handler
 // for one registration. Embedders with additional worker identities wire
 // it into that identity's heartbeat lane, so each registration's pushed
-// policy stays its own; other ops are ignored.
+// policy stays its own; other ops are ignored. Pair it with
+// DrainDeferredScanAcksFor(registration) as that lane's DrainDeferredAcks,
+// so each registration's scan completes only on its own beat with its own
+// report.
 func (d *Daemon) ApplyObservationMutations(registration string) func(context.Context, []PendingMutation) ([]string, []HeartbeatMutationFailure) {
 	return func(_ context.Context, mutations []PendingMutation) (applied []string, failures []HeartbeatMutationFailure) {
 		for _, m := range mutations {
@@ -168,11 +172,17 @@ func (d *Daemon) ApplyObservationMutations(registration string) func(context.Con
 			case observationsPolicyOp:
 				err = d.applyObservationsPolicy(registration, m)
 			case observationsScanOp:
-				err = d.applyObservationsScan(m)
+				err = d.applyObservationsScan(m, registration)
 			default:
 				continue
 			}
 			if err != nil {
+				// A queued scan is not acknowledged in this beat: like the
+				// daemon's own lane, absorb it so the platform redelivers
+				// and the redelivery observes the completed outcome.
+				if errors.Is(err, errObservationScanDeferred) {
+					continue
+				}
 				failures = append(failures, HeartbeatMutationFailure{ID: m.ID, Error: err.Error()})
 				continue
 			}

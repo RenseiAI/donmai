@@ -119,7 +119,7 @@ func (d *Daemon) applyOneMutation(m PendingMutation) error {
 	// observations.scan touches no yaml and runs probes for up to the scan
 	// timeout, so it too stays outside the config lock.
 	if m.Op == observationsScanOp {
-		return d.applyObservationsScan(m)
+		return d.applyObservationsScan(m, primaryObservationRegistration)
 	}
 	if m.Op == observationsPolicyOp {
 		return d.applyObservationsPolicy(primaryObservationRegistration, m)

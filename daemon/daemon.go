@@ -2773,6 +2773,12 @@ func (d *Daemon) Stop(ctx context.Context) error {
 	heartbeat := d.heartbeat
 	refresher := d.tokenRefresher
 	d.lifecycleMu.Unlock()
+	// The observations.scan queue observes Stop only once Stop owns the
+	// lifecycle: a Stop that never acquires the lease (contended owner,
+	// expired caller context) must leave scans enabled. The worker and the
+	// slot wait observe the scanner's context, pending requests fail closed,
+	// and the worker exits.
+	d.cancelObservationScans()
 	d.mu.RLock()
 	reloadCancel := d.registrationReloadCancel
 	credentials := d.credentials

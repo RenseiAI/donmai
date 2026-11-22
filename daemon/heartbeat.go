@@ -252,6 +252,11 @@ type HeartbeatService struct {
 	// pending observations.scan acknowledgements. It rides every beat, in
 	// place of the generic report, until a successful POST confirms them.
 	pendingScanReport *observation.Report
+	// pendingScanUnacked is true while a drained scan batch awaits
+	// confirmation. While set the next beat holds its drain, so a later
+	// scan's report never answers an earlier request on a failed-beat
+	// retry: one batch rides one report, oldest-first.
+	pendingScanUnacked bool
 
 	// shimProjection / shimAcknowledged are the session-shim hooks, seeded from
 	// opts and REPLACEABLE afterwards (SetSessionShimProjection). A daemon whose
@@ -555,22 +560,37 @@ func (h *HeartbeatService) sendOneSerialized(ctx context.Context) error {
 		}
 	}
 	if h.opts.DrainDeferredAcks != nil {
-		if applied, failures, report := h.opts.DrainDeferredAcks(); len(applied) > 0 || len(failures) > 0 || report != nil {
-			h.mu.Lock()
-			h.pendingApplied = append(h.pendingApplied, applied...)
-			h.pendingFailures = append(h.pendingFailures, failures...)
-			if report != nil {
-				h.pendingScanReport = report
+		h.mu.Lock()
+		hold := h.pendingScanReport != nil || h.pendingScanUnacked
+		h.mu.Unlock()
+		// While a drained scan batch still awaits confirmation, hold the
+		// next drain: every batch rides its own report, oldest-first, so
+		// a failed beat followed by a second completion never sends both
+		// acknowledgements with only the latest report.
+		if !hold {
+			if applied, failures, report := h.opts.DrainDeferredAcks(); len(applied) > 0 || len(failures) > 0 || report != nil {
+				h.mu.Lock()
+				h.pendingApplied = append(h.pendingApplied, applied...)
+				h.pendingFailures = append(h.pendingFailures, failures...)
+				if report != nil {
+					h.pendingScanReport = report
+				}
+				h.pendingScanUnacked = true
+				h.mu.Unlock()
 			}
-			h.mu.Unlock()
 		}
 	}
 	h.mu.Lock()
 	sentScanReport := h.pendingScanReport
+	// A pending scan failure batch carries no report of its own: while it
+	// awaits confirmation the beat omits observations instead of
+	// substituting the generic snapshot, so the failure acknowledgement
+	// never rides a report its scan did not produce.
+	scanFailuresPending := h.pendingScanUnacked && sentScanReport == nil && len(h.pendingFailures) > 0
 	h.mu.Unlock()
 	if sentScanReport != nil {
 		payload.Observations = sentScanReport
-	} else if h.opts.GetObservations != nil {
+	} else if !scanFailuresPending && h.opts.GetObservations != nil {
 		payload.Observations = h.opts.GetObservations()
 	}
 
@@ -642,6 +662,7 @@ func (h *HeartbeatService) sendOneSerialized(ctx context.Context) error {
 		// the platform's response (hostStatus + pendingMutations).
 		h.dropConfirmedAcks(ackApplied, ackFailures)
 		h.dropConfirmedScanReport(sentScanReport)
+		h.clearPendingScanUnacked()
 		h.handleHeartbeatResponse(ctx, resp)
 		if payload.SessionShim != nil && onSessionShimAcknowledged != nil {
 			onSessionShimAcknowledged(cloneSessionShimHeartbeatProjection(*payload.SessionShim))
@@ -695,6 +716,7 @@ func (h *HeartbeatService) sendOneSerialized(ctx context.Context) error {
 		}
 		h.dropConfirmedAcks(ackApplied, ackFailures)
 		h.dropConfirmedScanReport(sentScanReport)
+		h.clearPendingScanUnacked()
 		h.handleHeartbeatResponse(ctx, retryResp)
 		return nil
 	}
@@ -1038,6 +1060,16 @@ func (h *HeartbeatService) dropConfirmedScanReport(sent *observation.Report) {
 	if h.pendingScanReport == sent {
 		h.pendingScanReport = nil
 	}
+}
+
+// clearPendingScanUnacked releases the drain hold after a beat carrying the
+// drained scan batch was accepted. The hold guarantees at most one
+// unconfirmed scan batch, so the single batch just confirmed is the one
+// the hold was waiting on.
+func (h *HeartbeatService) clearPendingScanUnacked() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.pendingScanUnacked = false
 }
 
 // dropConfirmedAcks removes the ACK entries the platform just accepted
