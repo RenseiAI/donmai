@@ -1951,35 +1951,33 @@ func refusedAfterFailureReportsBare(t *testing.T, recoverFirst bool) {
 	}
 
 	// Record the status and text at the instant LostOwnership closes,
-	// racing the tick's trailing store on purpose.
-	var atClose atomic.Int64
-	atClose.Store(-1)
-	var closeText atomic.Value
-	closeText.Store("")
+	// racing the tick's trailing store on purpose. The recorder closes
+	// recorded only after BOTH reads, so the assertions below observe
+	// them through that happens-before edge rather than polling one
+	// value and reading the other before the recorder has stored it.
+	var (
+		atClose   int
+		closeText string
+	)
+	recorded := make(chan struct{})
 	go func() {
+		defer close(recorded)
 		<-p.LostOwnership()
-		atClose.Store(int64(p.LastFailureStatus()))
-		closeText.Store(heartbeat.LostOwnershipError(p))
+		atClose = p.LastFailureStatus()
+		closeText = heartbeat.LostOwnershipError(p)
 	}()
 
 	phase.Store(2)
 	select {
-	case <-p.LostOwnership():
+	case <-recorded:
 	case <-time.After(10 * time.Second):
 		t.Fatalf("LostOwnership did not fire on refused refresh (strikes=%d status=%d)", p.Strikes(), p.LastFailureStatus())
 	}
-	deadline = time.Now().Add(5 * time.Second)
-	for atClose.Load() == -1 {
-		if time.Now().After(deadline) {
-			t.Fatal("at-close recorder never ran")
-		}
-		time.Sleep(time.Millisecond)
+	if atClose != 0 {
+		t.Fatalf("at-close LastFailureStatus() = %d; want 0 (bare hand-off)", atClose)
 	}
-	if got := int(atClose.Load()); got != 0 {
-		t.Fatalf("at-close LastFailureStatus() = %d; want 0 (bare hand-off)", got)
-	}
-	if got, _ := closeText.Load().(string); got != heartbeat.ErrLostOwnership.Error() {
-		t.Fatalf("at-close LostOwnershipError = %q; want bare %q", got, heartbeat.ErrLostOwnership.Error())
+	if closeText != heartbeat.ErrLostOwnership.Error() {
+		t.Fatalf("at-close LostOwnershipError = %q; want bare %q", closeText, heartbeat.ErrLostOwnership.Error())
 	}
 }
 
