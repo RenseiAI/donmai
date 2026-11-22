@@ -124,6 +124,12 @@ var errObservationScanCancelled = errors.New("cancelled: daemon stopping")
 // than buffering. Overflow fails typed so the platform can retry it later.
 const observationScanMaxQueue = 32
 
+// observationScanMaxRetainedOutcomes bounds completed outcomes: validation
+// failures cost no scan, so without a cap a burst of distinct invalid ids
+// grows the map until its TTL. The oldest outcome by completion time goes
+// first, mirroring the host upgrade ledger bound.
+const observationScanMaxRetainedOutcomes = 128
+
 // observationScanRequest is one queued observations.scan mutation.
 type observationScanRequest struct {
 	id    string
@@ -359,6 +365,20 @@ func (s *observationScanner) recordScanOutcomeLocked(id string, err error, at ti
 		outcome.errText = err.Error()
 	}
 	s.done[id] = outcome
+	for len(s.done) > observationScanMaxRetainedOutcomes {
+		oldest := ""
+		var oldestAt time.Time
+		first := true
+		for oid, o := range s.done {
+			if first || o.at.Before(oldestAt) || (o.at.Equal(oldestAt) && oid < oldest) {
+				oldest, oldestAt, first = oid, o.at, false
+			}
+		}
+		if oldest == "" {
+			break
+		}
+		delete(s.done, oldest)
+	}
 }
 
 func (s *observationScanner) maxQueueOrDefault() int {

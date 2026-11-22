@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -542,5 +543,215 @@ func TestObservationsScanMutation_ValidatesAfterDedupeAndRejectsEmptyID(t *testi
 	d.observationScan.mu.Unlock()
 	if acks := drainUntil(t, d, 1); strings.Join(acks, ",") != "m1" {
 		t.Fatalf("acknowledged %v, want m1", acks)
+	}
+}
+
+func TestObservationsScanMutation_ValidationFailureReplaysIdentically(t *testing.T) {
+	var calls atomic.Int32
+	d := scanDaemon(map[string]quotaProbeFunc{"codex": countingFeed(&calls)})
+	// An invalid kind fails at once and records its exact failure text.
+	_, failures := d.applyPendingMutations(context.Background(), []PendingMutation{
+		{ID: "m1", Op: observationsScanOp, Params: json.RawMessage(`{"kinds":["bogus"]}`)},
+	})
+	if len(failures) != 1 || failures[0].ID != "m1" || !strings.Contains(failures[0].Error, `unknown observation kind "bogus"`) {
+		t.Fatalf("first failures = %v, want m1 failing on bogus", failures)
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("scans = %d after a validation failure, want none", calls.Load())
+	}
+	want := failures[0].Error
+	// A redelivery with valid params replays the original failure instead of
+	// starting a scan.
+	_, failures = d.applyPendingMutations(context.Background(), []PendingMutation{{ID: "m1", Op: observationsScanOp}})
+	if len(failures) != 1 || failures[0].ID != "m1" || failures[0].Error != want {
+		t.Fatalf("valid redelivery failures = %v, want replay of %q", failures, want)
+	}
+	// A redelivery with a different invalid kind still replays the original
+	// failure: the dedupe check runs before validation, so it never
+	// re-reports validation differently.
+	_, failures = d.applyPendingMutations(context.Background(), []PendingMutation{
+		{ID: "m1", Op: observationsScanOp, Params: json.RawMessage(`{"kinds":["other-bogus"]}`)},
+	})
+	if len(failures) != 1 || failures[0].ID != "m1" || failures[0].Error != want {
+		t.Fatalf("other-bogus redelivery failures = %v, want replay of %q", failures, want)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if calls.Load() != 0 {
+		t.Fatalf("scans = %d after redeliveries, want no second scan", calls.Load())
+	}
+	d.observationScan.mu.Lock()
+	queued := len(d.observationScan.queue)
+	d.observationScan.mu.Unlock()
+	if queued != 0 {
+		t.Fatalf("queued = %d after validation redeliveries, want nothing queued", queued)
+	}
+}
+
+func TestObservationsScanMutation_StopCancelsLongSlotWait(t *testing.T) {
+	d := New(Options{})
+	d.observationScan.probes = map[string]quotaProbeFunc{"codex": codexFeed("acct-a", false)}
+	d.spawner = NewWorkerSpawner(SpawnerOptions{})
+	d.setState(StateRunning)
+	// Park the next scan behind the rate-limit window, not just a short
+	// in-flight probe: the slot wait must observe the stop instead of
+	// sleeping out the window.
+	d.observationScan.mu.Lock()
+	d.observationScan.minInterval = time.Minute
+	d.observationScan.lastAt = time.Now()
+	d.observationScan.mu.Unlock()
+	if applied, failures := d.applyPendingMutations(context.Background(), []PendingMutation{{ID: "m1", Op: observationsScanOp}}); len(applied) != 0 || len(failures) != 0 {
+		t.Fatalf("applied = %v failures = %v, want the request queued behind the rate window", applied, failures)
+	}
+	stopDone := make(chan error, 1)
+	go func() { stopDone <- d.Stop(context.Background()) }()
+	select {
+	case err := <-stopDone:
+		if err != nil {
+			t.Fatalf("Stop: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop did not return within 5s while a scan waited out the rate window")
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		_, failures, _ := d.drainDeferredScanAcks()
+		if len(failures) == 1 && failures[0].ID == "m1" {
+			if !strings.Contains(failures[0].Error, "stopping") {
+				t.Fatalf("failure = %q, want a stop-cancelled failure", failures[0].Error)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no cancelled failure drained, failures = %v", failures)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	d.observationScan.mu.Lock()
+	working, queued := d.observationScan.working, len(d.observationScan.queue)
+	d.observationScan.mu.Unlock()
+	if working || queued != 0 {
+		t.Fatalf("working = %v queued = %d, want the worker exited with an empty queue", working, queued)
+	}
+}
+
+func TestHeartbeat_HoldsNextScanBatchUntilPriorBeatAccepted(t *testing.T) {
+	r1, err := observation.NewReport(time.Now().Add(-time.Hour).Truncate(time.Second), true, observationKinds, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r2, err := observation.NewReport(time.Now().Truncate(time.Second), true, observationKinds, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r1.ScannedAt == r2.ScannedAt {
+		t.Fatal("test reports share a scan time, want distinct reports")
+	}
+	var drains atomic.Int32
+	srv, bodies := heartbeatCapture(t, http.StatusInternalServerError, http.StatusOK, http.StatusOK)
+	hs := NewHeartbeatService(HeartbeatOptions{
+		WorkerID: "wkr_obs", Hostname: "h", OrchestratorURL: srv.URL, RuntimeJWT: "runtime.jwt.value", IntervalSeconds: 1,
+		GetActiveCount: func() int { return 0 }, GetMaxCount: func() int { return 1 },
+		GetStatus: func() RegistrationStatus { return RegistrationIdle },
+		DrainDeferredAcks: func() ([]string, []HeartbeatMutationFailure, *observation.Report) {
+			switch drains.Add(1) {
+			case 1:
+				return []string{"m1"}, nil, r1
+			case 2:
+				return []string{"m2"}, nil, r2
+			default:
+				return nil, nil, nil
+			}
+		},
+		GetObservations: func() *observation.Report { return nil },
+	})
+	type beatObs struct {
+		ScannedAt string `json:"scannedAt"`
+	}
+	type beat struct {
+		AppliedMutations []string `json:"appliedMutations"`
+		Observations     *beatObs `json:"observations"`
+	}
+	next := func() beat {
+		t.Helper()
+		select {
+		case buf := <-bodies:
+			var b beat
+			if err := json.Unmarshal(buf, &b); err != nil {
+				t.Fatal(err)
+			}
+			return b
+		case <-time.After(3 * time.Second):
+			t.Fatal("no heartbeat arrived")
+			return beat{}
+		}
+	}
+	// First beat fails to POST: m1 with its own report stays pending.
+	hs.sendOne(context.Background())
+	b1 := next()
+	if strings.Join(b1.AppliedMutations, ",") != "m1" || b1.Observations == nil || b1.Observations.ScannedAt != r1.ScannedAt {
+		t.Fatalf("beat1 = %v %v, want m1 with its own report", b1.AppliedMutations, b1.Observations)
+	}
+	// Second beat retries m1 with r1 instead of merging m2 with r2.
+	hs.sendOne(context.Background())
+	b2 := next()
+	if strings.Join(b2.AppliedMutations, ",") != "m1" || b2.Observations == nil || b2.Observations.ScannedAt != r1.ScannedAt {
+		t.Fatalf("beat2 = %v %v, want a retry of m1 with its own report", b2.AppliedMutations, b2.Observations)
+	}
+	// After the retry is accepted the held batch drains with its own report.
+	hs.sendOne(context.Background())
+	b3 := next()
+	if strings.Join(b3.AppliedMutations, ",") != "m2" || b3.Observations == nil || b3.Observations.ScannedAt != r2.ScannedAt {
+		t.Fatalf("beat3 = %v %v, want m2 with its own report", b3.AppliedMutations, b3.Observations)
+	}
+}
+
+func TestApplyObservationMutations_AbsorbsDeferredScan(t *testing.T) {
+	d := scanDaemon(map[string]quotaProbeFunc{"codex": codexFeed("acct-a", false)})
+	d.observationScan.mu.Lock()
+	d.observationScan.inFlight = true
+	d.observationScan.mu.Unlock()
+	apply := d.ApplyObservationMutations("")
+	applied, failures := apply(context.Background(), []PendingMutation{{ID: "m1", Op: observationsScanOp}})
+	if len(applied) != 0 || len(failures) != 0 {
+		t.Fatalf("applied = %v failures = %v, want a queued scan absorbed with no acknowledgement yet", applied, failures)
+	}
+	d.observationScan.mu.Lock()
+	d.observationScan.inFlight = false
+	d.observationScan.mu.Unlock()
+	if acks := drainUntil(t, d, 1); strings.Join(acks, ",") != "m1" {
+		t.Fatalf("acknowledged %v, want m1 once its scan completes", acks)
+	}
+}
+
+func TestObservationsScanMutation_RejectsWhitespaceID(t *testing.T) {
+	d := scanDaemon(map[string]quotaProbeFunc{"codex": codexFeed("acct-a", false)})
+	applied, failures := d.applyPendingMutations(context.Background(), []PendingMutation{{ID: "   ", Op: observationsScanOp}})
+	if len(applied) != 0 || len(failures) != 1 || !strings.Contains(failures[0].Error, "requires an id") {
+		t.Fatalf("whitespace id applied = %v failures = %v, want one requires-an-id failure", applied, failures)
+	}
+	d.observationScan.mu.Lock()
+	queued := len(d.observationScan.queue)
+	d.observationScan.mu.Unlock()
+	if queued != 0 {
+		t.Fatalf("queued = %d after a whitespace id, want nothing queued", queued)
+	}
+}
+
+func TestObservationsScanMutation_BoundsRetainedOutcomes(t *testing.T) {
+	d := scanDaemon(map[string]quotaProbeFunc{"codex": codexFeed("acct-a", false)})
+	for i := 0; i < observationScanMaxRetainedOutcomes+32; i++ {
+		mid := fmt.Sprintf("bound-m-%04d", i)
+		_, failures := d.applyPendingMutations(context.Background(), []PendingMutation{
+			{ID: mid, Op: observationsScanOp, Params: json.RawMessage(`{"kinds":["bogus"]}`)},
+		})
+		if len(failures) != 1 {
+			t.Fatalf("seed %d failures = %v, want one validation failure", i, failures)
+		}
+	}
+	d.observationScan.mu.Lock()
+	n := len(d.observationScan.done)
+	d.observationScan.mu.Unlock()
+	if n > observationScanMaxRetainedOutcomes {
+		t.Fatalf("retained outcomes = %d, want at most %d", n, observationScanMaxRetainedOutcomes)
 	}
 }

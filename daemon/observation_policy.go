@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"sync"
@@ -173,6 +174,12 @@ func (d *Daemon) ApplyObservationMutations(registration string) func(context.Con
 				continue
 			}
 			if err != nil {
+				// A queued scan is not acknowledged in this beat: like the
+				// daemon's own lane, absorb it so the platform redelivers
+				// and the redelivery observes the completed outcome.
+				if errors.Is(err, errObservationScanDeferred) {
+					continue
+				}
 				failures = append(failures, HeartbeatMutationFailure{ID: m.ID, Error: err.Error()})
 				continue
 			}
