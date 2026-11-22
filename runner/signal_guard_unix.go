@@ -72,6 +72,33 @@ type signalGuardLayout struct {
 	degraded bool
 }
 
+// writeSignalGuardFile durably installs one executable guard shim: the
+// content is written, synced to storage, and closed before the mode is
+// set and the caller can exec it. Closing (and syncing) before exec
+// avoids ETXTBSY (text file busy) when the shim is executed immediately
+// after install under load.
+func writeSignalGuardFile(path string, data []byte) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600) //nolint:gosec // G304: path is the runner-owned guard dir from MkdirTemp, not user input.
+	if err != nil {
+		return fmt.Errorf("runner: create signal guard script: %w", err)
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("runner: write signal guard script: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("runner: sync signal guard script: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("runner: close signal guard script: %w", err)
+	}
+	if err := os.Chmod(path, 0o755); err != nil { //nolint:gosec // G306: guard shims are session-executed; they must carry the exec bit.
+		return fmt.Errorf("runner: secure signal guard script: %w", err)
+	}
+	return nil
+}
+
 // installSignalGuard writes the runner-provided pkill/killall guard into
 // a fresh runner-owned directory outside any checkout and returns the
 // layout the session env must carry. The guard ships with the runner
@@ -96,9 +123,9 @@ func installSignalGuard() (signalGuardLayout, error) {
 		killall:  filepath.Join(dir, "killall"),
 	}
 	for _, path := range []string{layout.pkill, layout.killall} {
-		if err := os.WriteFile(path, []byte(signalGuardScript), 0o755); err != nil { //nolint:gosec // G306: guard shims are session-executed; they must carry the exec bit.
+		if err := writeSignalGuardFile(path, []byte(signalGuardScript)); err != nil {
 			_ = os.RemoveAll(dir)
-			return signalGuardLayout{}, fmt.Errorf("runner: write signal guard script: %w", err)
+			return signalGuardLayout{}, err
 		}
 	}
 	return layout, nil
