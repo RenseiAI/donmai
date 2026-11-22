@@ -2739,6 +2739,11 @@ func (d *Daemon) Stop(ctx context.Context) error {
 	// releases the lease; Stop then proceeds.
 	d.cancelHostUpgrades()
 
+	// The observations.scan queue ignores Stop unless cancelled: the worker
+	// and the slot wait observe the scanner's context, pending requests
+	// fail closed, and the worker exits.
+	d.cancelObservationScans()
+
 	lease, err := d.claimLifecycle(ctx, lifecycleStop)
 	if err != nil {
 		// Prefer a terminal result that raced the caller's wait over its now-stale

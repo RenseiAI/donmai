@@ -352,3 +352,195 @@ func TestObservationsReadEndpointDoesNotScan(t *testing.T) {
 		t.Fatalf("read = %d %s (scanned %v), want 200 with an empty full report and no scan", rec.Code, rec.Body, !d.observationScan.lastAt.IsZero())
 	}
 }
+
+// scanBatch is one drained observations.scan batch: the ids one scan
+// answered plus that scan's exact report.
+type scanBatch struct {
+	applied  []string
+	failures []HeartbeatMutationFailure
+	report   *observation.Report
+}
+
+// drainOneScanBatch drains the oldest completed scan batch through the
+// production heartbeat handoff.
+func drainOneScanBatch(t *testing.T, d *Daemon) scanBatch {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		applied, failures, report := d.drainDeferredScanAcks()
+		if len(applied) == 0 && len(failures) == 0 {
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		return scanBatch{applied: applied, failures: failures, report: report}
+	}
+	t.Fatal("no scan batch drained")
+	return scanBatch{}
+}
+
+func TestObservationsScanMutation_HoldsLaterAckUntilItsOwnScan(t *testing.T) {
+	var calls atomic.Int32
+	d := scanDaemon(map[string]quotaProbeFunc{"codex": countingFeed(&calls)})
+	d.observationScan.minInterval = time.Millisecond
+	if applied, failures := d.applyPendingMutations(context.Background(), []PendingMutation{
+		{ID: "m1", Op: observationsScanOp},
+		{ID: "m2", Op: observationsScanOp},
+	}); len(applied) != 0 || len(failures) != 0 {
+		t.Fatalf("applied = %v failures = %v, want both requests queued", applied, failures)
+	}
+	first := drainOneScanBatch(t, d)
+	if strings.Join(first.applied, ",") != "m1" || first.report == nil {
+		t.Fatalf("first batch = %v report %v, want [m1] with its own scan report", first.applied, first.report != nil)
+	}
+	second := drainOneScanBatch(t, d)
+	if strings.Join(second.applied, ",") != "m2" || second.report == nil {
+		t.Fatalf("second batch = %v report %v, want [m2] with its own scan report", second.applied, second.report != nil)
+	}
+	if first.report == second.report {
+		t.Fatal("both batches share one report pointer, want one exact report per scan")
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("scans = %d, want one fresh scan per request", calls.Load())
+	}
+}
+
+func TestObservationsScanMutation_StopCancelsQueuedScan(t *testing.T) {
+	d := New(Options{})
+	d.observationScan.probes = map[string]quotaProbeFunc{"codex": codexFeed("acct-a", false)}
+	d.spawner = NewWorkerSpawner(SpawnerOptions{})
+	d.setState(StateRunning)
+	d.observationScan.mu.Lock()
+	d.observationScan.inFlight = true
+	d.observationScan.mu.Unlock()
+	if applied, failures := d.applyPendingMutations(context.Background(), []PendingMutation{{ID: "m1", Op: observationsScanOp}}); len(applied) != 0 || len(failures) != 0 {
+		t.Fatalf("applied = %v failures = %v, want the request queued", applied, failures)
+	}
+	if err := d.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		_, failures, _ := d.drainDeferredScanAcks()
+		if len(failures) == 1 && failures[0].ID == "m1" {
+			if !strings.Contains(failures[0].Error, "stopping") {
+				t.Fatalf("failure = %q, want a stop-cancelled failure", failures[0].Error)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no cancelled failure drained, failures = %v", failures)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	d.observationScan.mu.Lock()
+	working, queued := d.observationScan.working, len(d.observationScan.queue)
+	d.observationScan.mu.Unlock()
+	if working || queued != 0 {
+		t.Fatalf("working = %v queued = %d, want the worker exited with an empty queue", working, queued)
+	}
+	if applied, failures := d.applyPendingMutations(context.Background(), []PendingMutation{{ID: "m2", Op: observationsScanOp}}); len(applied) != 0 || len(failures) != 1 || failures[0].ID != "m2" {
+		t.Fatalf("post-stop apply = %v %v, want m2 refused fail-closed", applied, failures)
+	}
+}
+
+func TestObservationsScanMutation_QueueFullFailsTyped(t *testing.T) {
+	d := scanDaemon(map[string]quotaProbeFunc{"codex": codexFeed("acct-a", false)})
+	d.observationScan.maxQueue = 2
+	d.observationScan.mu.Lock()
+	d.observationScan.inFlight = true
+	d.observationScan.mu.Unlock()
+	mk := func(id string) PendingMutation { return PendingMutation{ID: id, Op: observationsScanOp} }
+	if _, failures := d.applyPendingMutations(context.Background(), []PendingMutation{mk("m1")}); len(failures) != 0 {
+		t.Fatalf("m1 failures = %v, want queued", failures)
+	}
+	if _, failures := d.applyPendingMutations(context.Background(), []PendingMutation{mk("m2")}); len(failures) != 0 {
+		t.Fatalf("m2 failures = %v, want queued", failures)
+	}
+	applied, failures := d.applyPendingMutations(context.Background(), []PendingMutation{mk("m3")})
+	if len(applied) != 0 || len(failures) != 1 || failures[0].ID != "m3" || !strings.Contains(failures[0].Error, "queue full") {
+		t.Fatalf("m3 applied = %v failures = %v, want a typed queue-full failure", applied, failures)
+	}
+	d.observationScan.minInterval = time.Millisecond
+	d.observationScan.mu.Lock()
+	d.observationScan.inFlight = false
+	d.observationScan.mu.Unlock()
+	if acks := drainUntil(t, d, 2); strings.Join(acks, ",") != "m1,m2" {
+		t.Fatalf("acknowledged %v, want m1 then m2", acks)
+	}
+}
+
+func TestObservationsScanMutation_RedeliveryReplaysOutcomeAfterHandoff(t *testing.T) {
+	var calls atomic.Int32
+	d := scanDaemon(map[string]quotaProbeFunc{"codex": countingFeed(&calls)})
+	d.observationScan.minInterval = time.Millisecond
+	if applied, failures := d.applyPendingMutations(context.Background(), []PendingMutation{{ID: "m1", Op: observationsScanOp}}); len(applied) != 0 || len(failures) != 0 {
+		t.Fatalf("applied = %v failures = %v, want the request queued", applied, failures)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		d.observationScan.mu.Lock()
+		_, ok := d.observationScan.done["m1"]
+		d.observationScan.mu.Unlock()
+		if ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("scan did not complete")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// The scan completed long ago but the heartbeat only just took the
+	// acknowledgement: age the completion past the window, then drain.
+	d.observationScan.mu.Lock()
+	outcome := d.observationScan.done["m1"]
+	outcome.at = time.Now().Add(-(observationScanRecentTTL + time.Minute))
+	d.observationScan.done["m1"] = outcome
+	d.observationScan.mu.Unlock()
+	batch := drainOneScanBatch(t, d)
+	if strings.Join(batch.applied, ",") != "m1" || len(batch.failures) != 0 || batch.report == nil {
+		t.Fatalf("drained %v %v, want [m1] with its scan report", batch.applied, batch.failures)
+	}
+	// A redelivery after the handoff replays the outcome instead of starting
+	// a second scan, because the window runs from the handoff.
+	applied, failures := d.applyPendingMutations(context.Background(), []PendingMutation{{ID: "m1", Op: observationsScanOp}})
+	if strings.Join(applied, ",") != "m1" || len(failures) != 0 {
+		t.Fatalf("redelivery applied = %v failures = %v, want [m1] replayed", applied, failures)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if calls.Load() != 1 {
+		t.Fatalf("scans = %d, want no second scan for the redelivery", calls.Load())
+	}
+}
+
+func TestObservationsScanMutation_ValidatesAfterDedupeAndRejectsEmptyID(t *testing.T) {
+	d := scanDaemon(map[string]quotaProbeFunc{"codex": codexFeed("acct-a", false)})
+	applied, failures := d.applyPendingMutations(context.Background(), []PendingMutation{{ID: "", Op: observationsScanOp}})
+	if len(applied) != 0 || len(failures) != 1 || !strings.Contains(failures[0].Error, "requires an id") {
+		t.Fatalf("empty id applied = %v failures = %v, want one requires-an-id failure", applied, failures)
+	}
+	d.observationScan.mu.Lock()
+	queued := len(d.observationScan.queue)
+	d.observationScan.mu.Unlock()
+	if queued != 0 {
+		t.Fatalf("queued = %d after an empty id, want nothing queued", queued)
+	}
+	// Hold the worker in the slot so the queued request stays queued.
+	d.observationScan.mu.Lock()
+	d.observationScan.inFlight = true
+	d.observationScan.mu.Unlock()
+	if applied, failures := d.applyPendingMutations(context.Background(), []PendingMutation{{ID: "m1", Op: observationsScanOp}}); len(applied) != 0 || len(failures) != 0 {
+		t.Fatalf("m1 applied = %v failures = %v, want queued", applied, failures)
+	}
+	// A redelivery carrying invalid params must not re-report validation:
+	// the dedupe check runs first, so it stays deferred.
+	applied, failures = d.applyPendingMutations(context.Background(), []PendingMutation{{ID: "m1", Op: observationsScanOp, Params: json.RawMessage(`{"kinds":["bogus"]}`)}})
+	if len(applied) != 0 || len(failures) != 0 {
+		t.Fatalf("redelivery applied = %v failures = %v, want absorbed without re-validation", applied, failures)
+	}
+	d.observationScan.mu.Lock()
+	d.observationScan.inFlight = false
+	d.observationScan.mu.Unlock()
+	if acks := drainUntil(t, d, 1); strings.Join(acks, ",") != "m1" {
+		t.Fatalf("acknowledged %v, want m1", acks)
+	}
+}

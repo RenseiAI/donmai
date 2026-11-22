@@ -8,6 +8,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -69,22 +70,59 @@ type observationScanner struct {
 
 	// The observations.scan mutation queue: requests run in arrival order,
 	// one at a time, each as a fresh scan. queued holds every id that is
-	// queued, running or awaiting its acknowledgement, and recent holds ids
-	// acknowledged in the last observationScanRecentTTL, so a redelivered id
-	// never starts a second scan.
+	// queued or running, and done holds every completed outcome (applied or
+	// the exact failure text) for the last observationScanRecentTTL, so a
+	// redelivered id replays its outcome instead of starting a second scan
+	// or re-reporting validation differently.
 	queue   []observationScanRequest
 	queued  map[string]bool
-	recent  map[string]time.Time
+	done    map[string]observationScanOutcome
 	working bool
 
-	// Completed requests' acknowledgements and the exact report of the scan
-	// that answered them, drained into the heartbeat before it builds its
-	// observations report.
-	ackMu       sync.Mutex
-	ackApplied  []string
-	ackFailures []HeartbeatMutationFailure
-	ackReport   *observation.Report
+	// stopCh is closed when the daemon stops. The worker watches it to
+	// cancel the slot wait and the probes; on cancel every pending request
+	// fails closed and the worker exits. stopped refuses new requests
+	// fail-closed once cancellation has fired.
+	stopCh  chan struct{}
+	stopped bool
+
+	// maxQueue bounds the queue; zero selects observationScanMaxQueue.
+	maxQueue int
+
+	// Completed scans wait here as one batch each: the request id the scan
+	// answered plus that scan's exact report. Batches drain oldest-first,
+	// one per heartbeat, so every acknowledgement rides with the report of
+	// its own scan.
+	ackMu      sync.Mutex
+	ackBatches []observationScanAckBatch
 }
+
+// observationScanOutcome is one completed request: whether the platform
+// should see it applied, and the exact failure text otherwise. Redeliveries
+// replay it verbatim inside the dedupe window.
+type observationScanOutcome struct {
+	applied bool
+	errText string
+	at      time.Time
+}
+
+// observationScanAckBatch is one completed scan's heartbeat payload: the id
+// it answered and that scan's exact report (nil when the scan failed).
+type observationScanAckBatch struct {
+	applied  []string
+	failures []HeartbeatMutationFailure
+	report   *observation.Report
+}
+
+// errObservationScanCancelled aborts queued and running scans when the
+// daemon stops. Callers wrap it with the operation, so the heartbeat
+// failure matches the replayed outcome text exactly.
+var errObservationScanCancelled = errors.New("cancelled: daemon stopping")
+
+// observationScanMaxQueue caps queued scan requests: each one costs at
+// least one rate-limited scan slot, so a deeper queue is backlog rather
+// than buffering. Overflow fails typed so the platform can retry it later.
+const observationScanMaxQueue = 32
 
 // observationScanRequest is one queued observations.scan mutation.
 type observationScanRequest struct {
@@ -93,7 +131,7 @@ type observationScanRequest struct {
 }
 
 // A queued request waits at most observationScanQueueDeadline for its slot
-// (a running scan plus the rate window), then fails. Acknowledged ids are
+// (a running scan plus the rate window), then fails. Completed outcomes are
 // remembered for observationScanRecentTTL to absorb redelivery.
 const (
 	observationScanQueueDeadline = 10 * time.Minute
@@ -241,42 +279,66 @@ var errObservationScanDeferred = errors.New("observations.scan queued until its 
 // applyObservationsScan queues the observations.scan host mutation. Every
 // request is answered by a fresh scan run for it, in arrival order: a scan
 // already in flight, or one that ran inside the rate-limit window, never
-// answers it. The acknowledgement is sent with the exact report of that scan,
-// an empty full report included, on the first beat built after it completes.
-// A redelivered id that is queued, running, awaiting acknowledgement or
-// recently acknowledged starts no second scan.
+// answers it. The acknowledgement is sent with the exact report of that
+// scan, an empty full report included, on the first beat built after its
+// batch drains; batches drain oldest-first, one per beat, so a later scan's
+// report never answers an earlier request. A redelivered id that is queued
+// or running is absorbed, and a redelivered id with a completed outcome
+// replays that outcome verbatim inside the dedupe window, so it never
+// starts a second scan and never re-reports validation differently.
 func (d *Daemon) applyObservationsScan(m PendingMutation) error {
-	var params struct {
-		Kinds []string `json:"kinds"`
-	}
-	if len(m.Params) > 0 && string(m.Params) != "null" {
-		if err := json.Unmarshal(m.Params, &params); err != nil {
-			return fmt.Errorf("%s decode params: %w", observationsScanOp, err)
-		}
-	}
-	if err := checkObservationKinds(params.Kinds); err != nil {
-		return fmt.Errorf("%s: %w", observationsScanOp, err)
+	if strings.TrimSpace(m.ID) == "" {
+		return fmt.Errorf("%s requires an id", observationsScanOp)
 	}
 	s := &d.observationScan
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now()
-	for id, at := range s.recent {
-		if now.Sub(at) > observationScanRecentTTL {
-			delete(s.recent, id)
+	for id, outcome := range s.done {
+		if now.Sub(outcome.at) > observationScanRecentTTL {
+			delete(s.done, id)
 		}
 	}
+	if s.stopped {
+		return fmt.Errorf("%s: %v", observationsScanOp, errObservationScanCancelled)
+	}
+	// The dedupe check runs before parameter validation, so a redelivered
+	// id never re-reports a validation failure differently.
 	if s.queued[m.ID] {
 		return errObservationScanDeferred
 	}
-	if _, ok := s.recent[m.ID]; ok {
-		return errObservationScanDeferred
+	if outcome, ok := s.done[m.ID]; ok {
+		if outcome.applied {
+			return nil
+		}
+		return errors.New(outcome.errText)
+	}
+	var params struct {
+		Kinds []string `json:"kinds"`
+	}
+	if len(m.Params) > 0 && string(m.Params) != "null" {
+		if err := json.Unmarshal(m.Params, &params); err != nil {
+			err = fmt.Errorf("%s decode params: %w", observationsScanOp, err)
+			s.recordScanOutcomeLocked(m.ID, err, now)
+			return err
+		}
+	}
+	if err := checkObservationKinds(params.Kinds); err != nil {
+		err = fmt.Errorf("%s: %w", observationsScanOp, err)
+		s.recordScanOutcomeLocked(m.ID, err, now)
+		return err
+	}
+	if limit := s.maxQueueOrDefault(); len(s.queue) >= limit {
+		return fmt.Errorf("%s queue full (%d queued)", observationsScanOp, len(s.queue))
 	}
 	if s.queued == nil {
 		s.queued = map[string]bool{}
 	}
 	s.queued[m.ID] = true
 	s.queue = append(s.queue, observationScanRequest{id: m.ID, kinds: params.Kinds})
+	if s.stopCh == nil {
+		s.stopCh = make(chan struct{})
+	}
 	if !s.working {
 		s.working = true
 		go d.runObservationScanQueue()
@@ -284,12 +346,72 @@ func (d *Daemon) applyObservationsScan(m PendingMutation) error {
 	return errObservationScanDeferred
 }
 
+// recordScanOutcomeLocked remembers a terminal outcome for replay on
+// redelivery. The caller holds observationScan.mu.
+func (s *observationScanner) recordScanOutcomeLocked(id string, err error, at time.Time) {
+	if s.done == nil {
+		s.done = map[string]observationScanOutcome{}
+	}
+	outcome := observationScanOutcome{at: at}
+	if err == nil {
+		outcome.applied = true
+	} else {
+		outcome.errText = err.Error()
+	}
+	s.done[id] = outcome
+}
+
+func (s *observationScanner) maxQueueOrDefault() int {
+	if s.maxQueue > 0 {
+		return s.maxQueue
+	}
+	return observationScanMaxQueue
+}
+
+// cancelObservationScans fails the scan queue closed for daemon stop: new
+// requests refuse at once, the worker and the slot wait observe the cancel
+// context, every still-queued request is reported as a failure if a beat
+// still goes out, and the worker exits.
+func (d *Daemon) cancelObservationScans() {
+	s := &d.observationScan
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stopped {
+		return
+	}
+	s.stopped = true
+	if s.stopCh != nil {
+		close(s.stopCh)
+	}
+}
+
 // runObservationScanQueue runs queued requests in order until the queue is
 // empty. Each request waits for the scan slot (a running scan, then the rate
 // window) and runs its own scan; the per-kind probe timeout applies once that
-// scan starts.
+// scan starts. On daemon stop the slot wait and the probes observe the
+// scanner's cancel context, every still-queued request fails closed, and the
+// worker exits without starting another scan.
 func (d *Daemon) runObservationScanQueue() {
 	s := &d.observationScan
+	s.mu.Lock()
+	stopCh := s.stopCh
+	s.mu.Unlock()
+	// The slot wait and the probes observe ctx instead of sleeping: the
+	// watcher below cancels it when the daemon stops, and the deferred
+	// cancel releases the watcher when the queue drains.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if stopCh != nil {
+		watchDone := make(chan struct{})
+		defer close(watchDone)
+		go func() {
+			select {
+			case <-stopCh:
+				cancel()
+			case <-watchDone:
+			}
+		}()
+	}
 	for {
 		s.mu.Lock()
 		if len(s.queue) == 0 {
@@ -297,42 +419,79 @@ func (d *Daemon) runObservationScanQueue() {
 			s.mu.Unlock()
 			return
 		}
+		if ctx.Err() != nil {
+			cancelErr := fmt.Errorf("%s: %v", observationsScanOp, errObservationScanCancelled)
+			pending := s.queue
+			s.queue = nil
+			now := time.Now()
+			for _, req := range pending {
+				delete(s.queued, req.id)
+				s.recordScanOutcomeLocked(req.id, cancelErr, now)
+			}
+			s.working = false
+			s.mu.Unlock()
+			batch := observationScanAckBatch{}
+			for _, req := range pending {
+				batch.failures = append(batch.failures, HeartbeatMutationFailure{ID: req.id, Error: cancelErr.Error()})
+			}
+			s.ackMu.Lock()
+			s.ackBatches = append(s.ackBatches, batch)
+			s.ackMu.Unlock()
+			return
+		}
 		req := s.queue[0]
 		s.mu.Unlock()
-		result, err := d.scanWhenSlotOpens(req.kinds, time.Now().Add(observationScanQueueDeadline))
-		s.ackMu.Lock()
-		if err != nil {
-			s.ackFailures = append(s.ackFailures, HeartbeatMutationFailure{ID: req.id, Error: fmt.Sprintf("%s: %v", observationsScanOp, err)})
+		result, scanErr := d.scanWhenSlotOpens(ctx, req.kinds, time.Now().Add(observationScanQueueDeadline))
+		batch := observationScanAckBatch{}
+		var batchErr error
+		if scanErr != nil {
+			batchErr = fmt.Errorf("%s: %v", observationsScanOp, scanErr)
+			batch.failures = append(batch.failures, HeartbeatMutationFailure{ID: req.id, Error: batchErr.Error()})
 		} else {
-			s.ackApplied = append(s.ackApplied, req.id)
-			s.ackReport = result.Report
+			batch.applied = append(batch.applied, req.id)
+			batch.report = result.Report
 		}
-		s.ackMu.Unlock()
 		s.mu.Lock()
 		s.queue = s.queue[1:]
 		delete(s.queued, req.id)
-		if s.recent == nil {
-			s.recent = map[string]time.Time{}
-		}
-		s.recent[req.id] = time.Now()
+		s.recordScanOutcomeLocked(req.id, batchErr, time.Now())
 		s.mu.Unlock()
+		s.ackMu.Lock()
+		s.ackBatches = append(s.ackBatches, batch)
+		s.ackMu.Unlock()
 	}
 }
 
 // scanWhenSlotOpens waits for the scan slot and runs one scan, retrying when
-// another caller takes the slot first, until deadline.
-func (d *Daemon) scanWhenSlotOpens(kinds []string, deadline time.Time) (*ObservationScanResult, error) {
+// another caller takes the slot first, until deadline. The wait and the scan
+// observe ctx: on daemon stop the wait aborts instead of sleeping out the
+// rate window, and an already-running scan's probes abort with it.
+func (d *Daemon) scanWhenSlotOpens(ctx context.Context, kinds []string, deadline time.Time) (*ObservationScanResult, error) {
 	s := &d.observationScan
 	for {
 		wait := s.waitForSlot()
 		if time.Now().Add(wait).After(deadline) {
 			return nil, fmt.Errorf("observation scan slot not available within %s", observationScanQueueDeadline)
 		}
-		time.Sleep(wait)
-		result, err := d.ScanObservations(context.Background(), kinds)
+		if wait > 0 {
+			timer := time.NewTimer(wait)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return nil, errObservationScanCancelled
+			case <-timer.C:
+			}
+		}
+		if ctx.Err() != nil {
+			return nil, errObservationScanCancelled
+		}
+		result, err := d.ScanObservations(ctx, kinds)
 		var limited *observationScanLimitedError
 		if errors.As(err, &limited) {
 			continue
+		}
+		if ctx.Err() != nil {
+			return nil, errObservationScanCancelled
 		}
 		return result, err
 	}
@@ -354,18 +513,39 @@ func (s *observationScanner) waitForSlot() time.Duration {
 	return 0
 }
 
-// drainDeferredScanAcks hands the heartbeat the acknowledgements of completed
-// scan requests and the exact report of the latest such scan (nil when none
-// completed). The heartbeat drains before it builds its observations report
-// and sends that report, an empty full report included, with the
-// acknowledgements.
+// drainDeferredScanAcks hands the heartbeat the oldest completed scan's
+// batch: its request id and that scan's exact report (nil when the scan
+// failed). One batch drains per call, so every acknowledgement rides with
+// the report of its own scan and later batches wait for later beats. The
+// dedupe window refreshes at this handoff: the 10 minutes run from the
+// heartbeat taking the acknowledgement, not from the scan completing.
 func (d *Daemon) drainDeferredScanAcks() ([]string, []HeartbeatMutationFailure, *observation.Report) {
 	s := &d.observationScan
 	s.ackMu.Lock()
-	defer s.ackMu.Unlock()
-	applied, failures, report := s.ackApplied, s.ackFailures, s.ackReport
-	s.ackApplied, s.ackFailures, s.ackReport = nil, nil, nil
-	return applied, failures, report
+	if len(s.ackBatches) == 0 {
+		s.ackMu.Unlock()
+		return nil, nil, nil
+	}
+	batch := s.ackBatches[0]
+	s.ackBatches[0] = observationScanAckBatch{}
+	s.ackBatches = s.ackBatches[1:]
+	s.ackMu.Unlock()
+	now := time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, id := range batch.applied {
+		if outcome, ok := s.done[id]; ok {
+			outcome.at = now
+			s.done[id] = outcome
+		}
+	}
+	for _, failure := range batch.failures {
+		if outcome, ok := s.done[failure.ID]; ok {
+			outcome.at = now
+			s.done[failure.ID] = outcome
+		}
+	}
+	return batch.applied, batch.failures, batch.report
 }
 
 func (s *Server) handleObservations(w http.ResponseWriter, _ *http.Request) {
