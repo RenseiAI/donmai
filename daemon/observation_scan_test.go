@@ -480,7 +480,7 @@ func TestObservationsScanMutation_RedeliveryReplaysOutcomeAfterHandoff(t *testin
 	deadline := time.Now().Add(3 * time.Second)
 	for {
 		d.observationScan.mu.Lock()
-		_, ok := d.observationScan.done["m1"]
+		_, ok := d.observationScan.done[observationScanKey{id: "m1"}]
 		d.observationScan.mu.Unlock()
 		if ok {
 			break
@@ -493,19 +493,22 @@ func TestObservationsScanMutation_RedeliveryReplaysOutcomeAfterHandoff(t *testin
 	// The scan completed long ago but the heartbeat only just took the
 	// acknowledgement: age the completion past the window, then drain.
 	d.observationScan.mu.Lock()
-	outcome := d.observationScan.done["m1"]
+	outcome := d.observationScan.done[observationScanKey{id: "m1"}]
 	outcome.at = time.Now().Add(-(observationScanRecentTTL + time.Minute))
-	d.observationScan.done["m1"] = outcome
+	d.observationScan.done[observationScanKey{id: "m1"}] = outcome
 	d.observationScan.mu.Unlock()
 	batch := drainOneScanBatch(t, d)
 	if strings.Join(batch.applied, ",") != "m1" || len(batch.failures) != 0 || batch.report == nil {
 		t.Fatalf("drained %v %v, want [m1] with its scan report", batch.applied, batch.failures)
 	}
-	// A redelivery after the handoff replays the outcome instead of starting
-	// a second scan, because the window runs from the handoff.
+	// A redelivery after the handoff absorbs instead of starting a second
+	// scan, because the window runs from the handoff. It absorbs as
+	// deferred rather than replaying a bare applied: the acknowledgement
+	// already rides its own batch's drain with its own report, and a bare
+	// replay would merge with the next scan's report on a later beat.
 	applied, failures := d.applyPendingMutations(context.Background(), []PendingMutation{{ID: "m1", Op: observationsScanOp}})
-	if strings.Join(applied, ",") != "m1" || len(failures) != 0 {
-		t.Fatalf("redelivery applied = %v failures = %v, want [m1] replayed", applied, failures)
+	if len(applied) != 0 || len(failures) != 0 {
+		t.Fatalf("redelivery applied = %v failures = %v, want absorbed after the handoff", applied, failures)
 	}
 	time.Sleep(200 * time.Millisecond)
 	if calls.Load() != 1 {
@@ -820,7 +823,7 @@ func TestObservationsScanMutation_UndrainedBatchAbsorbsRedelivery(t *testing.T) 
 	deadline := time.Now().Add(3 * time.Second)
 	for {
 		d.observationScan.mu.Lock()
-		_, ok := d.observationScan.done["m1"]
+		_, ok := d.observationScan.done[observationScanKey{id: "m1"}]
 		d.observationScan.mu.Unlock()
 		if ok {
 			break
@@ -833,9 +836,9 @@ func TestObservationsScanMutation_UndrainedBatchAbsorbsRedelivery(t *testing.T) 
 	// Age the outcome past the window without draining: the completed
 	// batch still awaits its heartbeat handoff.
 	d.observationScan.mu.Lock()
-	outcome := d.observationScan.done["m1"]
+	outcome := d.observationScan.done[observationScanKey{id: "m1"}]
 	outcome.at = time.Now().Add(-(observationScanRecentTTL + time.Minute))
-	d.observationScan.done["m1"] = outcome
+	d.observationScan.done[observationScanKey{id: "m1"}] = outcome
 	d.observationScan.mu.Unlock()
 	// A redelivery before the handoff must be absorbed, not rescanned.
 	if applied, failures := d.applyPendingMutations(context.Background(), []PendingMutation{{ID: "m1", Op: observationsScanOp}}); len(applied) != 0 || len(failures) != 0 {
@@ -861,7 +864,7 @@ func TestObservationsScanMutation_DrainRerecordsPrunedOutcome(t *testing.T) {
 	deadline := time.Now().Add(3 * time.Second)
 	for {
 		d.observationScan.mu.Lock()
-		_, ok := d.observationScan.done["m1"]
+		_, ok := d.observationScan.done[observationScanKey{id: "m1"}]
 		d.observationScan.mu.Unlock()
 		if ok {
 			break
@@ -874,9 +877,9 @@ func TestObservationsScanMutation_DrainRerecordsPrunedOutcome(t *testing.T) {
 	// Age the outcome past the window, then prune it with an unrelated
 	// request while the batch still awaits its handoff.
 	d.observationScan.mu.Lock()
-	outcome := d.observationScan.done["m1"]
+	outcome := d.observationScan.done[observationScanKey{id: "m1"}]
 	outcome.at = time.Now().Add(-(observationScanRecentTTL + time.Minute))
-	d.observationScan.done["m1"] = outcome
+	d.observationScan.done[observationScanKey{id: "m1"}] = outcome
 	d.observationScan.mu.Unlock()
 	if _, failures := d.applyPendingMutations(context.Background(), []PendingMutation{
 		{ID: "other", Op: observationsScanOp, Params: json.RawMessage(`{"kinds":["bogus"]}`)},
@@ -884,14 +887,14 @@ func TestObservationsScanMutation_DrainRerecordsPrunedOutcome(t *testing.T) {
 		t.Fatalf("other failures = %v, want one validation failure", failures)
 	}
 	// The handoff re-records the pruned outcome, so a later redelivery
-	// replays instead of starting a second scan.
+	// absorbs instead of starting a second scan.
 	batch := drainOneScanBatch(t, d)
 	if strings.Join(batch.applied, ",") != "m1" || batch.report == nil {
 		t.Fatalf("drained %v with report %v, want [m1] with its scan report", batch.applied, batch.report != nil)
 	}
 	applied, failures := d.applyPendingMutations(context.Background(), []PendingMutation{{ID: "m1", Op: observationsScanOp}})
-	if strings.Join(applied, ",") != "m1" || len(failures) != 0 {
-		t.Fatalf("redelivery applied = %v failures = %v, want [m1] replayed", applied, failures)
+	if len(applied) != 0 || len(failures) != 0 {
+		t.Fatalf("redelivery applied = %v failures = %v, want absorbed after the handoff", applied, failures)
 	}
 	time.Sleep(200 * time.Millisecond)
 	if calls.Load() != 1 {
@@ -956,5 +959,114 @@ func TestHeartbeat_ScanFailureAckCarriesNoForeignReport(t *testing.T) {
 	}
 	if second.Observations == nil {
 		t.Fatal("beat2 observations = nil, want the generic report after confirmation")
+	}
+}
+
+func TestObservationsScanMutation_SatelliteCompletesOnlyOnOwningRegistration(t *testing.T) {
+	var calls atomic.Int32
+	d := scanDaemon(map[string]quotaProbeFunc{"codex": countingFeed(&calls)})
+	d.observationScan.minInterval = time.Millisecond
+	satellite := d.ApplyObservationMutations("satellite")
+	if applied, failures := satellite(context.Background(), []PendingMutation{{ID: "sat-scan", Op: observationsScanOp}}); len(applied) != 0 || len(failures) != 0 {
+		t.Fatalf("satellite apply = %v %v, want queued with no acknowledgement", applied, failures)
+	}
+	if applied, failures := d.applyPendingMutations(context.Background(), []PendingMutation{{ID: "pri-scan", Op: observationsScanOp}}); len(applied) != 0 || len(failures) != 0 {
+		t.Fatalf("primary apply = %v %v, want queued with no acknowledgement", applied, failures)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		d.observationScan.mu.Lock()
+		_, satOK := d.observationScan.done[observationScanKey{registration: "satellite", id: "sat-scan"}]
+		_, priOK := d.observationScan.done[observationScanKey{id: "pri-scan"}]
+		d.observationScan.mu.Unlock()
+		if satOK && priOK {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("both scans did not complete")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// The primary lane drains first: it must receive only its own batch,
+	// never the satellite's. A shared drain would hand sat-scan to the
+	// primary beat under the primary registration.
+	priApplied, _, priReport := d.drainDeferredScanAcks()
+	if strings.Join(priApplied, ",") != "pri-scan" || priReport == nil {
+		t.Fatalf("primary drain = %v report %v, want [pri-scan] with its own report", priApplied, priReport != nil)
+	}
+	satApplied, _, satReport := d.DrainDeferredScanAcksFor("satellite")
+	if strings.Join(satApplied, ",") != "sat-scan" || satReport == nil {
+		t.Fatalf("satellite drain = %v report %v, want [sat-scan] with its own report", satApplied, satReport != nil)
+	}
+	if satReport == priReport {
+		t.Fatal("both registrations share one report pointer, want one exact report per scan")
+	}
+	if applied, _, _ := d.drainDeferredScanAcks(); len(applied) != 0 {
+		t.Fatalf("primary redrain = %v, want nothing left", applied)
+	}
+	if applied, _, _ := d.DrainDeferredScanAcksFor("satellite"); len(applied) != 0 {
+		t.Fatalf("satellite redrain = %v, want nothing left", applied)
+	}
+	// The same id on two registrations is two independent requests.
+	if applied, failures := satellite(context.Background(), []PendingMutation{{ID: "dup", Op: observationsScanOp}}); len(applied) != 0 || len(failures) != 0 {
+		t.Fatalf("satellite dup apply = %v %v, want queued", applied, failures)
+	}
+	if applied, failures := d.applyPendingMutations(context.Background(), []PendingMutation{{ID: "dup", Op: observationsScanOp}}); len(applied) != 0 || len(failures) != 0 {
+		t.Fatalf("primary dup apply = %v %v, want queued independently", applied, failures)
+	}
+	deadline = time.Now().Add(3 * time.Second)
+	for {
+		d.observationScan.mu.Lock()
+		_, satOK := d.observationScan.done[observationScanKey{registration: "satellite", id: "dup"}]
+		_, priOK := d.observationScan.done[observationScanKey{id: "dup"}]
+		d.observationScan.mu.Unlock()
+		if satOK && priOK {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("both dup scans did not complete")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	satApplied, _, _ = d.DrainDeferredScanAcksFor("satellite")
+	priApplied, _, _ = d.drainDeferredScanAcks()
+	if strings.Join(satApplied, ",") != "dup" || strings.Join(priApplied, ",") != "dup" {
+		t.Fatalf("dup drains = satellite %v primary %v, want [dup] on each", satApplied, priApplied)
+	}
+	if calls.Load() != 4 {
+		t.Fatalf("scans = %d, want one fresh scan per request across registrations", calls.Load())
+	}
+}
+
+func TestObservationsScanMutation_HandedOffSuccessAbsorbsToPreserveReportFidelity(t *testing.T) {
+	var calls atomic.Int32
+	d := scanDaemon(map[string]quotaProbeFunc{"codex": countingFeed(&calls)})
+	d.observationScan.minInterval = time.Millisecond
+	if applied, failures := d.applyPendingMutations(context.Background(), []PendingMutation{{ID: "first-scan", Op: observationsScanOp}}); len(applied) != 0 || len(failures) != 0 {
+		t.Fatalf("applied = %v failures = %v, want the request queued", applied, failures)
+	}
+	first := drainOneScanBatch(t, d)
+	if strings.Join(first.applied, ",") != "first-scan" || first.report == nil {
+		t.Fatalf("first batch = %v report %v, want [first-scan] with its report", first.applied, first.report != nil)
+	}
+	// The handoff already acknowledged first-scan on its own beat with its
+	// own report. A redelivery alongside the next scan must absorb, not
+	// buffer a bare acknowledgement that would ride the next scan's report.
+	if applied, failures := d.applyPendingMutations(context.Background(), []PendingMutation{{ID: "first-scan", Op: observationsScanOp}}); len(applied) != 0 || len(failures) != 0 {
+		t.Fatalf("redelivery applied = %v failures = %v, want absorbed after the handoff", applied, failures)
+	}
+	if applied, failures := d.applyPendingMutations(context.Background(), []PendingMutation{{ID: "second-scan", Op: observationsScanOp}}); len(applied) != 0 || len(failures) != 0 {
+		t.Fatalf("second apply = %v %v, want queued", applied, failures)
+	}
+	second := drainOneScanBatch(t, d)
+	if strings.Join(second.applied, ",") != "second-scan" || second.report == nil {
+		t.Fatalf("second batch = %v report %v, want only [second-scan] with its own report", second.applied, second.report != nil)
+	}
+	if first.report == second.report {
+		t.Fatal("both batches share one report pointer, want one exact report per scan")
+	}
+	time.Sleep(200 * time.Millisecond)
+	if calls.Load() != 2 {
+		t.Fatalf("scans = %d, want no second scan for the redelivery", calls.Load())
 	}
 }

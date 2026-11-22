@@ -69,14 +69,15 @@ type observationScanner struct {
 	latest      map[observation.Ref]bool
 
 	// The observations.scan mutation queue: requests run in arrival order,
-	// one at a time, each as a fresh scan. queued holds every id that is
-	// queued or running, and done holds every completed outcome (applied or
-	// the exact failure text) for the last observationScanRecentTTL, so a
-	// redelivered id replays its outcome instead of starting a second scan
-	// or re-reporting validation differently.
+	// one at a time, each as a fresh scan. queued holds every key that is
+	// queued or running, and done holds every completed outcome for the
+	// last observationScanRecentTTL, so a redelivered id starts no second
+	// scan. Both are scoped by registration: an embedder's scan completes
+	// only on its own registration's drain, never on the primary's, and a
+	// redelivery on one registration never observes another's outcome.
 	queue   []observationScanRequest
-	queued  map[string]bool
-	done    map[string]observationScanOutcome
+	queued  map[observationScanKey]bool
+	done    map[observationScanKey]observationScanOutcome
 	working bool
 
 	// stopCh is closed when the daemon stops. The worker watches it to
@@ -90,28 +91,41 @@ type observationScanner struct {
 	maxQueue int
 
 	// Completed scans wait here as one batch each: the request id the scan
-	// answered plus that scan's exact report. Batches drain oldest-first,
-	// one per heartbeat, so every acknowledgement rides with the report of
-	// its own scan.
+	// answered plus that scan's exact report. Batches drain oldest-first
+	// per registration, one per heartbeat, so every acknowledgement rides
+	// with the report of its own scan on its own registration's beat.
 	ackMu      sync.Mutex
 	ackBatches []observationScanAckBatch
 }
 
+// observationScanKey scopes a scan request to its registration: the same
+// mutation id on two registrations is two independent requests.
+type observationScanKey struct {
+	registration string
+	id           string
+}
+
 // observationScanOutcome is one completed request: whether the platform
-// should see it applied, and the exact failure text otherwise. Redeliveries
-// replay it verbatim inside the dedupe window.
+// should see it applied, and the exact failure text otherwise. Validation
+// failures replay verbatim inside the dedupe window. Scan outcomes (a
+// success or a scan-execution failure) absorb redelivery as deferred: the
+// acknowledgement rides its own batch's drain with its own report, never
+// as a bare replay that could merge with another scan's report.
 type observationScanOutcome struct {
-	applied bool
-	errText string
-	at      time.Time
+	applied    bool
+	errText    string
+	at         time.Time
+	validation bool
 }
 
 // observationScanAckBatch is one completed scan's heartbeat payload: the id
 // it answered and that scan's exact report (nil when the scan failed).
+// registration is the lane that queued it; only that lane's drain returns it.
 type observationScanAckBatch struct {
-	applied  []string
-	failures []HeartbeatMutationFailure
-	report   *observation.Report
+	applied      []string
+	failures     []HeartbeatMutationFailure
+	report       *observation.Report
+	registration string
 }
 
 // errObservationScanCancelled aborts queued and running scans when the
@@ -132,8 +146,9 @@ const observationScanMaxRetainedOutcomes = 128
 
 // observationScanRequest is one queued observations.scan mutation.
 type observationScanRequest struct {
-	id    string
-	kinds []string
+	id           string
+	kinds        []string
+	registration string
 }
 
 // A queued request waits at most observationScanQueueDeadline for its slot
@@ -287,28 +302,33 @@ var errObservationScanDeferred = errors.New("observations.scan queued until its 
 // already in flight, or one that ran inside the rate-limit window, never
 // answers it. The acknowledgement is sent with the exact report of that
 // scan, an empty full report included, on the first beat built after its
-// batch drains; batches drain oldest-first, one per beat, so a later scan's
-// report never answers an earlier request. A redelivered id that is queued
-// or running is absorbed, and a redelivered id with a completed outcome
-// replays that outcome verbatim inside the dedupe window, so it never
-// starts a second scan and never re-reports validation differently.
-func (d *Daemon) applyObservationsScan(m PendingMutation) error {
+// batch drains on its own registration; batches drain oldest-first per
+// registration, one per beat, so a later scan's report never answers an
+// earlier request and one registration never acknowledges another's scan.
+// A redelivered id that is queued, running, or awaiting its own
+// registration's handoff is absorbed, and a redelivered validation failure
+// replays its exact text inside the dedupe window. A redelivered completed
+// scan absorbs too: its acknowledgement already rides its own batch's drain
+// with its own report, so a bare replay must never merge with another
+// scan's report on a later beat.
+func (d *Daemon) applyObservationsScan(m PendingMutation, registration string) error {
 	if strings.TrimSpace(m.ID) == "" {
 		return fmt.Errorf("%s requires an id", observationsScanOp)
 	}
 	s := &d.observationScan
+	key := observationScanKey{registration: registration, id: m.ID}
 	// Snapshot the undrained batches before taking mu: drain takes ackMu
 	// before mu, so nesting the check inside mu would invert the order.
 	// A redelivery answered here is always safe to defer: the pending
-	// batch will acknowledge it on its handoff, or the handoff will have
-	// refreshed its outcome by the next redelivery.
-	undrained := s.hasUndrainedBatch(m.ID)
+	// batch will acknowledge it on its own registration's handoff, or the
+	// handoff will have refreshed its outcome by the next redelivery.
+	undrained := s.hasUndrainedBatch(m.ID, registration)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now()
-	for id, outcome := range s.done {
+	for k, outcome := range s.done {
 		if now.Sub(outcome.at) > observationScanRecentTTL {
-			delete(s.done, id)
+			delete(s.done, k)
 		}
 	}
 	if s.stopped {
@@ -317,19 +337,19 @@ func (d *Daemon) applyObservationsScan(m PendingMutation) error {
 	// The dedupe check runs before parameter validation, so a redelivered
 	// id never re-reports a validation failure differently. An id with a
 	// completed but undrained batch is absorbed the same way: its
-	// acknowledgement is already decided and awaits only its heartbeat
-	// handoff, so it must not start a second scan.
-	if s.queued[m.ID] {
+	// acknowledgement is already decided and awaits only its own
+	// registration's heartbeat handoff, so it must not start a second scan.
+	if s.queued[key] {
 		return errObservationScanDeferred
 	}
 	if undrained {
 		return errObservationScanDeferred
 	}
-	if outcome, ok := s.done[m.ID]; ok {
-		if outcome.applied {
-			return nil
+	if outcome, ok := s.done[key]; ok {
+		if outcome.validation {
+			return errors.New(outcome.errText)
 		}
-		return errors.New(outcome.errText)
+		return errObservationScanDeferred
 	}
 	var params struct {
 		Kinds []string `json:"kinds"`
@@ -337,23 +357,23 @@ func (d *Daemon) applyObservationsScan(m PendingMutation) error {
 	if len(m.Params) > 0 && string(m.Params) != "null" {
 		if err := json.Unmarshal(m.Params, &params); err != nil {
 			err = fmt.Errorf("%s decode params: %w", observationsScanOp, err)
-			s.recordScanOutcomeLocked(m.ID, err, now)
+			s.recordScanOutcomeLocked(key, err, now, true)
 			return err
 		}
 	}
 	if err := checkObservationKinds(params.Kinds); err != nil {
 		err = fmt.Errorf("%s: %w", observationsScanOp, err)
-		s.recordScanOutcomeLocked(m.ID, err, now)
+		s.recordScanOutcomeLocked(key, err, now, true)
 		return err
 	}
 	if limit := s.maxQueueOrDefault(); len(s.queue) >= limit {
 		return fmt.Errorf("%s queue full (%d queued)", observationsScanOp, len(s.queue))
 	}
 	if s.queued == nil {
-		s.queued = map[string]bool{}
+		s.queued = map[observationScanKey]bool{}
 	}
-	s.queued[m.ID] = true
-	s.queue = append(s.queue, observationScanRequest{id: m.ID, kinds: params.Kinds})
+	s.queued[key] = true
+	s.queue = append(s.queue, observationScanRequest{id: m.ID, kinds: params.Kinds, registration: registration})
 	if s.stopCh == nil {
 		s.stopCh = make(chan struct{})
 	}
@@ -364,12 +384,16 @@ func (d *Daemon) applyObservationsScan(m PendingMutation) error {
 	return errObservationScanDeferred
 }
 
-// hasUndrainedBatch reports whether a completed scan's batch for id still
-// awaits its heartbeat handoff. The caller must not hold observationScan.mu.
-func (s *observationScanner) hasUndrainedBatch(id string) bool {
+// hasUndrainedBatch reports whether a completed scan's batch for id on
+// registration still awaits its own registration's heartbeat handoff. The
+// caller must not hold observationScan.mu.
+func (s *observationScanner) hasUndrainedBatch(id, registration string) bool {
 	s.ackMu.Lock()
 	defer s.ackMu.Unlock()
 	for _, batch := range s.ackBatches {
+		if batch.registration != registration {
+			continue
+		}
 		for _, appliedID := range batch.applied {
 			if appliedID == id {
 				return true
@@ -384,29 +408,35 @@ func (s *observationScanner) hasUndrainedBatch(id string) bool {
 	return false
 }
 
-// recordScanOutcomeLocked remembers a terminal outcome for replay on
-// redelivery. The caller holds observationScan.mu.
-func (s *observationScanner) recordScanOutcomeLocked(id string, err error, at time.Time) {
+// recordScanOutcomeLocked remembers a terminal outcome. Validation
+// failures replay verbatim on redelivery; scan outcomes (success or
+// execution failure) absorb redelivery as deferred so the acknowledgement
+// rides its own batch's drain with its own report. The caller holds
+// observationScan.mu.
+func (s *observationScanner) recordScanOutcomeLocked(key observationScanKey, err error, at time.Time, validation bool) {
 	if s.done == nil {
-		s.done = map[string]observationScanOutcome{}
+		s.done = map[observationScanKey]observationScanOutcome{}
 	}
-	outcome := observationScanOutcome{at: at}
+	outcome := observationScanOutcome{at: at, validation: validation}
 	if err == nil {
 		outcome.applied = true
 	} else {
 		outcome.errText = err.Error()
 	}
-	s.done[id] = outcome
+	s.done[key] = outcome
 	for len(s.done) > observationScanMaxRetainedOutcomes {
-		oldest := ""
+		var oldest observationScanKey
 		var oldestAt time.Time
 		first := true
-		for oid, o := range s.done {
-			if first || o.at.Before(oldestAt) || (o.at.Equal(oldestAt) && oid < oldest) {
-				oldest, oldestAt, first = oid, o.at, false
+		found := false
+		for k, o := range s.done {
+			older := first || o.at.Before(oldestAt) || (o.at.Equal(oldestAt) && (k.registration < oldest.registration || (k.registration == oldest.registration && k.id < oldest.id)))
+			if older {
+				oldest, oldestAt, first = k, o.at, false
+				found = true
 			}
 		}
-		if oldest == "" {
+		if !found {
 			break
 		}
 		delete(s.done, oldest)
@@ -477,24 +507,27 @@ func (d *Daemon) runObservationScanQueue() {
 			s.queue = nil
 			now := time.Now()
 			for _, req := range pending {
-				delete(s.queued, req.id)
-				s.recordScanOutcomeLocked(req.id, cancelErr, now)
+				delete(s.queued, observationScanKey{registration: req.registration, id: req.id})
+				s.recordScanOutcomeLocked(observationScanKey{registration: req.registration, id: req.id}, cancelErr, now, false)
 			}
 			s.working = false
 			s.mu.Unlock()
-			batch := observationScanAckBatch{}
-			for _, req := range pending {
-				batch.failures = append(batch.failures, HeartbeatMutationFailure{ID: req.id, Error: cancelErr.Error()})
-			}
+			// One batch per request preserves registration isolation: each
+			// lane drains only its own failures with no cross-lane merge.
 			s.ackMu.Lock()
-			s.ackBatches = append(s.ackBatches, batch)
+			for _, req := range pending {
+				s.ackBatches = append(s.ackBatches, observationScanAckBatch{
+					failures:     []HeartbeatMutationFailure{{ID: req.id, Error: cancelErr.Error()}},
+					registration: req.registration,
+				})
+			}
 			s.ackMu.Unlock()
 			return
 		}
 		req := s.queue[0]
 		s.mu.Unlock()
 		result, scanErr := d.scanWhenSlotOpens(ctx, req.kinds, time.Now().Add(observationScanQueueDeadline))
-		batch := observationScanAckBatch{}
+		batch := observationScanAckBatch{registration: req.registration}
 		var batchErr error
 		if scanErr != nil {
 			batchErr = fmt.Errorf("%s: %v", observationsScanOp, scanErr)
@@ -505,8 +538,8 @@ func (d *Daemon) runObservationScanQueue() {
 		}
 		s.mu.Lock()
 		s.queue = s.queue[1:]
-		delete(s.queued, req.id)
-		s.recordScanOutcomeLocked(req.id, batchErr, time.Now())
+		delete(s.queued, observationScanKey{registration: req.registration, id: req.id})
+		s.recordScanOutcomeLocked(observationScanKey{registration: req.registration, id: req.id}, batchErr, time.Now(), false)
 		s.mu.Unlock()
 		s.ackMu.Lock()
 		s.ackBatches = append(s.ackBatches, batch)
@@ -565,43 +598,66 @@ func (s *observationScanner) waitForSlot() time.Duration {
 	return 0
 }
 
-// drainDeferredScanAcks hands the heartbeat the oldest completed scan's
-// batch: its request id and that scan's exact report (nil when the scan
-// failed). One batch drains per call, so every acknowledgement rides with
+// drainDeferredScanAcks hands the primary heartbeat the oldest completed
+// scan's batch for its own registration: its request id and that scan's
+// exact report (nil when the scan failed). Embedder lanes drain only their
+// own registration via DrainDeferredScanAcksFor, so one registration never
+// acknowledges another's scan.
+func (d *Daemon) drainDeferredScanAcks() ([]string, []HeartbeatMutationFailure, *observation.Report) {
+	return d.drainDeferredScanAcksFor(primaryObservationRegistration)
+}
+
+// DrainDeferredScanAcksFor hands the named registration's heartbeat its
+// oldest completed scan batch. Embedders wire it as their heartbeat lane's
+// DrainDeferredAcks alongside ApplyObservationMutations as OnPendingMutations,
+// so each registration's scan completes only on its own beat with its own
+// report. One batch drains per call, so every acknowledgement rides with
 // the report of its own scan and later batches wait for later beats. The
 // dedupe window refreshes at this handoff: the 10 minutes run from the
 // heartbeat taking the acknowledgement, not from the scan completing.
-func (d *Daemon) drainDeferredScanAcks() ([]string, []HeartbeatMutationFailure, *observation.Report) {
+func (d *Daemon) DrainDeferredScanAcksFor(registration string) ([]string, []HeartbeatMutationFailure, *observation.Report) {
+	return d.drainDeferredScanAcksFor(registration)
+}
+
+func (d *Daemon) drainDeferredScanAcksFor(registration string) ([]string, []HeartbeatMutationFailure, *observation.Report) {
 	s := &d.observationScan
 	s.ackMu.Lock()
-	if len(s.ackBatches) == 0 {
+	idx := -1
+	for i, b := range s.ackBatches {
+		if b.registration == registration {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
 		s.ackMu.Unlock()
 		return nil, nil, nil
 	}
-	batch := s.ackBatches[0]
-	s.ackBatches[0] = observationScanAckBatch{}
-	s.ackBatches = s.ackBatches[1:]
+	batch := s.ackBatches[idx]
+	s.ackBatches = append(s.ackBatches[:idx], s.ackBatches[idx+1:]...)
 	s.ackMu.Unlock()
 	now := time.Now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, id := range batch.applied {
-		if outcome, ok := s.done[id]; ok {
+		key := observationScanKey{registration: registration, id: id}
+		if outcome, ok := s.done[key]; ok {
 			outcome.at = now
-			s.done[id] = outcome
+			s.done[key] = outcome
 		} else {
 			// The outcome was TTL-pruned while the batch awaited its
-			// handoff: re-record it so a later redelivery replays instead
+			// handoff: re-record it so a later redelivery absorbs instead
 			// of starting a second scan for an already-answered id.
-			s.recordScanOutcomeLocked(id, nil, now)
+			s.recordScanOutcomeLocked(key, nil, now, false)
 		}
 	}
 	for _, failure := range batch.failures {
-		if outcome, ok := s.done[failure.ID]; ok {
+		key := observationScanKey{registration: registration, id: failure.ID}
+		if outcome, ok := s.done[key]; ok {
 			outcome.at = now
-			s.done[failure.ID] = outcome
+			s.done[key] = outcome
 		} else {
-			s.recordScanOutcomeLocked(failure.ID, errors.New(failure.Error), now)
+			s.recordScanOutcomeLocked(key, errors.New(failure.Error), now, false)
 		}
 	}
 	return batch.applied, batch.failures, batch.report

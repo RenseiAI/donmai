@@ -160,7 +160,10 @@ func (d *Daemon) localObservationItem(key observationSlotKey) (LocalObservationI
 // ApplyObservationMutations returns the observations.* mutation handler
 // for one registration. Embedders with additional worker identities wire
 // it into that identity's heartbeat lane, so each registration's pushed
-// policy stays its own; other ops are ignored.
+// policy stays its own; other ops are ignored. Pair it with
+// DrainDeferredScanAcksFor(registration) as that lane's DrainDeferredAcks,
+// so each registration's scan completes only on its own beat with its own
+// report.
 func (d *Daemon) ApplyObservationMutations(registration string) func(context.Context, []PendingMutation) ([]string, []HeartbeatMutationFailure) {
 	return func(_ context.Context, mutations []PendingMutation) (applied []string, failures []HeartbeatMutationFailure) {
 		for _, m := range mutations {
@@ -169,7 +172,7 @@ func (d *Daemon) ApplyObservationMutations(registration string) func(context.Con
 			case observationsPolicyOp:
 				err = d.applyObservationsPolicy(registration, m)
 			case observationsScanOp:
-				err = d.applyObservationsScan(m)
+				err = d.applyObservationsScan(m, registration)
 			default:
 				continue
 			}
