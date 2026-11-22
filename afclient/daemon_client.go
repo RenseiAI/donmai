@@ -10,8 +10,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -58,7 +60,10 @@ func (c DaemonConfig) BaseURL() string {
 	if port == 0 {
 		port = 7734
 	}
-	return fmt.Sprintf("http://%s:%d", host, port)
+	// JoinHostPort brackets an IPv6 literal; trimming first keeps an
+	// already-bracketed host ("[::1]") working, so `--host ::1` and
+	// `--host '[::1]'` both reach http://[::1]:<port>.
+	return "http://" + net.JoinHostPort(strings.TrimSuffix(strings.TrimPrefix(host, "["), "]"), strconv.Itoa(port))
 }
 
 // ── Daemon API request/response types ────────────────────────────────────────

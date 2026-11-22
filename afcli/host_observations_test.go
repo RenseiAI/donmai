@@ -87,3 +87,55 @@ func TestHostObservationsCmd(t *testing.T) {
 		})
 	}
 }
+
+func TestHostObservationsCmd_KindFilterNarrowsCoverage(t *testing.T) {
+	tests := []struct {
+		name      string
+		kind      string
+		wantFull  bool
+		wantKinds string
+		wantItems int
+	}{
+		// A filter that covers none of the reported kinds is partial: it
+		// never claims an authoritative "no subscription logins".
+		{name: "uncovered kind", kind: "git-identity", wantFull: false, wantKinds: "", wantItems: 0},
+		{name: "covered kind", kind: "subscription-login", wantFull: true, wantKinds: "subscription-login", wantItems: 2},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fake := &fakeObservationsClient{obs: sampleHostObservations()}
+			cmd := newHostObservationsCmd(func(afclient.DaemonConfig) hostObservationsClient { return fake })
+			var out bytes.Buffer
+			cmd.SetOut(&out)
+			cmd.SetArgs([]string{"--json", "--kind", tt.kind})
+			if err := cmd.Execute(); err != nil {
+				t.Fatalf("execute: %v", err)
+			}
+			var got afclient.HostObservations
+			if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+				t.Fatalf("decode: %v\n%s", err, out.String())
+			}
+			if got.Report.Full != tt.wantFull || strings.Join(got.Report.Kinds, ",") != tt.wantKinds || len(got.Report.Items) != tt.wantItems {
+				t.Fatalf("full=%v kinds=%v items=%d, want full=%v kinds=[%s] items=%d", got.Report.Full, got.Report.Kinds, len(got.Report.Items), tt.wantFull, tt.wantKinds, tt.wantItems)
+			}
+		})
+	}
+}
+
+func TestHostObservationsCmd_IPv6HostReachesAValidURL(t *testing.T) {
+	for _, host := range []string{"::1", "[::1]"} {
+		var cfg afclient.DaemonConfig
+		cmd := newHostObservationsCmd(func(c afclient.DaemonConfig) hostObservationsClient {
+			cfg = c
+			return &fakeObservationsClient{obs: sampleHostObservations()}
+		})
+		cmd.SetOut(&bytes.Buffer{})
+		cmd.SetArgs([]string{"--host", host, "--port", "60874"})
+		if err := cmd.Execute(); err != nil {
+			t.Fatalf("--host %s: %v", host, err)
+		}
+		if got := cfg.BaseURL(); got != "http://[::1]:60874" {
+			t.Fatalf("--host %s: base URL %q, want http://[::1]:60874", host, got)
+		}
+	}
+}

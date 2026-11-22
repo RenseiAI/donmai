@@ -84,12 +84,20 @@ func newHostObservationsCmd(newClient func(afclient.DaemonConfig) hostObservatio
 	return cmd
 }
 
-// filterObservations keeps only items and marks of kinds, when given.
+// filterObservations keeps only items and marks of kinds, when given, and
+// narrows the report's coverage to match: its kinds become the requested
+// kinds the report actually covers, and it stays full only for a non-empty
+// coverage. A filter that covers none of the reported kinds therefore never
+// reads as an authoritative "no items".
 func filterObservations(obs *afclient.HostObservations, kinds []string) {
 	if len(kinds) == 0 {
 		return
 	}
 	keep := func(kind string) bool { return slices.Contains(kinds, kind) }
+	obs.Report.Kinds = slices.DeleteFunc(obs.Report.Kinds, func(k string) bool { return !keep(k) })
+	if len(obs.Report.Kinds) == 0 {
+		obs.Report.Full = false
+	}
 	obs.Report.Items = slices.DeleteFunc(obs.Report.Items, func(it afclient.HostObservationItem) bool { return !keep(it.Kind) })
 	obs.Marks = slices.DeleteFunc(obs.Marks, func(m afclient.HostObservationMark) bool { return !keep(m.Kind) })
 }
