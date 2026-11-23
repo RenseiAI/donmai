@@ -8,6 +8,10 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+No unreleased changes.
+
+## v0.73.12 — 2026-11-23
+
 ### Chores
 
 - The fast lane's `local-verify` status read-back now retries for about 35 seconds instead of reading the eventually consistent combined status once.
