@@ -415,6 +415,25 @@ func (q *interactiveNoticeQueue) clear() {
 	q.attempts, q.polls, q.offered = 0, 0, false
 }
 
+// readiness reads the truthful per-session semantic input readiness for the
+// session the supervisor currently owns. It is the observer half of attempt:
+// the same declared mechanism, the same exposed seam and the same driven set,
+// plus the live input state (idle/busy/modal/ended) and the live-versus-queue
+// split. Shell pty-notice reads as unavailable for chat on purpose: the PTY
+// write is correct push delivery for a shell, but a shell line is a command
+// the shell runs, not a turn the agent takes.
+func (q *interactiveNoticeQueue) readiness(isess agent.InteractiveSession, nch agent.NoticeChannel) agent.ChatReadiness {
+	busy := false
+	if q != nil {
+		busy = !q.idle()
+	}
+	var channel agent.NoticeDelivery
+	if q != nil {
+		channel = q.channel
+	}
+	return interactiveChatReadiness(channel, isess, nch, busy)
+}
+
 // deadLetter reports the held payload as undeliverable and frees the slot.
 //
 // This is the observability half of the head-of-line fix: a sender that was
