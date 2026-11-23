@@ -14,6 +14,10 @@ var (
 	// on a provider with SupportsSessionResume=false).
 	ErrUnsupported = errors.New("agent: capability not supported by provider")
 
+	// ErrInstructionUnsupported is returned before spawn when a required
+	// instruction translates to "unsupported" on the selected harness.
+	ErrInstructionUnsupported = errors.New("agent: required instruction unsupported by harness")
+
 	// ErrNoProvider is returned when the runner cannot resolve a
 	// Provider for a requested ProviderName (e.g. an org's profile
 	// names a provider not registered with the running binary).

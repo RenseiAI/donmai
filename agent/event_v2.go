@@ -193,7 +193,7 @@ func (NoticeEvent) isAgentEvent()   {}
 // isV2Kind reports an event model v2 kind.
 func isV2Kind(kind EventKind) bool {
 	switch kind {
-	case EventReasoning, EventPlan, EventFileChange, EventInteractiveRequest, EventTurn, EventNotice:
+	case EventReasoning, EventPlan, EventFileChange, EventInteractiveRequest, EventTurn, EventNotice, EventEffectiveSettings:
 		return true
 	}
 	return false
@@ -214,6 +214,8 @@ func unmarshalV2Event(kind EventKind, data []byte) (ev Event, ok bool, err error
 		return decodeV2[TurnEvent](data, "TurnEvent")
 	case EventNotice:
 		return decodeV2[NoticeEvent](data, "NoticeEvent")
+	case EventEffectiveSettings:
+		return decodeV2[EffectiveSettingsEvent](data, "EffectiveSettingsEvent")
 	}
 	return nil, false, nil
 }
