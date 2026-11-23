@@ -126,15 +126,39 @@ func runLoginStatus(ctx context.Context, binary string, baseEnv []string) (raw [
 	if !quiescent {
 		return nil, false, fmt.Errorf("%w: Claude host login could not prove child quiescence: %v", agent.ErrProviderUnavailable, err)
 	}
+	// A cancelled or expired check never ran: it carries no verdict,
+	// even when the child also wrote a refusal-shaped line or document.
+	if probeCtx.Err() != nil {
+		return nil, false, fmt.Errorf("%w: Claude host login: %w", agent.ErrProviderUnavailable, probeCtx.Err())
+	}
+	// An explicit logged-out status document answers even when the CLI
+	// exits nonzero: a signed-out `auth status --json` reports
+	// loggedIn:false on stdout and exits 1 with empty stderr. Trust that
+	// document before the generic failure below discards it.
+	if out := bytes.TrimSpace(stdout.buffer.Bytes()); len(out) != 0 {
+		var status struct {
+			LoggedIn    bool   `json:"loggedIn"`
+			AuthMethod  string `json:"authMethod"`
+			APIProvider string `json:"apiProvider"`
+		}
+		if json.Unmarshal(out, &status) == nil {
+			if !status.LoggedIn || status.AuthMethod != "claude.ai" || status.APIProvider != "firstParty" {
+				return nil, true, fmt.Errorf("%w: Claude runtime requires an authenticated first-party host login", agent.ErrProviderUnavailable)
+			}
+			if err == nil && stderr.buffer.Len() == 0 {
+				return append([]byte(nil), stdout.buffer.Bytes()...), false, nil
+			}
+			return nil, false, fmt.Errorf("%w: Claude host login status unavailable", agent.ErrProviderUnavailable)
+		}
+	}
 	// The CLI answers a missing login on stderr with its own refusal
 	// instead of a status document; that answered refusal is the verdict.
-	if strings.Contains(strings.ToLower(stderr.buffer.String()), "not logged in") && probeCtx.Err() == nil {
+	// Match it as a standalone line: a configuration error that merely
+	// quotes a directory named "not logged in" must not count.
+	if isClaudeLoginRefusal(stderr.buffer.String()) {
 		return nil, true, fmt.Errorf("%w: Claude runtime requires an authenticated first-party host login", agent.ErrProviderUnavailable)
 	}
 	if err != nil || stderr.buffer.Len() != 0 {
-		if probeCtx.Err() != nil {
-			return nil, false, fmt.Errorf("%w: Claude host login: %w", agent.ErrProviderUnavailable, probeCtx.Err())
-		}
 		return nil, false, fmt.Errorf("%w: Claude host login status unavailable", agent.ErrProviderUnavailable)
 	}
 	raw = append([]byte(nil), stdout.buffer.Bytes()...)
@@ -150,4 +174,40 @@ func runLoginStatus(ctx context.Context, binary string, baseEnv []string) (raw [
 		return nil, true, fmt.Errorf("%w: Claude runtime requires an authenticated first-party host login", agent.ErrProviderUnavailable)
 	}
 	return raw, false, nil
+}
+
+// isClaudeLoginRefusal reports whether stderr carries the CLI's own
+// logged-out refusal as a standalone line. A configuration error that
+// merely quotes a directory (for example one named "not logged in")
+// must not count: the phrase has to open the line (after an optional
+// "error:" label) and end or continue with punctuation or whitespace,
+// never with a path separator.
+func isClaudeLoginRefusal(stderr string) bool {
+	const phrase = "not logged in"
+	for _, line := range strings.Split(stderr, "\n") {
+		lower := strings.ToLower(strings.TrimSpace(line))
+		if lower == "" {
+			continue
+		}
+		if rest, ok := strings.CutPrefix(lower, "error:"); ok {
+			lower = strings.TrimSpace(rest)
+		} else if rest, ok := strings.CutPrefix(lower, "error -"); ok {
+			lower = strings.TrimSpace(rest)
+		}
+		if lower == phrase {
+			return true
+		}
+		if !strings.HasPrefix(lower, phrase) {
+			continue
+		}
+		rest := lower[len(phrase):]
+		if rest == "" {
+			return true
+		}
+		switch rest[0] {
+		case ' ', '\t', '.', ',', ':', ';', '!', '?', '"', '\'', '-':
+			return true
+		}
+	}
+	return false
 }

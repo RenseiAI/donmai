@@ -704,3 +704,75 @@ func TestProbeUsageScopedEvidence(t *testing.T) {
 		t.Errorf("scoped=%+v want claude/model_scoped percent 73 with account and reset", *scoped)
 	}
 }
+
+// TestProbeUsageForConfigDir_NonzeroLoggedOutStatusIsAnswered pins the
+// signed-out shape where the status child reports loggedIn:false on stdout
+// and exits nonzero with empty stderr: the failed usage read must still be
+// marked answered, so the daemon records ok:false beside the last windows.
+func TestProbeUsageForConfigDir_NonzeroLoggedOutStatusIsAnswered(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake CLI uses /bin/sh; skip on windows")
+	}
+	script := "#!/bin/sh\n" +
+		"case \" $* \" in *\" auth status --json \"*)\n" +
+		"  printf '{\"loggedIn\":false,\"authMethod\":\"none\",\"apiProvider\":\"firstParty\"}\\n'\n" +
+		"  exit 1;;\n" +
+		"esac\n" +
+		"printf '{\"type\":\"system\",\"subtype\":\"init\"}\\n'\n" +
+		"exit 0\n"
+	binary := writeFakeCLI(t, "fake-claude-nonzero-loggedout.sh", script)
+	selected := scopedHome(t, t.TempDir(), "selected-home")
+	_, probed, _ := ProbeUsageForConfigDir(t.Context(), binary, selected)
+	if probed.Unavailable == nil || probed.Unavailable.Reason != agent.UsageUnavailableProbeFailed {
+		t.Fatalf("probed = %+v, want probeFailed from the silent read", probed.Unavailable)
+	}
+	if !probed.Unavailable.Answered {
+		t.Error("nonzero logged-out status not marked answered; the explicit JSON verdict was discarded")
+	}
+}
+
+// TestProbeUsageForConfigDir_ConfigErrorQuotingPathIsUnanswered pins the
+// unreadable-config shape: the status child exits nonzero with a
+// configuration error that quotes the selected directory. When that
+// directory happens to contain the refusal phrase, the failure must stay
+// unanswered. A real refusal sentence on stderr must still answer.
+func TestProbeUsageForConfigDir_ConfigErrorQuotingPathIsUnanswered(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake CLI uses /bin/sh; skip on windows")
+	}
+	configErrScript := "#!/bin/sh\n" +
+		"case \" $* \" in *\" auth status --json \"*)\n" +
+		"  printf 'Claude configuration file at %s/.claude.json is corrupted: JSON Parse error\\nConfiguration error in %s/.claude.json: JSON Parse error\\n' \"$CLAUDE_CONFIG_DIR\" \"$CLAUDE_CONFIG_DIR\" >&2\n" +
+		"  exit 1;;\n" +
+		"esac\n" +
+		"printf '{\"type\":\"system\",\"subtype\":\"init\"}\\n'\n" +
+		"exit 0\n"
+	configErrBinary := writeFakeCLI(t, "fake-claude-config-error.sh", configErrScript)
+	parent := t.TempDir()
+	tricky := filepath.Join(parent, "not logged in", "one-file")
+	if err := os.MkdirAll(tricky, 0o700); err != nil {
+		t.Fatalf("make tricky home: %v", err)
+	}
+	neutral := scopedHome(t, parent, "plain-home")
+	for _, selected := range []string{tricky, neutral} {
+		_, probed, _ := ProbeUsageForConfigDir(t.Context(), configErrBinary, selected)
+		if probed.Unavailable == nil || probed.Unavailable.Reason != agent.UsageUnavailableProbeFailed {
+			t.Fatalf("selected %q: probed = %+v, want probeFailed", selected, probed.Unavailable)
+		}
+		if probed.Unavailable.Answered {
+			t.Errorf("selected %q: config error quoting the path marked answered; only a real refusal answers", selected)
+		}
+	}
+	refusalScript := "#!/bin/sh\n" +
+		"case \" $* \" in *\" auth status --json \"*)\n" +
+		"  printf 'Not logged in. Run claude auth login to authenticate.\\n' >&2\n" +
+		"  exit 1;;\n" +
+		"esac\n" +
+		"printf '{\"type\":\"system\",\"subtype\":\"init\"}\\n'\n" +
+		"exit 0\n"
+	refusalBinary := writeFakeCLI(t, "fake-claude-full-refusal.sh", refusalScript)
+	if _, probed, _ := ProbeUsageForConfigDir(t.Context(), refusalBinary, neutral); probed.Unavailable == nil ||
+		probed.Unavailable.Reason != agent.UsageUnavailableProbeFailed || !probed.Unavailable.Answered {
+		t.Fatalf("full refusal sentence: probed = %+v, want answered probeFailed", probed.Unavailable)
+	}
+}
