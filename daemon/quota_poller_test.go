@@ -657,6 +657,57 @@ func writeCodexHome(t *testing.T, dir, marker string) {
 	}
 }
 
+// writeCodexCountingCLI writes a stand-in codex binary that answers the
+// production app-server handshake and logs one line per rateLimits/read
+// carrying the isolated home's auth marker, so a poller test can count
+// how many distinct homes were probed without reading the log transport.
+func writeCodexCountingCLI(t *testing.T, probeLog string) string {
+	t.Helper()
+	script := `#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *rateLimits/read*)
+      id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+      [ -n "$id" ] || continue
+      marker=$(cat "$CODEX_HOME/auth.json" 2>/dev/null)
+      printf '%s\n' "$marker" >> "` + probeLog + `"
+      case "$marker" in
+        *home-a*) acct="fixture-codex-a"; plan="team"; p1=11; p2=12;;
+        *home-b*) acct="fixture-codex-b"; plan="plus"; p1=33; p2=34;;
+        *exhausted*) acct="fixture-codex-exhausted"; plan="team"; p1=100; p2=100;;
+        *) acct="fixture-codex-default"; plan="team"; p1=10; p2=20;;
+      esac
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"accountId":"%s","rateLimits":{"limitId":"codex","planType":"%s","primary":{"usedPercent":%s,"resetsAt":1893456000,"windowDurationMins":300},"secondary":{"usedPercent":%s,"resetsAt":1893456000,"windowDurationMins":10080}}}}\n' "$id" "$acct" "$plan" "$p1" "$p2"
+      ;;
+    *initialized*)
+      ;;
+    *initialize*)
+      id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+      [ -n "$id" ] || continue
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"codexHome":"%s"}}\n' "$id" "$CODEX_HOME"
+      ;;
+  esac
+done
+`
+	path := filepath.Join(t.TempDir(), "fake-codex-counting")
+	if err := testexec.WriteFile(path, []byte(script), 0o700); err != nil {
+		t.Fatalf("write counting slot CLI: %v", err)
+	}
+	return path
+}
+
+func codexProbeLines(t *testing.T, log string) []string {
+	t.Helper()
+	raw, _ := os.ReadFile(log)
+	var out []string
+	for _, l := range strings.Split(string(raw), "\n") {
+		if strings.TrimSpace(l) != "" {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
 func driveCodexScan(t *testing.T, bin, def string, extras []string) *Daemon {
 	t.Helper()
 	t.Setenv("CODEX_HOME", def)
@@ -725,5 +776,56 @@ func TestQuotaPoller_CodexSlotsPairAccountsAndPreserveHeartbeat(t *testing.T) {
 	}
 	if suspended, _ := quotaExhaustionSuspendsClaiming(snapEx, quotaServedClaimLanesForSnapshot(snapEx, map[string]string{"codex": bin}, nil), now); suspended {
 		t.Fatal("claiming suspended by exhausted extra")
+	}
+}
+
+// TestQuotaPoller_CodexDedupCountsProbesOnly is the codex twin of the
+// claude dedup proof: it drives the production poller with a counting
+// fixture CLI, so duplicate and symlink aliases of the default and of one
+// extra collapse to one probe each, an undeclared neighbor stays
+// unprobed, and an immediate second scan starts no new probe.
+func TestQuotaPoller_CodexDedupCountsProbesOnly(t *testing.T) {
+	root := t.TempDir()
+	def := filepath.Join(root, "def")
+	a := filepath.Join(root, "home-a")
+	b := filepath.Join(root, "home-b")
+	neighbor := filepath.Join(root, "neighbor")
+	for _, d := range []string{def, a, b, neighbor} {
+		writeCodexHome(t, d, filepath.Base(d))
+	}
+	linkA := filepath.Join(root, "link-a")
+	linkDef := filepath.Join(root, "link-def")
+	if err := os.Symlink(a, linkA); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(def, linkDef); err != nil {
+		t.Fatal(err)
+	}
+	probeLog := filepath.Join(root, "probes.log")
+	bin := writeCodexCountingCLI(t, probeLog)
+	driveCodexScan(t, bin, def, nil)
+	if got := len(codexProbeLines(t, probeLog)); got != 1 {
+		t.Fatalf("default-only codex probes = %d, want 1", got)
+	}
+	if err := os.Remove(probeLog); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	d2 := New(Options{QuotaProbeBinaries: map[string]string{agent.UsageHarnessCodex: bin}})
+	t.Setenv("CODEX_HOME", def)
+	d2.config = &Config{QuotaProbeHomes: map[string][]string{agent.UsageHarnessCodex: {a, a, linkA, b, linkDef}}}
+	newQuotaPoller(d2.quota, d2.quotaProbes()).probeDue(context.Background())
+	lines := codexProbeLines(t, probeLog)
+	if len(lines) != 3 {
+		t.Fatalf("codex probe lines = %v, want default plus two distinct extras", lines)
+	}
+	for _, l := range lines {
+		if strings.Contains(l, "neighbor") {
+			t.Fatalf("neighbor probed: %v", lines)
+		}
+	}
+	n := len(lines)
+	newQuotaPoller(d2.quota, d2.quotaProbes()).probeDue(context.Background())
+	if got := len(codexProbeLines(t, probeLog)); got != n {
+		t.Fatalf("second scan codex probes = %d, want %d (no repeat inside interval)", got, n)
 	}
 }
