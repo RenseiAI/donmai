@@ -573,6 +573,16 @@ func TestQuotaPoller_ClaudeUnknownHangAndMuseCancel(t *testing.T) {
 			t.Fatalf("later slot started after cancellation: %v", l)
 		}
 	}
+	hangAttempt, ok := dHang.quota.claudeSlotAttempt(normalizeClaudeProbeHome(hang))
+	if !ok {
+		t.Fatal("hang slot missing after cancelled scan")
+	}
+	if hangAttempt.limits.Unavailable == nil || hangAttempt.limits.Unavailable.Reason != agent.UsageUnavailableProbeFailed || hangAttempt.limits.Unavailable.Answered {
+		t.Fatalf("hang slot not unknown-unanswered: %+v", hangAttempt.limits.Unavailable)
+	}
+	if _, ok := dHang.quota.claudeSlotAttempt(normalizeClaudeProbeHome(later)); ok {
+		t.Fatal("later slot recorded after cancellation; no launch means no attempt")
+	}
 	time.Sleep(2200 * time.Millisecond)
 	if _, err := os.Stat(usageLog + ".survived"); !os.IsNotExist(err) {
 		t.Fatalf("hung child survived: %v", err)
@@ -600,5 +610,120 @@ func TestQuotaPoller_ClaudeUnknownHangAndMuseCancel(t *testing.T) {
 	newQuotaPoller(dMuse2.quota, dMuse2.quotaProbes()).probeDue(short)
 	if got := dMuse.quota.snapshot(); len(got) != 1 || got[0].AuthCheck == nil || !got[0].AuthCheck.OK {
 		t.Fatalf("cancelled muse overwrote verdict: %+v", got)
+	}
+}
+
+func writeCodexSlotCLI(t *testing.T) string {
+	t.Helper()
+	script := `#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *rateLimits/read*)
+      id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+      [ -n "$id" ] || continue
+      marker=$(cat "$CODEX_HOME/auth.json" 2>/dev/null)
+      case "$marker" in
+        *home-a*) acct="fixture-codex-a"; plan="team"; p1=11; p2=12;;
+        *home-b*) acct="fixture-codex-b"; plan="plus"; p1=33; p2=34;;
+        *exhausted*) acct="fixture-codex-exhausted"; plan="team"; p1=100; p2=100;;
+        *) acct="fixture-codex-default"; plan="team"; p1=10; p2=20;;
+      esac
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"accountId":"%s","rateLimits":{"limitId":"codex","planType":"%s","primary":{"usedPercent":%s,"resetsAt":1893456000,"windowDurationMins":300},"secondary":{"usedPercent":%s,"resetsAt":1893456000,"windowDurationMins":10080}}}}\n' "$id" "$acct" "$plan" "$p1" "$p2"
+      ;;
+    *initialized*)
+      ;;
+    *initialize*)
+      id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+      [ -n "$id" ] || continue
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"codexHome":"%s"}}\n' "$id" "$CODEX_HOME"
+      ;;
+  esac
+done
+`
+	path := filepath.Join(t.TempDir(), "fake-codex")
+	if err := testexec.WriteFile(path, []byte(script), 0o700); err != nil {
+		t.Fatalf("write slot CLI: %v", err)
+	}
+	return path
+}
+
+func writeCodexHome(t *testing.T, dir, marker string) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "auth.json"), []byte(`{"marker":"`+marker+`"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func driveCodexScan(t *testing.T, bin, def string, extras []string) *Daemon {
+	t.Helper()
+	t.Setenv("CODEX_HOME", def)
+	d := New(Options{QuotaProbeBinaries: map[string]string{agent.UsageHarnessCodex: bin}})
+	d.config = &Config{QuotaProbeHomes: map[string][]string{agent.UsageHarnessCodex: extras}}
+	newQuotaPoller(d.quota, d.quotaProbes()).probeDue(context.Background())
+	return d
+}
+
+func TestQuotaPoller_CodexSlotsPairAccountsAndPreserveHeartbeat(t *testing.T) {
+	root := t.TempDir()
+	def := filepath.Join(root, "def")
+	a := filepath.Join(root, "home-a")
+	b := filepath.Join(root, "home-b")
+	exh := filepath.Join(root, "exhausted")
+	writeCodexHome(t, def, "default")
+	writeCodexHome(t, a, "home-a")
+	writeCodexHome(t, b, "home-b")
+	writeCodexHome(t, exh, "exhausted")
+	bin := writeCodexSlotCLI(t)
+	cfgPath := filepath.Join(root, "daemon.yaml")
+	if err := WriteConfig(cfgPath, &Config{Machine: MachineConfig{ID: "m"}, Orchestrator: OrchestratorConfig{URL: "https://example.test"}, QuotaProbeHomes: map[string][]string{"codex": {a, b}}}); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadConfig(cfgPath)
+	if err != nil || len(loaded.QuotaProbeHomes["codex"]) != 2 {
+		t.Fatalf("load homes = %v, %v", loaded, err)
+	}
+	d1 := driveCodexScan(t, bin, def, []string{a, b})
+	d2 := driveCodexScan(t, bin, def, []string{b, a})
+	for _, tc := range []struct {
+		dir         string
+		wantAccount string
+		wantPlan    string
+		wantPrimary float64
+	}{
+		{a, "fixture-codex-a", "team", 11},
+		{b, "fixture-codex-b", "plus", 33},
+	} {
+		key := normalizeCodexProbeHome(tc.dir)
+		s1, ok1 := d1.quota.codexSlotAttempt(key)
+		s2, ok2 := d2.quota.codexSlotAttempt(key)
+		if !ok1 || !ok2 || s1.accountID == "" || s1.accountID != s2.accountID || s1.accountID != tc.wantAccount || s1.plan != tc.wantPlan || s2.plan != tc.wantPlan {
+			t.Fatalf("slot %s pairing failed: %+v %+v", tc.dir, s1, s2)
+		}
+		if len(s1.limits.Windows) != 2 || len(s2.limits.Windows) != 2 || s1.limits.Windows[0].UsedPercent != tc.wantPrimary || s2.limits.Windows[0].UsedPercent != tc.wantPrimary {
+			t.Fatalf("slot %s windows failed: %+v %+v", tc.dir, s1.limits.Windows, s2.limits.Windows)
+		}
+	}
+	if len(d1.QuotaSnapshot()) != 1 || len(d2.QuotaSnapshot()) != 1 {
+		t.Fatalf("snapshots = %v %v, want one default entry", d1.QuotaSnapshot(), d2.QuotaSnapshot())
+	}
+	dex := driveCodexScan(t, bin, def, []string{exh})
+	snapEx := dex.QuotaSnapshot()
+	dDef := driveCodexScan(t, bin, def, nil)
+	snapDef := dDef.QuotaSnapshot()
+	if len(snapEx) != 1 || len(snapDef) != 1 || snapEx[0].Provider != "codex" {
+		t.Fatalf("heartbeat snapshots = %v %v", snapEx, snapDef)
+	}
+	if snapEx[0].ID != snapDef[0].ID || snapEx[0].ID != "fixture-codex-default" || snapEx[0].Plan != "team" || len(snapEx[0].Limits.Windows) != 2 || snapEx[0].Limits.Windows[0].UsedPercent != 10 || snapDef[0].Limits.Windows[0].UsedPercent != 10 {
+		t.Fatalf("exhausted extra changed heartbeat: %+v vs %+v", snapEx, snapDef)
+	}
+	now := time.Now()
+	if err := decideQuotaClaimAdmission(snapEx, string(agent.AuthHostSession), "codex", now); err != nil {
+		t.Fatalf("claim admission refused on available default: %v", err)
+	}
+	if suspended, _ := quotaExhaustionSuspendsClaiming(snapEx, quotaServedClaimLanesForSnapshot(snapEx, map[string]string{"codex": bin}, nil), now); suspended {
+		t.Fatal("claiming suspended by exhausted extra")
 	}
 }

@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -29,7 +30,11 @@ func (d *Daemon) quotaProbes() map[string]quotaProbeFunc {
 		return probes
 	}
 	if bin := d.opts.QuotaProbeBinaries[agent.UsageHarnessCodex]; bin != "" {
-		probes[agent.UsageHarnessCodex] = codexQuotaProbe(bin, true)
+		var extras []string
+		if cfg := d.Config(); cfg != nil {
+			extras = cfg.QuotaProbeHomes[agent.UsageHarnessCodex]
+		}
+		probes[agent.UsageHarnessCodex] = codexQuotaProbe(bin, true, extras)
 	}
 	if bin := d.opts.QuotaProbeBinaries[agent.UsageHarnessClaude]; bin != "" {
 		var extras []string
@@ -101,37 +106,117 @@ type quotaProbeFunc func(ctx context.Context, q *quotaState)
 // login is projected into the probe's isolated home. An empty binary
 // (codex not installed) disables the probe: the attempt records
 // nothing and the heartbeat keeps omitting the codex entry.
-func codexQuotaProbe(codexBin string, hostAuth bool) quotaProbeFunc {
+func codexQuotaProbe(codexBin string, hostAuth bool, extraHomes []string) quotaProbeFunc {
+	homes := append([]string(nil), extraHomes...)
 	return func(ctx context.Context, q *quotaState) {
-		at := time.Now()
-		feed := func(accountID, plan string, probed agent.UsageLimits) {
-			q.noteCodexProbe(accountID, plan, probed, at)
+		if ctx == nil {
+			ctx = context.Background()
 		}
 		if codexBin == "" {
-			feed("", "", agent.MakeUnavailableUsageLimits(agent.ISOTime(at), agent.UsageUnavailableProbeFailed, "Codex did not answer the usage request."))
+			at := time.Now()
+			plan := buildCodexScanPlan(homes)
+			defKey := ""
+			if len(plan) > 0 {
+				defKey = plan[0].key
+			}
+			q.recordCodexSlotAttempt(defKey, "", "", agent.MakeUnavailableUsageLimits(agent.ISOTime(at), agent.UsageUnavailableProbeFailed, "Codex did not answer the usage request."), at, true)
 			return
 		}
-		provider, err := providercodex.New(providercodex.Options{
-			CodexBin:         codexBin,
-			HostSessionAuth:  hostAuth,
-			HandshakeTimeout: quotaProbeTimeout / 2,
-			RPCTimeout:       providercodex.RateLimitsProbeTimeout,
-		})
-		if err != nil {
-			// No host login, no isolated home: the attempt never
-			// reached the provider, so it advances the clock but
-			// records no verdict.
-			feed("", "", agent.MakeUnavailableUsageLimits(agent.ISOTime(at), agent.UsageUnavailableProbeFailed, "Codex did not answer the usage request."))
-			return
+		for _, slot := range buildCodexScanPlan(homes) {
+			if ctx.Err() != nil {
+				return
+			}
+			slotCtx, cancel := context.WithTimeout(ctx, quotaProbeTimeout)
+			at := time.Now()
+			accountID, plan, probed := probeCodexSlot(slotCtx, codexBin, hostAuth, slot.dir)
+			cancel()
+			q.recordCodexSlotAttempt(slot.key, accountID, plan, probed, at, slot.isDefault)
+			if ctx.Err() != nil {
+				return
+			}
 		}
-		accountID, plan, probed := provider.ProbeQuota(ctx)
-		defer func() {
-			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			_ = provider.Shutdown(shutdownCtx)
-		}()
-		feed(accountID, plan, probed)
 	}
+}
+
+// probeCodexSlot runs one codex quota read against an explicit config home.
+// An empty homeDir reads the default login; a non-empty value must name an
+// absolute config directory whose auth.json is projected into the probe's
+// isolated home. Unreadable homes yield unanswered failures, never verdicts.
+func probeCodexSlot(ctx context.Context, codexBin string, hostAuth bool, homeDir string) (string, string, agent.UsageLimits) {
+	at := time.Now()
+	failed := func() (string, string, agent.UsageLimits) {
+		return "", "", agent.MakeUnavailableUsageLimits(agent.ISOTime(at), agent.UsageUnavailableProbeFailed, "Codex did not answer the usage request.")
+	}
+	if homeDir != "" {
+		if !filepath.IsAbs(homeDir) {
+			return failed()
+		}
+		if info, err := os.Stat(homeDir); err != nil || !info.IsDir() {
+			return failed()
+		}
+	}
+	provider, err := providercodex.New(providercodex.Options{
+		CodexBin:         codexBin,
+		HostSessionAuth:  hostAuth,
+		HostHome:         homeDir,
+		HandshakeTimeout: quotaProbeTimeout / 2,
+		RPCTimeout:       providercodex.RateLimitsProbeTimeout,
+	})
+	if err != nil {
+		return failed()
+	}
+	accountID, plan, probed := provider.ProbeQuota(ctx)
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = provider.Shutdown(shutdownCtx)
+	}()
+	return accountID, plan, probed
+}
+
+type codexScanSlot struct {
+	key       string
+	dir       string
+	isDefault bool
+}
+
+func normalizeCodexProbeHome(dir string) string {
+	cleaned := filepath.Clean(dir)
+	if resolved, err := filepath.EvalSymlinks(cleaned); err == nil && resolved != "" {
+		return filepath.Clean(resolved)
+	}
+	if parent, err := filepath.EvalSymlinks(filepath.Dir(cleaned)); err == nil && parent != "" {
+		return filepath.Join(filepath.Clean(parent), filepath.Base(cleaned))
+	}
+	return cleaned
+}
+
+func buildCodexScanPlan(extraHomes []string) []codexScanSlot {
+	defDir := providercodex.DefaultCodexHome()
+	defKey := ""
+	if defDir != "" {
+		defKey = normalizeCodexProbeHome(defDir)
+	}
+	seen := map[string]struct{}{defKey: {}}
+	var extras []string
+	for _, raw := range extraHomes {
+		if strings.TrimSpace(raw) == "" || !filepath.IsAbs(raw) {
+			continue
+		}
+		key := normalizeCodexProbeHome(filepath.Clean(raw))
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		extras = append(extras, key)
+	}
+	sort.Strings(extras)
+	plan := make([]codexScanSlot, 0, 1+len(extras))
+	plan = append(plan, codexScanSlot{key: defKey, dir: "", isDefault: true})
+	for _, key := range extras {
+		plan = append(plan, codexScanSlot{key: key, dir: key})
+	}
+	return plan
 }
 
 type claudeScanSlot struct {
@@ -345,8 +430,8 @@ func (p *quotaPoller) untilNextDue(now time.Time) time.Duration {
 	return wait
 }
 
-// probeDue runs one attempt per due harness. Claude gets a fresh per-slot
-// timeout from the scan context; others share one per-attempt timeout.
+// probeDue runs one attempt per due harness. Claude and codex get a fresh
+// per-slot timeout from the scan context; others share one per-attempt timeout.
 func (p *quotaPoller) probeDue(ctx context.Context) {
 	now := time.Now()
 	for harness, probe := range p.probes {
@@ -370,7 +455,7 @@ func (p *quotaPoller) probeDue(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		if harness == agent.UsageHarnessClaude {
+		if harness == agent.UsageHarnessClaude || harness == agent.UsageHarnessCodex {
 			probe(ctx, p.quota)
 		} else {
 			attemptCtx, cancel := context.WithTimeout(ctx, quotaProbeTimeout)

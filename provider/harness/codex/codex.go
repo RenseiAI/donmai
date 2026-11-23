@@ -142,6 +142,12 @@ type Options struct {
 	// and MCP servers remain private.
 	HostSessionAuth bool
 
+	// HostHome names an explicit Codex config directory whose auth.json
+	// the host-session projection reads. Empty means the default login;
+	// a non-empty value must be absolute and is carried only to the auth
+	// file resolution, never to the child environment.
+	HostHome string
+
 	// HandshakeTimeout caps the JSON-RPC initialize handshake.
 	// Defaults to 30s.
 	HandshakeTimeout time.Duration
@@ -214,7 +220,7 @@ func New(opts Options) (*Provider, error) {
 	hostAuthFile := ""
 	if opts.HostSessionAuth {
 		var err error
-		hostAuthFile, err = resolveHostSessionAuthFile()
+		hostAuthFile, err = resolveHostSessionAuthFileFor(opts.HostHome)
 		if err != nil {
 			return nil, fmt.Errorf("%w: %v", agent.ErrProviderUnavailable, err)
 		}

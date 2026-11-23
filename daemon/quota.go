@@ -33,6 +33,15 @@ type quotaState struct {
 	museAuth   *agent.UsageAuthCheck
 
 	claudeAttempts map[string]claudeSlotAttempt
+	codexAttempts  map[string]codexSlotAttempt
+}
+
+type codexSlotAttempt struct {
+	at        time.Time
+	accountID string
+	plan      string
+	limits    agent.UsageLimits
+	auth      *agent.UsageAuthCheck
 }
 
 type claudeSlotAttempt struct {
@@ -210,6 +219,40 @@ func (q *quotaState) claudeSlotAttempt(home string) (claudeSlotAttempt, bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	attempt, ok := q.claudeAttempts[home]
+	return attempt, ok
+}
+
+func (q *quotaState) recordCodexSlotAttempt(home, accountID, plan string, probed agent.UsageLimits, at time.Time, isDefault bool) {
+	if q == nil {
+		return
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.codexAttempts == nil {
+		q.codexAttempts = make(map[string]codexSlotAttempt)
+	}
+	q.codexAttempts[home] = codexSlotAttempt{at: at, accountID: accountID, plan: plan, limits: probed, auth: agent.UsageAuthCheckAfterProbe(agent.UsageHarnessCodex, &probed, at)}
+	if !isDefault {
+		return
+	}
+	q.codex = agent.ResolveUsageLimitsAfterProbe(q.codex, &probed)
+	q.codexAt = at
+	if check := agent.UsageAuthCheckAfterProbe(agent.UsageHarnessCodex, &probed, at); check != nil {
+		q.codexAuth = check
+	}
+	if q.codex != nil && q.codex.Unavailable == nil {
+		q.codexID = accountID
+		q.codexPlan = plan
+	}
+}
+
+func (q *quotaState) codexSlotAttempt(home string) (codexSlotAttempt, bool) {
+	if q == nil {
+		return codexSlotAttempt{}, false
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	attempt, ok := q.codexAttempts[home]
 	return attempt, ok
 }
 

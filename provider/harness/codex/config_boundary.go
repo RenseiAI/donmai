@@ -151,17 +151,47 @@ func newCodexConfigBoundaryWithAuthMode(tempDir, authMode string) (*codexConfigB
 	return b, nil
 }
 
-// resolveHostSessionAuthFile returns the auth.json used by a normal Codex CLI
-// invocation on this host. It intentionally resolves only the path; credential
-// contents never enter Donmai memory or logs.
-func resolveHostSessionAuthFile() (string, error) {
+// DefaultCodexHome reports the default Codex config directory the quota
+// probe reads: the operator's CODEX_HOME, or ~/.codex under the host home.
+// An empty value means the default login has no readable home; a non-empty
+// value is always absolute.
+func DefaultCodexHome() string {
 	codexHome := strings.TrimSpace(os.Getenv("CODEX_HOME"))
 	if codexHome == "" {
 		userHome, err := os.UserHomeDir()
 		if err != nil {
-			return "", fmt.Errorf("resolve host Codex home: %w", err)
+			return ""
 		}
 		codexHome = filepath.Join(userHome, ".codex")
+	}
+	if !filepath.IsAbs(codexHome) {
+		return ""
+	}
+	return filepath.Clean(codexHome)
+}
+
+// resolveHostSessionAuthFile returns the auth.json used by a normal Codex CLI
+// invocation on this host. It intentionally resolves only the path; credential
+// contents never enter Donmai memory or logs.
+func resolveHostSessionAuthFile() (string, error) {
+	return resolveHostSessionAuthFileFor("")
+}
+
+// resolveHostSessionAuthFileFor returns the auth.json for an explicit config
+// home. An empty home reads the default login; a non-empty home must be
+// absolute. Only the path is resolved; credential contents never enter
+// Donmai memory or logs.
+func resolveHostSessionAuthFileFor(home string) (string, error) {
+	codexHome := strings.TrimSpace(home)
+	if codexHome == "" {
+		codexHome = strings.TrimSpace(os.Getenv("CODEX_HOME"))
+		if codexHome == "" {
+			userHome, err := os.UserHomeDir()
+			if err != nil {
+				return "", fmt.Errorf("resolve host Codex home: %w", err)
+			}
+			codexHome = filepath.Join(userHome, ".codex")
+		}
 	}
 	if !filepath.IsAbs(codexHome) {
 		return "", errors.New("host CODEX_HOME must be absolute")

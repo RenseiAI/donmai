@@ -1287,12 +1287,12 @@ func validateConfig(c *Config) error {
 		return fmt.Errorf("trust.mode invalid: %q (want permissive | signed-by-allowlist | attested)", c.Trust.Mode)
 	}
 	for harness, homes := range c.QuotaProbeHomes {
-		if harness != "claude" {
+		if harness != "claude" && harness != "codex" {
 			return fmt.Errorf("quotaProbeHomes: unsupported harness %q", harness)
 		}
 		for i, home := range homes {
 			if strings.TrimSpace(home) == "" || !filepath.IsAbs(home) {
-				return fmt.Errorf("quotaProbeHomes.claude[%d] must be an absolute path", i)
+				return fmt.Errorf("quotaProbeHomes.%s[%d] must be an absolute path", harness, i)
 			}
 		}
 	}
