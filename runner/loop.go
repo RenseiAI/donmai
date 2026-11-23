@@ -2378,7 +2378,21 @@ tailRecovery:
 		} else {
 			res.Status = "failed"
 			if res.FailureMode == "" {
-				res.FailureMode = FailureSilentExit
+				// A failed terminal ResultEvent can carry the provider's
+				// own failure text in Errors (codex turn/completed
+				// status failed). Surface it as the failure reason with
+				// a provider-error mode so the terminal reason names the
+				// provider refusal instead of falling back to the last
+				// progress note. A failed terminal with no error text
+				// keeps silent-exit.
+				if msg := terminalProviderErrorMessage(streamRes.terminalEvent); msg != "" {
+					res.FailureMode = FailureProviderError
+					if res.Error == "" {
+						res.Error = msg
+					}
+				} else {
+					res.FailureMode = FailureSilentExit
+				}
 			}
 		}
 	}
@@ -4050,6 +4064,30 @@ func classifyWorktreeErr(err error) string {
 	default:
 		return FailureWorktreeProvision
 	}
+}
+
+// terminalProviderErrorMessage reports the provider's failure text from a
+// failed terminal ResultEvent. It joins the non-empty Errors entries, but
+// ignores the harness-synthesized fallbacks ("Turn failed",
+// "Turn was interrupted") the mappers emit when the provider reported no
+// error text: those carry no provider diagnostic, so a failed terminal with
+// only that text keeps silent-exit instead of provider-error.
+func terminalProviderErrorMessage(ev *agent.ResultEvent) string {
+	if ev == nil || ev.Success || len(ev.Errors) == 0 {
+		return ""
+	}
+	var kept []string
+	for _, e := range ev.Errors {
+		trimmed := strings.TrimSpace(e)
+		if trimmed == "" || trimmed == "Turn failed" || trimmed == "Turn was interrupted" {
+			continue
+		}
+		kept = append(kept, trimmed)
+	}
+	if len(kept) == 0 {
+		return ""
+	}
+	return strings.Join(kept, "\n")
 }
 
 // boundedFailureTail redacts secret-shaped values then applies the
