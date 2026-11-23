@@ -503,7 +503,15 @@ func (p *Provider) ProbeQuota(ctx context.Context) (accountID, plan string, prob
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if err := p.ensureProbeStarted(ctx); err != nil {
+	// The shared app-server outlives one probe attempt, so its startup
+	// runs under a detached context: a slow but healthy initialize that
+	// outlasts this attempt's deadline must not poison the shared
+	// Provider with a permanent shutdown. The read below stays bound to
+	// the caller, and a cancelled attempt still yields unknown before or
+	// after the read without touching shared startup state. The
+	// probe-owned ProbeQuotaForLogin below keeps the caller's deadline
+	// for startup because it owns its process from construction onward.
+	if err := p.ensureProbeStarted(context.Background()); err != nil {
 		return "", "", agent.MakeUnavailableUsageLimits(agent.ISOTime(time.Now()), agent.UsageUnavailableProbeFailed, RateLimitsFailureMessage(err))
 	}
 	p.startMu.Lock()
@@ -546,7 +554,8 @@ func (p *Provider) ProbeQuota(ctx context.Context) (accountID, plan string, prob
 // plan and windows together, so a login that answers once is published even
 // when a second read would fail. Cancellation at any point — including
 // during shutdown grace — yields an unknown snapshot with empty identity
-// and plan, while a live login refusal stays answered. The private home is
+// and plan, superseding even a live login refusal; only an uncancelled
+// refusal stays answered. The private home is
 // joined before removal and retained when writer quiescence cannot be proved.
 func ProbeQuotaForLogin(ctx context.Context, opts Options, sourceHome string) (accountID, plan string, probed agent.UsageLimits) {
 	fail := func() (string, string, agent.UsageLimits) {
@@ -593,11 +602,13 @@ func ProbeQuotaForLogin(ctx context.Context, opts Options, sourceHome string) (a
 	// deferred Shutdown joins the owned group before the private home is
 	// removed, caps grace at the time remaining, and requests zero grace
 	// once the attempt is cancelled or expired. A cancellation that lands
-	// during shutdown supersedes a successful snapshot computed before it;
-	// a live login refusal is already unknown, so it is preserved.
+	// at any point — including during shutdown after a successful read or
+	// a live login refusal — supersedes every outcome with unknown: the
+	// daemon must not record a fresh login verdict for an attempt it
+	// cancelled. Only an uncancelled refusal stays answered.
 	defer func() {
 		_ = provider.Shutdown(ctx)
-		if ctx.Err() != nil && probed.Unavailable == nil {
+		if ctx.Err() != nil {
 			accountID, plan, probed = fail()
 		}
 	}()
