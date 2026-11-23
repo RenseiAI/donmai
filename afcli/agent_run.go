@@ -1235,6 +1235,14 @@ type agentRunCtorHints struct {
 	// path-override variable, so resolving it there would deny the
 	// default path while the live token sits at the override.
 	ControlTokenPath string
+
+	// PiHandshakeTimeout overrides the pi provider's per-attempt
+	// handshake deadline for this session. Derived from the fetched
+	// SessionDetail's ResolvedProfile.ProviderConfig
+	// (piHandshakeTimeoutHintKey, seconds); zero means unset and the
+	// provider default stands. An unsafe value fails the provider at
+	// construction rather than running with an undercut deadline.
+	PiHandshakeTimeout time.Duration
 }
 
 // agentRunHints collects every per-session constructor signal in one pass.
@@ -1245,6 +1253,7 @@ func agentRunHints(d *daemon.SessionDetail) agentRunCtorHints {
 	h.CodexHostSessionAuth = codexHostSessionCtorHint(d)
 	if d != nil {
 		h.ControlTokenPath = strings.TrimSpace(d.ControlTokenPath)
+		h.PiHandshakeTimeout = piHandshakeTimeoutHint(d)
 	}
 	return h
 }
@@ -1359,6 +1368,13 @@ func localCodexHostSessionHint(detail *daemon.SessionDetail) (bool, error) {
 // map[string]any JSON wire shape.
 const opencodeCtorHintKey = "opencode.preferServer"
 
+// piHandshakeTimeoutHintKey is the typed ResolvedProfile.ProviderConfig
+// knob carrying the pi per-session handshake deadline in seconds — the
+// daemon's harness configuration for how long one handshake attempt may
+// take before the fail-closed gate fires. Same opaque-ProviderConfig
+// namespaced-key pattern as opencodeCtorHintKey.
+const piHandshakeTimeoutHintKey = "pi.handshakeTimeoutSeconds"
+
 // opencodeCtorHints derives agentRunCtorHints from a fetched SessionDetail.
 // A nil detail/ResolvedProfile, a missing key, or a non-bool value all
 // resolve to the zero value (Lane-A default, unchanged historical
@@ -1391,11 +1407,57 @@ func codexCtorOptions(h agentRunCtorHints) providercodex.Options {
 	return providercodex.Options{HostSessionAuth: h.CodexHostSessionAuth}
 }
 
+// piHandshakeTimeoutHint derives the pi per-session handshake deadline
+// from a fetched SessionDetail. A nil detail/ResolvedProfile, a missing
+// key, or a non-positive value all resolve to zero (provider default,
+// unchanged historical behavior). A positive number of seconds wins; a
+// duration string (e.g. "15s") is accepted too. Unsafe values are not
+// clamped here — they ride through to provider construction, which
+// rejects them loudly instead of running with an undercut deadline.
+func piHandshakeTimeoutHint(d *daemon.SessionDetail) time.Duration {
+	if d == nil || d.ResolvedProfile == nil {
+		return 0
+	}
+	v, ok := d.ResolvedProfile.ProviderConfig[piHandshakeTimeoutHintKey]
+	if !ok {
+		return 0
+	}
+	switch n := v.(type) {
+	case float64:
+		if n > 0 {
+			return time.Duration(n * float64(time.Second))
+		}
+	case int:
+		if n > 0 {
+			return time.Duration(n) * time.Second
+		}
+	case int64:
+		if n > 0 {
+			return time.Duration(n) * time.Second
+		}
+	case string:
+		if s := strings.TrimSpace(n); s != "" {
+			if dur, err := time.ParseDuration(s); err == nil && dur > 0 {
+				return dur
+			}
+		}
+	}
+	return 0
+}
+
 func piCtorOptions(h agentRunCtorHints) providerpi.Options {
-	return providerpi.Options{
+	opts := providerpi.Options{
 		TrustedExtensions: append([]providerpi.TrustedExtensionIdentity(nil), h.PiTrustedExtensions...),
 		ControlTokenPath:  h.ControlTokenPath,
 	}
+	// A daemon-stated per-session handshake deadline reaches the real
+	// sessions; unset keeps the provider default. Unsafe values fail at
+	// provider construction (the registry skips pi loudly), never as a
+	// silent undercut deadline.
+	if h.PiHandshakeTimeout > 0 {
+		opts.HandshakeTimeout = h.PiHandshakeTimeout
+	}
+	return opts
 }
 
 // agentRunProviderCtors returns the single hand-authored ctor list — the SoT

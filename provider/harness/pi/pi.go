@@ -106,7 +106,15 @@ type Options struct {
 	VersionProbe versionProbeFunc
 
 	// HandshakeTimeout caps how long Spawn waits for the policy-extension
-	// handshake before failing closed. Defaults to 10s (design §2 step 3).
+	// handshake before failing closed (design §2 step 3). Defaults to
+	// DefaultHandshakeTimeout. Values below MinHandshakeTimeout are
+	// rejected at construction: an undercut deadline flakes under load
+	// and turns healthy-but-slow extensions into spawn failures. A
+	// per-session override arrives through the daemon's harness
+	// configuration (ResolvedProfile.ProviderConfig
+	// "pi.handshakeTimeoutSeconds"); every wait — the first attempt
+	// and the single retry alike — stays bounded by the caller's
+	// spawn-deadline context.
 	HandshakeTimeout time.Duration
 
 	// VersionProbeTimeout caps the construction-time version probe.
@@ -201,6 +209,23 @@ const (
 	piConfinementReadPathsEnvVar = runtimeenv.PiConfinementReadPathsEnv
 )
 
+// DefaultHandshakeTimeout is the per-attempt cap on the policy-extension
+// handshake when Options.HandshakeTimeout is unset.
+const DefaultHandshakeTimeout = 10 * time.Second
+
+// MinHandshakeTimeout floors Options.HandshakeTimeout. Anything positive
+// below it is rejected at construction: under load a healthy extension
+// routinely needs hundreds of milliseconds to start, and a sub-second
+// deadline would fail such sessions closed for no fault of their own.
+const MinHandshakeTimeout = time.Second
+
+// maxHandshakeAttempts bounds the fail-closed handshake gate: the first
+// attempt plus exactly one retry on a timeout. A handshake error, a child
+// exit, or malformed protocol data never retries — those classify the
+// extension as broken, not slow. Only a real (non-stubbed) child process
+// retries; protocol-scripted launches keep a single attempt.
+const maxHandshakeAttempts = 2
+
 // New probes the pi binary and enforces the version pin (probe-time, per
 // design §2 / opencode §8). A confirmed-below-MinVersion binary fails
 // construction with agent.ErrProviderUnavailable; an unverifiable/above
@@ -210,7 +235,10 @@ func New(opts Options) (*Provider, error) {
 		return nil, fmt.Errorf("%w: %v", agent.ErrProviderUnavailable, err)
 	}
 	if opts.HandshakeTimeout == 0 {
-		opts.HandshakeTimeout = 10 * time.Second
+		opts.HandshakeTimeout = DefaultHandshakeTimeout
+	}
+	if opts.HandshakeTimeout < MinHandshakeTimeout {
+		return nil, fmt.Errorf("%w: pi handshake timeout %s below the %s floor", agent.ErrProviderUnavailable, opts.HandshakeTimeout, MinHandshakeTimeout)
 	}
 	if opts.VersionProbeTimeout == 0 {
 		opts.VersionProbeTimeout = DefaultVersionProbeTimeout
@@ -495,120 +523,155 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 		removeCredentials()
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}
-	// Prepare the confinement plan for a session that requested it. The
-	// plan wraps the child argv below and binds the session tmp and caches
-	// over their variables; nil means the session did not request
-	// confinement and spawns exactly as before. Any failure refuses the
-	// spawn — the session never runs half-confined. Every failure path
-	// from here to the handle releases the rendered profile.
-	var plan *confinement.Plan
-	if confiner != nil {
-		plan, err = p.confineSession(spec, layout, confiner)
-		if err != nil {
-			removeCredentials()
-			return nil, err
-		}
+	// Each handshake attempt renders its own confinement plan, child
+	// environment, receipt admission and evidence claim, and owns exactly
+	// one child process: a timed-out first attempt is stopped — killing
+	// only that exact child — before the retry spawns, so attempts never
+	// share a process, a plan, or a pump. The session credentials above
+	// are written once and removed once: a discarded attempt's Stop must
+	// not remove them while the retry still needs them, so onStop is
+	// armed only on the handle whose handshake verified.
+	attempts := 1
+	if !p.opts.skipProcess {
+		attempts = maxHandshakeAttempts
 	}
-	releasePlan := func() {
-		if plan != nil {
-			_ = plan.Release()
-		}
-	}
-	// Compose once. Receipt admission inspects this exact final environment,
-	// and spawnChild assigns the same immutable slice to exec.Cmd.Env. The
-	// confinement bindings are appended last so they win. The credential
-	// file's PATH rides the env (sessionCredentialEnv); no credential VALUE
-	// does — the exec half of the partition holds allowlisted names only.
-	childEnv := confinePiEnv(sessionCredentialEnv(headlessChildEnv(childEnvParts.exec, spec, layout, token), credentialPath), plan)
-	var receipt *receiptAdmission
-	if spec.Autonomous {
-		startup := measureReceiptStartupContext(spec.Cwd, childEnv)
-		receipt, err = newReceiptAdmission(p.artifact, layout, actualExtensions, p.trustedExtensions, startup)
-		if err != nil {
-			releasePlan()
-			removeCredentials()
-			return nil, fmt.Errorf("%w: measure pi receipt extension closure: %v", agent.ErrSpawnFailed, err)
-		}
-	}
-
-	// Snapshot the shared state dir's existing transcripts BEFORE the child
-	// starts, so evidence reports only what this session writes. The state
-	// dir is shared across reuses of a workarea: without this, a reused
-	// workarea would attribute the previous session's transcript to this
-	// one. Taken after every parent write (extensions, credentials,
-	// tmp/cache dirs) and before the child can create its own transcript.
-	evidenceBaseline, evidenceIncomplete := snapshotPiTranscriptBaseline(layout.root)
-	evidenceClaim := acquirePiEvidenceClaim(layout.root)
-	spawned := false
-	defer func() {
-		if !spawned {
-			evidenceClaim.release()
-		}
-	}()
-
 	var (
+		h      *Handle
 		cmd    *exec.Cmd
-		stdin  io.Writer
-		stdout io.Reader
+		client *rpcClient
 	)
-	if p.opts.skipProcess {
-		stdin = p.opts.stdinOverride
-		stdout = p.opts.stdoutOverride
-	} else {
-		c, in, out, serr := p.spawnChild(spec, layout, extensionPaths, skills.Args, childEnv, mode, sessionID, p.artifact, receipt, plan)
-		if serr != nil {
-			releasePlan()
-			removeCredentials()
-			return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, serr)
-		}
-		cmd, stdin, stdout = c, in, out
-		if p.opts.afterChildStart != nil {
-			p.opts.afterChildStart()
-		}
-		if p.artifact != nil {
-			if err := revalidateLaunchTrust(p.artifact, receipt, childEnv); err != nil {
-				stopStartedChild(cmd)
-				releasePlan()
+	for attempt := 0; ; attempt++ {
+		// Prepare the confinement plan for a session that requested it. The
+		// plan wraps the child argv below and binds the session tmp and caches
+		// over their variables; nil means the session did not request
+		// confinement and spawns exactly as before. Any failure refuses the
+		// spawn — the session never runs half-confined. A discarded
+		// attempt's plan is released with that attempt; the winning
+		// handle owns its plan until session Stop.
+		var plan *confinement.Plan
+		if confiner != nil {
+			plan, err = p.confineSession(spec, layout, confiner)
+			if err != nil {
 				removeCredentials()
-				return nil, fmt.Errorf("%w: pi artifact changed after spawn: %v", agent.ErrSpawnFailed, err)
+				return nil, err
 			}
 		}
-	}
-
-	client := newRPCClient(stdin, stdout)
-	h := newHandle(client, cmd, spec, token, receipt)
-	if p.opts.MaxConsecutiveOutputLimitTurns > 0 {
-		h.maxConsecutiveOutputLimitTurns = p.opts.MaxConsecutiveOutputLimitTurns
-	}
-	h.setConfinement(plan)
-	h.setStateRoot(layout.root)
-	h.setEvidenceBaseline(evidenceBaseline, evidenceIncomplete)
-	h.evidenceClaim = evidenceClaim
-	// The session credential files live in the session state root. Stop
-	// removes them so a finished session leaves no secret on disk; the
-	// worktree lifecycle that removes the state root is the backstop.
-	h.onStop = func() {
-		removeCredentials()
-	}
-	// Set before the pump starts (the go statement orders the write before
-	// every read on the pump goroutine); dispatch emits them directly behind
-	// the session's InitEvent. See launchNotices.
-	h.launchNotices = p.launchNotices(spec)
-	go h.run()
-
-	// Fail-closed handshake gate.
-	select {
-	case herr := <-h.handshakeResult:
-		if herr != nil {
-			_ = h.Stop(context.Background())
-			return nil, fmt.Errorf("%w: policy extension failed to load: %v", agent.ErrSpawnFailed, herr)
+		releasePlan := func() {
+			if plan != nil {
+				_ = plan.Release()
+			}
 		}
-	case <-time.After(p.opts.HandshakeTimeout):
-		_ = h.Stop(context.Background())
-		return nil, fmt.Errorf("%w: policy extension failed to load (no handshake within %s)", agent.ErrSpawnFailed, p.opts.HandshakeTimeout)
-	case <-ctx.Done():
-		_ = h.Stop(context.Background())
-		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, ctx.Err())
+		// Compose once per attempt. Receipt admission inspects this exact final environment,
+		// and spawnChild assigns the same immutable slice to exec.Cmd.Env. The
+		// confinement bindings are appended last so they win. The credential
+		// file's PATH rides the env (sessionCredentialEnv); no credential VALUE
+		// does — the exec half of the partition holds allowlisted names only.
+		childEnv := confinePiEnv(sessionCredentialEnv(headlessChildEnv(childEnvParts.exec, spec, layout, token), credentialPath), plan)
+		var receipt *receiptAdmission
+		if spec.Autonomous {
+			startup := measureReceiptStartupContext(spec.Cwd, childEnv)
+			receipt, err = newReceiptAdmission(p.artifact, layout, actualExtensions, p.trustedExtensions, startup)
+			if err != nil {
+				releasePlan()
+				removeCredentials()
+				return nil, fmt.Errorf("%w: measure pi receipt extension closure: %v", agent.ErrSpawnFailed, err)
+			}
+		}
+
+		// Snapshot the shared state dir's existing transcripts BEFORE the child
+		// starts, so evidence reports only what this session writes. The state
+		// dir is shared across reuses of a workarea: without this, a reused
+		// workarea would attribute the previous session's transcript to this
+		// one. Taken after every parent write (extensions, credentials,
+		// tmp/cache dirs) and before the child can create its own transcript.
+		evidenceBaseline, evidenceIncomplete := snapshotPiTranscriptBaseline(layout.root)
+		evidenceClaim := acquirePiEvidenceClaim(layout.root)
+
+		var (
+			stdin  io.Writer
+			stdout io.Reader
+		)
+		if p.opts.skipProcess {
+			stdin = p.opts.stdinOverride
+			stdout = p.opts.stdoutOverride
+		} else {
+			c, in, out, serr := p.spawnChild(spec, layout, extensionPaths, skills.Args, childEnv, mode, sessionID, p.artifact, receipt, plan)
+			if serr != nil {
+				releasePlan()
+				evidenceClaim.release()
+				removeCredentials()
+				return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, serr)
+			}
+			cmd, stdin, stdout = c, in, out
+			if p.opts.afterChildStart != nil {
+				p.opts.afterChildStart()
+			}
+			if p.artifact != nil {
+				if err := revalidateLaunchTrust(p.artifact, receipt, childEnv); err != nil {
+					stopStartedChild(cmd)
+					releasePlan()
+					evidenceClaim.release()
+					removeCredentials()
+					return nil, fmt.Errorf("%w: pi artifact changed after spawn: %v", agent.ErrSpawnFailed, err)
+				}
+			}
+		}
+
+		client = newRPCClient(stdin, stdout)
+		h = newHandle(client, cmd, spec, token, receipt)
+		if p.opts.MaxConsecutiveOutputLimitTurns > 0 {
+			h.maxConsecutiveOutputLimitTurns = p.opts.MaxConsecutiveOutputLimitTurns
+		}
+		h.setConfinement(plan)
+		h.setStateRoot(layout.root)
+		h.setEvidenceBaseline(evidenceBaseline, evidenceIncomplete)
+		h.evidenceClaim = evidenceClaim
+		// Set before the pump starts (the go statement orders the write before
+		// every read on the pump goroutine); dispatch emits them directly behind
+		// the session's InitEvent. See launchNotices.
+		h.launchNotices = p.launchNotices(spec)
+		go h.run()
+
+		// Fail-closed handshake gate: one bounded retry on a timeout.
+		// A timeout stops only this attempt's child and retries once
+		// within the same per-attempt deadline; a handshake error, a
+		// child exit, or malformed protocol data classifies the
+		// extension as broken and never retries. Every wait also
+		// watches the parent spawn deadline, so a cancelled parent
+		// aborts the gate instead of waiting out the timeout.
+		verified := false
+		select {
+		case herr := <-h.handshakeResult:
+			if herr != nil {
+				_ = h.Stop(context.Background())
+				releasePlan()
+				removeCredentials()
+				return nil, fmt.Errorf("%w: policy extension failed to load: %w", agent.ErrSpawnFailed, herr)
+			}
+			verified = true
+		case <-time.After(p.opts.HandshakeTimeout):
+			_ = h.Stop(context.Background())
+			releasePlan()
+			if attempt+1 < attempts {
+				continue
+			}
+			removeCredentials()
+			return nil, fmt.Errorf("%w: policy extension failed to load (no handshake within %s): %w", agent.ErrSpawnFailed, p.opts.HandshakeTimeout, agent.ErrPolicyExtensionSlowStart)
+		case <-ctx.Done():
+			_ = h.Stop(context.Background())
+			releasePlan()
+			removeCredentials()
+			return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, ctx.Err())
+		}
+		if !verified {
+			continue
+		}
+		// The handshake verified: this handle owns the session. Arm
+		// credential removal on its Stop — no earlier handle may.
+		h.onStop = func() {
+			removeCredentials()
+		}
+		break
 	}
 
 	// Resolve the session id (agent_start carries none in the real protocol),
@@ -645,7 +708,6 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 	if spec.OnProcessSpawned != nil && cmd != nil && cmd.Process != nil {
 		spec.OnProcessSpawned(cmd.Process.Pid)
 	}
-	spawned = true
 	return h, nil
 }
 

@@ -68,6 +68,35 @@ const (
 // needs.
 const replyEnvVar = "FAKEPI_REPLY"
 
+// handshakeDelay reports how long to wait before emitting the handshake
+// request. FAKEPI_HANDSHAKE_DELAY_MS sleeps that many milliseconds first,
+// so a test can push the handshake past the harness's first-attempt
+// deadline. When FAKEPI_HANDSHAKE_DELAY_ONCE_FILE names a path, the delay
+// applies only when that file does not exist yet — fakepi creates it
+// before sleeping — so a retried spawn (the harness kills only the exact
+// timed-out child and spawns again) proceeds immediately on its second
+// attempt. Without the once-file the delay applies to every spawn, so
+// both attempts time out. A negative or unparsable value means no delay.
+func handshakeDelay() time.Duration {
+	raw := strings.TrimSpace(os.Getenv("FAKEPI_HANDSHAKE_DELAY_MS"))
+	ms, err := strconv.Atoi(raw)
+	if err != nil || ms <= 0 {
+		return 0
+	}
+	delay := time.Duration(ms) * time.Millisecond
+	once := strings.TrimSpace(os.Getenv("FAKEPI_HANDSHAKE_DELAY_ONCE_FILE"))
+	if once == "" {
+		return delay
+	}
+	if _, err := os.Stat(once); err == nil {
+		return 0
+	}
+	if err := os.WriteFile(once, []byte("delayed"), 0o600); err != nil {
+		return 0
+	}
+	return delay
+}
+
 // restoreSessionEnvironment does what the real boundary extension does at
 // load (extensions/donmai-policy.ts restoreSessionEnvironment): the harness
 // execs pi with an allowlisted environment only, and the session's other
@@ -106,6 +135,22 @@ func restoreSessionEnvironment() {
 	}
 }
 
+// recordStartupPID appends this process's pid to FAKEPI_PID_FILE when set,
+// so a test can prove a failed spawn leaves no owned child behind.
+// Best-effort: a write failure never fails the turn.
+func recordStartupPID() {
+	path := strings.TrimSpace(os.Getenv("FAKEPI_PID_FILE"))
+	if path == "" {
+		return
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return
+	}
+	_, _ = fmt.Fprintf(f, "%d\n", os.Getpid())
+	_ = f.Close()
+}
+
 func main() {
 	for _, a := range os.Args[1:] {
 		if a == "--version" {
@@ -123,9 +168,13 @@ func main() {
 	extPath, sessionDir, sessionDelay := parseArgs(os.Args[1:])
 	token := os.Getenv("DONMAI_PI_HANDSHAKE")
 	sha := extensionSHAOf(extPath)
+	recordStartupPID()
 
 	out := bufio.NewWriter(os.Stdout)
 	defer func() { _ = out.Flush() }()
+	if d := handshakeDelay(); d > 0 {
+		time.Sleep(d)
+	}
 	in := bufio.NewScanner(os.Stdin)
 	in.Buffer(make([]byte, 0, 64*1024), 1<<20)
 
