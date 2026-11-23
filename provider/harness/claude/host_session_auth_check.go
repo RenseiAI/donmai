@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
@@ -40,33 +41,72 @@ func CheckHostSessionLogin(ctx context.Context, binary string) error {
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("%w: Claude host login: %w", agent.ErrProviderUnavailable, err)
 	}
+	baseEnv, err := loginBaseEnv("", true)
+	if err != nil {
+		return err
+	}
+	_, _, err = runLoginStatus(ctx, binary, baseEnv)
+	return err
+}
+
+// loginBaseEnv carries the operator's own login locators to the login and
+// usage children: the real home (the read is authenticated as the host
+// login), PATH, NO_COLOR, and USER (the keychain login lookup needs it on
+// macOS). Unrelated process credentials are never inherited. The default
+// entry inherits the ambient config locators, resolving relative ones before
+// the caller enters a scratch directory; the selected entry carries exactly
+// one CLAUDE_CONFIG_DIR and never the ambient one, so one call can never
+// answer for another login.
+func loginBaseEnv(configDir string, useDefault bool) ([]string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil || !filepath.IsAbs(home) {
-		return fmt.Errorf("%w: Claude host login home is unavailable", agent.ErrProviderUnavailable)
+		return nil, fmt.Errorf("%w: Claude host login home is unavailable", agent.ErrProviderUnavailable)
 	}
 	env := []string{"HOME=" + home, "PATH=" + os.Getenv("PATH"), "NO_COLOR=1"}
-	// The login status child reads the keychain-backed login on macOS,
-	// which needs USER to locate the operator's login item. Without it
-	// a signed-in host reports logged-out, and a quota probe built on
-	// this check would record ok:false every interval. USER carries no
-	// credential material, only the account name the login already names.
+	// The keychain-backed login lookup on macOS needs USER; without it a
+	// signed-in host reports logged-out. USER carries no credential material.
 	if user, present := os.LookupEnv("USER"); present && user != "" {
 		env = append(env, "USER="+user)
 	}
-	for _, name := range []string{"CLAUDE_CONFIG_DIR", "XDG_CONFIG_HOME"} {
-		if value, present := os.LookupEnv(name); present && value != "" {
-			if !filepath.IsAbs(value) {
-				value, err = filepath.Abs(value)
-				if err != nil {
-					return fmt.Errorf("%w: resolve Claude host login config locator: %w", agent.ErrProviderUnavailable, err)
-				}
+	resolve := func(name, value string) (string, error) {
+		if !filepath.IsAbs(value) {
+			value, err = filepath.Abs(value)
+			if err != nil {
+				return "", fmt.Errorf("%w: resolve Claude host login config locator: %w", agent.ErrProviderUnavailable, err)
 			}
-			env = append(env, name+"="+value)
+		}
+		return name + "=" + value, nil
+	}
+	if !useDefault {
+		if strings.TrimSpace(configDir) == "" || !filepath.IsAbs(configDir) {
+			return nil, fmt.Errorf("%w: Claude host login needs an absolute config directory", agent.ErrProviderUnavailable)
+		}
+		env = append(env, claudeConfigDirEnv+"="+configDir)
+	}
+	for _, name := range []string{claudeConfigDirEnv, "XDG_CONFIG_HOME"} {
+		if !useDefault && name == claudeConfigDirEnv {
+			continue
+		}
+		if value, present := os.LookupEnv(name); present && value != "" {
+			entry, err := resolve(name, value)
+			if err != nil {
+				return nil, err
+			}
+			env = append(env, entry)
 		}
 	}
+	return env, nil
+}
+
+// runLoginStatus runs one owned `auth status --json` child under ctx with the
+// given locator environment and returns its exact validated stdout bytes.
+// The scratch directory is removed only once its writers are proven quiet.
+// Only an explicit logged-out response or the CLI's own "not logged in"
+// refusal reports refused=true.
+func runLoginStatus(ctx context.Context, binary string, baseEnv []string) (raw []byte, refused bool, err error) {
 	probeDir, err := tempown.MkdirTemp("", tempown.PrefixClaudeLogin)
 	if err != nil {
-		return fmt.Errorf("%w: create private Claude login probe: %w", agent.ErrProviderUnavailable, err)
+		return nil, false, fmt.Errorf("%w: create private Claude login probe: %w", agent.ErrProviderUnavailable, err)
 	}
 	quiescent := true
 	defer func() {
@@ -78,28 +118,36 @@ func CheckHostSessionLogin(ctx context.Context, binary string) error {
 	defer cancel()
 	command := exec.CommandContext(probeCtx, binary, "auth", "status", "--json")
 	command.Dir = probeDir
-	env = append(env, "TMPDIR="+probeDir, "XDG_CACHE_HOME="+probeDir)
-	command.Env = env
+	command.Env = append(append([]string{}, baseEnv...), "TMPDIR="+probeDir, "XDG_CACHE_HOME="+probeDir)
 	command.WaitDelay = 200 * time.Millisecond
 	var stdout, stderr boundedHostLoginOutput
 	command.Stdout, command.Stderr = &stdout, &stderr
 	quiescent, err = runOwnedModelVersionProbe(probeCtx, command)
 	if !quiescent {
-		return fmt.Errorf("%w: Claude host login could not prove child quiescence: %v", agent.ErrProviderUnavailable, err)
+		return nil, false, fmt.Errorf("%w: Claude host login could not prove child quiescence: %v", agent.ErrProviderUnavailable, err)
+	}
+	// The CLI answers a missing login on stderr with its own refusal
+	// instead of a status document; that answered refusal is the verdict.
+	if strings.Contains(strings.ToLower(stderr.buffer.String()), "not logged in") && probeCtx.Err() == nil {
+		return nil, true, fmt.Errorf("%w: Claude runtime requires an authenticated first-party host login", agent.ErrProviderUnavailable)
 	}
 	if err != nil || stderr.buffer.Len() != 0 {
 		if probeCtx.Err() != nil {
-			return fmt.Errorf("%w: Claude host login: %w", agent.ErrProviderUnavailable, probeCtx.Err())
+			return nil, false, fmt.Errorf("%w: Claude host login: %w", agent.ErrProviderUnavailable, probeCtx.Err())
 		}
-		return fmt.Errorf("%w: Claude host login status unavailable", agent.ErrProviderUnavailable)
+		return nil, false, fmt.Errorf("%w: Claude host login status unavailable", agent.ErrProviderUnavailable)
 	}
+	raw = append([]byte(nil), stdout.buffer.Bytes()...)
 	var status struct {
 		LoggedIn    bool   `json:"loggedIn"`
 		AuthMethod  string `json:"authMethod"`
 		APIProvider string `json:"apiProvider"`
 	}
-	if err := json.Unmarshal(stdout.buffer.Bytes(), &status); err != nil || !status.LoggedIn || status.AuthMethod != "claude.ai" || status.APIProvider != "firstParty" {
-		return fmt.Errorf("%w: Claude runtime requires an authenticated first-party host login", agent.ErrProviderUnavailable)
+	if err := json.Unmarshal(raw, &status); err != nil {
+		return nil, false, fmt.Errorf("%w: Claude host login status unreadable: %v", agent.ErrProviderUnavailable, err)
 	}
-	return nil
+	if !status.LoggedIn || status.AuthMethod != "claude.ai" || status.APIProvider != "firstParty" {
+		return nil, true, fmt.Errorf("%w: Claude runtime requires an authenticated first-party host login", agent.ErrProviderUnavailable)
+	}
+	return raw, false, nil
 }
