@@ -299,6 +299,14 @@ func (p *Provider) ensureProbeStarted() error {
 // layer materially differs rather than silently serving it the first session's
 // DONMAI_SESSION_ID and DONMAI_API_URL. See checkSessionEnvLocked.
 func (p *Provider) startLocked(sessionEnv map[string]string) error {
+	return p.startLockedWithContext(context.Background(), sessionEnv)
+}
+
+// startLockedWithContext starts the app-server with the handshake bound
+// by ctx and HandshakeTimeout (the smaller wins). startMu must be held.
+// Existing quota/spawn callers use the Background wrapper above, so
+// their budgets are unchanged; the catalog scan passes its scan ctx.
+func (p *Provider) startLockedWithContext(ctx context.Context, sessionEnv map[string]string) error {
 	if p.startErr != nil {
 		return p.startErr
 	}
@@ -370,7 +378,16 @@ func (p *Provider) startLocked(sessionEnv map[string]string) error {
 		go p.watchExit()
 	}
 
-	hctx, cancel := context.WithTimeout(context.Background(), p.opts.HandshakeTimeout)
+	handshakeTimeout := p.opts.HandshakeTimeout
+	if handshakeTimeout <= 0 {
+		handshakeTimeout = 30 * time.Second
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		if remaining := time.Until(deadline); remaining < handshakeTimeout {
+			handshakeTimeout = remaining
+		}
+	}
+	hctx, cancel := context.WithTimeout(ctx, handshakeTimeout)
 	defer cancel()
 	initRaw, err := p.client.Request(hctx, "initialize", map[string]any{
 		"clientInfo": map[string]any{
@@ -381,7 +398,7 @@ func (p *Provider) startLocked(sessionEnv map[string]string) error {
 		"capabilities": map[string]any{
 			"experimentalApi": true,
 		},
-	}, p.opts.HandshakeTimeout)
+	}, handshakeTimeout)
 	if err != nil {
 		return p.failStartLocked(fmt.Errorf("%w: codex initialize handshake: %v", agent.ErrProviderUnavailable, err))
 	}
