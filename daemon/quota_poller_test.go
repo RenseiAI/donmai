@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -374,5 +376,229 @@ func TestQuotaProbeBounds(t *testing.T) {
 	}
 	if providerclaude.UsageProbeTimeout > quotaProbeTimeout {
 		t.Errorf("claude usage read ceiling %v must stay within the probe attempt ceiling %v", providerclaude.UsageProbeTimeout, quotaProbeTimeout)
+	}
+}
+
+func writeClaudeSlotCLI(t *testing.T, usageLog string) string {
+	t.Helper()
+	t.Setenv("USER", "probe-operator")
+	script := "#!/bin/sh\n" +
+		"case \" $* \" in *\" auth status --json \"*)\n" +
+		"case \"$CLAUDE_CONFIG_DIR\" in *hang*) (sleep 1.5; touch \"" + usageLog + ".survived\") & sleep 30; exit 0;; *home-a*) printf '{\"loggedIn\":true,\"authMethod\":\"claude.ai\",\"apiProvider\":\"firstParty\",\"m\":\"a\"}\\n'; exit 0;; *home-b*|*exhausted*) printf '{\"loggedIn\":true,\"authMethod\":\"claude.ai\",\"apiProvider\":\"firstParty\",\"m\":\"b\"}\\n'; exit 0;; *) printf '{\"loggedIn\":true,\"authMethod\":\"claude.ai\",\"apiProvider\":\"firstParty\",\"m\":\"d\"}\\n'; exit 0;; esac;;\n" +
+		"esac\necho \"usage $CLAUDE_CONFIG_DIR\" >> \"" + usageLog + "\"\n" +
+		"case \"$CLAUDE_CONFIG_DIR\" in *hang*) (sleep 1.5; touch \"" + usageLog + ".survived\") & sleep 30; exit 0;; *home-a*) u='{\"five_hour\":{\"utilization\":11,\"resets_at\":\"2030-01-01T00:00:00Z\"},\"seven_day\":{\"utilization\":12,\"resets_at\":\"2030-01-01T00:00:00Z\"}}';; *exhausted*) u='{\"five_hour\":{\"utilization\":100,\"resets_at\":\"2030-01-01T00:00:00Z\"},\"seven_day\":{\"utilization\":100,\"resets_at\":\"2030-01-01T00:00:00Z\"}}';; *home-b*) u='{\"five_hour\":{\"utilization\":33,\"resets_at\":\"2030-01-01T00:00:00Z\"},\"seven_day\":{\"utilization\":34,\"resets_at\":\"2030-01-01T00:00:00Z\"}}';; *) u='{\"five_hour\":{\"utilization\":10,\"resets_at\":\"2030-01-01T00:00:00Z\"},\"seven_day\":{\"utilization\":20,\"resets_at\":\"2030-01-01T00:00:00Z\"}}';; esac\n" +
+		"printf '{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"response\":{\"rate_limits_available\":true,\"rate_limits\":%s}}}\\n' \"$u\"\n"
+	path := filepath.Join(t.TempDir(), "fake-claude")
+	if err := testexec.WriteFile(path, []byte(script), 0o700); err != nil {
+		t.Fatalf("write slot CLI: %v", err)
+	}
+	return path
+}
+
+func slotUsageLines(t *testing.T, log string) []string {
+	t.Helper()
+	raw, _ := os.ReadFile(log)
+	var out []string
+	for _, l := range strings.Split(string(raw), "\n") {
+		if strings.TrimSpace(l) != "" {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+func driveClaudeScan(t *testing.T, bin, def string, extras []string) *Daemon {
+	t.Helper()
+	t.Setenv("CLAUDE_CONFIG_DIR", def)
+	d := New(Options{QuotaProbeBinaries: map[string]string{agent.UsageHarnessClaude: bin}})
+	d.config = &Config{QuotaProbeHomes: map[string][]string{agent.UsageHarnessClaude: extras}}
+	newQuotaPoller(d.quota, d.quotaProbes()).probeDue(context.Background())
+	return d
+}
+
+func TestQuotaPoller_ClaudeSlotsPairAccountsAndPreserveHeartbeat(t *testing.T) {
+	root := t.TempDir()
+	def := filepath.Join(root, "def")
+	a := filepath.Join(root, "home-a")
+	b := filepath.Join(root, "home-b")
+	exh := filepath.Join(root, "exhausted")
+	for _, d := range []string{def, a, b, exh} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	usageLog := filepath.Join(root, "u.log")
+	bin := writeClaudeSlotCLI(t, usageLog)
+	cfgPath := filepath.Join(root, "daemon.yaml")
+	if err := WriteConfig(cfgPath, &Config{Machine: MachineConfig{ID: "m"}, Orchestrator: OrchestratorConfig{URL: "https://example.test"}, QuotaProbeHomes: map[string][]string{"claude": {a, b}}}); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadConfig(cfgPath)
+	if err != nil || len(loaded.QuotaProbeHomes["claude"]) != 2 {
+		t.Fatalf("load homes = %v, %v", loaded, err)
+	}
+	d1 := driveClaudeScan(t, bin, def, []string{a, b})
+	d2 := driveClaudeScan(t, bin, def, []string{b, a})
+	for _, key := range []string{normalizeClaudeProbeHome(a), normalizeClaudeProbeHome(b)} {
+		s1, ok1 := d1.quota.claudeSlotAttempt(key)
+		s2, ok2 := d2.quota.claudeSlotAttempt(key)
+		if !ok1 || !ok2 || s1.accountID == "" || s1.accountID != s2.accountID || len(s1.limits.Windows) != 2 || s1.limits.Windows[0].UsedPercent != s2.limits.Windows[0].UsedPercent {
+			t.Fatalf("slot %s pairing failed: %+v %+v", key, s1, s2)
+		}
+	}
+	if len(d1.QuotaSnapshot()) != 1 || len(d2.QuotaSnapshot()) != 1 {
+		t.Fatalf("snapshots = %v %v, want one default entry", d1.QuotaSnapshot(), d2.QuotaSnapshot())
+	}
+	dex := driveClaudeScan(t, bin, def, []string{exh})
+	snapEx := dex.QuotaSnapshot()
+	dDef := driveClaudeScan(t, bin, def, nil)
+	snapDef := dDef.QuotaSnapshot()
+	if len(snapEx) != 1 || len(snapDef) != 1 || snapEx[0].Provider != "claude" {
+		t.Fatalf("heartbeat snapshots = %v %v", snapEx, snapDef)
+	}
+	if snapEx[0].ID != snapDef[0].ID || len(snapEx[0].Limits.Windows) != 2 || snapEx[0].Limits.Windows[0].UsedPercent != 10 || snapDef[0].Limits.Windows[0].UsedPercent != 10 {
+		t.Fatalf("exhausted extra changed heartbeat: %+v vs %+v", snapEx, snapDef)
+	}
+	now := time.Now()
+	if err := decideQuotaClaimAdmission(snapEx, string(agent.AuthHostSession), "claude", now); err != nil {
+		t.Fatalf("claim admission refused on available default: %v", err)
+	}
+	if suspended, _ := quotaExhaustionSuspendsClaiming(snapEx, quotaServedClaimLanesForSnapshot(snapEx, map[string]string{"claude": bin}, nil), now); suspended {
+		t.Fatal("claiming suspended by exhausted extra")
+	}
+}
+
+func TestQuotaPoller_ClaudeDedupCountsUsageOnly(t *testing.T) {
+	root := t.TempDir()
+	def := filepath.Join(root, "def")
+	a := filepath.Join(root, "home-a")
+	eb := filepath.Join(root, "home-b")
+	neighbor := filepath.Join(root, "neighbor")
+	for _, d := range []string{def, a, eb, neighbor} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	linkA := filepath.Join(root, "link-a")
+	linkDef := filepath.Join(root, "link-def")
+	if err := os.Symlink(a, linkA); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(def, linkDef); err != nil {
+		t.Fatal(err)
+	}
+	usageLog := filepath.Join(root, "u.log")
+	bin := writeClaudeSlotCLI(t, usageLog)
+	driveClaudeScan(t, bin, def, nil)
+	if got := len(slotUsageLines(t, usageLog)); got != 1 {
+		t.Fatalf("default-only usage lines = %d, want 1", got)
+	}
+	if err := os.Remove(usageLog); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	d2 := New(Options{QuotaProbeBinaries: map[string]string{agent.UsageHarnessClaude: bin}})
+	t.Setenv("CLAUDE_CONFIG_DIR", def)
+	d2.config = &Config{QuotaProbeHomes: map[string][]string{"claude": {a, a, linkA, eb, linkDef}}}
+	newQuotaPoller(d2.quota, d2.quotaProbes()).probeDue(context.Background())
+	lines := slotUsageLines(t, usageLog)
+	if len(lines) != 3 {
+		t.Fatalf("usage lines = %v, want default plus two distinct extras", lines)
+	}
+	for _, l := range lines {
+		if strings.Contains(l, neighbor) {
+			t.Fatalf("neighbor probed: %v", lines)
+		}
+	}
+	n := len(lines)
+	newQuotaPoller(d2.quota, d2.quotaProbes()).probeDue(context.Background())
+	if got := len(slotUsageLines(t, usageLog)); got != n {
+		t.Fatalf("second scan usage = %d, want %d (no repeat inside interval)", got, n)
+	}
+}
+
+func TestQuotaPoller_ClaudeUnknownHangAndMuseCancel(t *testing.T) {
+	root := t.TempDir()
+	def := filepath.Join(root, "def")
+	good := filepath.Join(root, "home-a")
+	hang := filepath.Join(root, "hang")
+	later := filepath.Join(root, "home-b")
+	for _, d := range []string{def, good, hang, later} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	usageLog := filepath.Join(root, "u.log")
+	bin := writeClaudeSlotCLI(t, usageLog)
+	d := driveClaudeScan(t, bin, def, []string{good, later})
+	goodKey := normalizeClaudeProbeHome(good)
+	first, ok := d.quota.claudeSlotAttempt(goodKey)
+	if !ok || first.accountID == "" {
+		t.Fatalf("first scan missing good slot: %+v", first)
+	}
+	if err := os.RemoveAll(good); err != nil {
+		t.Fatal(err)
+	}
+	d.quota.mu.Lock()
+	d.quota.claudeAt = time.Now().Add(-providercodex.RateLimitsProbeInterval - time.Second)
+	d.quota.mu.Unlock()
+	newQuotaPoller(d.quota, d.quotaProbes()).probeDue(context.Background())
+	after, ok := d.quota.claudeSlotAttempt(goodKey)
+	if !ok {
+		t.Fatal("good slot missing after rescan")
+	}
+	if after.limits.Unavailable == nil || after.limits.Unavailable.Reason != agent.UsageUnavailableProbeFailed || after.limits.Unavailable.Answered {
+		t.Fatalf("unreadable slot not unknown: %+v", after.limits.Unavailable)
+	}
+	if _, ok := d.quota.claudeSlotAttempt(normalizeClaudeProbeHome(later)); !ok {
+		t.Fatal("sibling slot lost after failure")
+	}
+	if err := os.Remove(usageLog); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	if err := os.Remove(usageLog + ".survived"); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	dHang := New(Options{QuotaProbeBinaries: map[string]string{agent.UsageHarnessClaude: bin}})
+	t.Setenv("CLAUDE_CONFIG_DIR", def)
+	dHang.config = &Config{QuotaProbeHomes: map[string][]string{"claude": {hang, later}}}
+	ctx, cancel := context.WithTimeout(context.Background(), 900*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	newQuotaPoller(dHang.quota, dHang.quotaProbes()).probeDue(ctx)
+	if time.Since(start) > 10*time.Second {
+		t.Fatal("hung scan held caller past deadline")
+	}
+	for _, l := range slotUsageLines(t, usageLog) {
+		if strings.Contains(l, later) {
+			t.Fatalf("later slot started after cancellation: %v", l)
+		}
+	}
+	time.Sleep(2200 * time.Millisecond)
+	if _, err := os.Stat(usageLog + ".survived"); !os.IsNotExist(err) {
+		t.Fatalf("hung child survived: %v", err)
+	}
+	if _, ok := dHang.quota.claudeSlotAttempt(normalizeClaudeProbeHome(def)); !ok {
+		t.Fatal("earlier slot lost after hang")
+	}
+	goodMuse := writeFakeMuseProbeCLI(t, "Muse Code 1.4.9 (1.4.9-R6297.1)", false)
+	dMuse := New(Options{QuotaProbeBinaries: map[string]string{agent.UsageHarnessMuse: goodMuse}})
+	newQuotaPoller(dMuse.quota, dMuse.quotaProbes()).probeDue(context.Background())
+	if got := dMuse.QuotaSnapshot(); len(got) != 1 || got[0].AuthCheck == nil || !got[0].AuthCheck.OK {
+		t.Fatalf("muse initial verdict = %+v", got)
+	}
+	busy := filepath.Join(root, "busy-muse")
+	if err := testexec.WriteFile(busy, []byte("#!/bin/sh\nwhile :; do :; done\n"), 0o700); err != nil {
+		t.Fatalf("write busy muse: %v", err)
+	}
+	dMuse2 := New(Options{QuotaProbeBinaries: map[string]string{agent.UsageHarnessMuse: busy}})
+	dMuse2.quota = dMuse.quota
+	dMuse2.quota.mu.Lock()
+	dMuse2.quota.museAt = time.Now().Add(-providercodex.RateLimitsProbeInterval - time.Second)
+	dMuse2.quota.mu.Unlock()
+	short, cancel2 := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel2()
+	newQuotaPoller(dMuse2.quota, dMuse2.quotaProbes()).probeDue(short)
+	if got := dMuse.quota.snapshot(); len(got) != 1 || got[0].AuthCheck == nil || !got[0].AuthCheck.OK {
+		t.Fatalf("cancelled muse overwrote verdict: %+v", got)
 	}
 }

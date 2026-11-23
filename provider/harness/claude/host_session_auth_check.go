@@ -34,6 +34,14 @@ func (b *boundedHostLoginOutput) Write(data []byte) (int, error) {
 // the status child; unrelated process credentials are never inherited.
 // This is local login evidence, not online model entitlement.
 func CheckHostSessionLogin(ctx context.Context, binary string) error {
+	return checkHostSessionLogin(ctx, binary, "")
+}
+
+func CheckHostSessionLoginWithConfigDir(ctx context.Context, binary, configDir string) error {
+	return checkHostSessionLogin(ctx, binary, configDir)
+}
+
+func checkHostSessionLogin(ctx context.Context, binary, override string) error {
 	if ctx == nil || !filepath.IsAbs(binary) {
 		return fmt.Errorf("%w: Claude host login needs an absolute CLI path and context", agent.ErrProviderUnavailable)
 	}
@@ -53,15 +61,31 @@ func CheckHostSessionLogin(ctx context.Context, binary string) error {
 	if user, present := os.LookupEnv("USER"); present && user != "" {
 		env = append(env, "USER="+user)
 	}
-	for _, name := range []string{"CLAUDE_CONFIG_DIR", "XDG_CONFIG_HOME"} {
-		if value, present := os.LookupEnv(name); present && value != "" {
+	if override != "" {
+		if !filepath.IsAbs(override) {
+			return fmt.Errorf("%w: Claude host login config home must be absolute", agent.ErrProviderUnavailable)
+		}
+		env = append(env, "CLAUDE_CONFIG_DIR="+override)
+		if value, present := os.LookupEnv("XDG_CONFIG_HOME"); present && value != "" {
 			if !filepath.IsAbs(value) {
 				value, err = filepath.Abs(value)
 				if err != nil {
 					return fmt.Errorf("%w: resolve Claude host login config locator: %w", agent.ErrProviderUnavailable, err)
 				}
 			}
-			env = append(env, name+"="+value)
+			env = append(env, "XDG_CONFIG_HOME="+value)
+		}
+	} else {
+		for _, name := range []string{"CLAUDE_CONFIG_DIR", "XDG_CONFIG_HOME"} {
+			if value, present := os.LookupEnv(name); present && value != "" {
+				if !filepath.IsAbs(value) {
+					value, err = filepath.Abs(value)
+					if err != nil {
+						return fmt.Errorf("%w: resolve Claude host login config locator: %w", agent.ErrProviderUnavailable, err)
+					}
+				}
+				env = append(env, name+"="+value)
+			}
 		}
 	}
 	probeDir, err := tempown.MkdirTemp("", tempown.PrefixClaudeLogin)

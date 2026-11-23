@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -42,6 +43,14 @@ import (
 // a stable hash of the login response, so the platform can correlate
 // the entry without ever seeing who signed in.
 func ProbeUsage(ctx context.Context, binary string) (accountID string, probed agent.UsageLimits, names ScopedLimitNames) {
+	return ProbeUsageWithConfigDir(ctx, binary, "")
+}
+
+func DefaultProbeConfigDir() string {
+	return interactiveUsageConfigDir(nil)
+}
+
+func ProbeUsageWithConfigDir(ctx context.Context, binary, configDir string) (accountID string, probed agent.UsageLimits, names ScopedLimitNames) {
 	now := time.Now()
 	checkedAt := agent.ISOTime(now)
 	failed := func() (string, agent.UsageLimits, ScopedLimitNames) {
@@ -50,21 +59,29 @@ func ProbeUsage(ctx context.Context, binary string) (accountID string, probed ag
 	if strings.TrimSpace(binary) == "" {
 		return failed()
 	}
+	if configDir != "" {
+		if !filepath.IsAbs(configDir) {
+			return failed()
+		}
+		if info, err := os.Stat(configDir); err != nil || !info.IsDir() {
+			return failed()
+		}
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, UsageProbeTimeout)
 	defer cancel()
-	raw, ok := readUsageControl(probeCtx, binary)
+	raw, ok := readUsageControlFor(probeCtx, binary, configDir)
 	if !ok {
 		out := agent.MakeUnavailableUsageLimits(checkedAt, agent.UsageUnavailableProbeFailed, "Claude did not answer the usage request.")
-		if loginRefused(probeCtx, binary) {
+		if loginRefusedFor(probeCtx, binary, configDir) {
 			out.Unavailable.Answered = true
 		}
 		return "", out, ScopedLimitNames{}
 	}
 	limits, scoped := UsageResponseToLimits(raw, checkedAt)
-	return loginAccountID(probeCtx, binary), limits, scoped
+	return loginAccountIDFor(probeCtx, binary, configDir), limits, scoped
 }
 
 // usageControlRequest is the single control request the probe sends
@@ -114,6 +131,10 @@ var probeUsageArgv = []string{
 // on macOS). Unrelated process credentials are never inherited: only
 // these names cross, never tokens or keys.
 func probeUsageEnv() []string {
+	return probeUsageEnvFor("")
+}
+
+func probeUsageEnvFor(override string) []string {
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
 		home = os.Getenv("HOME")
@@ -121,6 +142,13 @@ func probeUsageEnv() []string {
 	env := []string{"HOME=" + home, "PATH=" + os.Getenv("PATH"), "NO_COLOR=1"}
 	if user, present := os.LookupEnv("USER"); present && user != "" {
 		env = append(env, "USER="+user)
+	}
+	if override != "" {
+		env = append(env, "CLAUDE_CONFIG_DIR="+override)
+		if value, present := os.LookupEnv("XDG_CONFIG_HOME"); present && value != "" {
+			env = append(env, "XDG_CONFIG_HOME="+value)
+		}
+		return env
 	}
 	for _, name := range []string{"CLAUDE_CONFIG_DIR", "XDG_CONFIG_HOME"} {
 		if value, present := os.LookupEnv(name); present && value != "" {
@@ -158,6 +186,10 @@ func (b *boundedProbeOutput) Write(data []byte) (int, error) {
 // produced one — a missing binary, a timeout, an unreadable reply —
 // which is never a login verdict by itself.
 func readUsageControl(ctx context.Context, binary string) (json.RawMessage, bool) {
+	return readUsageControlFor(ctx, binary, "")
+}
+
+func readUsageControlFor(ctx context.Context, binary, override string) (json.RawMessage, bool) {
 	probeDir, err := tempown.MkdirTemp("", tempown.PrefixClaudeUsage)
 	if err != nil {
 		return nil, false
@@ -166,7 +198,7 @@ func readUsageControl(ctx context.Context, binary string) (json.RawMessage, bool
 	// nolint:gosec // binary is the resolved CLI path the provider probed at construction.
 	command := exec.CommandContext(ctx, binary, probeUsageArgv...)
 	command.Dir = probeDir
-	command.Env = probeUsageEnv()
+	command.Env = probeUsageEnvFor(override)
 	command.Stdin = strings.NewReader(usageProbeStdin(probeDir))
 	// A hung child (a usage read that never answers) must not hold
 	// the probe past the context: kill the process group on expiry so
@@ -217,6 +249,10 @@ func scanUsageControl(output []byte) (json.RawMessage, bool) {
 // it. A check that never ran (missing binary, timeout, unreadable
 // reply) is not a refusal.
 func loginRefused(ctx context.Context, binary string) bool {
+	return loginRefusedFor(ctx, binary, "")
+}
+
+func loginRefusedFor(ctx context.Context, binary, override string) bool {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -229,6 +265,9 @@ func loginRefused(ctx context.Context, binary string) bool {
 	}
 	checkCtx, cancel := context.WithTimeout(ctx, hostLoginTimeout)
 	defer cancel()
+	if override != "" {
+		return CheckHostSessionLoginWithConfigDir(checkCtx, binary, override) != nil && checkCtx.Err() == nil
+	}
 	return CheckHostSessionLogin(checkCtx, binary) != nil && checkCtx.Err() == nil
 }
 
@@ -240,6 +279,10 @@ func loginRefused(ctx context.Context, binary string) bool {
 // refusal would mint a stable id for "nobody signed in" and merge
 // every logged-out host into one phantom account.
 func loginAccountID(ctx context.Context, binary string) string {
+	return loginAccountIDFor(ctx, binary, "")
+}
+
+func loginAccountIDFor(ctx context.Context, binary, override string) string {
 	if strings.TrimSpace(binary) == "" {
 		return ""
 	}
@@ -248,14 +291,18 @@ func loginAccountID(ctx context.Context, binary string) string {
 	}
 	checkCtx, cancel := context.WithTimeout(ctx, hostLoginTimeout)
 	defer cancel()
-	if CheckHostSessionLogin(checkCtx, binary) != nil {
+	if override != "" {
+		if CheckHostSessionLoginWithConfigDir(checkCtx, binary, override) != nil {
+			return ""
+		}
+	} else if CheckHostSessionLogin(checkCtx, binary) != nil {
 		return ""
 	}
 	statusCtx, cancel := context.WithTimeout(ctx, hostLoginTimeout)
 	defer cancel()
 	// nolint:gosec // binary is the resolved CLI path the provider probed at construction.
 	command := exec.CommandContext(statusCtx, binary, "auth", "status", "--json")
-	command.Env = loginStatusEnv()
+	command.Env = loginStatusEnvFor(override)
 	var stdout boundedHostLoginOutput
 	command.Stdout = &stdout
 	command.Stderr = &boundedHostLoginOutput{}
@@ -270,6 +317,10 @@ func loginAccountID(ctx context.Context, binary string) string {
 // (real home, config overrides, USER) to the status child, so the two
 // agree on what login backs the host. See probeUsageEnv.
 func loginStatusEnv() []string {
+	return loginStatusEnvFor("")
+}
+
+func loginStatusEnvFor(override string) []string {
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
 		home = os.Getenv("HOME")
@@ -277,6 +328,13 @@ func loginStatusEnv() []string {
 	env := []string{"HOME=" + home, "PATH=" + os.Getenv("PATH"), "NO_COLOR=1"}
 	if user, present := os.LookupEnv("USER"); present && user != "" {
 		env = append(env, "USER="+user)
+	}
+	if override != "" {
+		env = append(env, "CLAUDE_CONFIG_DIR="+override)
+		if value, present := os.LookupEnv("XDG_CONFIG_HOME"); present && value != "" {
+			env = append(env, "XDG_CONFIG_HOME="+value)
+		}
+		return env
 	}
 	for _, name := range []string{"CLAUDE_CONFIG_DIR", "XDG_CONFIG_HOME"} {
 		if value, present := os.LookupEnv(name); present && value != "" {

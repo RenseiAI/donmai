@@ -104,7 +104,8 @@ type Config struct {
 	// runner.DefaultMaxToolOutputBytes (262144, 256 KiB); a positive
 	// value states DONMAI_MAX_TOOL_OUTPUT_BYTES in every spawned worker's
 	// environment. Read at daemon start.
-	MaxToolOutputBytes int `yaml:"maxToolOutputBytes,omitempty" json:"maxToolOutputBytes,omitempty"`
+	MaxToolOutputBytes int                 `yaml:"maxToolOutputBytes,omitempty" json:"maxToolOutputBytes,omitempty"`
+	QuotaProbeHomes    map[string][]string `yaml:"quotaProbeHomes,omitempty" json:"-"`
 	// Workarea holds Layer-3 workarea-surface tunables (archive root,
 	// diff streaming threshold). Optional; populated with defaults if
 	// absent.
@@ -1284,6 +1285,16 @@ func validateConfig(c *Config) error {
 	case "", TrustModePermissive, TrustModeSignedByAllowlist, TrustModeAttested:
 	default:
 		return fmt.Errorf("trust.mode invalid: %q (want permissive | signed-by-allowlist | attested)", c.Trust.Mode)
+	}
+	for harness, homes := range c.QuotaProbeHomes {
+		if harness != "claude" {
+			return fmt.Errorf("quotaProbeHomes: unsupported harness %q", harness)
+		}
+		for i, home := range homes {
+			if strings.TrimSpace(home) == "" || !filepath.IsAbs(home) {
+				return fmt.Errorf("quotaProbeHomes.claude[%d] must be an absolute path", i)
+			}
+		}
 	}
 	return nil
 }

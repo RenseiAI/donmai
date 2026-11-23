@@ -31,6 +31,15 @@ type quotaState struct {
 	codexAuth  *agent.UsageAuthCheck
 	claudeAuth *agent.UsageAuthCheck
 	museAuth   *agent.UsageAuthCheck
+
+	claudeAttempts map[string]claudeSlotAttempt
+}
+
+type claudeSlotAttempt struct {
+	at        time.Time
+	accountID string
+	limits    agent.UsageLimits
+	auth      *agent.UsageAuthCheck
 }
 
 // QuotaSnapshot composes the heartbeat quota field: one entry per
@@ -169,6 +178,39 @@ func (q *quotaState) noteClaudeProbe(accountID string, probed agent.UsageLimits,
 	if q.claude != nil && q.claude.Unavailable == nil {
 		q.claudeID = accountID
 	}
+}
+
+func (q *quotaState) recordClaudeSlotAttempt(home, accountID string, probed agent.UsageLimits, at time.Time, isDefault bool) {
+	if q == nil {
+		return
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.claudeAttempts == nil {
+		q.claudeAttempts = make(map[string]claudeSlotAttempt)
+	}
+	q.claudeAttempts[home] = claudeSlotAttempt{at: at, accountID: accountID, limits: probed, auth: agent.UsageAuthCheckAfterProbe(agent.UsageHarnessClaude, &probed, at)}
+	if !isDefault {
+		return
+	}
+	q.claude = agent.ResolveUsageLimitsAfterProbe(q.claude, &probed)
+	q.claudeAt = at
+	if check := agent.UsageAuthCheckAfterProbe(agent.UsageHarnessClaude, &probed, at); check != nil {
+		q.claudeAuth = check
+	}
+	if q.claude != nil && q.claude.Unavailable == nil {
+		q.claudeID = accountID
+	}
+}
+
+func (q *quotaState) claudeSlotAttempt(home string) (claudeSlotAttempt, bool) {
+	if q == nil {
+		return claudeSlotAttempt{}, false
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	attempt, ok := q.claudeAttempts[home]
+	return attempt, ok
 }
 
 // noteCodexUpdate folds one turn-driven codex update into the published

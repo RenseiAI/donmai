@@ -3,6 +3,9 @@ package daemon
 import (
 	"context"
 	"log/slog"
+	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -29,7 +32,11 @@ func (d *Daemon) quotaProbes() map[string]quotaProbeFunc {
 		probes[agent.UsageHarnessCodex] = codexQuotaProbe(bin, true)
 	}
 	if bin := d.opts.QuotaProbeBinaries[agent.UsageHarnessClaude]; bin != "" {
-		probes[agent.UsageHarnessClaude] = claudeQuotaProbe(bin)
+		var extras []string
+		if cfg := d.Config(); cfg != nil {
+			extras = cfg.QuotaProbeHomes[agent.UsageHarnessClaude]
+		}
+		probes[agent.UsageHarnessClaude] = claudeQuotaProbe(bin, extras)
 	}
 	if bin := d.opts.QuotaProbeBinaries[agent.UsageHarnessMuse]; bin != "" {
 		probes[agent.UsageHarnessMuse] = museQuotaProbe(bin)
@@ -127,19 +134,80 @@ func codexQuotaProbe(codexBin string, hostAuth bool) quotaProbeFunc {
 	}
 }
 
-// claudeQuotaProbe returns the probe that reads the host's claude
-// login through a short-lived CLI usage session. binary is the
-// resolved claude binary; empty disables the probe like the codex
-// one above.
-func claudeQuotaProbe(binary string) quotaProbeFunc {
+type claudeScanSlot struct {
+	key       string
+	dir       string
+	isDefault bool
+}
+
+func normalizeClaudeProbeHome(dir string) string {
+	cleaned := filepath.Clean(dir)
+	if resolved, err := filepath.EvalSymlinks(cleaned); err == nil && resolved != "" {
+		return filepath.Clean(resolved)
+	}
+	if parent, err := filepath.EvalSymlinks(filepath.Dir(cleaned)); err == nil && parent != "" {
+		return filepath.Join(filepath.Clean(parent), filepath.Base(cleaned))
+	}
+	return cleaned
+}
+
+func buildClaudeScanPlan(extraHomes []string) []claudeScanSlot {
+	defDir := providerclaude.DefaultProbeConfigDir()
+	defKey := ""
+	if defDir != "" {
+		defKey = normalizeClaudeProbeHome(defDir)
+	}
+	seen := map[string]struct{}{defKey: {}}
+	var extras []string
+	for _, raw := range extraHomes {
+		if strings.TrimSpace(raw) == "" || !filepath.IsAbs(raw) {
+			continue
+		}
+		key := normalizeClaudeProbeHome(filepath.Clean(raw))
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		extras = append(extras, key)
+	}
+	sort.Strings(extras)
+	plan := make([]claudeScanSlot, 0, 1+len(extras))
+	plan = append(plan, claudeScanSlot{key: defKey, dir: "", isDefault: true})
+	for _, key := range extras {
+		plan = append(plan, claudeScanSlot{key: key, dir: key})
+	}
+	return plan
+}
+
+func claudeQuotaProbe(binary string, extraHomes []string) quotaProbeFunc {
+	homes := append([]string(nil), extraHomes...)
 	return func(ctx context.Context, q *quotaState) {
-		at := time.Now()
+		if ctx == nil {
+			ctx = context.Background()
+		}
 		if binary == "" {
-			q.noteClaudeProbe("", agent.MakeUnavailableUsageLimits(agent.ISOTime(at), agent.UsageUnavailableProbeFailed, "Claude did not answer the usage request."), at)
+			at := time.Now()
+			plan := buildClaudeScanPlan(homes)
+			defKey := ""
+			if len(plan) > 0 {
+				defKey = plan[0].key
+			}
+			q.recordClaudeSlotAttempt(defKey, "", agent.MakeUnavailableUsageLimits(agent.ISOTime(at), agent.UsageUnavailableProbeFailed, "Claude did not answer the usage request."), at, true)
 			return
 		}
-		accountID, probed, _ := providerclaude.ProbeUsage(ctx, binary)
-		q.noteClaudeProbe(accountID, probed, at)
+		for _, slot := range buildClaudeScanPlan(homes) {
+			if ctx.Err() != nil {
+				return
+			}
+			slotCtx, cancel := context.WithTimeout(ctx, quotaProbeTimeout)
+			at := time.Now()
+			accountID, probed, _ := providerclaude.ProbeUsageWithConfigDir(slotCtx, binary, slot.dir)
+			cancel()
+			q.recordClaudeSlotAttempt(slot.key, accountID, probed, at, slot.isDefault)
+			if ctx.Err() != nil {
+				return
+			}
+		}
 	}
 }
 
@@ -149,29 +217,23 @@ func claudeQuotaProbe(binary string) quotaProbeFunc {
 // slot rather than an account.
 const museHostSessionAccountID = "muse-host-session"
 
-// museQuotaProbe returns the probe that checks the host's muse CLI:
-// resolve the binary through the shared harness resolver, then run
-// the host login check. The CLI exposes no usage read and reports no
-// windows on a cold host, so the entry carries an empty window set
-// beside its verdict. An unresolvable binary disables the probe like
-// the codex one: the attempt records nothing and the heartbeat keeps
-// omitting the muse entry.
-//
-// The check runs under context.Background(), not the per-attempt ctx:
-// a cancelled attempt must not record a false ok:false verdict, so
-// the probe always runs to its own 5 s bound and a stopping poller
-// waits it out instead of publishing the cancellation as a refusal.
+// museQuotaProbe checks the host muse CLI. Cancellation is unanswered.
 func museQuotaProbe(binary string) quotaProbeFunc {
-	return func(_ context.Context, q *quotaState) {
+	return func(ctx context.Context, q *quotaState) {
+		if ctx == nil {
+			ctx = context.Background()
+		}
 		at := time.Now()
 		if binary == "" {
 			q.noteMuseProbe("", agent.MakeUnavailableUsageLimits(agent.ISOTime(at), agent.UsageUnavailableProbeFailed, "Muse did not answer the usage request."), at)
 			return
 		}
 		probed := agent.MakeUsageLimits(agent.ISOTime(at), nil)
-		if err := providermuse.CheckHostSessionLogin(context.Background(), binary); err != nil {
+		if err := providermuse.CheckHostSessionLogin(ctx, binary); err != nil {
 			out := agent.MakeUnavailableUsageLimits(agent.ISOTime(at), agent.UsageUnavailableProbeFailed, "Muse did not answer the usage request.")
-			out.Unavailable.Answered = true
+			// Cancellation never answers: a stopping poller must not
+			// publish its own shutdown as a login refusal.
+			out.Unavailable.Answered = ctx.Err() == nil
 			probed = out
 		}
 		q.noteMuseProbe(museHostSessionAccountID, probed, at)
@@ -283,11 +345,8 @@ func (p *quotaPoller) untilNextDue(now time.Time) time.Duration {
 	return wait
 }
 
-// probeDue runs one attempt for every harness whose probe is due. Each
-// attempt carries the per-attempt timeout and feeds the cache even
-// when the read fails: every attempt advances the probe clock (so
-// retries stay on the interval cadence) and an answered refusal
-// refreshes the login verdict.
+// probeDue runs one attempt per due harness. Claude gets a fresh per-slot
+// timeout from the scan context; others share one per-attempt timeout.
 func (p *quotaPoller) probeDue(ctx context.Context) {
 	now := time.Now()
 	for harness, probe := range p.probes {
@@ -308,9 +367,16 @@ func (p *quotaPoller) probeDue(ctx context.Context) {
 		if !due {
 			continue
 		}
-		attemptCtx, cancel := context.WithTimeout(ctx, quotaProbeTimeout)
-		probe(attemptCtx, p.quota)
-		cancel()
+		if ctx.Err() != nil {
+			return
+		}
+		if harness == agent.UsageHarnessClaude {
+			probe(ctx, p.quota)
+		} else {
+			attemptCtx, cancel := context.WithTimeout(ctx, quotaProbeTimeout)
+			probe(attemptCtx, p.quota)
+			cancel()
+		}
 		if ctx.Err() != nil {
 			return
 		}
