@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"errors"
 	"math"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -408,7 +409,10 @@ func (p *Provider) ProbeQuota(ctx context.Context) (accountID, plan string, prob
 	if p == nil {
 		return "", "", agent.MakeUnavailableUsageLimits(agent.ISOTime(time.Now()), agent.UsageUnavailableProbeFailed, "Codex did not answer the usage request.")
 	}
-	if err := p.ensureProbeStarted(); err != nil {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := p.ensureProbeStarted(ctx); err != nil {
 		return "", "", agent.MakeUnavailableUsageLimits(agent.ISOTime(time.Now()), agent.UsageUnavailableProbeFailed, RateLimitsFailureMessage(err))
 	}
 	p.startMu.Lock()
@@ -418,7 +422,88 @@ func (p *Provider) ProbeQuota(ctx context.Context) (accountID, plan string, prob
 	if probed.Unavailable != nil {
 		return "", "", probed
 	}
-	return readAccountIdentity(ctx, client, probed)
+	if ctx.Err() != nil {
+		return "", "", agent.MakeUnavailableUsageLimits(agent.ISOTime(time.Now()), agent.UsageUnavailableProbeFailed, "Codex did not answer the usage request.")
+	}
+	accountID, plan, probed = readAccountIdentity(ctx, client, probed)
+	if ctx.Err() != nil {
+		return "", "", agent.MakeUnavailableUsageLimits(agent.ISOTime(time.Now()), agent.UsageUnavailableProbeFailed, "Codex did not answer the usage request.")
+	}
+	return accountID, plan, probed
+}
+
+// ProbeQuotaForLogin reads quota for exactly one login through a probe-owned
+// app-server, bound by the caller's deadline from construction through
+// shutdown. sourceHome selects the login: empty preserves the default host
+// resolution, while a non-empty value must be an absolute path whose auth.json
+// is projected through the checked private hard link. The child always starts
+// with the private CODEX_HOME and must confirm it; the source home is never
+// passed to the child and its files are never written. Cancellation at any
+// point — including during the identity reread or shutdown grace — yields an
+// unknown snapshot with empty identity and plan, while a live login refusal
+// stays answered. The private home is joined before removal and retained when
+// writer quiescence cannot be proved.
+func ProbeQuotaForLogin(ctx context.Context, opts Options, sourceHome string) (accountID, plan string, probed agent.UsageLimits) {
+	fail := func() (string, string, agent.UsageLimits) {
+		return "", "", agent.MakeUnavailableUsageLimits(agent.ISOTime(time.Now()), agent.UsageUnavailableProbeFailed, "Codex did not answer the usage request.")
+	}
+	if ctx == nil || ctx.Err() != nil {
+		return fail()
+	}
+	explicit := strings.TrimSpace(sourceHome) != ""
+	var hostAuthFile string
+	fileAuth := opts.HostSessionAuth
+	if explicit {
+		if !opts.HostSessionAuth {
+			return fail()
+		}
+		// Resolve before constructing the private home and never consult
+		// the default: a valid explicit login must not depend on it.
+		resolved, err := explicitHostSessionAuthFile(sourceHome)
+		if err != nil {
+			return fail()
+		}
+		if _, err := os.Lstat(resolved); err != nil {
+			return fail()
+		}
+		hostAuthFile = resolved
+		fileAuth = true
+	} else if opts.HostSessionAuth {
+		resolved, err := resolveHostSessionAuthFile()
+		if err != nil {
+			return fail()
+		}
+		hostAuthFile = resolved
+	}
+	provider, err := newProviderWithHostAuth(opts, hostAuthFile, fileAuth)
+	if err != nil {
+		return fail()
+	}
+	// Own shutdown from construction onward under the attempt budget: the
+	// deferred Shutdown joins the owned group before the private home is
+	// removed, caps grace at the time remaining, and requests zero grace
+	// once the attempt is cancelled or expired.
+	defer func() {
+		_ = provider.Shutdown(ctx)
+	}()
+	if err := provider.ensureProbeStarted(ctx); err != nil {
+		return fail()
+	}
+	provider.startMu.Lock()
+	client := provider.client
+	provider.startMu.Unlock()
+	probed = NewRateLimitsProbe().ReadProbe(ctx, client)
+	if probed.Unavailable != nil {
+		return "", "", probed
+	}
+	if ctx.Err() != nil {
+		return fail()
+	}
+	accountID, plan, probed = readAccountIdentity(ctx, client, probed)
+	if ctx.Err() != nil {
+		return fail()
+	}
+	return accountID, plan, probed
 }
 
 // readAccountIdentity re-reads the raw response to lift the account

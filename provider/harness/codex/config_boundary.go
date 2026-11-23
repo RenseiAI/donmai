@@ -169,6 +169,18 @@ func resolveHostSessionAuthFile() (string, error) {
 	return filepath.Join(codexHome, codexAuthFileName), nil
 }
 
+// explicitHostSessionAuthFile resolves an explicit source home's auth.json
+// without consulting the default host home. The result must still be
+// projected through linkHostSessionAuth so mode, inode and symlink checks
+// apply. It carries no credential bytes and never names the default home.
+func explicitHostSessionAuthFile(sourceHome string) (string, error) {
+	clean := filepath.Clean(sourceHome)
+	if !filepath.IsAbs(clean) {
+		return "", errors.New("explicit Codex source home must be absolute")
+	}
+	return filepath.Join(clean, codexAuthFileName), nil
+}
+
 // linkHostSessionAuth projects exactly the host login into the private Codex
 // home. A hard link is deliberate: unlike a copy it keeps refresh-token writes
 // coherent, and unlike reusing the host CODEX_HOME it does not expose ambient
