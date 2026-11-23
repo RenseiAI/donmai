@@ -877,6 +877,7 @@ func (d *Daemon) executeHostUpgrade(ctx context.Context) (*UpdateResult, error) 
 		CurrentVersion: d.EffectiveVersion(),
 		Config:         cfg.AutoUpdate,
 		CDNBase:        cdnBase,
+		Verifier:       d.managedUpdateVerifier(cfg.AutoUpdate),
 		SkipExit:       true,
 	})
 	return updater.RunUpdate(ctx)
