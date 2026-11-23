@@ -36,7 +36,10 @@ func (h *codexFailedTurnHandle) Inject(context.Context, string) error {
 
 func (h *codexFailedTurnHandle) Stop(context.Context) error { return nil }
 
-func newCodexFailedTurnHandle(progress string, terminalErrors []string) *codexFailedTurnHandle {
+func newCodexFailedTurnHandle(progress string, terminalErrors []string, subtype string) *codexFailedTurnHandle {
+	if subtype == "" {
+		subtype = "turn_failed"
+	}
 	ch := make(chan agent.Event, 8)
 	ch <- agent.InitEvent{SessionID: "codex-failed-turn"}
 	// Interim progress note: without the fix the terminal reason falls back
@@ -46,7 +49,7 @@ func newCodexFailedTurnHandle(progress string, terminalErrors []string) *codexFa
 	ch <- agent.SystemEvent{Subtype: "codex_moderation", Message: "Codex turn moderation: {\"review\":true}"}
 	// Mapped form of the error notification.
 	ch <- agent.SystemEvent{Subtype: "codex_error", Message: "Codex error"}
-	ch <- agent.ResultEvent{Success: false, Errors: terminalErrors, ErrorSubtype: "turn_failed"}
+	ch <- agent.ResultEvent{Success: false, Errors: terminalErrors, ErrorSubtype: subtype}
 	close(ch)
 	return &codexFailedTurnHandle{events: ch}
 }
@@ -63,23 +66,39 @@ func TestRun_CodexFailedTurnReportsProviderError(t *testing.T) {
 	tests := []struct {
 		name           string
 		terminalErrors []string
+		subtype        string
 		wantMode       string
 		wantError      string
 	}{
 		{
 			name:           "provider refusal is the failure reason",
 			terminalErrors: []string{refusal},
+			subtype:        "turn_failed",
 			wantMode:       FailureProviderError,
 			wantError:      refusal,
 		},
 		{
 			name:           "synthesized fallback keeps silent-exit",
 			terminalErrors: []string{"Turn failed"},
+			subtype:        "turn_failed",
 			wantMode:       FailureSilentExit,
 		},
 		{
 			name:           "no error text keeps silent-exit",
 			terminalErrors: nil,
+			subtype:        "turn_failed",
+			wantMode:       FailureSilentExit,
+		},
+		{
+			name:           "interrupted turn keeps silent-exit",
+			terminalErrors: []string{"interrupted by user"},
+			subtype:        "interrupted",
+			wantMode:       FailureSilentExit,
+		},
+		{
+			name:           "turn cap keeps silent-exit",
+			terminalErrors: []string{"max turns exceeded"},
+			subtype:        "error_max_turns",
 			wantMode:       FailureSilentExit,
 		},
 	}
@@ -98,7 +117,7 @@ func TestRun_CodexFailedTurnReportsProviderError(t *testing.T) {
 			}
 			provider := &evidenceProvider{
 				HarnessProvider: hp,
-				spawnHandle:     newCodexFailedTurnHandle(progress, tc.terminalErrors),
+				spawnHandle:     newCodexFailedTurnHandle(progress, tc.terminalErrors, tc.subtype),
 			}
 			reg := NewRegistry()
 			if err := reg.Register(provider); err != nil {
@@ -261,5 +280,127 @@ func TestRun_OutputCapKeepsFailureTransition(t *testing.T) {
 	states, _ := stateWrites(t, calls, mu)
 	if !reflect.DeepEqual(states, []string{"state-start", "state-failure"}) {
 		t.Fatalf("state writes = %v; want [state-start state-failure] (the failure transition ran)", states)
+	}
+}
+
+// TestRun_NonProviderTerminalKeepsFailureTransition pins that an
+// interrupted turn (a host reporting turn/completed cancelled before a tool
+// ran) and a turn-cap stop (error_max_turns from the checked-in CLI result)
+// stay silent-exit failures with the declared failure transition, even when
+// the work item opts into deferring provider-error failures. It drives the
+// production entry point (Runner.Run) with stage transitions so the
+// deferred-vs-failure branch is observed through the real state writes, not
+// only the mode string.
+func TestRun_NonProviderTerminalKeepsFailureTransition(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		subtype  string
+		errors   []string
+		tailWant string
+	}{
+		{name: "interrupted by user before tool runs", subtype: "interrupted", errors: []string{"interrupted by user"}, tailWant: "interrupted by user"},
+		{name: "turn cap is not a provider failure", subtype: "error_max_turns", errors: []string{"max turns exceeded"}, tailWant: "max turns exceeded"},
+	}
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			srv, calls, mu := stubProxyServer(t)
+			wtm, err := worktree.NewManager(worktree.Options{ParentDir: t.TempDir()})
+			if err != nil {
+				t.Fatalf("worktree.NewManager: %v", err)
+			}
+			poster, err := result.NewPoster(result.Options{
+				PlatformURL: srv.URL, WorkerID: "wkr-cap", AuthToken: "tok-cap", HTTPClient: srv.Client(), BaseDelay: 1,
+			})
+			if err != nil {
+				t.Fatalf("result.NewPoster: %v", err)
+			}
+			base, err := stub.New()
+			if err != nil {
+				t.Fatalf("stub.New: %v", err)
+			}
+			hp, ok := base.(agent.HarnessProvider)
+			if !ok {
+				t.Fatal("stub provider does not satisfy HarnessProvider")
+			}
+			ch := make(chan agent.Event, 8)
+			ch <- agent.InitEvent{SessionID: "non-provider-terminal"}
+			ch <- agent.AssistantTextEvent{Text: "partial output..."}
+			ch <- agent.ResultEvent{Success: false, Errors: tc.errors, ErrorSubtype: tc.subtype}
+			close(ch)
+			provider := &evidenceProvider{HarnessProvider: hp, spawnHandle: &outputCapHandle{events: ch}}
+			reg := NewRegistry()
+			if err := reg.Register(provider); err != nil {
+				t.Fatalf("Register: %v", err)
+			}
+			r, err := New(Options{
+				Registry: reg, WorktreeManager: wtm, Poster: poster, HTTPClient: srv.Client(),
+				Logger:                 slog.New(slog.NewTextHandler(io.Discard, nil)),
+				SkipBackstop:           true,
+				SkipSteering:           true,
+				PreserveWorktreeAlways: true,
+			})
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			qw := QueuedWork{
+				QueuedWork:             queuedWorkBase("NON-PROVIDER-TERMINAL"),
+				WorkerID:               "wkr-cap",
+				AuthToken:              "tok-cap",
+				PlatformURL:            srv.URL,
+				ResolvedProfile:        ResolvedProfile{Provider: agent.ProviderStub},
+				DeferFailureTransition: true,
+			}
+			qw.WorkType = WorkTypeQAStr
+			qw.Repository = makeBareRepo(t)
+			qw.Stage = &stagewire.Stage{ID: "stg", Key: "verify", Name: "Verify", Role: stagewire.RoleReview}
+			qw.Card = &stagewire.Card{ID: "card", Handle: "reviewer", Contract: &stagewire.Contract{Verdict: true, WorkResult: true}}
+			qw.Transitions = stageTransitionsFixture()
+			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			defer cancel()
+			res, err := r.Run(ctx, qw)
+			if err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			if res == nil {
+				t.Fatal("Run returned nil result")
+			}
+			if res.Status != "failed" {
+				t.Fatalf("Status = %q; want failed (mode=%q error=%q)", res.Status, res.FailureMode, res.Error)
+			}
+			if res.FailureMode != FailureSilentExit {
+				t.Fatalf("FailureMode = %q; want %q (subtype %q is not a provider failure; Error=%q OutputTail=%q)", res.FailureMode, FailureSilentExit, tc.subtype, res.Error, res.OutputTail)
+			}
+			if res.Error != "" {
+				t.Fatalf("Error = %q; want empty (the diagnostic rides OutputTail, not the retry-bearing Error)", res.Error)
+			}
+			if res.Resumable {
+				t.Fatal("Resumable = true; want false (only provider-error failures are resumable)")
+			}
+			if res.ToolCalls != 0 {
+				t.Fatalf("ToolCalls = %d; want 0 (the turn made no tool call)", res.ToolCalls)
+			}
+			if !strings.Contains(res.OutputTail, tc.tailWant) {
+				t.Fatalf("OutputTail = %q; want it to preserve %q", res.OutputTail, tc.tailWant)
+			}
+			if res.StageTransition == nil {
+				t.Fatal("StageTransition is nil; want the failure transition record")
+			}
+			if res.StageTransition.Reason == "deferred-provider-error" {
+				t.Fatalf("StageTransition reason = deferred-provider-error; want the failure transition (states=%v)", res.StageTransition)
+			}
+			if res.StageTransition.Outcome != string(stagewire.OutcomeFailure) || !res.StageTransition.Succeeded {
+				t.Fatalf("StageTransition = %+v; want failure outcome succeeded", res.StageTransition)
+			}
+			if res.LinearStatusTransition != nil {
+				t.Fatalf("legacy post-session ran: %+v", res.LinearStatusTransition)
+			}
+			states, _ := stateWrites(t, calls, mu)
+			if !reflect.DeepEqual(states, []string{"state-start", "state-failure"}) {
+				t.Fatalf("state writes = %v; want [state-start state-failure] (the failure transition ran)", states)
+			}
+		})
 	}
 }

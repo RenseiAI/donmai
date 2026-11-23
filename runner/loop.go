@@ -4070,12 +4070,16 @@ func classifyWorktreeErr(err error) string {
 // failed terminal ResultEvent. It joins the non-empty Errors entries, but
 // ignores the harness-synthesized fallbacks ("Turn failed",
 // "Turn was interrupted") the mappers emit when the provider reported no
-// error text, and the finish-reason stops (ErrorSubtype "finish_*") a
+// error text, the finish-reason stops (ErrorSubtype "finish_*") a
 // mapper reports when the model hit a cap or policy finish reason instead
-// of a provider failure (for example Gemini "MAX_TOKENS"): those carry no
-// provider diagnostic, so a failed terminal with only that text keeps
-// silent-exit instead of provider-error. The OutputTail fallback still
-// preserves the finish reason as the diagnostic tail.
+// of a provider failure (for example Gemini "MAX_TOKENS"), the
+// interruption stops (ErrorSubtype "interrupted") a host reports when
+// the turn was cancelled before a tool ran, and the turn-cap stops
+// (ErrorSubtype "error_max_turns") a harness reports when the model hit
+// its configured turn ceiling: none of those carry a provider diagnostic,
+// so a failed terminal with only that text keeps silent-exit instead of
+// provider-error. The OutputTail fallback still preserves the diagnostic
+// tail.
 func terminalProviderErrorMessage(ev *agent.ResultEvent) string {
 	if ev == nil || ev.Success || len(ev.Errors) == 0 {
 		return ""
@@ -4084,6 +4088,16 @@ func terminalProviderErrorMessage(ev *agent.ResultEvent) string {
 	// failure: the retry-bearing provider-error mode (resumable, deferred
 	// failure transition, provider-error retries) must not apply to it.
 	if strings.HasPrefix(ev.ErrorSubtype, "finish_") {
+		return ""
+	}
+	// An interrupted turn (user or operator cancel) and a turn-cap stop
+	// are not provider failures either: they must stay silent-exit so the
+	// run is not resumable and still takes its declared failure
+	// transition. Only a genuine provider refusal or endpoint failure
+	// (for example Codex turn_failed with the provider's error text)
+	// promotes to provider-error.
+	switch ev.ErrorSubtype {
+	case "interrupted", "error_max_turns":
 		return ""
 	}
 	var kept []string
