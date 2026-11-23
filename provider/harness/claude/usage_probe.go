@@ -46,10 +46,15 @@ func ProbeUsage(ctx context.Context, binary string) (accountID string, probed ag
 	return ProbeUsageWithConfigDir(ctx, binary, "")
 }
 
+// DefaultProbeConfigDir reports the default config directory the usage probe reads.
 func DefaultProbeConfigDir() string {
 	return interactiveUsageConfigDir(nil)
 }
 
+// ProbeUsageWithConfigDir runs one usage read against an explicit config home.
+// An empty configDir reads the default login; a non-empty value must name an
+// absolute config directory and is carried to the usage and status children.
+// Unreadable homes and expired reads are unanswered failures, never verdicts.
 func ProbeUsageWithConfigDir(ctx context.Context, binary, configDir string) (accountID string, probed agent.UsageLimits, names ScopedLimitNames) {
 	now := time.Now()
 	checkedAt := agent.ISOTime(now)
@@ -125,15 +130,11 @@ var probeUsageArgv = []string{
 	"--safe-mode",
 }
 
-// probeUsageEnv carries the operator's own login locators to the usage
+// probeUsageEnvFor carries the operator's own login locators to the usage
 // child: the real home (the read is authenticated as the host login),
 // its config overrides, and USER (the keychain login lookup needs it
 // on macOS). Unrelated process credentials are never inherited: only
 // these names cross, never tokens or keys.
-func probeUsageEnv() []string {
-	return probeUsageEnvFor("")
-}
-
 func probeUsageEnvFor(override string) []string {
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
@@ -179,16 +180,12 @@ func (b *boundedProbeOutput) Write(data []byte) (int, error) {
 	return len(data), nil
 }
 
-// readUsageControl runs the usage child to its control answer and
+// readUsageControlFor runs the usage child to its control answer and
 // returns the inner usage body: the `response.response` object of the
 // `control_response` line, which carries the rate_limits shape
 // UsageResponseToLimits maps. It reports false when the child never
 // produced one — a missing binary, a timeout, an unreadable reply —
 // which is never a login verdict by itself.
-func readUsageControl(ctx context.Context, binary string) (json.RawMessage, bool) {
-	return readUsageControlFor(ctx, binary, "")
-}
-
 func readUsageControlFor(ctx context.Context, binary, override string) (json.RawMessage, bool) {
 	probeDir, err := tempown.MkdirTemp("", tempown.PrefixClaudeUsage)
 	if err != nil {
@@ -271,17 +268,13 @@ func loginRefusedFor(ctx context.Context, binary, override string) bool {
 	return CheckHostSessionLogin(checkCtx, binary) != nil && checkCtx.Err() == nil
 }
 
-// loginAccountID names the probed account opaquely: a stable hash of
+// loginAccountIDFor names the probed account opaquely: a stable hash of
 // the login response. The raw response carries the operator's address
 // and organization name; only the hash leaves this function, so the
 // quota entry the platform hashes never carries who signed in.
 // A status the login check itself refuses names no account: hashing a
 // refusal would mint a stable id for "nobody signed in" and merge
 // every logged-out host into one phantom account.
-func loginAccountID(ctx context.Context, binary string) string {
-	return loginAccountIDFor(ctx, binary, "")
-}
-
 func loginAccountIDFor(ctx context.Context, binary, override string) string {
 	if strings.TrimSpace(binary) == "" {
 		return ""
@@ -313,13 +306,9 @@ func loginAccountIDFor(ctx context.Context, binary, override string) string {
 	return "claude-" + hex.EncodeToString(sum[:])
 }
 
-// loginStatusEnv carries the same login locators as the usage child
+// loginStatusEnvFor carries the same login locators as the usage child
 // (real home, config overrides, USER) to the status child, so the two
-// agree on what login backs the host. See probeUsageEnv.
-func loginStatusEnv() []string {
-	return loginStatusEnvFor("")
-}
-
+// agree on what login backs the host. See probeUsageEnvFor.
 func loginStatusEnvFor(override string) []string {
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {

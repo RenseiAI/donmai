@@ -37,6 +37,10 @@ func CheckHostSessionLogin(ctx context.Context, binary string) error {
 	return checkHostSessionLogin(ctx, binary, "")
 }
 
+// CheckHostSessionLoginWithConfigDir observes the selected native CLI's
+// first-party host login using an explicit config directory. An empty
+// configDir reads the default login; a non-empty value must be absolute
+// and is carried to the status child only. Cancellation is unanswered.
 func CheckHostSessionLoginWithConfigDir(ctx context.Context, binary, configDir string) error {
 	return checkHostSessionLogin(ctx, binary, configDir)
 }
