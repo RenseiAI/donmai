@@ -537,14 +537,17 @@ func (p *Provider) ProbeQuota(ctx context.Context) (accountID, plan string, prob
 // ProbeQuotaForLogin reads quota for exactly one login through a probe-owned
 // app-server, bound by the caller's deadline from construction through
 // shutdown. sourceHome selects the login: empty preserves the default host
-// resolution, while a non-empty value must be an absolute path whose auth.json
-// is projected through the checked private hard link. The child always starts
-// with the private CODEX_HOME and must confirm it; the source home is never
-// passed to the child and its files are never written. Cancellation at any
-// point — including during the identity reread or shutdown grace — yields an
-// unknown snapshot with empty identity and plan, while a live login refusal
-// stays answered. The private home is joined before removal and retained when
-// writer quiescence cannot be proved.
+// resolution, while any non-empty value is an explicit selector that must be
+// an absolute path whose auth.json is projected through the checked private
+// hard link. A blank or otherwise invalid explicit selector never falls back
+// to the default: it yields unknown. The child always starts with the private
+// CODEX_HOME and must confirm it; the source home is never passed to the
+// child and its files are never written. One quota read serves identity,
+// plan and windows together, so a login that answers once is published even
+// when a second read would fail. Cancellation at any point — including
+// during shutdown grace — yields an unknown snapshot with empty identity
+// and plan, while a live login refusal stays answered. The private home is
+// joined before removal and retained when writer quiescence cannot be proved.
 func ProbeQuotaForLogin(ctx context.Context, opts Options, sourceHome string) (accountID, plan string, probed agent.UsageLimits) {
 	fail := func() (string, string, agent.UsageLimits) {
 		return "", "", agent.MakeUnavailableUsageLimits(agent.ISOTime(time.Now()), agent.UsageUnavailableProbeFailed, "Codex did not answer the usage request.")
@@ -552,11 +555,16 @@ func ProbeQuotaForLogin(ctx context.Context, opts Options, sourceHome string) (a
 	if ctx == nil || ctx.Err() != nil {
 		return fail()
 	}
-	explicit := strings.TrimSpace(sourceHome) != ""
+	// Any non-empty selector is explicit: a blank selector is an invalid
+	// explicit login, not an omitted one, so it must not resolve the default.
+	explicit := sourceHome != ""
 	var hostAuthFile string
 	fileAuth := opts.HostSessionAuth
 	if explicit {
 		if !opts.HostSessionAuth {
+			return fail()
+		}
+		if strings.TrimSpace(sourceHome) == "" {
 			return fail()
 		}
 		// Resolve before constructing the private home and never consult
@@ -584,38 +592,33 @@ func ProbeQuotaForLogin(ctx context.Context, opts Options, sourceHome string) (a
 	// Own shutdown from construction onward under the attempt budget: the
 	// deferred Shutdown joins the owned group before the private home is
 	// removed, caps grace at the time remaining, and requests zero grace
-	// once the attempt is cancelled or expired.
+	// once the attempt is cancelled or expired. A cancellation that lands
+	// during shutdown supersedes a successful snapshot computed before it;
+	// a live login refusal is already unknown, so it is preserved.
 	defer func() {
 		_ = provider.Shutdown(ctx)
+		if ctx.Err() != nil && probed.Unavailable == nil {
+			accountID, plan, probed = fail()
+		}
 	}()
 	if err := provider.ensureProbeStarted(ctx); err != nil {
-		return fail()
+		accountID, plan, probed = fail()
+		return accountID, plan, probed
 	}
 	provider.startMu.Lock()
 	client := provider.client
 	provider.startMu.Unlock()
-	probed = NewRateLimitsProbe().ReadProbe(ctx, client)
-	if probed.Unavailable != nil {
-		return "", "", probed
-	}
-	if ctx.Err() != nil {
-		return fail()
-	}
-	accountID, plan, probed = readAccountIdentity(ctx, client)
-	if ctx.Err() != nil {
-		return fail()
-	}
-	return accountID, plan, probed
-}
-
-// readAccountIdentity re-reads the raw response to lift the account
-// identity and plan slug the mapped snapshot drops. It runs under the
-// probe's own timeout; any failure yields an unknown snapshot with empty
-// identity and plan, and a live login refusal stays answered.
-func readAccountIdentity(ctx context.Context, client *Client) (string, string, agent.UsageLimits) {
 	if client == nil {
-		return "", "", agent.MakeUnavailableUsageLimits(agent.ISOTime(time.Now()), agent.UsageUnavailableProbeFailed, "Codex did not answer the usage request.")
+		accountID, plan, probed = fail()
+		return accountID, plan, probed
 	}
+	if ctx.Err() != nil {
+		accountID, plan, probed = fail()
+		return accountID, plan, probed
+	}
+	// A single read serves identity, plan and windows from the same reply:
+	// discarding it for a second read would publish nothing on a cold cache
+	// when the backend fails between the two calls.
 	checkedAt := agent.ISOTime(time.Now())
 	reqCtx, cancel := context.WithTimeout(ctx, RateLimitsProbeTimeout)
 	defer cancel()
@@ -623,13 +626,24 @@ func readAccountIdentity(ctx context.Context, client *Client) (string, string, a
 	if err != nil {
 		out := agent.MakeUnavailableUsageLimits(checkedAt, agent.UsageUnavailableProbeFailed, RateLimitsFailureMessage(err))
 		out.Unavailable.Answered = answeredByAppServer(client, err)
-		return "", "", out
+		accountID, plan, probed = "", "", out
+		return accountID, plan, probed
 	}
 	var resp rateLimitsReadResponse
 	if err := json.Unmarshal(raw, &resp); err != nil {
-		return "", "", agent.MakeUnavailableUsageLimits(checkedAt, agent.UsageUnavailableProbeFailed, "Codex did not answer the usage request.")
+		accountID, plan, probed = fail()
+		return accountID, plan, probed
 	}
-	return decodeRateLimitsRead(resp, checkedAt)
+	if ctx.Err() != nil {
+		accountID, plan, probed = fail()
+		return accountID, plan, probed
+	}
+	accountID, plan, probed = decodeRateLimitsRead(resp, checkedAt)
+	if ctx.Err() != nil {
+		accountID, plan, probed = fail()
+		return accountID, plan, probed
+	}
+	return accountID, plan, probed
 }
 
 // rateLimitsRefusalCode is the JSON-RPC code the app-server answers a

@@ -1208,8 +1208,23 @@ func (p *Provider) stopProcess(ctx context.Context) error {
 	}
 	// Offer every request to the single signal/wait owner: it keeps the
 	// shortest grace so a cancellation arriving during grace shortens the
-	// wait instead of queuing behind the first stop.
+	// wait instead of queuing behind the first stop. When the caller's
+	// context cancels mid-wait, offer zero grace at that moment so an
+	// in-progress drain does not hold the original grace: the waiter
+	// reaps on the shortest request.
+	release := func() bool { return false }
+	if ctx != nil {
+		if done := ctx.Done(); done != nil {
+			select {
+			case <-done:
+			// Already cancelled: grace is already zero above.
+			default:
+				release = context.AfterFunc(ctx, func() { _ = p.ownedProcess.stop(0) })
+			}
+		}
+	}
 	err := p.ownedProcess.stop(grace)
+	release()
 	p.stopOnce.Do(func() { p.stopErr = err })
 	if p.stopErr != nil {
 		return p.stopErr
