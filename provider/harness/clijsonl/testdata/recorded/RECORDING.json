@@ -1,0 +1,10 @@
+{
+  "cliVersion": "2.1.328",
+  "model": "haiku",
+  "scenarios": [
+    "streamed_long_tool",
+    "task_list",
+    "tool_call"
+  ],
+  "command": "claude -p <prompt> --output-format stream-json --verbose"
+}
