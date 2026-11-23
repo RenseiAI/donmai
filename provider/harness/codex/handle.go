@@ -303,10 +303,7 @@ func (h *Handle) start(ctx context.Context, plan SpawnPlan, resumeThreadID strin
 		h.idMu.Lock()
 		h.threadID = resumeThreadID
 		h.idMu.Unlock()
-		params := map[string]any{
-			"threadId":    resumeThreadID,
-			"personality": "pragmatic",
-		}
+		params := threadResumeParams(resumeThreadID)
 		if _, err := h.client.RequestWithRetry(ctx, "thread/resume", params, h.rpcTimeout); err != nil {
 			h.client.Unsubscribe(resumeThreadID)
 			// A rejected resume is not a fresh spawn: when the backend

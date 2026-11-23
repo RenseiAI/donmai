@@ -439,3 +439,8 @@ func ignoredSpecFields(spec agent.Spec) []SpecFieldNote {
 	// This is documented as honored, not ignored.
 	return notes
 }
+
+// threadResumeParams builds the JSON-RPC params for `thread/resume`.
+func threadResumeParams(threadID string) map[string]any {
+	return map[string]any{"threadId": threadID, "personality": "pragmatic"}
+}
