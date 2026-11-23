@@ -776,3 +776,78 @@ func TestProbeUsageForConfigDir_ConfigErrorQuotingPathIsUnanswered(t *testing.T)
 		t.Fatalf("full refusal sentence: probed = %+v, want answered probeFailed", probed.Unavailable)
 	}
 }
+
+// TestProbeUsageForConfigDir_CorruptConfigSplitPathIsUnanswered replays the
+// corrupt-config shape where the operator-selected directory name itself
+// holds a line break before the refusal phrase: the diagnostic quotes the
+// full directory path, so the phrase-named tail lands at the start of its
+// own stderr line. That path fragment must not read as logged out.
+func TestProbeUsageForConfigDir_CorruptConfigSplitPathIsUnanswered(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake CLI uses /bin/sh; skip on windows")
+	}
+	script := "#!/bin/sh\n" +
+		"case \" $* \" in *\" auth status --json \"*)\n" +
+		"  printf '%s/.claude.json: JSON Parse error: Expected }\\n' \"$CLAUDE_CONFIG_DIR\" >&2\n" +
+		"  exit 1;;\n" +
+		"esac\n" +
+		"printf '{\"type\":\"system\",\"subtype\":\"init\"}\\n'\n" +
+		"exit 0\n"
+	binary := writeFakeCLI(t, "fake-claude-split-path-config-error.sh", script)
+	// The directory name holds a line break before the refusal phrase, so
+	// the quoted diagnostic splits and its second line starts with the
+	// phrase-named tail plus a path separator.
+	selected := filepath.Join(t.TempDir(), "backup\nnot logged in - archived")
+	if err := os.MkdirAll(selected, 0o700); err != nil {
+		t.Fatalf("make split-path home: %v", err)
+	}
+	_, probed, _ := ProbeUsageForConfigDir(t.Context(), binary, selected)
+	if probed.Unavailable == nil || probed.Unavailable.Reason != agent.UsageUnavailableProbeFailed {
+		t.Fatalf("probed = %+v, want probeFailed from the silent read", probed.Unavailable)
+	}
+	if probed.Unavailable.Answered {
+		t.Error("corrupt-config diagnostic quoting a split path marked answered; only a real refusal answers")
+	}
+}
+
+// TestProbeUsageForConfigDir_MalformedStatusIsUnanswered pins the malformed
+// status boundary: `null`, `{}`, an error object, and a null member decode
+// without error yet name no login, so a failed read behind any of them
+// stays unanswered. An explicit logged-out document on the same nonzero
+// exit still answers.
+func TestProbeUsageForConfigDir_MalformedStatusIsUnanswered(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake CLI uses /bin/sh; skip on windows")
+	}
+	for _, tc := range []struct {
+		name         string
+		body         string
+		wantAnswered bool
+	}{
+		{"null", "null", false},
+		{"empty object", "{}", false},
+		{"error object", `{"error":"status failed"}`, false},
+		{"null member", `{"loggedIn":null,"authMethod":"claude.ai","apiProvider":"firstParty"}`, false},
+		{"explicit logged out", `{"loggedIn":false,"authMethod":"claude.ai","apiProvider":"firstParty"}`, true},
+	} {
+		script := "#!/bin/sh\n" +
+			"case \" $* \" in *\" auth status --json \"*)\n" +
+			"  printf '%s\\n' '" + tc.body + "'\n" +
+			"  exit 1;;\n" +
+			"esac\n" +
+			"printf '{\"type\":\"system\",\"subtype\":\"init\"}\\n'\n" +
+			"exit 0\n"
+		binary := writeFakeCLI(t, "fake-claude-malformed-status.sh", script)
+		selected := scopedHome(t, t.TempDir(), "selected-home")
+		accountID, probed, _ := ProbeUsageForConfigDir(t.Context(), binary, selected)
+		if probed.Unavailable == nil || probed.Unavailable.Reason != agent.UsageUnavailableProbeFailed {
+			t.Fatalf("%s: probed = %+v, want probeFailed from the silent read", tc.name, probed.Unavailable)
+		}
+		if probed.Unavailable.Answered != tc.wantAnswered {
+			t.Errorf("%s: answered = %v, want %v", tc.name, probed.Unavailable.Answered, tc.wantAnswered)
+		}
+		if accountID != "" {
+			t.Errorf("%s: account id = %q, want empty without a validated login", tc.name, accountID)
+		}
+	}
+}

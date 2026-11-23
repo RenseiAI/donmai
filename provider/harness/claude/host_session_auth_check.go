@@ -134,15 +134,13 @@ func runLoginStatus(ctx context.Context, binary string, baseEnv []string) (raw [
 	// An explicit logged-out status document answers even when the CLI
 	// exits nonzero: a signed-out `auth status --json` reports
 	// loggedIn:false on stdout and exits 1 with empty stderr. Trust that
-	// document before the generic failure below discards it.
+	// document before the generic failure below discards it. The document
+	// must carry an explicit loggedIn verdict: `null`, `{}`, or an error
+	// object decodes without error yet names no login, and trusting one
+	// would mint a false refusal that overwrites a positive check.
 	if out := bytes.TrimSpace(stdout.buffer.Bytes()); len(out) != 0 {
-		var status struct {
-			LoggedIn    bool   `json:"loggedIn"`
-			AuthMethod  string `json:"authMethod"`
-			APIProvider string `json:"apiProvider"`
-		}
-		if json.Unmarshal(out, &status) == nil {
-			if !status.LoggedIn || status.AuthMethod != "claude.ai" || status.APIProvider != "firstParty" {
+		if loggedIn, authMethod, apiProvider, ok := decodeLoginStatus(out); ok {
+			if !loggedIn || authMethod != "claude.ai" || apiProvider != "firstParty" {
 				return nil, true, fmt.Errorf("%w: Claude runtime requires an authenticated first-party host login", agent.ErrProviderUnavailable)
 			}
 			if err == nil && stderr.buffer.Len() == 0 {
@@ -162,26 +160,41 @@ func runLoginStatus(ctx context.Context, binary string, baseEnv []string) (raw [
 		return nil, false, fmt.Errorf("%w: Claude host login status unavailable", agent.ErrProviderUnavailable)
 	}
 	raw = append([]byte(nil), stdout.buffer.Bytes()...)
-	var status struct {
-		LoggedIn    bool   `json:"loggedIn"`
-		AuthMethod  string `json:"authMethod"`
-		APIProvider string `json:"apiProvider"`
+	loggedIn, authMethod, apiProvider, ok := decodeLoginStatus(raw)
+	if !ok {
+		return nil, false, fmt.Errorf("%w: Claude host login status unreadable", agent.ErrProviderUnavailable)
 	}
-	if err := json.Unmarshal(raw, &status); err != nil {
-		return nil, false, fmt.Errorf("%w: Claude host login status unreadable: %v", agent.ErrProviderUnavailable, err)
-	}
-	if !status.LoggedIn || status.AuthMethod != "claude.ai" || status.APIProvider != "firstParty" {
+	if !loggedIn || authMethod != "claude.ai" || apiProvider != "firstParty" {
 		return nil, true, fmt.Errorf("%w: Claude runtime requires an authenticated first-party host login", agent.ErrProviderUnavailable)
 	}
 	return raw, false, nil
+}
+
+// decodeLoginStatus validates one `auth status --json` document: it must
+// be a JSON object carrying an explicit loggedIn boolean. `null`, `{}`,
+// and error objects decode into the zero value without error; without
+// the explicit-field check they read as logged-out and mint a false
+// refusal. A document that fails validation carries no verdict.
+func decodeLoginStatus(raw []byte) (loggedIn bool, authMethod, apiProvider string, ok bool) {
+	var doc struct {
+		LoggedIn    *bool  `json:"loggedIn"`
+		AuthMethod  string `json:"authMethod"`
+		APIProvider string `json:"apiProvider"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(raw), &doc); err != nil || doc.LoggedIn == nil {
+		return false, "", "", false
+	}
+	return *doc.LoggedIn, doc.AuthMethod, doc.APIProvider, true
 }
 
 // isClaudeLoginRefusal reports whether stderr carries the CLI's own
 // logged-out refusal as a standalone line. A configuration error that
 // merely quotes a directory (for example one named "not logged in")
 // must not count: the phrase has to open the line (after an optional
-// "error:" label) and end or continue with punctuation or whitespace,
-// never with a path separator.
+// "error:" label) and continue with punctuation or whitespace, and the
+// line must carry no path separator. A corrupt-config diagnostic that
+// quotes an operator-selected directory containing the phrase always
+// carries the directory's separators, so it can never match.
 func isClaudeLoginRefusal(stderr string) bool {
 	const phrase = "not logged in"
 	for _, line := range strings.Split(stderr, "\n") {
@@ -203,6 +216,13 @@ func isClaudeLoginRefusal(stderr string) bool {
 		rest := lower[len(phrase):]
 		if rest == "" {
 			return true
+		}
+		// A diagnostic quoting a directory path carries its separators
+		// past the phrase (for example " - archived/.claude.json: ..."
+		// when the directory name itself holds a line break). A genuine
+		// refusal sentence never names a path.
+		if strings.ContainsAny(rest, `/\`) {
+			continue
 		}
 		switch rest[0] {
 		case ' ', '\t', '.', ',', ':', ';', '!', '?', '"', '\'', '-':
