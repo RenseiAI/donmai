@@ -14,6 +14,7 @@ package agent
 import (
 	"math"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -98,6 +99,61 @@ type UsageUnavailable struct {
 	Answered bool `json:"-"`
 }
 
+// UsageObservedUnit is the raw unit of an observed amount.
+type UsageObservedUnit string
+
+const (
+	// UsageUnitPercent marks an observed amount as a 0–100 percentage share.
+	UsageUnitPercent UsageObservedUnit = "percent"
+	// UsageUnitTokens marks an observed amount as an explicit token count.
+	UsageUnitTokens UsageObservedUnit = "tokens"
+)
+
+// UsageBillingMode is the observed mode paying for an allowance.
+type UsageBillingMode string
+
+const (
+	// UsageBillingUnknown marks an allowance whose paying mode is missing or unrecognized.
+	UsageBillingUnknown UsageBillingMode = "unknown"
+	// UsageBillingAllowance marks an allowance paid by the subscription itself.
+	UsageBillingAllowance UsageBillingMode = "allowance"
+	// UsageBillingCredits marks an allowance paid from a prepaid credit balance.
+	UsageBillingCredits UsageBillingMode = "credits"
+	// UsageBillingOverage marks an allowance paid as overage beyond the subscription.
+	UsageBillingOverage UsageBillingMode = "overage"
+	// UsageBillingAPI marks an allowance metered through the usage API.
+	UsageBillingAPI UsageBillingMode = "api"
+)
+
+// ParseUsageBillingMode maps an explicit provider value; missing or
+// unrecognized maps to unknown even with a reported balance.
+func ParseUsageBillingMode(value string) UsageBillingMode {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "allowance", "subscription", "plan":
+		return UsageBillingAllowance
+	case "credits", "credit", "prepaid":
+		return UsageBillingCredits
+	case "overage":
+		return UsageBillingOverage
+	case "api", "api_metered", "metered", "payg":
+		return UsageBillingAPI
+	default:
+		return UsageBillingUnknown
+	}
+}
+
+// UsageMeterEvidence is the local projection of one allowance/window.
+type UsageMeterEvidence struct {
+	Provider, Plan, Allowance, Window, Account, User string
+	Unit                                             UsageObservedUnit
+	Used                                             float64
+	Limit                                            *float64
+	ResetsAt                                         *string
+	DurationMins                                     *int
+	Billing                                          UsageBillingMode
+	Balance                                          *float64
+}
+
 // UsageLimits is the subscription usage a provider knows about the
 // signed-in account.
 type UsageLimits struct {
@@ -107,6 +163,8 @@ type UsageLimits struct {
 	ResetCredits *ResetCredits `json:"resetCredits,omitempty"`
 	// Unavailable distinguishes "cannot report" from "failed this time".
 	Unavailable *UsageUnavailable `json:"unavailable,omitempty"`
+	// Evidence is the local projection behind the display rows.
+	Evidence []UsageMeterEvidence `json:"-"`
 }
 
 // UsageLimitsUpdate is what a harness reports when its runtime pushes a

@@ -166,6 +166,9 @@ type recordingInteractiveSession struct {
 	refuseNotice bool
 	// noticeErr makes TryWriteNotice fail outright (a dead PTY master).
 	noticeErr error
+	// altScreen models the alternate-screen buffer: a full-screen UI where
+	// every byte is a command. Push delivery must refuse while it holds.
+	altScreen bool
 }
 
 // zeroEpochInteractiveSession models the shipped legacy PTY surface whose
@@ -231,6 +234,22 @@ func (s *recordingInteractiveSession) setRefuseNotice(v bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.refuseNotice = v
+}
+
+// AlternateScreenActive reports the test's modelled alternate-screen state.
+// It lets readiness tests drive the observable modal half of the input state
+// without a real full-screen child.
+func (s *recordingInteractiveSession) AlternateScreenActive() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.altScreen
+}
+
+// setAlternateScreen flips the modelled alternate-screen gate.
+func (s *recordingInteractiveSession) setAlternateScreen(v bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.altScreen = v
 }
 
 // recordedWrites returns a copy of every recorded write, one entry per
