@@ -2,12 +2,18 @@ package runner
 
 import (
 	"context"
+	"io"
+	"log/slog"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/provider/harness/stub"
+	"github.com/RenseiAI/donmai/result"
+	"github.com/RenseiAI/donmai/runtime/worktree"
+	"github.com/RenseiAI/donmai/stagewire"
 )
 
 // codexFailedTurnHandle is a scripted app-server-like session: it replays
@@ -130,5 +136,130 @@ func TestRun_CodexFailedTurnReportsProviderError(t *testing.T) {
 				t.Fatalf("FailureMode = provider-error with no error text (Error=%q)", res.Error)
 			}
 		})
+	}
+}
+
+// outputCapHandle replays the terminal shape a mapper emits when the model
+// hits a configured output cap: a failed ResultEvent whose Errors carries
+// the finish reason with an ErrorSubtype of "finish_<REASON>" (here
+// Gemini "MAX_TOKENS"). It carries no tool call, so the run is eligible
+// for the deferred provider-error transition — which must NOT apply: a cap
+// is a truncation, not a provider failure.
+type outputCapHandle struct {
+	events chan agent.Event
+}
+
+func (h *outputCapHandle) SessionID() string { return "output-cap" }
+
+func (h *outputCapHandle) Events() <-chan agent.Event { return h.events }
+
+func (h *outputCapHandle) Inject(context.Context, string) error {
+	return agent.ErrUnsupported
+}
+
+func (h *outputCapHandle) Stop(context.Context) error { return nil }
+
+// TestRun_OutputCapKeepsFailureTransition pins that a finish-reason cap
+// stays a silent-exit failure with its diagnostic preserved and takes the
+// declared failure transition, even when the work item opts into deferring
+// provider-error failures. It drives the production entry point
+// (Runner.Run) with stage transitions so the deferred-vs-failure branch is
+// observed through the real state writes, not only the mode string.
+func TestRun_OutputCapKeepsFailureTransition(t *testing.T) {
+	t.Parallel()
+	srv, calls, mu := stubProxyServer(t)
+	wtm, err := worktree.NewManager(worktree.Options{ParentDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("worktree.NewManager: %v", err)
+	}
+	poster, err := result.NewPoster(result.Options{
+		PlatformURL: srv.URL, WorkerID: "wkr-cap", AuthToken: "tok-cap", HTTPClient: srv.Client(), BaseDelay: 1,
+	})
+	if err != nil {
+		t.Fatalf("result.NewPoster: %v", err)
+	}
+	base, err := stub.New()
+	if err != nil {
+		t.Fatalf("stub.New: %v", err)
+	}
+	hp, ok := base.(agent.HarnessProvider)
+	if !ok {
+		t.Fatal("stub provider does not satisfy HarnessProvider")
+	}
+	ch := make(chan agent.Event, 8)
+	ch <- agent.InitEvent{SessionID: "output-cap"}
+	ch <- agent.AssistantTextEvent{Text: "partial output..."}
+	ch <- agent.ResultEvent{Success: false, Errors: []string{"MAX_TOKENS"}, ErrorSubtype: "finish_MAX_TOKENS"}
+	close(ch)
+	provider := &evidenceProvider{HarnessProvider: hp, spawnHandle: &outputCapHandle{events: ch}}
+	reg := NewRegistry()
+	if err := reg.Register(provider); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	r, err := New(Options{
+		Registry: reg, WorktreeManager: wtm, Poster: poster, HTTPClient: srv.Client(),
+		Logger:                 slog.New(slog.NewTextHandler(io.Discard, nil)),
+		SkipBackstop:           true,
+		SkipSteering:           true,
+		PreserveWorktreeAlways: true,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	qw := QueuedWork{
+		QueuedWork:             queuedWorkBase("OUTPUT-CAP"),
+		WorkerID:               "wkr-cap",
+		AuthToken:              "tok-cap",
+		PlatformURL:            srv.URL,
+		ResolvedProfile:        ResolvedProfile{Provider: agent.ProviderStub},
+		DeferFailureTransition: true,
+	}
+	qw.WorkType = WorkTypeQAStr
+	qw.Repository = makeBareRepo(t)
+	qw.Stage = &stagewire.Stage{ID: "stg", Key: "verify", Name: "Verify", Role: stagewire.RoleReview}
+	qw.Card = &stagewire.Card{ID: "card", Handle: "reviewer", Contract: &stagewire.Contract{Verdict: true, WorkResult: true}}
+	qw.Transitions = stageTransitionsFixture()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	res, err := r.Run(ctx, qw)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res == nil {
+		t.Fatal("Run returned nil result")
+	}
+	if res.Status != "failed" {
+		t.Fatalf("Status = %q; want failed (mode=%q error=%q)", res.Status, res.FailureMode, res.Error)
+	}
+	if res.FailureMode != FailureSilentExit {
+		t.Fatalf("FailureMode = %q; want %q (a cap is not a provider failure; Error=%q OutputTail=%q)", res.FailureMode, FailureSilentExit, res.Error, res.OutputTail)
+	}
+	if res.Error != "" {
+		t.Fatalf("Error = %q; want empty (the cap diagnostic rides OutputTail, not the retry-bearing Error)", res.Error)
+	}
+	if res.Resumable {
+		t.Fatal("Resumable = true; want false (only provider-error failures are resumable)")
+	}
+	if res.ToolCalls != 0 {
+		t.Fatalf("ToolCalls = %d; want 0 (the cap turn made no tool call)", res.ToolCalls)
+	}
+	if !strings.Contains(res.OutputTail, "MAX_TOKENS") {
+		t.Fatalf("OutputTail = %q; want it to preserve the MAX_TOKENS diagnostic", res.OutputTail)
+	}
+	if res.StageTransition == nil {
+		t.Fatal("StageTransition is nil; want the failure transition record")
+	}
+	if res.StageTransition.Reason == "deferred-provider-error" {
+		t.Fatalf("StageTransition reason = deferred-provider-error; want the failure transition (states=%v)", res.StageTransition)
+	}
+	if res.StageTransition.Outcome != string(stagewire.OutcomeFailure) || !res.StageTransition.Succeeded {
+		t.Fatalf("StageTransition = %+v; want failure outcome succeeded", res.StageTransition)
+	}
+	if res.LinearStatusTransition != nil {
+		t.Fatalf("legacy post-session ran: %+v", res.LinearStatusTransition)
+	}
+	states, _ := stateWrites(t, calls, mu)
+	if !reflect.DeepEqual(states, []string{"state-start", "state-failure"}) {
+		t.Fatalf("state writes = %v; want [state-start state-failure] (the failure transition ran)", states)
 	}
 }

@@ -4070,10 +4070,20 @@ func classifyWorktreeErr(err error) string {
 // failed terminal ResultEvent. It joins the non-empty Errors entries, but
 // ignores the harness-synthesized fallbacks ("Turn failed",
 // "Turn was interrupted") the mappers emit when the provider reported no
-// error text: those carry no provider diagnostic, so a failed terminal with
-// only that text keeps silent-exit instead of provider-error.
+// error text, and the finish-reason stops (ErrorSubtype "finish_*") a
+// mapper reports when the model hit a cap or policy finish reason instead
+// of a provider failure (for example Gemini "MAX_TOKENS"): those carry no
+// provider diagnostic, so a failed terminal with only that text keeps
+// silent-exit instead of provider-error. The OutputTail fallback still
+// preserves the finish reason as the diagnostic tail.
 func terminalProviderErrorMessage(ev *agent.ResultEvent) string {
 	if ev == nil || ev.Success || len(ev.Errors) == 0 {
+		return ""
+	}
+	// A finish-reason stop is a cap or policy truncation, not a provider
+	// failure: the retry-bearing provider-error mode (resumable, deferred
+	// failure transition, provider-error retries) must not apply to it.
+	if strings.HasPrefix(ev.ErrorSubtype, "finish_") {
 		return ""
 	}
 	var kept []string
