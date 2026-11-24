@@ -13,10 +13,9 @@ import (
 	"github.com/RenseiAI/donmai/agent"
 )
 
-// A completed turn whose final MCP config release fails in a contained way
-// (Provider poisoned, owner removal clean) must still deliver its result,
-// with the cleanup failure as a warning. An uncontained failure keeps the
-// terminal mcp_cleanup_failed error in place of the result.
+// A successful turn whose final MCP config release fails must still deliver
+// its result, with the cleanup failure as a warning — contained or not. A
+// turn that did not finish successfully keeps failing closed.
 func TestHandle_TerminalResultSurvivesContainedMCPCleanupFailure(t *testing.T) {
 	cleanupErr := codexMCPApplicationError("clear isolated MCP config: isolated config boundary rejected: isolated Codex home mode is 0750, want 0700")
 	cases := []struct {
@@ -51,15 +50,31 @@ func TestHandle_TerminalResultSurvivesContainedMCPCleanupFailure(t *testing.T) {
 			wantWarning: true,
 		},
 		{
-			name:      "uncontained failure stays fatal",
+			name:        "uncontained failure after successful turn still delivers the result with a warning",
+			release:     func() error { return &mcpCleanupError{err: cleanupErr} },
+			params:      `{"turn":{"id":"t","status":"completed"}}`,
+			wantResult:  true,
+			wantSuccess: true,
+			wantWarning: true,
+		},
+		{
+			name:        "untyped failure after successful turn still delivers the result with a warning",
+			release:     func() error { return cleanupErr },
+			params:      `{"turn":{"id":"t","status":"completed"}}`,
+			wantResult:  true,
+			wantSuccess: true,
+			wantWarning: true,
+		},
+		{
+			name:      "uncontained failure after failed turn stays fatal",
 			release:   func() error { return &mcpCleanupError{err: cleanupErr} },
-			params:    `{"turn":{"id":"t","status":"completed"}}`,
+			params:    `{"turn":{"id":"t","status":"failed","error":{"message":"boom"}}}`,
 			wantError: true,
 		},
 		{
-			name:      "untyped failure stays fatal",
+			name:      "untyped failure after failed turn stays fatal",
 			release:   func() error { return cleanupErr },
-			params:    `{"turn":{"id":"t","status":"completed"}}`,
+			params:    `{"turn":{"id":"t","status":"failed","error":{"message":"boom"}}}`,
 			wantError: true,
 		},
 	}
@@ -318,6 +333,137 @@ func TestHandle_ContainedCleanupResultSurvivesWriterStopClientClose(t *testing.T
 			}
 			if got := strings.Join(kinds, ","); got != "warning,result" {
 				t.Fatalf("events = %q, want %q", got, "warning,result")
+			}
+		})
+	}
+}
+
+// The final clear is retried with a short bounded backoff before it is
+// reported as failed: one transient batchWrite failure still releases cleanly
+// and the provider stays usable for the next lease.
+func TestProvider_FinalReleaseRetriesThenSucceeds(t *testing.T) {
+	fs, stdinW, stdoutR := newFakeServer()
+	go fs.run(t, "thread-retry")
+	p, err := New(Options{
+		skipProcess: true, stdinOverride: stdinW, stdoutOverride: stdoutR,
+		configTempDir: t.TempDir(), verifyMCPReadback: true,
+	})
+	if err != nil {
+		fs.close()
+		t.Fatalf("New: %v", err)
+	}
+	startTestProvider(t, p)
+	t.Cleanup(func() {
+		p.client.Stop(errors.New("test complete"))
+		fs.close()
+	})
+	release, err := p.acquireMCPConfig(t.Context(), map[string]any{}, t.TempDir())
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	// Fail the next clear once with a non-transient code so the client's own
+	// RequestWithRetry does not mask the outer release retry.
+	fs.mu.Lock()
+	fs.failNextBatchWrites = 1
+	fs.failBatchWriteCode = -32602
+	fs.mu.Unlock()
+	writesBefore := func() int {
+		fs.mu.Lock()
+		defer fs.mu.Unlock()
+		return len(fs.mcpWrites)
+	}()
+	if err := release(); err != nil {
+		t.Fatalf("release after one transient failure = %v, want nil (retry-then-success)", err)
+	}
+	fs.mu.Lock()
+	writesAfter := len(fs.mcpWrites)
+	fs.mu.Unlock()
+	if writesAfter < writesBefore+2 {
+		t.Fatalf("batchWrite count = %d, want at least %d (failed attempt + retry)", writesAfter, writesBefore+2)
+	}
+	if _, err := p.acquireMCPConfig(context.Background(), map[string]any{}, t.TempDir()); err != nil {
+		t.Fatalf("provider refused a new lease after retry-then-success: %v", err)
+	}
+}
+
+// Table-driven over the fake app-server: a successful turn's result survives
+// a cleanup failure whether the failure is contained (owner removal clean)
+// or not (owner removal failed). Both go through the real release path so the
+// retry, poison and retention/sweep wiring is exercised, not only the mapper.
+func TestHandle_SuccessfulResultSurvivesCleanupFailureOverFakeServer(t *testing.T) {
+	cases := []struct {
+		name          string
+		failClears    int
+		breakRemoval  bool
+		wantContained bool
+	}{
+		{name: "contained", failClears: 10, wantContained: true},
+		{name: "non-contained", failClears: 10, breakRemoval: true, wantContained: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fs, stdinW, stdoutR := newFakeServer()
+			go fs.run(t, "thread-cleanup-"+tc.name)
+			p, err := New(Options{
+				skipProcess: true, stdinOverride: stdinW, stdoutOverride: stdoutR,
+				configTempDir: t.TempDir(),
+			})
+			if err != nil {
+				fs.close()
+				t.Fatalf("New: %v", err)
+			}
+			startTestProvider(t, p)
+			t.Cleanup(func() {
+				p.client.Stop(errors.New("test complete"))
+				fs.close()
+			})
+			release, err := p.acquireMCPConfig(t.Context(), map[string]any{}, t.TempDir())
+			if err != nil {
+				t.Fatalf("acquire: %v", err)
+			}
+			// Fail every clear attempt so the bounded retry exhausts and the
+			// release reports a failure; the removal outcome decides
+			// contained vs not. Non-transient keeps the client retry out.
+			fs.mu.Lock()
+			fs.failNextBatchWrites = tc.failClears
+			fs.failBatchWriteCode = -32602
+			fs.mu.Unlock()
+			if tc.breakRemoval {
+				other, err := os.Stat(t.TempDir())
+				if err != nil {
+					t.Fatal(err)
+				}
+				p.config.parentInfo = other
+			}
+			h := newHandle(p, p.client, agent.Spec{}, HandleOptions{EventBuffer: 512})
+			h.mcpRelease = release
+			p.registerHandle(h)
+			h.handleNotification(notification{Method: "turn/completed", Params: json.RawMessage(`{"turn":{"id":"t","status":"completed"}}`)})
+			h.signalClosed()
+			h.closeEvents()
+			var kinds []string
+			var warning *agent.SystemEvent
+			for event := range h.Events() {
+				switch value := event.(type) {
+				case agent.ResultEvent:
+					if !value.Success {
+						t.Fatalf("result success = false, want the completed turn")
+					}
+					kinds = append(kinds, "result")
+				case agent.SystemEvent:
+					if value.Subtype == "codex_warning" {
+						warning = &value
+						kinds = append(kinds, "warning")
+					}
+				case agent.ErrorEvent:
+					kinds = append(kinds, "error:"+value.Code)
+				}
+			}
+			if got := strings.Join(kinds, ","); got != "warning,result" {
+				t.Fatalf("events = %q, want %q (contained=%v)", got, "warning,result", tc.wantContained)
+			}
+			if warning == nil || !strings.Contains(warning.Message, "clear isolated MCP config") {
+				t.Fatalf("warning = %+v, want the bounded clear detail", warning)
 			}
 		})
 	}

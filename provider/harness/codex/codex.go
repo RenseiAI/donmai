@@ -28,6 +28,17 @@ import (
 // remains bounded beneath the ordinary RPC timeout while covering that drain.
 const mcpConfigCleanupTimeout = 5 * time.Second
 
+// mcpClearMaxAttempts bounds the final-release clear retries: the first
+// attempt plus two short-backoff retries. A loaded host can fail one clear
+// RPC while the next succeeds; anything still failing after these attempts
+// is reported through the existing poison + retention/sweep path.
+const mcpClearMaxAttempts = 3
+
+// mcpClearRetryBaseDelay is the linear backoff unit between clear attempts
+// (50ms, then 100ms). Short and bounded so the release stays well under the
+// per-attempt RPC timeout while covering transient load spikes.
+const mcpClearRetryBaseDelay = 50 * time.Millisecond
+
 // Provider is the agent.Provider implementation backed by a long-lived
 // `codex app-server` subprocess. One Provider instance owns one
 // subprocess; sessions multiplex via JSON-RPC `thread/start` calls.
@@ -767,9 +778,18 @@ func (p *Provider) acquireMCPConfig(ctx context.Context, mcpConfig map[string]an
 					}
 					return
 				}
-				cleanupCtx, cancel := context.WithTimeout(context.Background(), min(p.opts.RPCTimeout, mcpConfigCleanupTimeout))
-				err := p.applyMCPConfig(cleanupCtx, map[string]any{}, cwd, true)
-				cancel()
+				var err error
+				for attempt := 1; attempt <= mcpClearMaxAttempts; attempt++ {
+					cleanupCtx, cancel := context.WithTimeout(context.Background(), min(p.opts.RPCTimeout, mcpConfigCleanupTimeout))
+					err = p.applyMCPConfig(cleanupCtx, map[string]any{}, cwd, true)
+					cancel()
+					if err == nil {
+						break
+					}
+					if attempt < mcpClearMaxAttempts {
+						time.Sleep(mcpClearRetryBaseDelay * time.Duration(attempt))
+					}
+				}
 				if err != nil {
 					p.mcpConfigKnown = false
 					p.mcpPoisoned = true
@@ -957,10 +977,10 @@ func (e *mcpBoundaryError) reason() string {
 // session's server credentials). Owner removal follows the normal retention
 // rule: a home holding resumable session state is kept (only cache/ is
 // removed), so its config.toml stays on disk exactly as it would after any
-// other session end; contained never claims that file was scrubbed. A
-// contained failure after a completed turn is reported as a warning next to
-// the turn's result; an uncontained one keeps replacing the result with the
-// terminal mcp_cleanup_failed error.
+// other session end; contained never claims that file was scrubbed. A cleanup
+// failure after a successful turn is reported as a warning next to the turn's
+// result (contained or not); only a turn that did not finish successfully
+// keeps failing closed with the terminal mcp_cleanup_failed error.
 type mcpCleanupError struct {
 	err       error
 	contained bool

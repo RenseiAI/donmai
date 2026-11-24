@@ -455,13 +455,23 @@ func (h *Handle) handleNotification(n notification) bool {
 				h.provider.unregisterHandle(h)
 			}
 			if err := h.releaseMCPConfig(); err != nil {
-				if ev.Kind() == agent.EventResult && mcpCleanupContained(err) {
-					// The turn already finished and its result is real; the
-					// failed clear is contained (Provider poisoned, writer
-					// stopped, home removed or retained by the owner's
-					// retention rule). Report the result and surface the
-					// cleanup failure as a warning instead of discarding a
-					// completed turn.
+				if result, ok := ev.(agent.ResultEvent); ok && result.Success {
+					// The turn finished successfully and its result is real.
+					// A cleanup failure (contained or not) never replaces a
+					// successful result: report the result and surface the
+					// cleanup failure as a warning with its own reason
+					// (codex_warning carrying the bounded release detail).
+					// The Provider is poisoned for later leases and the
+					// private home went through the retention/sweep path,
+					// so nothing live or reusable is left behind.
+					slog.Warn("codex: isolated MCP config cleanup failed after the turn completed; app-server stopped, provider refuses new sessions",
+						"threadId", h.SessionID(), "err", err)
+					h.emit(mcpCleanupWarningEvent(err))
+					h.emit(ev)
+				} else if ev.Kind() == agent.EventResult && mcpCleanupContained(err) {
+					// A failed turn whose clear is contained keeps its own
+					// result alongside the warning; anything else fails
+					// closed so an unfinished turn never reports success.
 					slog.Warn("codex: isolated MCP config cleanup failed after the turn completed; app-server stopped, provider refuses new sessions",
 						"threadId", h.SessionID(), "err", err)
 					h.emit(mcpCleanupWarningEvent(err))
