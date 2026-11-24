@@ -45,6 +45,8 @@ func TestStreamProgress_ContentFreeSubtypesHidden(t *testing.T) {
 		agent.SystemSubtypeStreamProgress,
 		agent.SystemSubtypeModelIdentity,
 		agent.SystemSubtypeGenerationID,
+		"command_progress",
+		"codex_progress",
 	} {
 		m := newProgressModel(true)
 		m.applyTailBatch([]TailEvent{{SessionID: "sess-1", Event: agent.SystemEvent{Subtype: sub}, At: progressNow}})
@@ -115,5 +117,55 @@ func TestStreamProgress_PlainOutputStable(t *testing.T) {
 	}
 	if strings.Contains(first, agent.SystemSubtypeStreamProgress) {
 		t.Fatalf("plain view prints progress lines:\n%s", first)
+	}
+}
+
+func toolProgressEvents(n int) []TailEvent {
+	evs := make([]TailEvent, n)
+	for i := range evs {
+		evs[i] = TailEvent{SessionID: "sess-1", Event: agent.ToolProgressEvent{ToolName: "Bash", ElapsedSeconds: float64(i + 1)}, At: progressNow}
+	}
+	return evs
+}
+
+func TestToolProgress_DrivesIndicatorNotLines(t *testing.T) {
+	m := newProgressModel(false)
+	m.applyTailBatch(toolProgressEvents(12))
+	if m.stream.total != 0 {
+		t.Fatalf("tool progress appended %d stream lines: %q", m.stream.total, m.stream.lines)
+	}
+	ind := m.cards[0].streamingIndicator(progressNow, false)
+	if want := streamFrames[12%len(streamFrames)] + " running Bash 12s · "; ind != want {
+		t.Fatalf("indicator = %q, want %q", ind, want)
+	}
+	m.applyTailBatch([]TailEvent{{SessionID: "sess-1", Event: agent.ToolResultEvent{ToolName: "Bash"}, At: progressNow}})
+	if got := m.cards[0].streamingIndicator(progressNow, false); got != "" {
+		t.Fatalf("indicator %q survived the tool result", got)
+	}
+}
+
+func TestToolProgress_PlainOutputStable(t *testing.T) {
+	m := newProgressModel(true)
+	m.applyTailBatch(toolProgressEvents(1))
+	first := m.render()
+	m.applyTailBatch(toolProgressEvents(30))
+	if got := m.render(); got != first {
+		t.Fatalf("plain view changed per tool progress tick:\n%s\n---\n%s", first, got)
+	}
+	if !strings.Contains(first, "running Bash · ") {
+		t.Fatalf("plain view does not name the running tool:\n%s", first)
+	}
+}
+
+func TestToolResult_NamedFromItsCall(t *testing.T) {
+	m := newProgressModel(true)
+	m.applyTailBatch([]TailEvent{
+		{SessionID: "sess-1", Event: agent.ToolUseEvent{ToolName: "Bash", ToolUseID: "tu-1", Input: map[string]any{"command": "ls"}}, At: progressNow},
+		{SessionID: "sess-1", Event: agent.ToolResultEvent{ToolUseID: "tu-1", Content: "ok"}, At: progressNow},
+		{SessionID: "sess-2", Event: agent.ToolResultEvent{ToolUseID: "tu-1", Content: "ok"}, At: progressNow},
+	})
+	lines := m.stream.lines
+	if len(lines) != 3 || !strings.Contains(lines[1], "tool_result  Bash → ok") || !strings.Contains(lines[2], "tool → ok") {
+		t.Fatalf("lines = %q; want the result named after its call, other sessions untouched", lines)
 	}
 }

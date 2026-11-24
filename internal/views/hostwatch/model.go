@@ -183,8 +183,12 @@ type Model struct {
 
 	cards    []SessionCard
 	counters Counters
-	cursor   int
-	snapErr  error
+
+	// toolNames maps session + tool-use id to the call's tool name, so a
+	// result reported by id alone (Claude stream-json) renders named.
+	toolNames map[string]string
+	cursor    int
+	snapErr   error
 
 	// tailers is keyed by session id. A session that disappears from the
 	// index (terminal + reaped) or whose tailer reports Done is dropped.
@@ -1555,6 +1559,7 @@ func (m *Model) applyTailBatch(events []TailEvent) {
 		if ev.source != nil && m.tailers[ev.SessionID] != ev.source {
 			continue // old asynchronous batch from a removed/replaced reader
 		}
+		ev = m.nameToolResult(ev)
 		label := m.labels[ev.SessionID]
 		idx := m.prefixes.get(ev.SessionID)
 		if !ev.Replay || m.opts.Replay {
@@ -1613,6 +1618,8 @@ func (c *SessionCard) retainLegacyFolded(prev SessionCard) {
 	c.LastOutputAt = prev.LastOutputAt
 	c.streamTicks = prev.streamTicks
 	c.streamingAt = prev.streamingAt
+	c.progressTool = prev.progressTool
+	c.progressElapsed = prev.progressElapsed
 	c.ActualModel = prev.ActualModel
 	c.ActualModelProvider = prev.ActualModelProvider
 	c.ActualModelVersion = prev.ActualModelVersion
@@ -1669,13 +1676,22 @@ func (m *Model) foldMetrics(ev TailEvent) {
 	live := !ev.Replay
 	switch e := ev.Event.(type) {
 	case agent.SystemEvent:
-		if live && e.Subtype == agent.SystemSubtypeStreamProgress {
+		if live && livenessSubtype(e.Subtype) {
 			c.streamTicks++
 			c.streamingAt = ev.EventAt()
+		}
+	case agent.ToolProgressEvent:
+		// A long tool's tick moves the indicator and names the tool; it
+		// never becomes a stream line.
+		if live {
+			c.streamTicks++
+			c.streamingAt = ev.EventAt()
+			c.progressTool, c.progressElapsed = e.ToolName, e.ElapsedSeconds
 		}
 	case agent.AssistantTextEvent, agent.ToolUseEvent, agent.ToolResultEvent,
 		agent.ResultEvent, agent.ErrorEvent:
 		c.streamTicks, c.streamingAt = 0, time.Time{} // content ends the stream
+		c.progressTool, c.progressElapsed = "", 0
 	}
 	switch e := ev.Event.(type) {
 	case agent.ToolUseEvent:
@@ -2224,4 +2240,35 @@ func observedUsageKey(call agent.LlmCallEvent, offset *int64) string {
 		return fmt.Sprintf("journal:%d", *offset)
 	}
 	return ""
+}
+
+// maxPendingToolNames bounds toolNames: calls whose results never arrive
+// are forgotten wholesale rather than accumulating for the view's lifetime.
+const maxPendingToolNames = 4096
+
+// nameToolResult remembers each call's tool name by id and gives it to the
+// matching result when the harness reported the result by id alone.
+func (m *Model) nameToolResult(ev TailEvent) TailEvent {
+	switch e := ev.Event.(type) {
+	case agent.ToolUseEvent:
+		if e.ToolUseID == "" {
+			return ev
+		}
+		if m.toolNames == nil || len(m.toolNames) >= maxPendingToolNames {
+			m.toolNames = make(map[string]string)
+		}
+		m.toolNames[ev.SessionID+"\x00"+e.ToolUseID] = e.ToolName
+	case agent.ToolResultEvent:
+		key := ev.SessionID + "\x00" + e.ToolUseID
+		name, ok := m.toolNames[key]
+		if e.ToolUseID == "" || !ok {
+			return ev
+		}
+		delete(m.toolNames, key)
+		if e.ToolName == "" {
+			e.ToolName = name
+			ev.Event = e
+		}
+	}
+	return ev
 }
