@@ -374,3 +374,38 @@ func TestHandshakeRetry_ThirdAttemptSucceedsWhenBudgetAllows(t *testing.T) {
 		}
 	})
 }
+
+// TestHandshakeRetry_ParentExpiryDuringCleanupDoesNotSpawnAgain: a parent
+// deadline that fires while the first timed-out child is being reaped must
+// fail closed without starting a second child. The first-attempt cleanup
+// runs on a detached context and takes the abort grace to reap the child,
+// so a 1.5 s parent easily lands inside it (1 s attempt deadline + ~2 s
+// reap). Without the recheck after cleanup the loop retries with the
+// cancelled session's credentials and the spawn count reads 2.
+func TestHandshakeRetry_ParentExpiryDuringCleanupDoesNotSpawnAgain(t *testing.T) {
+	requireUnixForHandshakeRetry(t)
+	bin := buildRetryFakePi(t)
+	// Every attempt delays past both the attempt deadline and the parent,
+	// so the only question is whether the retry fires after the parent
+	// expires mid-cleanup.
+	t.Setenv("FAKEPI_HANDSHAKE_DELAY_MS", "10000")
+	p := retryTestProvider(t, bin, time.Second)
+	var spawns atomic.Int32
+	p.opts.afterChildStart = func() { spawns.Add(1) }
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+	h, err := p.Spawn(ctx, agent.Spec{Cwd: t.TempDir(), Prompt: "hi"})
+	if !errors.Is(err, agent.ErrSpawnFailed) {
+		t.Fatalf("err = %v, want ErrSpawnFailed", err)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want the parent deadline to bound the retry", err)
+	}
+	if h != nil {
+		t.Fatal("Spawn must return a nil Handle when the parent expires during cleanup")
+	}
+	if n := spawns.Load(); n != 1 {
+		t.Fatalf("spawn attempts = %d, want exactly 1 (no retry past the parent deadline)", n)
+	}
+}

@@ -684,6 +684,16 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 		case <-time.After(p.opts.HandshakeTimeout):
 			_ = h.Stop(context.Background())
 			releasePlan()
+			// The cleanup above runs on a detached context so a timed-out
+			// child is always reaped, but it can outlive the caller's
+			// deadline. Recheck the parent before spawning again: a
+			// parent that expired mid-cleanup must fail closed here
+			// instead of starting a second child with a cancelled
+			// session's credentials and state.
+			if ctx.Err() != nil {
+				removeCredentials()
+				return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, ctx.Err())
+			}
 			if attempt+1 < attempts {
 				continue
 			}
