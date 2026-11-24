@@ -10,6 +10,26 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 No unreleased changes.
 
+## v0.73.13 — 2026-11-24
+
+### Features
+
+- Honour a profile-declared cyber access program per turn
+- Shared tool presentation rules for every harness
+- Normalized instructions, translation report, effective settings
+
+### Fixes
+
+- Keep a completed turn's result when MCP cleanup is contained
+
+### Chores
+
+- Preserve provider metering evidence for probed logins
+- Auto-recovered session work
+- Expose per-session chat readiness and prove hook delivery
+- Harden transcript-tail redaction for failed sessions
+- Report a failed turn's provider error instead of the last progress note
+
 ## v0.73.12 — 2026-11-23
 
 ### Chores
