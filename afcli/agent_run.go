@@ -1460,8 +1460,14 @@ func piHandshakeTimeoutHint(d *daemon.SessionDetail) time.Duration {
 		// A value past maxHandshakeTimeoutSeconds (for example a duration
 		// written as nanoseconds) would overflow time.Duration; NaN and
 		// Inf fail these comparisons too. All are invalid, never clamped.
+		// A positive value that truncates to zero (below one nanosecond)
+		// is a present declaration, not an absent one: it must reach
+		// construction as invalid instead of collapsing to unset and
+		// silently installing the default.
 		if n > 0 && n <= float64(maxHandshakeTimeoutSeconds) {
-			return time.Duration(n * float64(time.Second))
+			if d := time.Duration(n * float64(time.Second)); d > 0 {
+				return d
+			}
 		}
 	case int:
 		if n > 0 && int64(n) <= maxHandshakeTimeoutSeconds {

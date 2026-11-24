@@ -409,3 +409,39 @@ func TestHandshakeRetry_ParentExpiryDuringCleanupDoesNotSpawnAgain(t *testing.T)
 		t.Fatalf("spawn attempts = %d, want exactly 1 (no retry past the parent deadline)", n)
 	}
 }
+
+// TestHandshakeRetry_CancelAtRetryChildStartDoesNotStartChild: after the
+// first attempt times out, a caller cancel that lands while the retry
+// prepares its launch (past the retry loop's own parent check) must stop
+// the retry at the process-start boundary. Exactly one child starts and
+// the error carries the typed cancellation.
+func TestHandshakeRetry_CancelAtRetryChildStartDoesNotStartChild(t *testing.T) {
+	requireUnixForHandshakeRetry(t)
+	bin := buildRetryFakePi(t)
+	t.Setenv("FAKEPI_HANDSHAKE_DELAY_MS", "10000")
+	p := retryTestProvider(t, bin, time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var before, spawns atomic.Int32
+	p.opts.beforeChildStart = func() {
+		if before.Add(1) == 2 {
+			cancel()
+		}
+	}
+	p.opts.afterChildStart = func() { spawns.Add(1) }
+
+	h, err := p.Spawn(ctx, agent.Spec{Cwd: t.TempDir(), Prompt: "hi"})
+	if h != nil {
+		_ = h.Stop(context.Background())
+		t.Fatal("Spawn must return a nil Handle when the caller cancels before the retry starts")
+	}
+	if before.Load() < 2 {
+		t.Fatalf("pre-start barrier reached %d time(s); the retry never reached child start", before.Load())
+	}
+	if !errors.Is(err, agent.ErrSpawnFailed) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want ErrSpawnFailed wrapping context.Canceled", err)
+	}
+	if n := spawns.Load(); n != 1 {
+		t.Fatalf("children started = %d, want exactly 1 (the retry must not start after the cancel)", n)
+	}
+}

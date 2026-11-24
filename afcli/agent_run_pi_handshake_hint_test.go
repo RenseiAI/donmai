@@ -215,6 +215,7 @@ func TestPiHandshakeTimeoutHint_UnrepresentableSecondsAreRejected(t *testing.T) 
 		{"nanoseconds-as-seconds float", `10000000000`},
 		{"just past the limit", `9223372037`},
 		{"huge exponent", `1e300`},
+		{"sub-nanosecond truncates to zero", `0.0000000005`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -191,8 +191,10 @@ type Options struct {
 	// establish this ordering: the child may already have started its turn.
 	// Nil leaves the production launch sequence unchanged.
 	beforeInitialPrompt func(*Handle) error
-	// beforeChildStart and afterChildStart are deterministic mutation barriers
-	// around the two artifact-lease checks. Nil leaves production unchanged.
+	// beforeChildStart and afterChildStart are deterministic barriers around
+	// child start: beforeChildStart runs before the pre-start artifact-lease
+	// check and the caller recheck, afterChildStart after the process starts.
+	// Nil leaves production unchanged.
 	beforeChildStart func()
 	afterChildStart  func()
 	// handshakeToken pins the per-session token in skipProcess tests so a
@@ -626,12 +628,12 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 			stdin = p.opts.stdinOverride
 			stdout = p.opts.stdoutOverride
 		} else {
-			c, in, out, serr := p.spawnChild(spec, layout, extensionPaths, skills.Args, childEnv, mode, sessionID, p.artifact, receipt, plan)
+			c, in, out, serr := p.spawnChild(ctx, spec, layout, extensionPaths, skills.Args, childEnv, mode, sessionID, p.artifact, receipt, plan)
 			if serr != nil {
 				releasePlan()
 				evidenceClaim.release()
 				removeCredentials()
-				return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, serr)
+				return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, serr)
 			}
 			cmd, stdin, stdout = c, in, out
 			if p.opts.afterChildStart != nil {
@@ -889,7 +891,7 @@ func newHeadlessChildCommand(argv []string, dir string, env []string) *exec.Cmd 
 // stdin/stdout/stderr pipes created below — and never a descriptor open on
 // an out-of-set file (ExtraFiles is never set: newHeadlessChildCommand).
 // spawnChild never releases the plan: on any error the caller does.
-func (p *Provider) spawnChild(spec agent.Spec, layout sessionLayout, extensionPaths, skillArgs []string, childEnv []string, mode launchMode, sessionID string, artifact *artifactLease, receipt *receiptAdmission, plan *confinement.Plan) (*exec.Cmd, io.WriteCloser, io.ReadCloser, error) {
+func (p *Provider) spawnChild(ctx context.Context, spec agent.Spec, layout sessionLayout, extensionPaths, skillArgs []string, childEnv []string, mode launchMode, sessionID string, artifact *artifactLease, receipt *receiptAdmission, plan *confinement.Plan) (*exec.Cmd, io.WriteCloser, io.ReadCloser, error) {
 	argv, err := confinePiArgv(plan, append([]string{p.binary}, rpcArgsWithSkills(layout, extensionPaths, mode, sessionID, spec, skillArgs)...))
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("pi confine command: %w", err)
@@ -910,13 +912,20 @@ func (p *Provider) spawnChild(spec agent.Spec, layout sessionLayout, extensionPa
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("pi stderr pipe: %w", err)
 	}
+	if p.opts.beforeChildStart != nil {
+		p.opts.beforeChildStart()
+	}
 	if artifact != nil {
-		if p.opts.beforeChildStart != nil {
-			p.opts.beforeChildStart()
-		}
 		if err := revalidateLaunchTrust(artifact, receipt, childEnv); err != nil {
 			return nil, nil, nil, fmt.Errorf("pi artifact changed before spawn: %w", err)
 		}
+	}
+	// Recheck the caller at the process-start boundary: a cancel that lands
+	// while this attempt prepares or revalidates its launch (after the
+	// retry loop's own check) must not start a child that would hold the
+	// cancelled session's credential-file paths.
+	if err := ctx.Err(); err != nil {
+		return nil, nil, nil, fmt.Errorf("pi spawn: caller cancelled before child start: %w", err)
 	}
 	if err := cmd.Start(); err != nil {
 		return nil, nil, nil, fmt.Errorf("pi spawn: %w", err)
