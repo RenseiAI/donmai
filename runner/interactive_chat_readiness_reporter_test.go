@@ -475,3 +475,72 @@ func TestDispatchInteractive_RefreshesSoonAfterHookConsumption(t *testing.T) {
 		t.Fatalf("idle refresh gap after hook consumption = %v; want <=3s (2s interval + 1s tolerance)", gap)
 	}
 }
+
+// TestChatReadinessReporter_LostResponseCorrects pins the lost-response fix:
+// the receiver applies a busy update but its HTTP response is lost, so the
+// POST reports failure while the watermark still holds idle. The reverted
+// idle read must still re-post (correcting the receiver back to idle)
+// instead of reading as unchanged until the 60s refresh. Ended never posts
+// even while uncertain.
+func TestChatReadinessReporter_LostResponseCorrects(t *testing.T) {
+	var mu sync.Mutex
+	var posts []string
+	failBusyOnce := true
+	now := time.Now()
+	clock := func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
+	post := func(_ context.Context, w *afclient.SessionChatReadiness) error {
+		mu.Lock()
+		defer mu.Unlock()
+		if w.State == "busy" && failBusyOnce {
+			failBusyOnce = false
+			// Receiver applied busy before the connection dropped: record
+			// the applied state, then report the lost response as failure.
+			posts = append(posts, "applied-busy-lost-response")
+			return errors.New("chat readiness response lost")
+		}
+		posts = append(posts, w.State)
+		return nil
+	}
+	c := newChatReadinessReporter(post, clock, 60*time.Second)
+	idle := agent.ChatReadiness{Channel: agent.NoticeDeliveryHook, State: agent.ChatStateIdle, LiveSupported: true, QueueSupported: true}
+	busy := idle
+	busy.State = agent.ChatStateBusy
+	ended := idle
+	ended.State = agent.ChatStateEnded
+
+	if !c.maybeReport(context.Background(), idle) {
+		t.Fatal("initial idle did not initiate a POST")
+	}
+	if !c.waitIdle(10 * time.Second) {
+		t.Fatal("background POST did not settle")
+	}
+	if n := len(posts); n != 1 || posts[0] != "idle" {
+		t.Fatalf("posts = %v; want [idle] after initial ack", posts)
+	}
+	if !c.maybeReport(context.Background(), busy) {
+		t.Fatal("busy change did not initiate a POST")
+	}
+	if !c.waitIdle(10 * time.Second) {
+		t.Fatal("background POST did not settle")
+	}
+	// The busy POST failed after the receiver applied it: the watermark is
+	// still idle, but the cache is uncertain so the reverted idle read must
+	// correct the receiver instead of reading as unchanged.
+	if !c.maybeReport(context.Background(), idle) {
+		t.Fatal("reverted idle after a lost busy response did not initiate a corrective POST")
+	}
+	if !c.waitIdle(10 * time.Second) {
+		t.Fatal("background POST did not settle")
+	}
+	mu.Lock()
+	got := append([]string(nil), posts...)
+	mu.Unlock()
+	if len(got) != 3 || got[0] != "idle" || got[1] != "applied-busy-lost-response" || got[2] != "idle" {
+		t.Fatalf("posts = %v; want [idle applied-busy-lost-response idle] corrective sequence", got)
+	}
+	// The corrective POST cleared the uncertainty: a further unchanged idle
+	// read stays quiet until the refresh bound.
+	if c.maybeReport(context.Background(), idle) {
+		t.Fatal("settled idle re-posted before the interval")
+	}
+}

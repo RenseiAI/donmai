@@ -54,7 +54,13 @@ type chatReadinessReporter struct {
 	hasLast  bool
 	last     agent.ChatReadiness
 	lastPost time.Time
-	inFlight bool
+	// uncertain marks the receiver as possibly ahead of the watermark: the
+	// last POST reached the receiver but its response was lost (or the POST
+	// failed after the receiver applied it). The next non-ended sample must
+	// re-post even when it equals the last acknowledged read, otherwise a
+	// busy update the receiver applied stays stuck until the 60s refresh.
+	uncertain bool
+	inFlight  bool
 }
 
 func newChatReadinessReporter(post func(context.Context, *afclient.SessionChatReadiness) error, now func() time.Time, interval time.Duration) *chatReadinessReporter {
@@ -70,6 +76,9 @@ func newChatReadinessReporter(post func(context.Context, *afclient.SessionChatRe
 func (c *chatReadinessReporter) shouldPost(current agent.ChatReadiness, now time.Time) bool {
 	if current.State == agent.ChatStateEnded {
 		return false
+	}
+	if c.uncertain {
+		return true
 	}
 	if !c.hasLast {
 		return true
@@ -105,6 +114,15 @@ func (c *chatReadinessReporter) maybeReport(ctx context.Context, current agent.C
 		c.inFlight = false
 		if err == nil {
 			c.last, c.hasLast, c.lastPost = current, true, now
+			c.uncertain = false
+		} else {
+			// The POST may have reached the receiver before the response
+			// was lost: the receiver can hold the attempted read while
+			// the watermark still carries the previous acknowledged
+			// value. Marking the cache uncertain forces the next sample
+			// to re-post, so a reverted read corrects the receiver
+			// instead of reading as unchanged until the next refresh.
+			c.uncertain = true
 		}
 		c.mu.Unlock()
 	}()
