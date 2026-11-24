@@ -10,6 +10,13 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 No unreleased changes.
 
+## v0.73.15 — 2026-11-24
+
+### Chores
+
+- Preserve successful turn result when isolated config cleanup fails
+- Pi handshake: retry one slow start, classify broken extensions
+
 ## v0.73.14 — 2026-11-24
 
 ### Features
