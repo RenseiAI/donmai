@@ -102,6 +102,7 @@ type rawSystemEnvelope struct {
 type rawToolProgressEnvelope struct {
 	Type               string  `json:"type"`
 	ToolName           string  `json:"tool_name"`
+	ToolUseID          string  `json:"tool_use_id"`
 	ElapsedTimeSeconds float64 `json:"elapsed_time_seconds"`
 }
 
@@ -477,20 +478,20 @@ func mapAssistant(line []byte) []agent.Event {
 				Input:           input,
 				Raw:             json.RawMessage(line),
 			})
+			if plan, ok := todoPlan(block.Name, input, line); ok {
+				out = append(out, plan)
+			}
 		case "thinking":
-			// Model reasoning rides as SystemEvent{Subtype: "reasoning"}
-			// — the activity poster whitelists exactly that subtype and
-			// forwards it as a "thought" activity (parity with codex
-			// completed reasoning items). It must NOT become an
-			// AssistantTextEvent: the runner scans assistant text for
-			// verdict markers.
+			// Model reasoning is a typed ReasoningEvent (event model v2);
+			// the activity poster forwards it as a "thought". It must NOT
+			// become an AssistantTextEvent: the runner scans assistant text
+			// for verdict markers.
 			if block.Thinking == "" {
 				continue
 			}
-			out = append(out, agent.SystemEvent{
-				Subtype: "reasoning",
-				Message: block.Thinking,
-				Raw:     json.RawMessage(line),
+			out = append(out, agent.ReasoningEvent{
+				Text: block.Thinking,
+				Raw:  json.RawMessage(line),
 			})
 		case "redacted_thinking":
 			// Encrypted reasoning — nothing renderable; deliberately
@@ -614,6 +615,7 @@ func mapToolProgress(line []byte) []agent.Event {
 	return []agent.Event{agent.ToolProgressEvent{
 		ToolName:       p.ToolName,
 		ElapsedSeconds: p.ElapsedTimeSeconds,
+		ItemID:         p.ToolUseID,
 		Raw:            json.RawMessage(line),
 	}}
 }
@@ -925,4 +927,37 @@ func decodeToolResultContent(raw json.RawMessage) string {
 	}
 	// Otherwise stringify the raw JSON body.
 	return string(raw)
+}
+
+// todoPlanItemID is the item id of the todo list: Claude keeps one list per
+// session and every TodoWrite call replaces it whole.
+const todoPlanItemID = "todos"
+
+// todoPlan maps a TodoWrite call's input to the whole current plan.
+func todoPlan(toolName string, input map[string]any, line []byte) (agent.PlanEvent, bool) {
+	if toolName != "TodoWrite" {
+		return agent.PlanEvent{}, false
+	}
+	todos, ok := input["todos"].([]any)
+	if !ok {
+		return agent.PlanEvent{}, false
+	}
+	steps := make([]agent.PlanStep, 0, len(todos))
+	for _, item := range todos {
+		todo, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		text, _ := todo["content"].(string)
+		status, _ := todo["status"].(string)
+		step := agent.PlanStep{Text: text, Status: agent.PlanStepPending}
+		switch status {
+		case "in_progress":
+			step.Status = agent.PlanStepInProgress
+		case "completed":
+			step.Status = agent.PlanStepCompleted
+		}
+		steps = append(steps, step)
+	}
+	return agent.PlanEvent{ItemID: todoPlanItemID, Steps: steps, Raw: json.RawMessage(line)}, true
 }

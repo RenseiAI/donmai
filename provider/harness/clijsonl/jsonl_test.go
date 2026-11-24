@@ -146,12 +146,10 @@ func TestMapLine_AssistantMixed(t *testing.T) {
 	}
 }
 
-// Claude extended-thinking blocks must surface as
-// SystemEvent{Subtype: "reasoning"} — the activity poster whitelists
-// exactly that subtype and forwards it as a "thought" activity (parity
-// with codex completed reasoning items). They must never become
-// AssistantTextEvent: the runner scans assistant text for verdict
-// markers.
+// Claude extended-thinking blocks must surface as a typed ReasoningEvent
+// (event model v2), which the activity poster forwards as a "thought".
+// They must never become AssistantTextEvent: the runner scans assistant
+// text for verdict markers.
 func TestMapLine_AssistantThinking(t *testing.T) {
 	t.Parallel()
 
@@ -160,15 +158,12 @@ func TestMapLine_AssistantThinking(t *testing.T) {
 	if len(events) != 2 {
 		t.Fatalf("got %d events, want 2 (reasoning + text): %v", len(events), events)
 	}
-	sys, ok := events[0].(agent.SystemEvent)
+	sys, ok := events[0].(agent.ReasoningEvent)
 	if !ok {
-		t.Fatalf("event[0] %T, want SystemEvent", events[0])
+		t.Fatalf("event[0] %T, want ReasoningEvent", events[0])
 	}
-	if sys.Subtype != "reasoning" {
-		t.Errorf("Subtype = %q, want %q", sys.Subtype, "reasoning")
-	}
-	if sys.Message != "The user wants the file listed; ls is sufficient." {
-		t.Errorf("Message = %q, want fixture thinking text", sys.Message)
+	if sys.Text != "The user wants the file listed; ls is sufficient." {
+		t.Errorf("Text = %q, want fixture thinking text", sys.Text)
 	}
 	if sys.Raw == nil {
 		t.Errorf("Raw should be non-nil")
@@ -1035,5 +1030,35 @@ func TestMapLine_StreamingGenerationID(t *testing.T) {
 	progress, ok := events[1].(agent.SystemEvent)
 	if !ok || progress.Subtype != agent.SystemSubtypeStreamProgress {
 		t.Fatalf("event = %+v; want stream progress", events[1])
+	}
+}
+
+func TestMapLine_ToolProgressCarriesItemID(t *testing.T) {
+	t.Parallel()
+	events := mapLine([]byte(`{"type":"tool_progress","tool_name":"Bash","tool_use_id":"toolu_1","elapsed_time_seconds":3}`))
+	if len(events) != 1 {
+		t.Fatalf("got %d events, want 1", len(events))
+	}
+	p, ok := events[0].(agent.ToolProgressEvent)
+	if !ok || p.ItemID != "toolu_1" || p.ToolName != "Bash" || p.ElapsedSeconds != 3 {
+		t.Fatalf("event = %#v; want progress for toolu_1", events[0])
+	}
+}
+
+func TestMapLine_TodoWriteEmitsWholePlan(t *testing.T) {
+	t.Parallel()
+	line := `{"type":"assistant","message":{"model":"m","id":"msg_1","role":"assistant","content":[{"type":"tool_use","id":"toolu_2","name":"TodoWrite","input":{"todos":[` +
+		`{"content":"read","status":"completed","activeForm":"Reading"},{"content":"edit","status":"in_progress","activeForm":"Editing"},{"content":"test","status":"pending","activeForm":"Testing"}]}}]},"session_id":"s"}`
+	var plan *agent.PlanEvent
+	for _, ev := range mapLine([]byte(line)) {
+		if p, ok := ev.(agent.PlanEvent); ok {
+			plan = &p
+		}
+	}
+	if plan == nil {
+		t.Fatal("TodoWrite produced no PlanEvent")
+	}
+	if plan.ItemID != "todos" || plan.Summary() != "Plan 1/3 · edit" {
+		t.Fatalf("plan = %#v (summary %q)", plan, plan.Summary())
 	}
 }
