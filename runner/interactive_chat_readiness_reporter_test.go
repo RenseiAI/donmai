@@ -55,7 +55,7 @@ func TestChatReadinessReporter_ChangeRefreshEnded(t *testing.T) {
 		t.Fatalf("unchanged read reposted before the interval: %d posts", n)
 	}
 	mu.Lock()
-	now = now.Add(61 * time.Second)
+	now = now.Add(60 * time.Second)
 	mu.Unlock()
 	c.maybeReport(context.Background(), idle)
 	if n := len(posts); n != 2 {
@@ -84,7 +84,6 @@ func TestChatReadinessReporter_ChangeRefreshEnded(t *testing.T) {
 func TestDispatchInteractive_PostsChatReadiness(t *testing.T) {
 	oldInterval := chatReadinessRefreshInterval
 	chatReadinessRefreshInterval = time.Hour
-	defer func() { chatReadinessRefreshInterval = oldInterval }()
 
 	var mu sync.Mutex
 	var running [][]byte
@@ -129,7 +128,7 @@ func TestDispatchInteractive_PostsChatReadiness(t *testing.T) {
 		_, err := r.dispatchInteractive(context.Background(), handle, t.TempDir(), qw, res, &recordingSink{}, newFakeInteractivePulser(), injectCh, agent.NoticeDeliveryHook)
 		done <- err
 	}()
-	t.Cleanup(func() { close(sess.done); <-done })
+	t.Cleanup(func() { close(sess.done); <-done; chatReadinessRefreshInterval = oldInterval })
 
 	waitPosts := func(n int) [][]byte {
 		t.Helper()

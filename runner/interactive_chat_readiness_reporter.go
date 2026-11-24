@@ -20,7 +20,7 @@ func chatReadinessWire(r agent.ChatReadiness, now time.Time) *afclient.SessionCh
 		Version: afclient.SessionChatReadinessVersion, Channel: string(r.Channel),
 		State: string(r.State), LiveSupported: r.LiveSupported,
 		QueueSupported: r.QueueSupported, Reason: r.Reason,
-		ObservedAt:     now.UTC().Format(time.RFC3339),
+		ObservedAt: now.UTC().Format(time.RFC3339),
 	}
 }
 

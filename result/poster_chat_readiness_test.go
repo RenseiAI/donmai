@@ -60,6 +60,31 @@ func TestPostRunningChatReadiness_Golden(t *testing.T) {
 	}
 }
 
+// TestPostRunningChatReadiness_EmptySessionID pins the unpinned validation
+// guard: an empty session ID returns the typed error and posts nothing,
+// instead of a malformed /api/sessions//status POST.
+func TestPostRunningChatReadiness_EmptySessionID(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+	p := newPoster(t, srv.URL, 0)
+	readiness := &afclient.SessionChatReadiness{
+		Version: 1, Channel: "hook", State: "idle",
+		LiveSupported: true, QueueSupported: true,
+		ObservedAt: time.Now().UTC().Format(time.RFC3339),
+	}
+	err := p.PostRunningChatReadiness(context.Background(), "", readiness)
+	if err == nil || !strings.Contains(err.Error(), "sessionID is required") {
+		t.Fatalf("err = %v; want sessionID is required", err)
+	}
+	if calls != 0 {
+		t.Fatalf("posts = %d; want 0 for empty session ID", calls)
+	}
+}
+
 // TestPosterPost_TerminalOmitsChatReadiness proves terminal posts never carry
 // the field: the terminal wire stays byte-identical for old receivers.
 func TestPosterPost_TerminalOmitsChatReadiness(t *testing.T) {
