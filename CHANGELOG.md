@@ -8,6 +8,10 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+No unreleased changes.
+
+## v0.73.14 — 2026-11-24
+
 ### Features
 
 - Expose a Go reader for replaying the current run’s local session journal and following live events.
