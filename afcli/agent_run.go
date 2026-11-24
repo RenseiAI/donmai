@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"math/rand/v2"
 	"net/http"
 	"os"
@@ -1456,15 +1457,18 @@ func piHandshakeTimeoutHint(d *daemon.SessionDetail) time.Duration {
 	}
 	switch n := v.(type) {
 	case float64:
-		if n > 0 {
+		// A value past maxHandshakeTimeoutSeconds (for example a duration
+		// written as nanoseconds) would overflow time.Duration; NaN and
+		// Inf fail these comparisons too. All are invalid, never clamped.
+		if n > 0 && n <= float64(maxHandshakeTimeoutSeconds) {
 			return time.Duration(n * float64(time.Second))
 		}
 	case int:
-		if n > 0 {
+		if n > 0 && int64(n) <= maxHandshakeTimeoutSeconds {
 			return time.Duration(n) * time.Second
 		}
 	case int64:
-		if n > 0 {
+		if n > 0 && n <= maxHandshakeTimeoutSeconds {
 			return time.Duration(n) * time.Second
 		}
 	case string:
@@ -1476,6 +1480,11 @@ func piHandshakeTimeoutHint(d *daemon.SessionDetail) time.Duration {
 	}
 	return invalidHandshakeTimeout
 }
+
+// maxHandshakeTimeoutSeconds is the largest whole number of seconds a
+// time.Duration can hold. Larger declared values are rejected as invalid
+// instead of overflowing into a wrapped or near-unbounded deadline.
+const maxHandshakeTimeoutSeconds = math.MaxInt64 / int64(time.Second)
 
 // piHandshakeMaxAttemptsHint derives the pi handshake-attempt budget from
 // a fetched SessionDetail. Absent resolves to zero (provider default). A

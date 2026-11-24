@@ -1,6 +1,7 @@
 package afcli
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -196,5 +197,51 @@ func TestPiCtorOptions_ThreadsHandshakeMaxAttempts(t *testing.T) {
 	}
 	if got := agentRunHints(d); got.PiHandshakeMaxAttempts != 3 {
 		t.Errorf("agentRunHints(pi 3 attempts).PiHandshakeMaxAttempts = %d; want 3", got.PiHandshakeMaxAttempts)
+	}
+}
+
+// TestPiHandshakeTimeoutHint_UnrepresentableSecondsAreRejected proves a
+// declared value too large for time.Duration — for example a 10 s deadline
+// written as nanoseconds — is rejected at construction instead of
+// overflowing into a near-unbounded handshake wait. It decodes the real
+// SessionDetail JSON wire shape so the float64 path is the one exercised.
+func TestPiHandshakeTimeoutHint_UnrepresentableSecondsAreRejected(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		wire string
+	}{
+		{"nanoseconds-as-seconds float", `10000000000`},
+		{"just past the limit", `9223372037`},
+		{"huge exponent", `1e300`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			raw := `{"resolvedProfile":{"provider":"pi","providerConfig":{"` + piHandshakeTimeoutHintKey + `":` + tc.wire + `}}}`
+			var d daemon.SessionDetail
+			if err := json.Unmarshal([]byte(raw), &d); err != nil {
+				t.Fatalf("decode wire detail: %v", err)
+			}
+			if d.ResolvedProfile == nil {
+				t.Fatal("wire detail decoded without a resolved profile; fixture does not match the wire shape")
+			}
+			h := agentRunHints(&d)
+			if h.PiHandshakeTimeout != invalidHandshakeTimeout {
+				t.Fatalf("hint = %v, want the invalid sentinel", h.PiHandshakeTimeout)
+			}
+			if _, err := providerpi.New(piCtorOptions(h)); err == nil {
+				t.Fatal("New accepted an unrepresentable handshake timeout; want a typed rejection")
+			}
+		})
+	}
+
+	// The largest representable whole-second value still parses (it then
+	// meets construction's own bounds, which are tested elsewhere).
+	if got := piHandshakeTimeoutHint(&daemon.SessionDetail{ResolvedProfile: &daemon.SessionResolvedProfile{
+		ProviderConfig: map[string]any{piHandshakeTimeoutHintKey: int64(9223372036)},
+	}}); got <= 0 {
+		t.Fatalf("max representable seconds resolved to %v, want a positive duration", got)
 	}
 }
