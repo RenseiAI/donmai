@@ -185,7 +185,7 @@ func (h *Handle) Stop(ctx context.Context) error {
 	})
 	cleanupErr := h.releaseMCPConfig()
 	if cleanupErr != nil {
-		h.emit(mcpCleanupErrorEvent())
+		h.emitCoarse(mcpCleanupErrorEvent())
 	}
 	// Broadcast shutdown + close events; both are idempotent guards
 	// (closedOnce / eventsClosed) so the call is safe even if the
@@ -210,9 +210,9 @@ func (h *Handle) failNow(err error) {
 	// eventsClosed is already set. Posting BEFORE we close lets the
 	// runner observe the failure rather than racing with closure.
 	if cleanupErr != nil {
-		h.emit(mcpCleanupErrorEvent())
+		h.emitCoarse(mcpCleanupErrorEvent())
 	} else {
-		h.emit(agent.ErrorEvent{
+		h.emitCoarse(agent.ErrorEvent{
 			Message: fmt.Sprintf("codex provider failure: %s", err.Error()),
 			Code:    "app_server_crashed",
 		})
@@ -406,7 +406,7 @@ func (h *Handle) forward(ctx context.Context) {
 			ctxStop, cancel := context.WithTimeout(context.Background(), h.rpcTimeout)
 			_ = h.Stop(ctxStop)
 			cancel()
-			h.emit(agent.ErrorEvent{Message: "session cancelled: " + ctx.Err().Error(), Code: "context_cancelled"})
+			h.emitCoarse(agent.ErrorEvent{Message: "session cancelled: " + ctx.Err().Error(), Code: "context_cancelled"})
 			return
 		case <-h.closed:
 			return
@@ -484,10 +484,10 @@ func (h *Handle) handleNotification(n notification) bool {
 						"threadId", h.SessionID(), "err", err)
 					h.emitTerminalWithWarning(mcpCleanupWarningEvent(err, true), ev)
 				} else {
-					h.emit(mcpCleanupErrorEvent())
+					h.emitCoarse(mcpCleanupErrorEvent())
 				}
 			} else {
-				h.emit(ev)
+				h.emitCoarse(ev)
 			}
 			return true
 		}
@@ -516,27 +516,40 @@ func mcpCleanupWarningEvent(err error, writerStopped bool) agent.SystemEvent {
 	}
 }
 
+// terminalReservedSlots holds the coarse Init/Result contract: stream deltas
+// never take these slots, so the terminal warning plus result always fit
+// without discarding queued history. Mirrors the interactive lane's
+// coarse-slot reservation (interactive.go).
+const terminalReservedSlots = 2
+
 // emitTerminalWithWarning emits a cleanup warning plus the turn's terminal
-// outcome while reserving the final buffer slot for that outcome. A burst of
-// stream deltas can leave exactly one slot after completion usage is queued;
-// emitting the warning first would take that slot and drop the successful
-// result, closing the stream with no terminal event. When fewer than two
-// slots remain the terminal outcome wins and the warning is dropped (it stays
-// in the logs). When the buffer is completely full one expendable queued event
-// is discarded so the terminal outcome is still delivered.
+// outcome without discarding queued history. Stream deltas never fill the
+// reserved slots (see emit), so both normally fit; when only one slot
+// remains the terminal outcome wins and the warning is dropped (it stays in
+// the logs). A completely full buffer can only happen when the channel was
+// filled bypassing emit (tiny test buffers, direct sends): the terminal then
+// waits for the consumer to drain rather than discarding the oldest queued
+// event, which carries the session identity the runner needs for the result
+// and recovery state.
 func (h *Handle) emitTerminalWithWarning(warning agent.SystemEvent, terminal agent.Event) {
-	if cap(h.events)-len(h.events) < 2 {
-		if len(h.events) == cap(h.events) {
-			select {
-			case <-h.events:
-			default:
-			}
-		}
-		h.emit(terminal)
+	if cap(h.events)-len(h.events) >= 2 {
+		h.emitCoarse(warning)
+		h.emitCoarse(terminal)
 		return
 	}
-	h.emit(warning)
-	h.emit(terminal)
+	if cap(h.events)-len(h.events) == 1 {
+		h.emitCoarse(terminal)
+		return
+	}
+	h.eventsMu.RLock()
+	defer h.eventsMu.RUnlock()
+	if h.eventsClosed.Load() {
+		return
+	}
+	select {
+	case h.events <- terminal:
+	case <-h.closed:
+	}
 }
 
 func mcpCleanupErrorEvent() agent.ErrorEvent {
@@ -631,10 +644,11 @@ func (h *Handle) handleServerRequest(n notification) {
 	})
 }
 
-// emit publishes an event on the events channel without blocking. If
-// the channel is full, the event is dropped silently — the runner is
-// expected to keep up; emitting backpressure into the JSON-RPC stream
-// would deadlock the codex side.
+// emit publishes a stream-delta event on the events channel without
+// blocking. Deltas never take the terminalReservedSlots held for the
+// terminal warning plus result; once only those remain the delta is dropped
+// silently — the runner is expected to keep up, and emitting backpressure
+// into the JSON-RPC stream would deadlock the codex side.
 //
 // Close-protocol invariant: emit holds eventsMu.RLock for
 // the duration of the send and aborts early when eventsClosed is set.
@@ -644,6 +658,31 @@ func (h *Handle) handleServerRequest(n notification) {
 // selected against so a slow send unblocks promptly when shutdown
 // begins, even if the closer has not yet acquired the write lock.
 func (h *Handle) emit(ev agent.Event) {
+	h.eventsMu.RLock()
+	defer h.eventsMu.RUnlock()
+	if h.eventsClosed.Load() {
+		return
+	}
+	// Never take a slot reserved for the terminal warning plus result:
+	// with at most terminalReservedSlots coarse sends over the handle's
+	// life, the coarse senders below always fit what deltas left free.
+	// When the consumer is slow the delta is dropped rather than stalling
+	// the forwarder or displacing queued history.
+	if len(h.events) >= cap(h.events)-terminalReservedSlots {
+		return
+	}
+	select {
+	case h.events <- ev:
+	case <-h.closed:
+	default:
+	}
+}
+
+// emitCoarse publishes a terminal event (every Result/Error terminal above
+// plus the Stop/failNow/cancel paths below) without the delta reservation:
+// the reserved slots exist exactly so these sends fit. Non-blocking with the
+// same close-protocol guard as emit.
+func (h *Handle) emitCoarse(ev agent.Event) {
 	h.eventsMu.RLock()
 	defer h.eventsMu.RUnlock()
 	if h.eventsClosed.Load() {

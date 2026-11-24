@@ -46,6 +46,12 @@ type fakeServer struct {
 	// RequestWithRetry from masking the outer release retry.
 	failNextBatchWrites int
 	failBatchWriteCode  int
+
+	// hangBatchWrite, when true, records config/batchWrite requests but
+	// never answers them, so the client's per-attempt timeout fires. Tests
+	// set it after acquire to prove the final release fits one shared
+	// budget instead of holding the terminal past the run deadline.
+	hangBatchWrite bool
 }
 
 func newFakeServer() (*fakeServer, *io.PipeWriter, *io.PipeReader) {
@@ -146,6 +152,12 @@ func (fs *fakeServer) run(t *testing.T, threadID string) {
 			}
 			fs.write(t, map[string]any{"jsonrpc": "2.0", "id": idRaw, "result": result})
 		case method == "config/batchWrite" && hasID:
+			fs.mu.Lock()
+			hang := fs.hangBatchWrite
+			fs.mu.Unlock()
+			if hang {
+				continue
+			}
 			fs.mu.Lock()
 			failRemaining := fs.failNextBatchWrites
 			failCode := fs.failBatchWriteCode

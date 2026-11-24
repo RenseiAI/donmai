@@ -778,11 +778,20 @@ func (p *Provider) acquireMCPConfig(ctx context.Context, mcpConfig map[string]an
 					}
 					return
 				}
+				// One shared budget for every clear attempt, not a fresh
+				// window per attempt: the turn's terminal event is already
+				// known and the runner is waiting on its run deadline, so
+				// holding the result past that deadline turns a completed
+				// turn into a timeout. A hung clear consumes the budget
+				// on the first attempt and no further attempt is sent; a
+				// fast failure still leaves budget for the retry.
+				cleanupCtx, cancel := context.WithTimeout(context.Background(), min(p.opts.RPCTimeout, mcpConfigCleanupTimeout))
 				var err error
 				for attempt := 1; attempt <= mcpClearMaxAttempts; attempt++ {
-					cleanupCtx, cancel := context.WithTimeout(context.Background(), min(p.opts.RPCTimeout, mcpConfigCleanupTimeout))
+					if attempt > 1 && cleanupCtx.Err() != nil {
+						break
+					}
 					err = p.applyMCPConfig(cleanupCtx, map[string]any{}, cwd, true)
-					cancel()
 					if err == nil {
 						break
 					}
@@ -790,6 +799,7 @@ func (p *Provider) acquireMCPConfig(ctx context.Context, mcpConfig map[string]an
 						time.Sleep(mcpClearRetryBaseDelay * time.Duration(attempt))
 					}
 				}
+				cancel()
 				if err != nil {
 					p.mcpConfigKnown = false
 					p.mcpPoisoned = true

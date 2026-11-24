@@ -386,6 +386,54 @@ func TestProvider_FinalReleaseRetriesThenSucceeds(t *testing.T) {
 	}
 }
 
+// The final clear runs under one shared budget, not a fresh window per
+// attempt: when the server stops answering, the first attempt consumes the
+// budget and no further clear is sent, so the already-known terminal result
+// is reported before the runner's deadline instead of being held past it.
+func TestProvider_FinalReleaseHungServerSendsOnce(t *testing.T) {
+	fs, stdinW, stdoutR := newFakeServer()
+	go fs.run(t, "thread-hung")
+	p, err := New(Options{
+		skipProcess: true, stdinOverride: stdinW, stdoutOverride: stdoutR,
+		configTempDir: t.TempDir(), RPCTimeout: 300 * time.Millisecond,
+	})
+	if err != nil {
+		fs.close()
+		t.Fatalf("New: %v", err)
+	}
+	startTestProvider(t, p)
+	t.Cleanup(func() {
+		p.client.Stop(errors.New("test complete"))
+		fs.close()
+	})
+	release, err := p.acquireMCPConfig(t.Context(), map[string]any{}, t.TempDir())
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	fs.mu.Lock()
+	fs.hangBatchWrite = true
+	writesBefore := len(fs.mcpWrites)
+	fs.mu.Unlock()
+	start := time.Now()
+	err = release()
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("release against a hung server = nil, want the bounded failure (poison)")
+	}
+	fs.mu.Lock()
+	sends := len(fs.mcpWrites) - writesBefore
+	fs.mu.Unlock()
+	if sends != 1 {
+		t.Fatalf("hung-server clear sends = %d, want exactly 1 (no fresh window per retry)", sends)
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("hung-server release took %v, want within one shared budget (well under per-attempt windows stacked)", elapsed)
+	}
+	if _, err := p.acquireMCPConfig(context.Background(), map[string]any{}, t.TempDir()); err == nil {
+		t.Fatal("provider granted a new lease after a failed release, want poisoned")
+	}
+}
+
 // Table-driven over the fake app-server: a successful turn's result survives
 // a cleanup failure whether the failure is contained (owner removal clean)
 // or not (owner removal failed). Both go through the real release path so the
@@ -513,77 +561,188 @@ func TestMCPBoundaryErrorReasonIsBounded(t *testing.T) {
 	}
 }
 
-// A burst of stream deltas can leave exactly one slot after completion usage
-// is queued. The terminal outcome reserves that slot: when only one slot (or
-// none) remains, the warning is dropped and the successful result is still
-// delivered instead of being lost with no terminal event.
+// Stream deltas never take the slots reserved for the terminal warning plus
+// result: prefilling past cap-2 drops deltas, keeps the head (which carries
+// the session identity), and still delivers both warning and result.
 func TestHandle_TerminalResultReservedUnderBufferPressure(t *testing.T) {
 	cleanupErr := codexMCPApplicationError("clear isolated MCP config: isolated config activation verification failed")
-	cases := []struct {
-		name     string
-		bufCap   int
-		prefill  int
-		wantWarn bool
-	}{
-		{name: "room for both keeps warning and result", bufCap: 8, prefill: 5, wantWarn: true},
-		{name: "one slot left drops warning keeps result", bufCap: 8, prefill: 6, wantWarn: false},
-		{name: "full buffer still delivers result", bufCap: 8, prefill: 8, wantWarn: false},
+	h := newHandle(nil, nil, agent.Spec{}, HandleOptions{EventBuffer: 8})
+	for i := 0; i < 64; i++ {
+		h.emit(agent.SystemEvent{Subtype: "codex_progress", Message: "fill"})
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			h := newHandle(nil, nil, agent.Spec{}, HandleOptions{EventBuffer: tc.bufCap})
-			for i := 0; i < tc.prefill; i++ {
-				h.emit(agent.SystemEvent{Subtype: "codex_progress", Message: "fill"})
-			}
-			// Uncontained cleanup failure after a successful turn: the
-			// shape that previously lost the result to the warning.
-			h.mcpRelease = func() error { return &mcpCleanupError{err: cleanupErr} }
-			h.handleNotification(notification{Method: "turn/completed", Params: json.RawMessage(`{"turn":{"id":"t","status":"completed"}}`)})
-			var kinds []string
-			for {
-				select {
-				case ev := <-h.Events():
-					switch value := ev.(type) {
-					case agent.ResultEvent:
-						if !value.Success {
-							t.Fatalf("result success = false, want the completed turn")
-						}
-						kinds = append(kinds, "result")
-					case agent.SystemEvent:
-						if value.Subtype == "codex_warning" {
-							kinds = append(kinds, "warning")
-						}
-					case agent.ErrorEvent:
-						kinds = append(kinds, "error:"+value.Code)
-					}
-				default:
-					goto drained
+	// Two slots stay reserved for the terminal warning plus result.
+	if got := len(h.events); got != 8-2 {
+		t.Fatalf("buffered deltas = %d, want %d (deltas never take the reserved slots)", got, 8-2)
+	}
+	// Uncontained cleanup failure after a successful turn: the shape that
+	// previously lost the result to the warning.
+	h.mcpRelease = func() error { return &mcpCleanupError{err: cleanupErr} }
+	h.handleNotification(notification{Method: "turn/completed", Params: json.RawMessage(`{"turn":{"id":"t","status":"completed"}}`)})
+	var kinds []string
+	for {
+		select {
+		case ev := <-h.Events():
+			switch value := ev.(type) {
+			case agent.ResultEvent:
+				if !value.Success {
+					t.Fatalf("result success = false, want the completed turn")
 				}
-			}
-		drained:
-			hasResult := false
-			hasWarning := false
-			hasCleanupError := false
-			for _, k := range kinds {
-				switch {
-				case k == "result":
-					hasResult = true
-				case k == "warning":
-					hasWarning = true
-				case strings.HasPrefix(k, "error:"):
-					hasCleanupError = true
+				kinds = append(kinds, "result")
+			case agent.SystemEvent:
+				if value.Subtype == "codex_warning" {
+					kinds = append(kinds, "warning")
 				}
+			case agent.ErrorEvent:
+				kinds = append(kinds, "error:"+value.Code)
 			}
-			if !hasResult {
-				t.Fatalf("kinds = %q, want the successful result delivered (warning=%v)", strings.Join(kinds, ","), tc.wantWarn)
+		default:
+			goto drained
+		}
+	}
+drained:
+	if got := strings.Join(kinds, ","); !strings.Contains(got, "warning") || !strings.Contains(got, "result") {
+		t.Fatalf("kinds = %q, want warning and result alongside %d kept deltas", got, 8-2)
+	}
+	if strings.Contains(strings.Join(kinds, ","), "error:") {
+		t.Fatalf("kinds = %q, want no terminal cleanup error after a successful turn", strings.Join(kinds, ","))
+	}
+	if got := kinds[len(kinds)-2:]; strings.Join(got, ",") != "warning,result" {
+		t.Fatalf("terminal order = %q, want warning then result last", strings.Join(got, ","))
+	}
+}
+
+// The session identity survives buffer pressure: a thread/started plus a
+// flood of deltas and then a failed cleanup still delivers the head
+// InitEvent (with the provider session id) first and the successful result
+// last. Discarding the oldest queued event here would lose the InitEvent the
+// runner uses for the result and recovery state.
+func TestHandle_BufferPressureKeepsSessionIdentity(t *testing.T) {
+	cleanupErr := codexMCPApplicationError("clear isolated MCP config: isolated config activation verification failed")
+	h := newHandle(nil, nil, agent.Spec{}, HandleOptions{EventBuffer: 8})
+	// start() records the thread id before the forwarder runs; mirror that
+	// so the handle identity matches the InitEvent below.
+	h.threadID = "thread-A"
+	h.handleNotification(notification{Method: "thread/started", Params: json.RawMessage(`{"thread":{"id":"thread-A"}}`)})
+	for i := 0; i < 64; i++ {
+		h.emit(agent.SystemEvent{Subtype: "codex_progress", Message: "fill"})
+	}
+	h.mcpRelease = func() error { return &mcpCleanupError{err: cleanupErr} }
+	h.handleNotification(notification{Method: "turn/completed", Params: json.RawMessage(`{"turn":{"id":"t","status":"completed"}}`)})
+	var events []agent.Event
+	for {
+		select {
+		case ev := <-h.Events():
+			events = append(events, ev)
+		default:
+			goto drained
+		}
+	}
+drained:
+	if len(events) == 0 {
+		t.Fatal("no events delivered")
+	}
+	init, ok := events[0].(agent.InitEvent)
+	if !ok {
+		t.Fatalf("first event = %T, want InitEvent (head must survive buffer pressure)", events[0])
+	}
+	if init.SessionID != "thread-A" {
+		t.Fatalf("InitEvent session = %q, want thread-A", init.SessionID)
+	}
+	result, ok := events[len(events)-1].(agent.ResultEvent)
+	if !ok || !result.Success {
+		t.Fatalf("last event = %T %+v, want successful ResultEvent", events[len(events)-1], events[len(events)-1])
+	}
+	if got := h.SessionID(); got != "thread-A" {
+		t.Fatalf("handle session = %q, want thread-A", got)
+	}
+}
+
+// A channel with exactly one free slot still delivers the terminal without
+// discarding the head: the warning is dropped (it stays in the logs) and the
+// successful result is delivered after the queued history, in order.
+func TestHandle_OneSlotLeftKeepsHeadForTerminal(t *testing.T) {
+	cleanupErr := codexMCPApplicationError("clear isolated MCP config: isolated config activation verification failed")
+	h := newHandle(nil, nil, agent.Spec{}, HandleOptions{EventBuffer: 4})
+	for i := 0; i < 3; i++ {
+		h.events <- agent.SystemEvent{Subtype: "codex_progress", Message: "direct"}
+	}
+	h.mcpRelease = func() error { return &mcpCleanupError{err: cleanupErr} }
+	h.handleNotification(notification{Method: "turn/completed", Params: json.RawMessage(`{"turn":{"id":"t","status":"completed"}}`)})
+	var events []agent.Event
+	for {
+		select {
+		case ev := <-h.Events():
+			events = append(events, ev)
+		default:
+			goto drained
+		}
+	}
+drained:
+	if len(events) != 4 {
+		t.Fatalf("events = %d, want 3 head progress events plus the terminal result", len(events))
+	}
+	for i := 0; i < 3; i++ {
+		if _, ok := events[i].(agent.SystemEvent); !ok {
+			t.Fatalf("event %d = %T, want the head progress history in order (oldest must not be discarded)", i, events[i])
+		}
+	}
+	result, ok := events[3].(agent.ResultEvent)
+	if !ok || !result.Success {
+		t.Fatalf("last event = %T %+v, want successful ResultEvent", events[3], events[3])
+	}
+}
+
+// A channel filled bypassing emit (production deltas can never do this: the
+// reservation caps them at cap-2) still delivers the terminal without
+// discarding the head: the terminal waits for the consumer to drain rather
+// than dropping the oldest queued event.
+func TestHandle_FullBufferDeliversTerminalKeepsHead(t *testing.T) {
+	cleanupErr := codexMCPApplicationError("clear isolated MCP config: isolated config activation verification failed")
+	h := newHandle(nil, nil, agent.Spec{}, HandleOptions{EventBuffer: 4})
+	for i := 0; i < 4; i++ {
+		h.events <- agent.SystemEvent{Subtype: "codex_progress", Message: "direct"}
+	}
+	h.mcpRelease = func() error { return &mcpCleanupError{err: cleanupErr} }
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.handleNotification(notification{Method: "turn/completed", Params: json.RawMessage(`{"turn":{"id":"t","status":"completed"}}`)})
+	}()
+	var events []agent.Event
+	timeout := time.After(10 * time.Second)
+collect:
+	for {
+		select {
+		case ev := <-h.Events():
+			events = append(events, ev)
+			if result, ok := ev.(agent.ResultEvent); ok {
+				if !result.Success {
+					t.Fatalf("result success = false, want the completed turn")
+				}
+				break collect
 			}
-			if hasCleanupError {
-				t.Fatalf("kinds = %q, want no terminal cleanup error after a successful turn", strings.Join(kinds, ","))
-			}
-			if hasWarning != tc.wantWarn {
-				t.Fatalf("warning = %v, want %v (kinds = %q)", hasWarning, tc.wantWarn, strings.Join(kinds, ","))
-			}
-		})
+		case <-timeout:
+			t.Fatalf("timed out waiting for the terminal result (got %d events)", len(events))
+		}
+	}
+	<-done
+	if len(events) == 0 {
+		t.Fatal("no events delivered")
+	}
+	if _, ok := events[0].(agent.SystemEvent); !ok {
+		t.Fatalf("first event = %T, want the head progress event (oldest must not be discarded)", events[0])
+	}
+	progress := 0
+	for _, ev := range events[:len(events)-1] {
+		if sys, ok := ev.(agent.SystemEvent); ok && sys.Subtype == "codex_progress" {
+			progress++
+		}
+		if _, ok := ev.(agent.ErrorEvent); ok {
+			t.Fatalf("got terminal cleanup error after a successful turn")
+		}
+	}
+	if progress != 4 {
+		t.Fatalf("kept progress events = %d, want 4 (the whole head survives)", progress)
 	}
 }
 
