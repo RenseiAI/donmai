@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"math"
 	"strings"
+	"time"
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/internal/providerretry"
@@ -56,6 +57,40 @@ type mapperState struct {
 	sawAgentEnd bool
 	endSuccess  bool
 	settled     bool
+
+	// toolStarted records when each in-flight tool call started, by call id,
+	// so a progress update that carries no elapsed time still reports one.
+	// now is the clock (nil reads time.Now).
+	toolStarted map[string]time.Time
+	now         func() time.Time
+}
+
+func (st *mapperState) clock() time.Time {
+	if st.now != nil {
+		return st.now()
+	}
+	return time.Now()
+}
+
+// reasoningEvents returns the thinking parts of a completed assistant
+// message as typed reasoning. In debug mode the thinking deltas are already
+// in the text buffer, so they are not repeated.
+func (st *mapperState) reasoningEvents(msg map[string]any, ev rawEvent) []agent.Event {
+	if st.debug || stringField(msg, "role") != "assistant" {
+		return nil
+	}
+	parts, _ := msg["content"].([]any)
+	var out []agent.Event
+	for _, part := range parts {
+		p, ok := part.(map[string]any)
+		if !ok || stringField(p, "type") != "thinking" {
+			continue
+		}
+		if text := strings.TrimSpace(stringField(p, "thinking")); text != "" {
+			out = append(out, agent.ReasoningEvent{Text: text, Raw: raw(ev)})
+		}
+	}
+	return out
 }
 
 // mapEvent translates one pi event (or command response) into zero or more
@@ -137,6 +172,7 @@ func mapEvent(ev rawEvent, st *mapperState) (out []agent.Event, terminal bool) {
 		if id := stringField(msg, "responseId"); stringField(msg, "role") == "assistant" && id != "" {
 			out = append(out, agent.SystemEvent{Subtype: agent.SystemSubtypeGenerationID, GenerationID: id})
 		}
+		out = append(out, st.reasoningEvents(msg, ev)...)
 		text := st.textBuf.String()
 		st.textBuf.Reset()
 		if text != "" {
@@ -158,6 +194,12 @@ func mapEvent(ev rawEvent, st *mapperState) (out []agent.Event, terminal bool) {
 		return out, false
 
 	case "tool_execution_start":
+		if id := toolCallID(f); id != "" {
+			if st.toolStarted == nil {
+				st.toolStarted = make(map[string]time.Time)
+			}
+			st.toolStarted[id] = st.clock()
+		}
 		return []agent.Event{agent.ToolUseEvent{
 			ToolName:  stringField(f, "toolName", "tool", "name"),
 			ToolUseID: toolCallID(f),
@@ -166,13 +208,20 @@ func mapEvent(ev rawEvent, st *mapperState) (out []agent.Event, terminal bool) {
 		}}, false
 
 	case "tool_execution_update":
+		id := toolCallID(f)
+		elapsed := floatField(f, "elapsedSeconds", "elapsed")
+		if start, ok := st.toolStarted[id]; ok && elapsed == 0 {
+			elapsed = st.clock().Sub(start).Seconds()
+		}
 		return []agent.Event{agent.ToolProgressEvent{
 			ToolName:       stringField(f, "toolName", "tool", "name"),
-			ElapsedSeconds: floatField(f, "elapsedSeconds", "elapsed"),
+			ElapsedSeconds: elapsed,
+			ItemID:         id,
 			Raw:            raw(ev),
 		}}, false
 
 	case "tool_execution_end":
+		delete(st.toolStarted, toolCallID(f))
 		result := agent.ToolResultEvent{
 			ToolName:  stringField(f, "toolName", "tool", "name"),
 			ToolUseID: toolCallID(f), Content: toolResultContent(f),
