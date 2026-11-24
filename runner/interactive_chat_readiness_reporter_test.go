@@ -42,34 +42,58 @@ func TestChatReadinessReporter_ChangeRefreshEnded(t *testing.T) {
 	}
 	c := newChatReadinessReporter(post, clock, 60*time.Second)
 	idle := agent.ChatReadiness{Channel: agent.NoticeDeliveryHook, State: agent.ChatStateIdle, LiveSupported: true, QueueSupported: true}
-	c.maybeReport(context.Background(), idle)
+	if !c.maybeReport(context.Background(), idle) {
+		t.Fatal("first read did not initiate a POST")
+	}
+	if !c.waitIdle(10 * time.Second) {
+		t.Fatal("background POST did not settle")
+	}
 	if n := len(posts); n != 0 {
 		t.Fatalf("failed first POST advanced the watermark: %d posts", n)
 	}
-	c.maybeReport(context.Background(), idle)
+	if !c.maybeReport(context.Background(), idle) {
+		t.Fatal("retry of failed first post did not initiate")
+	}
+	if !c.waitIdle(10 * time.Second) {
+		t.Fatal("background POST did not settle")
+	}
 	if n := len(posts); n != 1 {
 		t.Fatalf("posts = %d; want 1 after retry of failed first post", n)
 	}
-	c.maybeReport(context.Background(), idle)
+	if c.maybeReport(context.Background(), idle) {
+		t.Fatal("unchanged read initiated a POST before the interval")
+	}
 	if n := len(posts); n != 1 {
 		t.Fatalf("unchanged read reposted before the interval: %d posts", n)
 	}
 	mu.Lock()
 	now = now.Add(60 * time.Second)
 	mu.Unlock()
-	c.maybeReport(context.Background(), idle)
+	if !c.maybeReport(context.Background(), idle) {
+		t.Fatal("refresh read did not initiate a POST after 60s")
+	}
+	if !c.waitIdle(10 * time.Second) {
+		t.Fatal("background POST did not settle")
+	}
 	if n := len(posts); n != 2 {
 		t.Fatalf("posts = %d; want refresh after 60s", n)
 	}
 	busy := idle
 	busy.State = agent.ChatStateBusy
-	c.maybeReport(context.Background(), busy)
+	if !c.maybeReport(context.Background(), busy) {
+		t.Fatal("change read did not initiate a POST on idle->busy")
+	}
+	if !c.waitIdle(10 * time.Second) {
+		t.Fatal("background POST did not settle")
+	}
 	if n := len(posts); n != 3 {
 		t.Fatalf("posts = %d; want change-driven post on idle->busy", n)
 	}
 	ended := busy
 	ended.State = agent.ChatStateEnded
-	c.maybeReport(context.Background(), ended)
+	if c.maybeReport(context.Background(), ended) {
+		t.Fatal("ended read initiated a POST")
+	}
 	if n := len(posts); n != 3 {
 		t.Fatalf("ended read posted: %d posts", n)
 	}
@@ -169,5 +193,285 @@ func TestDispatchInteractive_PostsChatReadiness(t *testing.T) {
 	}
 	if second["chatReadiness"].(map[string]any)["state"] != "busy" {
 		t.Fatalf("second chatReadiness state = %v; want busy after inject", second["chatReadiness"])
+	}
+}
+
+// TestDispatchInteractive_SamplesAlternateScreenBetweenTicks proves the
+// supervisor observes a modal excursion that opens and closes without any
+// queued notice: a push PTY flips to the alternate screen and back, and the
+// running wire must emit the modal state (B3). Without the 1s sample poll the
+// Hour-grid ticker never fires during the window and the wire stays idle.
+func TestDispatchInteractive_SamplesAlternateScreenBetweenTicks(t *testing.T) {
+	oldRefresh, oldSample := chatReadinessRefreshInterval, chatReadinessSampleInterval
+	chatReadinessRefreshInterval, chatReadinessSampleInterval = time.Hour, 50*time.Millisecond
+	t.Cleanup(func() { chatReadinessRefreshInterval, chatReadinessSampleInterval = oldRefresh, oldSample })
+
+	var mu sync.Mutex
+	var states []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		var body struct {
+			Status string `json:"status"`
+			Chat   struct {
+				State string `json:"state"`
+			} `json:"chatReadiness"`
+		}
+		if json.Unmarshal(b, &body) == nil && body.Status == "running" {
+			mu.Lock()
+			states = append(states, body.Chat.State)
+			mu.Unlock()
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	wtm, err := worktree.NewManager(worktree.Options{ParentDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := result.NewPoster(result.Options{PlatformURL: srv.URL, WorkerID: "wkr-chat-modal", AuthToken: "tok", HTTPClient: srv.Client(), BaseDelay: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := New(Options{Registry: NewRegistry(), WorktreeManager: wtm, Poster: p, HTTPClient: srv.Client(), MaxSessionDuration: -1, SkipBackstop: true, SkipSteering: true, SkipPostSession: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(envAttachURL, "")
+	t.Setenv(envAttachToken, "")
+	sess := liveRecordingInteractiveSession()
+	injectCh := make(chan heartbeat.InjectPayload, 8)
+	res := &Result{SessionID: "sess-chat-modal"}
+	done := make(chan error, 1)
+	handle := &testInteractiveHandle{Handle: &fakeHandle{events: make(chan agent.Event)}, session: sess}
+	qw := QueuedWork{QueuedWork: prompt.QueuedWork{SessionID: "sess-chat-modal", Mode: interactiveRunMode}}
+	go func() {
+		_, err := r.dispatchInteractive(context.Background(), handle, t.TempDir(), qw, res, &recordingSink{}, newFakeInteractivePulser(), injectCh, agent.NoticeDeliveryPTYNotice)
+		done <- err
+	}()
+	t.Cleanup(func() { close(sess.done); <-done })
+
+	waitState := func(want string) {
+		t.Helper()
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			mu.Lock()
+			found := false
+			for _, s := range states {
+				if s == want {
+					found = true
+					break
+				}
+			}
+			mu.Unlock()
+			if found {
+				return
+			}
+			if time.Now().After(deadline) {
+				mu.Lock()
+				got := append([]string(nil), states...)
+				mu.Unlock()
+				t.Fatalf("timed out waiting for chat state %q; got %v", want, got)
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	waitState("idle")
+	sess.setAlternateScreen(true)
+	waitState("modal")
+	sess.setAlternateScreen(false)
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		mu.Lock()
+		got := append([]string(nil), states...)
+		mu.Unlock()
+		if len(got) >= 3 && got[len(got)-1] == "idle" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for the post-modal idle refresh; got %v", got)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestDispatchInteractive_OperatorStopDuringStalledReadinessPost proves a slow
+// status receiver never blocks operator stop: the running POST stalls, the
+// heartbeat fires lost-ownership, and the dispatch must return promptly (B2).
+// Without the background POST the supervisor sits inside the HTTP call for
+// the full stall and the stop waits behind it.
+func TestDispatchInteractive_OperatorStopDuringStalledReadinessPost(t *testing.T) {
+	oldRefresh, oldSample := chatReadinessRefreshInterval, chatReadinessSampleInterval
+	chatReadinessRefreshInterval, chatReadinessSampleInterval = time.Hour, time.Hour
+	t.Cleanup(func() { chatReadinessRefreshInterval, chatReadinessSampleInterval = oldRefresh, oldSample })
+
+	var mu sync.Mutex
+	var running int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		var body struct {
+			Status string `json:"status"`
+		}
+		if json.Unmarshal(b, &body) != nil || body.Status != "running" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		mu.Lock()
+		running++
+		n := running
+		mu.Unlock()
+		if n > 1 {
+			select {
+			case <-r.Context().Done():
+			case <-time.After(5 * time.Second):
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	wtm, err := worktree.NewManager(worktree.Options{ParentDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := result.NewPoster(result.Options{PlatformURL: srv.URL, WorkerID: "wkr-chat-stall", AuthToken: "tok", HTTPClient: srv.Client(), BaseDelay: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := New(Options{Registry: NewRegistry(), WorktreeManager: wtm, Poster: p, HTTPClient: srv.Client(), MaxSessionDuration: -1, SkipBackstop: true, SkipSteering: true, SkipPostSession: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(envAttachURL, "")
+	t.Setenv(envAttachToken, "")
+	nch := &fakeNoticeChannel{}
+	sess := liveRecordingInteractiveSession()
+	injectCh := make(chan heartbeat.InjectPayload, 8)
+	res := &Result{SessionID: "sess-chat-stall"}
+	done := make(chan error, 1)
+	pulser := newFakeInteractivePulser()
+	handle := &testNoticeChannelHandle{InteractiveCapable: &testInteractiveHandle{Handle: &fakeHandle{events: make(chan agent.Event)}, session: sess}, channel: nch}
+	qw := QueuedWork{QueuedWork: prompt.QueuedWork{SessionID: "sess-chat-stall", Mode: interactiveRunMode}}
+	go func() {
+		_, err := r.dispatchInteractive(context.Background(), handle, t.TempDir(), qw, res, &recordingSink{}, pulser, injectCh, agent.NoticeDeliveryHook)
+		done <- err
+	}()
+	returned := false
+	t.Cleanup(func() {
+		if !returned {
+			close(sess.done)
+			<-done
+		}
+	})
+
+	waitRunning := func(n int) {
+		t.Helper()
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			mu.Lock()
+			got := running
+			mu.Unlock()
+			if got >= n {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("timed out waiting for %d running posts; got %d", n, got)
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	waitRunning(1)
+	injectCh <- heartbeat.InjectPayload{DeliveryID: "dlv-chat-stall", Text: "hello stalled"}
+	time.Sleep(200 * time.Millisecond)
+	start := time.Now()
+	close(pulser.lost)
+	select {
+	case <-done:
+		returned = true
+	case <-time.After(15 * time.Second):
+		t.Fatal("dispatch did not return after operator stop")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("operator stop took %v with a stalled readiness receiver; want <2s", elapsed)
+	}
+}
+
+// TestDispatchInteractive_RefreshesSoonAfterHookConsumption proves the
+// periodic refresh stays anchored to the last successful POST instead of a
+// fixed 60s grid: after a hook offer (busy) and consumption (idle), the next
+// refresh must land about one interval after the idle post (B1). On the old
+// grid the first tick after the change is skipped and the receiver goes
+// ~2x the interval without an observation.
+func TestDispatchInteractive_RefreshesSoonAfterHookConsumption(t *testing.T) {
+	oldRefresh, oldSample := chatReadinessRefreshInterval, chatReadinessSampleInterval
+	chatReadinessRefreshInterval, chatReadinessSampleInterval = 2*time.Second, 100*time.Millisecond
+	t.Cleanup(func() { chatReadinessRefreshInterval, chatReadinessSampleInterval = oldRefresh, oldSample })
+
+	var mu sync.Mutex
+	var at []time.Time
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		var body struct {
+			Status string `json:"status"`
+		}
+		if json.Unmarshal(b, &body) == nil && body.Status == "running" {
+			mu.Lock()
+			at = append(at, time.Now())
+			mu.Unlock()
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	wtm, err := worktree.NewManager(worktree.Options{ParentDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := result.NewPoster(result.Options{PlatformURL: srv.URL, WorkerID: "wkr-chat-gap", AuthToken: "tok", HTTPClient: srv.Client(), BaseDelay: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := New(Options{Registry: NewRegistry(), WorktreeManager: wtm, Poster: p, HTTPClient: srv.Client(), MaxSessionDuration: -1, SkipBackstop: true, SkipSteering: true, SkipPostSession: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(envAttachURL, "")
+	t.Setenv(envAttachToken, "")
+	nch := &fakeNoticeChannel{}
+	sess := liveRecordingInteractiveSession()
+	injectCh := make(chan heartbeat.InjectPayload, 8)
+	res := &Result{SessionID: "sess-chat-gap"}
+	done := make(chan error, 1)
+	handle := &testNoticeChannelHandle{InteractiveCapable: &testInteractiveHandle{Handle: &fakeHandle{events: make(chan agent.Event)}, session: sess}, channel: nch}
+	qw := QueuedWork{QueuedWork: prompt.QueuedWork{SessionID: "sess-chat-gap", Mode: interactiveRunMode}}
+	go func() {
+		_, err := r.dispatchInteractive(context.Background(), handle, t.TempDir(), qw, res, &recordingSink{}, newFakeInteractivePulser(), injectCh, agent.NoticeDeliveryHook)
+		done <- err
+	}()
+	t.Cleanup(func() { close(sess.done); <-done })
+
+	waitPosts := func(n int) []time.Time {
+		t.Helper()
+		deadline := time.Now().Add(15 * time.Second)
+		for {
+			mu.Lock()
+			got := append([]time.Time(nil), at...)
+			mu.Unlock()
+			if len(got) >= n {
+				return got
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("timed out waiting for %d running posts; got %d", n, len(got))
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	waitPosts(1)
+	injectCh <- heartbeat.InjectPayload{DeliveryID: "dlv-chat-gap", Text: "hello gap"}
+	waitPosts(2)
+	nch.setConsumed(true)
+	got := waitPosts(4)
+	if gap := got[3].Sub(got[2]); gap > 3*time.Second {
+		t.Fatalf("idle refresh gap after hook consumption = %v; want <=3s (2s interval + 1s tolerance)", gap)
 	}
 }

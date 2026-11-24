@@ -458,9 +458,21 @@ func (r *Runner) dispatchInteractive(
 		defer cancel()
 		return r.poster.PostRunningChatReadiness(postCtx, qw.SessionID, wire)
 	}, chatNow, chatReadinessRefreshInterval)
-	chatReporter.maybeReport(interactiveCtx, notices.readiness(isess, noticeChannel))
-	chatTicker := time.NewTicker(chatReadinessRefreshInterval)
-	defer chatTicker.Stop()
+	// chatCtx bounds the background readiness POSTs to the session: the
+	// supervisor never waits for them (see the reporter), and the deferred
+	// cancel aborts an in-flight POST on return instead of posting running
+	// status past the terminal report.
+	chatCtx, chatCancel := context.WithCancel(interactiveCtx)
+	defer chatCancel()
+	chatReporter.maybeReport(chatCtx, notices.readiness(isess, noticeChannel))
+	// Sample the observable readiness every second: hook consumption and the
+	// alternate-screen modal flip between 60s ticks, and a change-driven post
+	// desynchronizes a 60s-grid ticker (the next tick lands <60s after the
+	// change and is skipped, stalling the receiver for ~2x the interval).
+	// The reporter still gates the wire to change-or-60s, so the fast poll is
+	// a cheap local read that only posts on news.
+	chatSampleTicker := time.NewTicker(chatReadinessSampleInterval)
+	defer chatSampleTicker.Stop()
 	defer func() {
 		// Held/buffered at session end is NOT dead-lettered: the payload is
 		// still unacked, so the producer re-offers it to a session that can
@@ -528,7 +540,7 @@ func (r *Runner) dispatchInteractive(
 			if notices.attempt(r, qw, res, isess, noticeChannel) == noticeHeld {
 				retry.Reset(interactiveNoticeRetry)
 			}
-			chatReporter.maybeReport(interactiveCtx, notices.readiness(isess, noticeChannel))
+			chatReporter.maybeReport(chatCtx, notices.readiness(isess, noticeChannel))
 			continue
 
 		case <-retry.Chan():
@@ -538,11 +550,11 @@ func (r *Runner) dispatchInteractive(
 			if notices.attempt(r, qw, res, isess, noticeChannel) == noticeHeld {
 				retry.Reset(interactiveNoticeRetry)
 			}
-			chatReporter.maybeReport(interactiveCtx, notices.readiness(isess, noticeChannel))
+			chatReporter.maybeReport(chatCtx, notices.readiness(isess, noticeChannel))
 			continue
 
-		case <-chatTicker.C:
-			chatReporter.maybeReport(interactiveCtx, notices.readiness(isess, noticeChannel))
+		case <-chatSampleTicker.C:
+			chatReporter.maybeReport(chatCtx, notices.readiness(isess, noticeChannel))
 			continue
 
 		case <-isess.Done():
