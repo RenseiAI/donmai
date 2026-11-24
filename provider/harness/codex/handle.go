@@ -461,21 +461,28 @@ func (h *Handle) handleNotification(n notification) bool {
 					// successful result: report the result and surface the
 					// cleanup failure as a warning with its own reason
 					// (codex_warning carrying the bounded release detail).
-					// The Provider is poisoned for later leases and the
-					// private home went through the retention/sweep path,
-					// so nothing live or reusable is left behind.
-					slog.Warn("codex: isolated MCP config cleanup failed after the turn completed; app-server stopped, provider refuses new sessions",
-						"threadId", h.SessionID(), "err", err)
-					h.emit(mcpCleanupWarningEvent(err))
-					h.emit(ev)
+					// The Provider is poisoned for later leases and the private
+					// home went through the retention/sweep path. Only a
+					// contained removal proves the writer stopped; otherwise
+					// shutdown stays unconfirmed and the warning says so.
+					contained := mcpCleanupContained(err)
+					if contained {
+						slog.Warn("codex: isolated MCP config cleanup failed after the turn completed; app-server stopped, provider refuses new sessions",
+							"threadId", h.SessionID(), "err", err)
+					} else {
+						slog.Warn("codex: isolated MCP config cleanup failed after the turn completed; app-server shutdown unconfirmed (writer may still be live), provider refuses new sessions",
+							"threadId", h.SessionID(), "err", err)
+					}
+					h.emitTerminalWithWarning(mcpCleanupWarningEvent(err, contained), ev)
 				} else if ev.Kind() == agent.EventResult && mcpCleanupContained(err) {
 					// A failed turn whose clear is contained keeps its own
 					// result alongside the warning; anything else fails
 					// closed so an unfinished turn never reports success.
+					// Contained removal proves the writer stopped, so the
+					// stopped claim is accurate here.
 					slog.Warn("codex: isolated MCP config cleanup failed after the turn completed; app-server stopped, provider refuses new sessions",
 						"threadId", h.SessionID(), "err", err)
-					h.emit(mcpCleanupWarningEvent(err))
-					h.emit(ev)
+					h.emitTerminalWithWarning(mcpCleanupWarningEvent(err, true), ev)
 				} else {
 					h.emit(mcpCleanupErrorEvent())
 				}
@@ -489,14 +496,47 @@ func (h *Handle) handleNotification(n notification) bool {
 	return false
 }
 
-// mcpCleanupWarningEvent reports a contained cleanup failure. The detail is
-// the bounded release error (codexMCPConfigFailureDetail never carries config
-// values), so the cause is visible without leaking the session's MCP config.
-func mcpCleanupWarningEvent(err error) agent.SystemEvent {
+// mcpCleanupWarningEvent reports a cleanup failure that accompanies the
+// turn's own result. The detail is the bounded release error
+// (codexMCPConfigFailureDetail never carries config values), so the cause is
+// visible without leaking the session's MCP config. writerStopped reports
+// whether owner removal proved the writer stopped (contained): only then does
+// the message claim the app-server was stopped, otherwise it reports shutdown
+// as unconfirmed so a live writer is never described as stopped.
+func mcpCleanupWarningEvent(err error, writerStopped bool) agent.SystemEvent {
+	if writerStopped {
+		return agent.SystemEvent{
+			Subtype: "codex_warning",
+			Message: "codex isolated MCP configuration cleanup failed after the turn completed; the app-server was stopped and this provider refuses new sessions: " + err.Error(),
+		}
+	}
 	return agent.SystemEvent{
 		Subtype: "codex_warning",
-		Message: "codex isolated MCP configuration cleanup failed after the turn completed; the app-server was stopped and this provider refuses new sessions: " + err.Error(),
+		Message: "codex isolated MCP configuration cleanup failed after the turn completed; app-server shutdown unconfirmed and this provider refuses new sessions: " + err.Error(),
 	}
+}
+
+// emitTerminalWithWarning emits a cleanup warning plus the turn's terminal
+// outcome while reserving the final buffer slot for that outcome. A burst of
+// stream deltas can leave exactly one slot after completion usage is queued;
+// emitting the warning first would take that slot and drop the successful
+// result, closing the stream with no terminal event. When fewer than two
+// slots remain the terminal outcome wins and the warning is dropped (it stays
+// in the logs). When the buffer is completely full one expendable queued event
+// is discarded so the terminal outcome is still delivered.
+func (h *Handle) emitTerminalWithWarning(warning agent.SystemEvent, terminal agent.Event) {
+	if cap(h.events)-len(h.events) < 2 {
+		if len(h.events) == cap(h.events) {
+			select {
+			case <-h.events:
+			default:
+			}
+		}
+		h.emit(terminal)
+		return
+	}
+	h.emit(warning)
+	h.emit(terminal)
 }
 
 func mcpCleanupErrorEvent() agent.ErrorEvent {

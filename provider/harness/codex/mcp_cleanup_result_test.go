@@ -465,6 +465,24 @@ func TestHandle_SuccessfulResultSurvivesCleanupFailureOverFakeServer(t *testing.
 			if warning == nil || !strings.Contains(warning.Message, "clear isolated MCP config") {
 				t.Fatalf("warning = %+v, want the bounded clear detail", warning)
 			}
+			// Only a contained removal proves the writer stopped: the
+			// rotated-parent case below must say unconfirmed while the
+			// app-server still answers, never that it was stopped.
+			if tc.wantContained {
+				if !strings.Contains(warning.Message, "was stopped") || strings.Contains(warning.Message, "unconfirmed") {
+					t.Fatalf("contained warning must report stopped, got %q", warning.Message)
+				}
+			} else {
+				if strings.Contains(warning.Message, "was stopped") || !strings.Contains(warning.Message, "unconfirmed") {
+					t.Fatalf("uncontained warning must report shutdown unconfirmed, got %q", warning.Message)
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				_, err := p.client.Request(ctx, "config/read", map[string]any{"includeLayers": true}, 5*time.Second)
+				cancel()
+				if err != nil {
+					t.Fatalf("app-server ping after uncontained cleanup = %v, want success (writer still alive)", err)
+				}
+			}
 		})
 	}
 }
@@ -490,6 +508,133 @@ func TestMCPBoundaryErrorReasonIsBounded(t *testing.T) {
 			detail := codexMCPConfigFailureDetail(&mcpBoundaryError{err: tc.err})
 			if strings.Contains(detail, "/tmp/") || strings.Contains(detail, "permission denied") {
 				t.Fatalf("detail leaked the wrapped error: %q", detail)
+			}
+		})
+	}
+}
+
+// A burst of stream deltas can leave exactly one slot after completion usage
+// is queued. The terminal outcome reserves that slot: when only one slot (or
+// none) remains, the warning is dropped and the successful result is still
+// delivered instead of being lost with no terminal event.
+func TestHandle_TerminalResultReservedUnderBufferPressure(t *testing.T) {
+	cleanupErr := codexMCPApplicationError("clear isolated MCP config: isolated config activation verification failed")
+	cases := []struct {
+		name     string
+		bufCap   int
+		prefill  int
+		wantWarn bool
+	}{
+		{name: "room for both keeps warning and result", bufCap: 8, prefill: 5, wantWarn: true},
+		{name: "one slot left drops warning keeps result", bufCap: 8, prefill: 6, wantWarn: false},
+		{name: "full buffer still delivers result", bufCap: 8, prefill: 8, wantWarn: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHandle(nil, nil, agent.Spec{}, HandleOptions{EventBuffer: tc.bufCap})
+			for i := 0; i < tc.prefill; i++ {
+				h.emit(agent.SystemEvent{Subtype: "codex_progress", Message: "fill"})
+			}
+			// Uncontained cleanup failure after a successful turn: the
+			// shape that previously lost the result to the warning.
+			h.mcpRelease = func() error { return &mcpCleanupError{err: cleanupErr} }
+			h.handleNotification(notification{Method: "turn/completed", Params: json.RawMessage(`{"turn":{"id":"t","status":"completed"}}`)})
+			var kinds []string
+			for {
+				select {
+				case ev := <-h.Events():
+					switch value := ev.(type) {
+					case agent.ResultEvent:
+						if !value.Success {
+							t.Fatalf("result success = false, want the completed turn")
+						}
+						kinds = append(kinds, "result")
+					case agent.SystemEvent:
+						if value.Subtype == "codex_warning" {
+							kinds = append(kinds, "warning")
+						}
+					case agent.ErrorEvent:
+						kinds = append(kinds, "error:"+value.Code)
+					}
+				default:
+					goto drained
+				}
+			}
+		drained:
+			hasResult := false
+			hasWarning := false
+			hasCleanupError := false
+			for _, k := range kinds {
+				switch {
+				case k == "result":
+					hasResult = true
+				case k == "warning":
+					hasWarning = true
+				case strings.HasPrefix(k, "error:"):
+					hasCleanupError = true
+				}
+			}
+			if !hasResult {
+				t.Fatalf("kinds = %q, want the successful result delivered (warning=%v)", strings.Join(kinds, ","), tc.wantWarn)
+			}
+			if hasCleanupError {
+				t.Fatalf("kinds = %q, want no terminal cleanup error after a successful turn", strings.Join(kinds, ","))
+			}
+			if hasWarning != tc.wantWarn {
+				t.Fatalf("warning = %v, want %v (kinds = %q)", hasWarning, tc.wantWarn, strings.Join(kinds, ","))
+			}
+		})
+	}
+}
+
+// Only a contained removal proves the writer stopped. An uncontained (or
+// untyped) cleanup failure after a successful turn reports shutdown as
+// unconfirmed so a live writer is never described as stopped.
+func TestHandle_CleanupWarningStatesWriterShutdownAccurately(t *testing.T) {
+	cleanupErr := codexMCPApplicationError("clear isolated MCP config: isolated config boundary rejected: isolated Codex home mode is 0750, want 0700")
+	cases := []struct {
+		name            string
+		release         func() error
+		wantStopped     bool
+		wantUnconfirmed bool
+	}{
+		{
+			name:            "contained reports stopped",
+			release:         func() error { return &mcpCleanupError{err: cleanupErr, contained: true} },
+			wantStopped:     true,
+			wantUnconfirmed: false,
+		},
+		{
+			name:            "uncontained reports unconfirmed",
+			release:         func() error { return &mcpCleanupError{err: cleanupErr} },
+			wantStopped:     false,
+			wantUnconfirmed: true,
+		},
+		{
+			name:            "untyped reports unconfirmed",
+			release:         func() error { return cleanupErr },
+			wantStopped:     false,
+			wantUnconfirmed: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := notificationHandle()
+			h.mcpRelease = tc.release
+			var warning *agent.SystemEvent
+			for _, ev := range dispatch(t, h, "turn/completed", `{"turn":{"id":"t","status":"completed"}}`) {
+				if value, ok := ev.(agent.SystemEvent); ok && value.Subtype == "codex_warning" {
+					warning = &value
+				}
+			}
+			if warning == nil {
+				t.Fatal("no codex_warning emitted alongside the successful result")
+			}
+			if got := strings.Contains(warning.Message, "was stopped"); got != tc.wantStopped {
+				t.Fatalf("warning stopped claim = %v, want %v: %q", got, tc.wantStopped, warning.Message)
+			}
+			if got := strings.Contains(warning.Message, "unconfirmed"); got != tc.wantUnconfirmed {
+				t.Fatalf("warning unconfirmed claim = %v, want %v: %q", got, tc.wantUnconfirmed, warning.Message)
 			}
 		})
 	}
