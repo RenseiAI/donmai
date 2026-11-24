@@ -112,10 +112,22 @@ type Options struct {
 	// and turns healthy-but-slow extensions into spawn failures. A
 	// per-session override arrives through the daemon's harness
 	// configuration (ResolvedProfile.ProviderConfig
-	// "pi.handshakeTimeoutSeconds"); every wait — the first attempt
-	// and the single retry alike — stays bounded by the caller's
-	// spawn-deadline context.
+	// "pi.handshakeTimeoutSeconds"); every wait — each attempt alike —
+	// stays bounded by the caller's spawn-deadline context.
 	HandshakeTimeout time.Duration
+
+	// HandshakeMaxAttempts bounds how many handshake attempts Spawn may
+	// make before failing closed (design §2 step 3). Defaults to
+	// DefaultHandshakeMaxAttempts. Values outside
+	// [MinHandshakeMaxAttempts, MaxHandshakeMaxAttempts] are rejected at
+	// construction: an unbounded retry budget would let a broken
+	// extension hold the spawn open, while zero would disable the single
+	// bounded retry healthy-but-slow extensions get under load. A
+	// per-session override arrives through the daemon's harness
+	// configuration (ResolvedProfile.ProviderConfig
+	// "pi.handshakeMaxAttempts"); every wait stays bounded by the
+	// caller's spawn-deadline context.
+	HandshakeMaxAttempts int
 
 	// VersionProbeTimeout caps the construction-time version probe.
 	VersionProbeTimeout time.Duration
@@ -219,12 +231,25 @@ const DefaultHandshakeTimeout = 10 * time.Second
 // deadline would fail such sessions closed for no fault of their own.
 const MinHandshakeTimeout = time.Second
 
-// maxHandshakeAttempts bounds the fail-closed handshake gate: the first
-// attempt plus exactly one retry on a timeout. A handshake error, a child
-// exit, or malformed protocol data never retries — those classify the
-// extension as broken, not slow. Only a real (non-stubbed) child process
-// retries; protocol-scripted launches keep a single attempt.
-const maxHandshakeAttempts = 2
+// DefaultHandshakeMaxAttempts is the handshake-attempt budget when
+// Options.HandshakeMaxAttempts is unset: the first attempt plus exactly one
+// retry on a timeout. A handshake error, a child exit, or malformed
+// protocol data never retries — those classify the extension as broken,
+// not slow. Only a real (non-stubbed) child process retries;
+// protocol-scripted launches keep a single attempt.
+const DefaultHandshakeMaxAttempts = 2
+
+// MinHandshakeMaxAttempts floors Options.HandshakeMaxAttempts: zero would
+// disable the single bounded retry healthy-but-slow extensions get under
+// load.
+const MinHandshakeMaxAttempts = 1
+
+// MaxHandshakeMaxAttempts ceilings Options.HandshakeMaxAttempts: each extra
+// attempt costs up to one full HandshakeTimeout window, so an unbounded
+// budget would let a broken extension hold the spawn open. Five bounds the
+// worst-case added latency while leaving room for hosts under startup
+// contention.
+const MaxHandshakeMaxAttempts = 5
 
 // New probes the pi binary and enforces the version pin (probe-time, per
 // design §2 / opencode §8). A confirmed-below-MinVersion binary fails
@@ -239,6 +264,12 @@ func New(opts Options) (*Provider, error) {
 	}
 	if opts.HandshakeTimeout < MinHandshakeTimeout {
 		return nil, fmt.Errorf("%w: pi handshake timeout %s below the %s floor", agent.ErrProviderUnavailable, opts.HandshakeTimeout, MinHandshakeTimeout)
+	}
+	if opts.HandshakeMaxAttempts == 0 {
+		opts.HandshakeMaxAttempts = DefaultHandshakeMaxAttempts
+	}
+	if opts.HandshakeMaxAttempts < MinHandshakeMaxAttempts || opts.HandshakeMaxAttempts > MaxHandshakeMaxAttempts {
+		return nil, fmt.Errorf("%w: pi handshake attempts %d outside the [%d, %d] bounds", agent.ErrProviderUnavailable, opts.HandshakeMaxAttempts, MinHandshakeMaxAttempts, MaxHandshakeMaxAttempts)
 	}
 	if opts.VersionProbeTimeout == 0 {
 		opts.VersionProbeTimeout = DefaultVersionProbeTimeout
@@ -533,7 +564,7 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 	// armed only on the handle whose handshake verified.
 	attempts := 1
 	if !p.opts.skipProcess {
-		attempts = maxHandshakeAttempts
+		attempts = p.opts.HandshakeMaxAttempts
 	}
 	var (
 		h      *Handle
@@ -632,9 +663,10 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 		h.launchNotices = p.launchNotices(spec)
 		go h.run()
 
-		// Fail-closed handshake gate: one bounded retry on a timeout.
-		// A timeout stops only this attempt's child and retries once
-		// within the same per-attempt deadline; a handshake error, a
+		// Fail-closed handshake gate: bounded retries on timeouts (the
+		// attempt budget is Options.HandshakeMaxAttempts). A timeout
+		// stops only this attempt's child and retries within the same
+		// per-attempt deadline; a handshake error, a
 		// child exit, or malformed protocol data classifies the
 		// extension as broken and never retries. Every wait also
 		// watches the parent spawn deadline, so a cancelled parent

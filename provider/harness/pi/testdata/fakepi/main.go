@@ -75,8 +75,12 @@ const replyEnvVar = "FAKEPI_REPLY"
 // applies only when that file does not exist yet — fakepi creates it
 // before sleeping — so a retried spawn (the harness kills only the exact
 // timed-out child and spawns again) proceeds immediately on its second
-// attempt. Without the once-file the delay applies to every spawn, so
-// both attempts time out. A negative or unparsable value means no delay.
+// attempt. When FAKEPI_HANDSHAKE_DELAY_TIMES names a positive count N, the
+// delay applies to the first N spawns sharing that state file (a counter
+// fakepi increments before sleeping) so a test can prove an attempt budget
+// above two lets a twice-slow extension succeed on its third try.
+// Without the once-file the delay applies to every spawn, so both
+// attempts time out. A negative or unparsable value means no delay.
 func handshakeDelay() time.Duration {
 	raw := strings.TrimSpace(os.Getenv("FAKEPI_HANDSHAKE_DELAY_MS"))
 	ms, err := strconv.Atoi(raw)
@@ -86,6 +90,25 @@ func handshakeDelay() time.Duration {
 	delay := time.Duration(ms) * time.Millisecond
 	once := strings.TrimSpace(os.Getenv("FAKEPI_HANDSHAKE_DELAY_ONCE_FILE"))
 	if once == "" {
+		return delay
+	}
+	if timesRaw := strings.TrimSpace(os.Getenv("FAKEPI_HANDSHAKE_DELAY_TIMES")); timesRaw != "" {
+		times, terr := strconv.Atoi(timesRaw)
+		if terr != nil || times <= 0 {
+			return 0
+		}
+		count := 0
+		if rawCount, rerr := os.ReadFile(once); rerr == nil { //nolint:gosec // test-state file this stub itself manages.
+			if parsed, perr := strconv.Atoi(strings.TrimSpace(string(rawCount))); perr == nil && parsed > 0 {
+				count = parsed
+			}
+		}
+		if count >= times {
+			return 0
+		}
+		if err := os.WriteFile(once, []byte(strconv.Itoa(count+1)), 0o600); err != nil {
+			return 0
+		}
 		return delay
 	}
 	if _, err := os.Stat(once); err == nil {

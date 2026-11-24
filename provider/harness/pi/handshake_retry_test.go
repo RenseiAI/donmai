@@ -282,3 +282,95 @@ func TestHandshakeRetry_BoundedByParentDeadline(t *testing.T) {
 		t.Fatalf("Spawn took %s with a 300 ms parent deadline — the gate outlived its parent", elapsed)
 	}
 }
+
+// TestHandshakeMaxAttempts_BoundsRejectUnsafe (B1): the attempt budget is a
+// declared, validated setting — not a hidden constant. Zero means unset
+// (the default of two stands); values outside [min, max] fail construction
+// loudly.
+func TestHandshakeMaxAttempts_BoundsRejectUnsafe(t *testing.T) {
+	requireUnixForHandshakeRetry(t)
+	stub := func(context.Context, string) (string, error) { return PinnedVersion, nil }
+	for _, attempts := range []int{-1, -5, MaxHandshakeMaxAttempts + 1, 100} {
+		if _, err := New(Options{skipProcess: true, HandshakeMaxAttempts: attempts, VersionProbe: stub}); !errors.Is(err, agent.ErrProviderUnavailable) {
+			t.Fatalf("New(HandshakeMaxAttempts=%d) err = %v, want ErrProviderUnavailable", attempts, err)
+		}
+	}
+	p, err := New(Options{skipProcess: true, HandshakeMaxAttempts: MinHandshakeMaxAttempts, VersionProbe: stub})
+	if err != nil {
+		t.Fatalf("New at the floor: %v", err)
+	}
+	if p.opts.HandshakeMaxAttempts != MinHandshakeMaxAttempts {
+		t.Fatalf("HandshakeMaxAttempts = %d, want the stated floor %d", p.opts.HandshakeMaxAttempts, MinHandshakeMaxAttempts)
+	}
+	p, err = New(Options{skipProcess: true, VersionProbe: stub})
+	if err != nil {
+		t.Fatalf("New with zero attempts: %v", err)
+	}
+	if p.opts.HandshakeMaxAttempts != DefaultHandshakeMaxAttempts {
+		t.Fatalf("HandshakeMaxAttempts = %d, want the default %d", p.opts.HandshakeMaxAttempts, DefaultHandshakeMaxAttempts)
+	}
+}
+
+// TestHandshakeRetry_ThirdAttemptSucceedsWhenBudgetAllows (B1): a declared
+// budget above the default lets a twice-slow extension succeed on its third
+// try — proving the budget is a real setting, not a hidden two-attempt cap.
+// With the default budget the same extension fails slow-start after two
+// bounded timeouts.
+func TestHandshakeRetry_ThirdAttemptSucceedsWhenBudgetAllows(t *testing.T) {
+	requireUnixForHandshakeRetry(t)
+	bin := buildRetryFakePi(t)
+
+	spawnWithBudget := func(t *testing.T, budget int) (agent.Handle, int32, error) {
+		t.Helper()
+		state := filepath.Join(t.TempDir(), "delay-state")
+		t.Setenv("FAKEPI_HANDSHAKE_DELAY_MS", "1500")
+		t.Setenv("FAKEPI_HANDSHAKE_DELAY_ONCE_FILE", state)
+		t.Setenv("FAKEPI_HANDSHAKE_DELAY_TIMES", "2")
+		p, err := New(Options{
+			PiBin:                bin,
+			HandshakeTimeout:     time.Second,
+			HandshakeMaxAttempts: budget,
+			VersionProbe:         func(context.Context, string) (string, error) { return PinnedVersion, nil },
+		})
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		t.Cleanup(func() { _ = p.Shutdown(context.Background()) })
+		var spawns atomic.Int32
+		p.opts.afterChildStart = func() { spawns.Add(1) }
+		h, err := p.Spawn(context.Background(), agent.Spec{Cwd: t.TempDir(), Prompt: "hi"})
+		return h, spawns.Load(), err
+	}
+
+	t.Run("budget three succeeds", func(t *testing.T) {
+		h, spawns, err := spawnWithBudget(t, 3)
+		if err != nil {
+			t.Fatalf("Spawn with budget 3 should succeed on the third attempt: %v", err)
+		}
+		t.Cleanup(func() { _ = h.Stop(context.Background()) })
+		if spawns != 3 {
+			t.Fatalf("spawn attempts = %d, want exactly 3 (two timeouts + one success)", spawns)
+		}
+		if evs := drain(t, h); len(evs) == 0 {
+			t.Fatal("no events from the retried session")
+		} else if _, ok := evs[len(evs)-1].(agent.ResultEvent); !ok {
+			t.Fatalf("terminal = %#v, want a successful ResultEvent", evs[len(evs)-1])
+		}
+	})
+
+	t.Run("default budget stops at two", func(t *testing.T) {
+		h, spawns, err := spawnWithBudget(t, 0)
+		if !errors.Is(err, agent.ErrSpawnFailed) {
+			t.Fatalf("err = %v, want ErrSpawnFailed", err)
+		}
+		if !errors.Is(err, agent.ErrPolicyExtensionSlowStart) {
+			t.Fatalf("err = %v, want the retryable slow-start classification", err)
+		}
+		if h != nil {
+			t.Fatal("Spawn must return a nil Handle on a failed handshake")
+		}
+		if spawns != 2 {
+			t.Fatalf("spawn attempts = %d, want exactly 2 (the default budget)", spawns)
+		}
+	})
+}
