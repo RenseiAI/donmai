@@ -2,6 +2,7 @@ package runner
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -62,6 +63,110 @@ func TestRun_SuccessWithCleanupWarningStaysCompleted(t *testing.T) {
 	}
 	if res.BackstopReport != nil {
 		t.Fatalf("BackstopReport = %+v; want nil (no backstop on a completed run)", res.BackstopReport)
+	}
+}
+
+// cleanupWarningStopFailHandle replays a completed turn followed by a cleanup
+// warning, then fails Stop with the cached cleanup error, as the real codex
+// handle does after its terminal release is poisoned. Inject is unsupported
+// so steering takes the stop-and-resume rail and observes the Stop failure.
+type cleanupWarningStopFailHandle struct {
+	events  chan agent.Event
+	stopErr error
+}
+
+func (h *cleanupWarningStopFailHandle) SessionID() string { return "cleanup-warning-steer" }
+
+func (h *cleanupWarningStopFailHandle) Events() <-chan agent.Event { return h.events }
+
+func (h *cleanupWarningStopFailHandle) Inject(context.Context, string) error {
+	return agent.ErrUnsupported
+}
+
+func (h *cleanupWarningStopFailHandle) Stop(context.Context) error { return h.stopErr }
+
+// A completed turn plus a cleanup warning on work that owes a pull request
+// reaches steering, whose stop-and-resume fails on the cached release error.
+// The runner must not flip the delivered work to failed: the steering error
+// is a soft fallthrough to the deterministic backstop, which opens the pull
+// request without editing its title or body.
+func TestRun_SuccessWithCleanupWarningSteersToBackstop(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	h := newRunnerHarness(t)
+	h.runner.skipSteering = false
+	h.runner.skipBackstop = false
+
+	const wantURL = "https://github.com/example/project/pull/77"
+	capture := stubGhVisibilityAndPRCreate(t, "PRIVATE", wantURL)
+
+	base, err := stub.New(stub.WithCapabilities(agent.Capabilities{SupportsMessageInjection: false, SupportsSessionResume: true}))
+	if err != nil {
+		t.Fatalf("stub.New: %v", err)
+	}
+	hp, ok := base.(agent.HarnessProvider)
+	if !ok {
+		t.Fatal("stub provider does not satisfy HarnessProvider")
+	}
+	ch := make(chan agent.Event, 8)
+	ch <- agent.InitEvent{SessionID: "cleanup-warning-steer"}
+	ch <- agent.AssistantTextEvent{Text: "done\nWORK_RESULT: passed\n"}
+	ch <- agent.SystemEvent{
+		Subtype: "codex_warning",
+		Message: "codex isolated MCP configuration cleanup failed after the turn completed; app-server shutdown unconfirmed and this provider refuses new sessions: clear isolated MCP config: isolated config activation verification failed",
+	}
+	ch <- agent.ResultEvent{Success: true}
+	close(ch)
+	provider := &evidenceProvider{
+		HarnessProvider: hp,
+		spawnHandle:     &cleanupWarningStopFailHandle{events: ch, stopErr: errors.New("codex isolated MCP configuration cleanup failed")},
+	}
+	reg := NewRegistry()
+	if err := reg.Register(provider); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	h.runner.registry = reg
+	qw := h.queuedWork("CLEANUP-WARNING-STEER")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := h.runner.Run(ctx, qw)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Status != "completed" {
+		t.Fatalf("Status = %q; want completed (mode=%q error=%q)", res.Status, res.FailureMode, res.Error)
+	}
+	if res.FailureMode != "" {
+		t.Fatalf("FailureMode = %q; want empty (warning plus steering soft-fail is not a failure)", res.FailureMode)
+	}
+	if res.WorkResult != "passed" {
+		t.Fatalf("WorkResult = %q; want passed", res.WorkResult)
+	}
+	if !res.SteeringTriggered {
+		t.Fatal("SteeringTriggered = false; want the pull-request nudge on requiresPR work with no agent PR")
+	}
+	if res.BackstopReport == nil {
+		t.Fatal("BackstopReport = nil; want the deterministic backstop after the steering soft-fail")
+	}
+	if !res.BackstopReport.Pushed {
+		t.Errorf("BackstopReport.Pushed = false; want true")
+	}
+	if res.BackstopReport.PRURL != wantURL {
+		t.Errorf("BackstopReport.PRURL = %q; want %q", res.BackstopReport.PRURL, wantURL)
+	}
+	if res.PullRequestURL != wantURL {
+		t.Errorf("PullRequestURL = %q; want the backstop %q", res.PullRequestURL, wantURL)
+	}
+	args, err := os.ReadFile(capture.args)
+	if err != nil {
+		t.Fatalf("read gh args: %v", err)
+	}
+	if !strings.Contains(string(args), "create") {
+		t.Errorf("gh args = %q; want a pr create call", args)
+	}
+	if strings.Contains(string(args), "edit") {
+		t.Errorf("gh args = %q; want no pr edit (backstop must not rewrite title/body)", args)
 	}
 }
 
