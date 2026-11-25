@@ -372,6 +372,12 @@ func ParseExecutionSecurity(raw []byte) (*ExecutionSecurity, error) {
 // ExecutionSecurityFromOperationalPayload reads the executionSecurity member
 // of a raw queued-work object with the closed decoder. An absent member
 // returns nil, nil; a present one — an explicit null included — must decode.
+//
+// It also reads the startPermissionMode member with its closed decoder
+// (ParseStartPermissionMode). That request only selects a permission mode
+// the toolApproval stamp already grants, so a malformed one is refused the
+// same way a malformed stamp is: execution_security_unresolvable, which every
+// caller of this function treats as a permanent refusal of the work item.
 func ExecutionSecurityFromOperationalPayload(raw []byte) (*ExecutionSecurity, error) {
 	if len(bytes.TrimSpace(raw)) == 0 {
 		return nil, nil
@@ -380,11 +386,41 @@ func ExecutionSecurityFromOperationalPayload(raw []byte) (*ExecutionSecurity, er
 	if err := json.Unmarshal(raw, &members); err != nil {
 		return nil, fmt.Errorf("agent: decode queued work for executionSecurity: %w", err)
 	}
+	if mode, present := members["startPermissionMode"]; present {
+		if _, err := ParseStartPermissionMode(mode); err != nil {
+			return nil, err
+		}
+	}
 	member, present := members["executionSecurity"]
 	if !present {
 		return nil, nil
 	}
 	return ParseExecutionSecurity(member)
+}
+
+// StartPermissionModeBypass is the only value of a queued work item's
+// startPermissionMode member: a human-controlled session asks to start in
+// the harness's bypass (never-ask) permission mode.
+const StartPermissionModeBypass = "bypass"
+
+// ParseStartPermissionMode strictly decodes one present startPermissionMode
+// member. JSON null reads as absent and returns "". Any other value that is
+// not exactly "bypass" — the empty string, another mode, a non-string — is
+// refused with an *ExecutionSecurityError coded
+// execution_security_unresolvable whose detail names the field.
+func ParseStartPermissionMode(raw []byte) (string, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if bytes.Equal(trimmed, []byte("null")) {
+		return "", nil
+	}
+	var value string
+	if err := json.Unmarshal(trimmed, &value); err != nil {
+		return "", &ExecutionSecurityError{Code: ExecutionSecurityUnresolvable, Detail: fmt.Sprintf("startPermissionMode must be a string: %v", err)}
+	}
+	if value != StartPermissionModeBypass {
+		return "", &ExecutionSecurityError{Code: ExecutionSecurityUnresolvable, Detail: fmt.Sprintf("startPermissionMode %q is not a known mode (want %q)", value, StartPermissionModeBypass)}
+	}
+	return value, nil
 }
 
 // ExecutionSecurityRefusalCode is the closed refusal-code enum of the ADR's D5.

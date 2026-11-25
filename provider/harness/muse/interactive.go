@@ -14,6 +14,7 @@ import (
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/provider/harness/ptycli"
 	"github.com/RenseiAI/donmai/runtime/confinement"
+	"github.com/RenseiAI/donmai/tempown"
 )
 
 // museAuthPathEnv overrides the credential-file location the host login
@@ -162,7 +163,7 @@ func probeHostSessionLogin(ctx context.Context, binary string) error {
 // environment injected, so the credential-resolution leg is table-testable
 // without mutating process state.
 func probeHostSessionLoginWithEnv(ctx context.Context, binary string, env []string) error {
-	probeDir, err := os.MkdirTemp("", "donmai-muse-login-")
+	probeDir, err := tempown.MkdirTemp("", tempown.PrefixMuseLogin)
 	if err != nil {
 		return errHostSessionLogin
 	}
@@ -334,7 +335,7 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 	var sessionDir string
 	if confiner != nil {
 		var derr error
-		sessionDir, derr = os.MkdirTemp("", "muse-interactive-")
+		sessionDir, derr = tempown.MkdirTemp("", tempown.PrefixMuseInteractive)
 		if derr != nil {
 			return nil, fmt.Errorf("%w: muse interactive session scratch: %v", agent.ErrSpawnFailed, derr)
 		}
@@ -458,6 +459,9 @@ func serveEnvMap(env []string) map[string]string {
 //	                   allowAll for a policy-free autonomous session; a
 //	                   non-autonomous session keeps the CLI default
 //	                   on-request so the attached human approves)
+//	StartInBypass      → --approval-mode never for a non-autonomous session
+//	                   whose stamped toolApproval level is "bypass" (see
+//	                   startsInBypass); otherwise ignored
 //	SandboxLevel       → --disable-shell --disable-write on the read-only
 //	                   lane (byte-identical to serveArgs: the read-only lane
 //	                   is never widened); provider DisableSandbox →
@@ -506,6 +510,15 @@ func museSeedMessage(seed string) string {
 	return seed
 }
 
+// startsInBypass reports whether a human-controlled session asked to start
+// in the never-ask approval mode and its stamped toolApproval level already
+// grants bypass. The stamp is re-checked here so the request can never
+// widen what the execution-security levels allow.
+func startsInBypass(spec agent.Spec) bool {
+	return !spec.Autonomous && spec.StartInBypass && spec.ExecutionSecurity != nil &&
+		spec.ExecutionSecurity.Levels.ToolApproval == agent.ToolApprovalBypass
+}
+
 func (p *Provider) interactiveArgs(spec agent.Spec) []string {
 	var argv []string
 	trustWorkspace := p != nil && p.opts.TrustWorkspace
@@ -520,7 +533,7 @@ func (p *Provider) interactiveArgs(spec agent.Spec) []string {
 	} else if disableSandbox {
 		argv = append(argv, "--disable-sandbox")
 	}
-	if spec.Autonomous {
+	if spec.Autonomous || startsInBypass(spec) {
 		argv = append(argv, "--approval-mode", "never")
 	}
 	if model := strings.TrimSpace(spec.Model); model != "" && model != "default" {

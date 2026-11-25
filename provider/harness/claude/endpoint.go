@@ -2,7 +2,9 @@ package claude
 
 import (
 	"fmt"
+	"maps"
 	"os"
+	"strings"
 
 	"github.com/RenseiAI/donmai/agent"
 )
@@ -37,7 +39,48 @@ const (
 
 	// EnvVertexRegion is the GCP region the Vertex host serves from.
 	EnvVertexRegion = "CLOUD_ML_REGION"
+
+	// EnvCustomHeaders is the CLI's own knob for extra request headers:
+	// newline-separated "Name: Value" lines sent on every model request.
+	EnvCustomHeaders = "ANTHROPIC_CUSTOM_HEADERS"
 )
+
+// withProviderHTTPHeaders merges the declared provider headers
+// (agent.ProviderHTTPHeadersEnv) into EnvCustomHeaders, which the CLI reads
+// from its process env on every turn, --resume included. Existing lines are
+// kept as written and a declared header is appended only when no line names
+// it (case-insensitively), so a second pass returns env unchanged, as does no
+// declaration. A malformed declaration refuses the session; env is never
+// mutated.
+func withProviderHTTPHeaders(env map[string]string) (map[string]string, error) {
+	declared, err := agent.ProviderHTTPHeadersFromEnv(env)
+	if err != nil {
+		return env, err
+	}
+	existing := strings.TrimRight(env[EnvCustomHeaders], "\r\n")
+	present := map[string]bool{}
+	for _, line := range strings.Split(existing, "\n") {
+		if name, _, ok := strings.Cut(line, ":"); ok {
+			present[strings.ToLower(strings.TrimSpace(name))] = true
+		}
+	}
+	var missing []string
+	for _, h := range declared {
+		if !present[strings.ToLower(h.Name)] {
+			missing = append(missing, h.Name+": "+h.Value)
+		}
+	}
+	if len(missing) == 0 {
+		return env, nil
+	}
+	lines := missing
+	if strings.TrimSpace(existing) != "" {
+		lines = append([]string{existing}, missing...)
+	}
+	out := maps.Clone(env)
+	out[EnvCustomHeaders] = strings.Join(lines, "\n")
+	return out, nil
+}
 
 // routingPinEnvNames are the CLI routing DESTINATION knobs the session
 // launcher pins AFTER repo-local harness config is applied, so a repo
@@ -139,6 +182,17 @@ var pinnedFallbackRoutingEnv = []string{
 // for no redirect it closes — those sessions pin nothing and stay
 // byte-identical. The returned map is a fresh copy; spec is never mutated.
 func pinnedRoutingEnv(spec agent.Spec) map[string]string {
+	// A host-login session (host-session/local) has no route of its own to
+	// hold: it authenticates and routes through the host's CLI login, and
+	// applyAuthMode already removed every routing and credential name from
+	// its env. A pin here would re-read the fallback switches from the
+	// parent process (effectiveRoutingValue) and restate them on the CLI's
+	// winning --settings layer, undoing that strip whenever a region name
+	// (AWS_REGION, CLOUD_ML_REGION) still marks the spec as routed. So a
+	// host-login session pins nothing, on the spawn and on every --resume.
+	if usesHostLogin(spec.AuthMode) {
+		return nil
+	}
 	pin := make(map[string]string)
 	hasOwnRouting := false
 	for k, v := range spec.Env {

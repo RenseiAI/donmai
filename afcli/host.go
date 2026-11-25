@@ -62,6 +62,7 @@ func newHostCmdWithFactory(factory daemonClientFactory, ds func() afclient.DataS
 	cmd.AddCommand(newWorkareaCmd(ds))
 	cmd.AddCommand(newProjectCmd(cfg))
 	cmd.AddCommand(newHostWatchCmd())
+	cmd.AddCommand(newHostObservationsCmd(defaultHostObservationsClient))
 
 	return cmd
 }
@@ -84,7 +85,9 @@ func addHostLifecycleCommands(parent *cobra.Command, factory daemonClientFactory
 	parent.AddCommand(newDaemonRunCmd(cfg))
 	parent.AddCommand(newDaemonStatusCmd(factory, bin))
 	parent.AddCommand(newDaemonLogsCmd())
-	parent.AddCommand(newDaemonDoctorCmd(bin))
+	doctor := newDaemonDoctorCmd(bin)
+	doctor.AddCommand(newDaemonDoctorTempCmd(factory, bin))
+	parent.AddCommand(doctor)
 	parent.AddCommand(newDaemonPauseCmd(factory, bin))
 	parent.AddCommand(newDaemonResumeCmd(factory))
 	parent.AddCommand(newDaemonUpdateCmd(factory))

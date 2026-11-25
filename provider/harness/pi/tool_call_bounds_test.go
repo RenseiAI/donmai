@@ -211,7 +211,9 @@ func TestToolCallBounds_SequentialOverridesLayerUnderTheFence(t *testing.T) {
 	if len(report.UnresolvedHost.Tools) != 0 {
 		t.Errorf("unresolved host package still registered tools: %+v", report.UnresolvedHost.Tools)
 	}
-	if want := []string{"on:session_start", "on:tool_call"}; !slices.Equal(report.UnresolvedHost.Sequence, want) {
+	// The context-overflow marker (message_end) registers on every lane; the
+	// rest is the boundary fence.
+	if want := []string{"on:message_end", "on:session_start", "on:tool_call"}; !slices.Equal(report.UnresolvedHost.Sequence, want) {
 		t.Errorf("unresolved host package: handlers %q, want the fence %q", report.UnresolvedHost.Sequence, want)
 	}
 

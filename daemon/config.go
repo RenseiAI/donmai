@@ -71,6 +71,10 @@ type Config struct {
 	Orchestrator  OrchestratorConfig   `yaml:"orchestrator"           json:"orchestrator"`
 	AutoUpdate    AutoUpdateConfig     `yaml:"autoUpdate"             json:"autoUpdate"`
 	Observability *ObservabilityConfig `yaml:"observability,omitempty" json:"observability,omitempty"`
+	// Observations narrows observed-item policy on this host: it can
+	// disable an item or raise its guard, never widen what a control
+	// plane pushed. nil = no local narrowing.
+	Observations *ObservationsConfig `yaml:"observations,omitempty" json:"observations,omitempty"`
 	// ModelAccess is the platform-synced per-machine + per-workload
 	// model-access narrowing block (P3 / ADR-2026-06-06 D5). nil = no
 	// machine narrowing => the platform ceiling holds unchanged (identity).
@@ -90,6 +94,17 @@ type Config struct {
 	// always torn down; interactive sessions keep their own publication
 	// hold regardless of this setting.
 	KeepFailedWorktrees bool `yaml:"keepFailedWorktrees,omitempty" json:"keepFailedWorktrees,omitempty"`
+	// MaxToolOutputBytes bounds one tool result's content, in bytes, that
+	// each spawned worker's runner retains or forwards (the audit log,
+	// the activity stream, the pull request scan). A larger result is
+	// truncated around a marker naming the truncation, and the seat keeps
+	// going; the harness has already handed the full result to the model
+	// by then, so this bounds the runner's copy, not the model's context.
+	// Absent, zero or negative leaves the runner default,
+	// runner.DefaultMaxToolOutputBytes (262144, 256 KiB); a positive
+	// value states DONMAI_MAX_TOOL_OUTPUT_BYTES in every spawned worker's
+	// environment. Read at daemon start.
+	MaxToolOutputBytes int `yaml:"maxToolOutputBytes,omitempty" json:"maxToolOutputBytes,omitempty"`
 	// Workarea holds Layer-3 workarea-surface tunables (archive root,
 	// diff streaming threshold). Optional; populated with defaults if
 	// absent.
@@ -110,6 +125,11 @@ type Config struct {
 	// configures an endpoint. Consent state is separate from daemon
 	// registration, credentials, and auto-update configuration.
 	UsagePing UsagePingConfig `yaml:"usagePing,omitempty" json:"usagePing,omitempty"`
+	// SessionScratch holds the per-session scratch directory setting (see
+	// SessionScratchConfig and daemon/README.md). Optional; absent means
+	// derivation is on. Process-level: a change takes effect at the next
+	// daemon start.
+	SessionScratch SessionScratchConfig `yaml:"sessionScratch,omitempty" json:"sessionScratch,omitempty"`
 	// Trust holds the daemon-wide signature-verification policy
 	// (sigstore bundle-mode verifier mode + issuer allowlist + audit
 	// actor). Optional; applyDefaults seeds Mode via
@@ -137,6 +157,28 @@ type Config struct {
 	// can mark an explicit "stable", which is otherwise indistinguishable
 	// from the compiled default.
 	autoUpdateChannelAuthored bool
+}
+
+// SessionScratchDeriveKey is the dotted daemon.yaml key that turns the
+// derived per-session scratch directory on or off (`host set
+// sessionScratch.derive 0|1`).
+const SessionScratchDeriveKey = "sessionScratch.derive"
+
+// SessionScratchConfig is the daemon's per-session scratch directory
+// setting.
+type SessionScratchConfig struct {
+	// Derive decides what a session that declares no DONMAI_SESSION_TMPDIR
+	// runs with. True — the default when absent — gives it a directory of
+	// its own, /tmp/donmai-<12 random hex digits>, created before the worker
+	// starts and removed when the session ends. False leaves it on the
+	// daemon's own TMPDIR, TMP and TEMP, exactly as before derivation
+	// existed. A declared value binds either way.
+	Derive *bool `yaml:"derive,omitempty" json:"derive,omitempty"`
+}
+
+// DeriveEnabled reports the effective setting: on unless explicitly false.
+func (c SessionScratchConfig) DeriveEnabled() bool {
+	return c.Derive == nil || *c.Derive
 }
 
 // LocalRuntimeConfig is non-secret operator policy. Credentials remain in
@@ -544,6 +586,24 @@ type AutoUpdateConfig struct {
 	// upgrade refuses without a swap until the operator sets this
 	// alongside the signer allowlist.
 	CDNBase string `yaml:"cdnBase,omitempty" json:"cdnBase,omitempty"`
+
+	// ManagedTrust is the explicit local opt-in for coordinator-managed
+	// update trust. When Enabled the daemon accepts signer/root rotations
+	// delivered over the heartbeat channel for the already configured
+	// coordinator (Orchestrator.URL). The managed signer/root pair is a
+	// REPLACEMENT for the local Signers/TrustRootPath, never a union.
+	// Disabled (zero value) ignores remote trust projections and keeps
+	// local verification behavior.
+	ManagedTrust ManagedUpdateTrustConfig `yaml:"managedTrust,omitempty" json:"managedTrust,omitempty"`
+}
+
+// ManagedUpdateTrustConfig is the explicit local opt-in for
+// coordinator-managed update trust. Authorization requires Enabled plus
+// an already configured coordinator URL; the heartbeat channel that
+// carries the projection is that coordinator's, so no additional
+// coordinator identity travels in the projection itself.
+type ManagedUpdateTrustConfig struct {
+	Enabled bool `yaml:"enabled,omitempty" json:"enabled,omitempty"`
 }
 
 // UpdateSigner pins one identity trusted to sign release binaries.

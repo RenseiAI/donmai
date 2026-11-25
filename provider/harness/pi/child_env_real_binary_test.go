@@ -115,12 +115,14 @@ func (p *listingProbe) assertNoLeak(t *testing.T) {
 }
 
 // realSessionSentinelSpec is the sentinel table on Spec.Env for a real
-// session. The injected provider's key is left to the binding (applyEndpoint
-// mirrors it), so the stub can assert the session authenticated with the
-// binding's own credential.
+// session, plus a declared provider header whose value is a sentinel (a
+// header value can be a gateway credential). The injected provider's key is
+// left to the binding (applyEndpoint mirrors it), so the stub can assert the
+// session authenticated with the binding's own credential.
 func realSessionSentinelSpec(spec agent.Spec) agent.Spec {
 	env := sentinelSpecEnv()
 	delete(env, PiKeyEnvVar)
+	env[agent.ProviderHTTPHeadersEnv] = "cf-aig-authorization: Bearer sentinel-provider-header"
 	spec.Env = env
 	return spec
 }
@@ -232,7 +234,7 @@ func TestRealBinary_SessionEnvironment_InteractiveNeverInListing(t *testing.T) {
 	probe := &listingProbe{stateRoot: newSessionLayout(workdir).root}
 	stub := newRealBinaryStub(t, realBinaryModel)
 	var authMu sync.Mutex
-	var auths []string
+	var auths, gatewayAuths []string
 	sampled := make(chan struct{})
 	var sampleOnce sync.Once
 	stub.responses = []stubResponse{
@@ -242,6 +244,7 @@ func TestRealBinary_SessionEnvironment_InteractiveNeverInListing(t *testing.T) {
 	stub.beforeResponse = func(r *http.Request, n int) {
 		authMu.Lock()
 		auths = append(auths, r.Header.Get("Authorization"))
+		gatewayAuths = append(gatewayAuths, r.Header.Get("cf-aig-authorization"))
 		authMu.Unlock()
 		if n == 2 {
 			probe.sample()
@@ -272,9 +275,12 @@ func TestRealBinary_SessionEnvironment_InteractiveNeverInListing(t *testing.T) {
 	assertToolEnvironment(t, workdir)
 	authMu.Lock()
 	defer authMu.Unlock()
-	for _, auth := range auths {
+	for i, auth := range auths {
 		if auth != "Bearer real-binary-stub-key" {
 			t.Errorf("model request authorization = %q, want the binding's key from the credential file", auth)
+		}
+		if gatewayAuths[i] != "Bearer sentinel-provider-header" {
+			t.Errorf("model request cf-aig-authorization = %q, want the declared header from the credential file", gatewayAuths[i])
 		}
 	}
 }

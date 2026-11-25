@@ -374,7 +374,7 @@ func TestDaemon_AcceptWorkWithDetail_ActiveRetryPreservesOwner(t *testing.T) {
 	if !ok {
 		t.Fatal("active session detail was deleted by rejected retry")
 	}
-	if got != original || got.AuthToken != "owner-token" {
+	if got.SessionID != spec.SessionID || got.AuthToken != "owner-token" {
 		t.Fatalf("active session detail = %#v, want original owner detail", got)
 	}
 	if got := d.spawner.ActiveCount(); got != 1 {

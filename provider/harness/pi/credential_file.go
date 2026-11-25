@@ -124,7 +124,7 @@ type sessionCredential struct {
 }
 
 // sessionCredentialFile is the on-disk shape: a versioned envelope around two
-// ordered lists that are never mixed. Credentials are the session's model
+// ordered lists that are never mixed, plus the provider-headers section. Credentials are the session's model
 // credentials; only the extension reads them, and it reads only the
 // injected provider's key. Environment is the session's other bindings,
 // kept out of the allowlisted exec environment (child_env.go); the
@@ -132,9 +132,24 @@ type sessionCredential struct {
 // starts inherit them. A reader that predates the environment section
 // ignores it.
 type sessionCredentialFile struct {
-	SchemaVersion int                 `json:"schemaVersion"`
-	Credentials   []sessionCredential `json:"credentials"`
-	Environment   []sessionCredential `json:"environment,omitempty"`
+	SchemaVersion   int                     `json:"schemaVersion"`
+	Credentials     []sessionCredential     `json:"credentials"`
+	Environment     []sessionCredential     `json:"environment,omitempty"`
+	ProviderHeaders *sessionProviderHeaders `json:"providerHeaders,omitempty"`
+}
+
+// sessionProviderHeaders is the third section: the session's declared
+// provider HTTP headers (providerHeadersPin), which the extension sets on
+// the provider config it registers. A header value can be a credential (a
+// gateway auth header, say), so the section rides this owner-only file and
+// never the exec environment a same-user listing renders.
+type sessionProviderHeaders struct {
+	// Headers maps each header name to its value, escaped for pi's
+	// config-value syntax (piConfigLiteral).
+	Headers map[string]string `json:"headers"`
+	// NativeProvider names the built-in provider a native pin selects; the
+	// extension gives it the same headers as a header-only override.
+	NativeProvider string `json:"nativeProvider,omitempty"`
 }
 
 // credentialFilePath returns the absolute path of the session credential
@@ -232,22 +247,22 @@ var undeclaredSecretValueNames = []string{
 }
 
 // writeSessionCredentialFile writes entries (the session's model
-// credentials) and environment (its deferred non-credential bindings,
-// child_env.go) as the session credential file under layout's root, mode
-// 0600, through the session-state writer (which refuses a planted link
-// instead of following it out of the set). With both lists empty it writes
-// no file and returns "": the session has nothing to deliver, and the child
-// must read the key as absent rather than as an empty file. The caller
-// composes the returned path onto the child env under credentialFileEnvVar;
-// the caller owns removal (Stop on both lanes).
-func writeSessionCredentialFile(layout sessionLayout, entries, environment []sessionCredential) (string, error) {
-	if len(entries) == 0 && len(environment) == 0 {
+// credentials), environment (its deferred non-credential bindings,
+// child_env.go) and headers (its declared provider headers, or nil) as the
+// session credential file under layout's root, mode 0600, through the
+// session-state writer (which refuses a planted link instead of following it
+// out of the set). With nothing to carry it writes no file and returns "":
+// the child must read the key as absent rather than as an empty file. The
+// caller composes the returned path onto the child env under
+// credentialFileEnvVar; the caller owns removal (Stop on both lanes).
+func writeSessionCredentialFile(layout sessionLayout, entries, environment []sessionCredential, headers *sessionProviderHeaders) (string, error) {
+	if len(entries) == 0 && len(environment) == 0 && headers == nil {
 		return "", nil
 	}
 	if entries == nil {
 		entries = []sessionCredential{}
 	}
-	payload, err := json.Marshal(sessionCredentialFile{SchemaVersion: 1, Credentials: entries, Environment: environment})
+	payload, err := json.Marshal(sessionCredentialFile{SchemaVersion: 1, Credentials: entries, Environment: environment, ProviderHeaders: headers})
 	if err != nil {
 		return "", fmt.Errorf("pi: encode session credential file: %w", err)
 	}

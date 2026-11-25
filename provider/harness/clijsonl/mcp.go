@@ -10,6 +10,7 @@ import (
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/runtime/mcp"
+	"github.com/RenseiAI/donmai/tempown"
 )
 
 // mcpConfigFile is the JSON shape Claude CLI's `--mcp-config` flag
@@ -91,7 +92,7 @@ func writeMCPConfigWithEnv(servers []agent.MCPServerConfig, env map[string]strin
 		return "", fmt.Errorf("provider/claude: build MCP config: %w", err)
 	}
 
-	f, err := os.CreateTemp("", "donmai-claude-mcp-*.json")
+	f, err := tempown.CreateTemp("", tempown.PrefixClaudeMCPConfig)
 	if err != nil {
 		return "", fmt.Errorf("provider/claude: create MCP tmpfile: %w", err)
 	}

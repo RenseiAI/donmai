@@ -1,5 +1,5 @@
 {
-  "schemaVersion": "p1.4",
+  "schemaVersion": "p1.5",
   "contractAbi": "capability-matrix/v1",
   "generatedFrom": "donmai/matrix (go generate ./matrix/...)",
   "harnesses": [
@@ -2576,6 +2576,368 @@
       "adapterVersion": "claude-code/headless/tool-lifecycle-v1",
       "mode": "autonomous",
       "emitsSubagentEvents": true
+    }
+  ],
+  "subscriptionProviders": [
+    {
+      "id": "anthropic-claude",
+      "kind": "direct",
+      "displayName": "Claude",
+      "loginKinds": [
+        "subscription-login"
+      ],
+      "plans": [
+        {
+          "slug": "pro",
+          "displayName": "Pro",
+          "allowanceShape": "percent windows",
+          "lowCap": true,
+          "reachableModels": [
+            {
+              "modelProvider": "anthropic",
+              "modelId": "claude-sonnet-5"
+            }
+          ],
+          "compatibleHarnesses": [
+            "claude-code"
+          ],
+          "billingModes": [
+            "allowance",
+            "overage",
+            "api-metered"
+          ],
+          "defaults": {
+            "allowApiBilledFallback": false,
+            "allowCredits": false,
+            "allowOverage": false,
+            "guardPercent": 50,
+            "warnAtPercent": [
+              80
+            ]
+          }
+        },
+        {
+          "slug": "max",
+          "displayName": "Max",
+          "allowanceShape": "percent windows",
+          "lowCap": false,
+          "reachableModels": [
+            {
+              "modelProvider": "anthropic",
+              "modelId": "claude-sonnet-5"
+            }
+          ],
+          "compatibleHarnesses": [
+            "claude-code"
+          ],
+          "billingModes": [
+            "allowance",
+            "overage",
+            "api-metered"
+          ],
+          "defaults": {
+            "allowApiBilledFallback": false,
+            "allowCredits": false,
+            "allowOverage": false,
+            "guardPercent": 0,
+            "warnAtPercent": [
+              80
+            ]
+          }
+        },
+        {
+          "slug": "team",
+          "displayName": "Team",
+          "allowanceShape": "percent windows",
+          "lowCap": false,
+          "reachableModels": [
+            {
+              "modelProvider": "anthropic",
+              "modelId": "claude-sonnet-5"
+            }
+          ],
+          "compatibleHarnesses": [
+            "claude-code"
+          ],
+          "billingModes": [
+            "allowance",
+            "overage",
+            "api-metered"
+          ],
+          "defaults": {
+            "allowApiBilledFallback": false,
+            "allowCredits": false,
+            "allowOverage": false,
+            "guardPercent": 0,
+            "warnAtPercent": [
+              80
+            ]
+          }
+        },
+        {
+          "slug": "enterprise",
+          "displayName": "Enterprise",
+          "allowanceShape": "percent windows",
+          "lowCap": false,
+          "reachableModels": [
+            {
+              "modelProvider": "anthropic",
+              "modelId": "claude-sonnet-5"
+            }
+          ],
+          "compatibleHarnesses": [
+            "claude-code"
+          ],
+          "billingModes": [
+            "allowance",
+            "overage",
+            "api-metered"
+          ],
+          "defaults": {
+            "allowApiBilledFallback": false,
+            "allowCredits": false,
+            "allowOverage": false,
+            "guardPercent": 0,
+            "warnAtPercent": [
+              80
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "openai-chatgpt",
+      "kind": "direct",
+      "displayName": "ChatGPT",
+      "loginKinds": [
+        "subscription-login"
+      ],
+      "plans": [
+        {
+          "slug": "free",
+          "displayName": "Free",
+          "allowanceShape": "monthly percent",
+          "lowCap": true,
+          "reachableModels": [
+            {
+              "modelProvider": "openai",
+              "modelId": "gpt-6-sol"
+            }
+          ],
+          "compatibleHarnesses": [
+            "codex"
+          ],
+          "billingModes": [
+            "allowance",
+            "credits"
+          ],
+          "defaults": {
+            "allowApiBilledFallback": false,
+            "allowCredits": false,
+            "allowOverage": false,
+            "guardPercent": 50,
+            "warnAtPercent": [
+              80
+            ]
+          }
+        },
+        {
+          "slug": "go",
+          "displayName": "Go",
+          "allowanceShape": "monthly percent",
+          "lowCap": true,
+          "reachableModels": [
+            {
+              "modelProvider": "openai",
+              "modelId": "gpt-6-sol"
+            }
+          ],
+          "compatibleHarnesses": [
+            "codex"
+          ],
+          "billingModes": [
+            "allowance",
+            "credits"
+          ],
+          "defaults": {
+            "allowApiBilledFallback": false,
+            "allowCredits": false,
+            "allowOverage": false,
+            "guardPercent": 50,
+            "warnAtPercent": [
+              80
+            ]
+          }
+        },
+        {
+          "slug": "plus",
+          "displayName": "Plus",
+          "allowanceShape": "percent windows",
+          "lowCap": true,
+          "reachableModels": [
+            {
+              "modelProvider": "openai",
+              "modelId": "gpt-6-sol"
+            }
+          ],
+          "compatibleHarnesses": [
+            "codex"
+          ],
+          "billingModes": [
+            "allowance",
+            "credits"
+          ],
+          "defaults": {
+            "allowApiBilledFallback": false,
+            "allowCredits": false,
+            "allowOverage": false,
+            "guardPercent": 50,
+            "warnAtPercent": [
+              80
+            ]
+          }
+        },
+        {
+          "slug": "pro",
+          "displayName": "Pro",
+          "allowanceShape": "percent windows",
+          "lowCap": false,
+          "reachableModels": [
+            {
+              "modelProvider": "openai",
+              "modelId": "gpt-6-sol"
+            }
+          ],
+          "compatibleHarnesses": [
+            "codex"
+          ],
+          "billingModes": [
+            "allowance",
+            "credits"
+          ],
+          "defaults": {
+            "allowApiBilledFallback": false,
+            "allowCredits": false,
+            "allowOverage": false,
+            "guardPercent": 0,
+            "warnAtPercent": [
+              80
+            ]
+          }
+        },
+        {
+          "slug": "team",
+          "displayName": "Team",
+          "allowanceShape": "percent windows",
+          "lowCap": true,
+          "reachableModels": [
+            {
+              "modelProvider": "openai",
+              "modelId": "gpt-6-sol"
+            }
+          ],
+          "compatibleHarnesses": [
+            "codex"
+          ],
+          "billingModes": [
+            "allowance",
+            "credits"
+          ],
+          "defaults": {
+            "allowApiBilledFallback": false,
+            "allowCredits": false,
+            "allowOverage": false,
+            "guardPercent": 50,
+            "warnAtPercent": [
+              80
+            ]
+          }
+        },
+        {
+          "slug": "business",
+          "displayName": "Business",
+          "allowanceShape": "percent windows",
+          "lowCap": true,
+          "reachableModels": [
+            {
+              "modelProvider": "openai",
+              "modelId": "gpt-6-sol"
+            }
+          ],
+          "compatibleHarnesses": [
+            "codex"
+          ],
+          "billingModes": [
+            "allowance",
+            "credits"
+          ],
+          "defaults": {
+            "allowApiBilledFallback": false,
+            "allowCredits": false,
+            "allowOverage": false,
+            "guardPercent": 50,
+            "warnAtPercent": [
+              80
+            ]
+          }
+        },
+        {
+          "slug": "enterprise",
+          "displayName": "Enterprise",
+          "allowanceShape": "percent windows",
+          "lowCap": false,
+          "reachableModels": [
+            {
+              "modelProvider": "openai",
+              "modelId": "gpt-6-sol"
+            }
+          ],
+          "compatibleHarnesses": [
+            "codex"
+          ],
+          "billingModes": [
+            "allowance",
+            "credits"
+          ],
+          "defaults": {
+            "allowApiBilledFallback": false,
+            "allowCredits": false,
+            "allowOverage": false,
+            "guardPercent": 0,
+            "warnAtPercent": [
+              80
+            ]
+          }
+        },
+        {
+          "slug": "edu",
+          "displayName": "Edu",
+          "allowanceShape": "percent windows",
+          "lowCap": false,
+          "reachableModels": [
+            {
+              "modelProvider": "openai",
+              "modelId": "gpt-6-sol"
+            }
+          ],
+          "compatibleHarnesses": [
+            "codex"
+          ],
+          "billingModes": [
+            "allowance",
+            "credits"
+          ],
+          "defaults": {
+            "allowApiBilledFallback": false,
+            "allowCredits": false,
+            "allowOverage": false,
+            "guardPercent": 0,
+            "warnAtPercent": [
+              80
+            ]
+          }
+        }
+      ]
     }
   ]
 }

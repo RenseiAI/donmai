@@ -20,6 +20,7 @@ import (
 	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 	"github.com/RenseiAI/donmai/runtime/workarea"
 	"github.com/RenseiAI/donmai/runtime/worktree"
+	"github.com/RenseiAI/donmai/tempown"
 )
 
 // Teardown deletes the session's workarea. Before it does, the runner checks
@@ -461,7 +462,7 @@ func (r *Runner) rescueCheckout(sessionID string, dirFor func() (string, error),
 	// Stage the whole working state into a throw-away index, drop the paths
 	// that are not work, and write that state as a tree. The checkout's own
 	// index is never touched.
-	indexDir, err := os.MkdirTemp("", "rescue-index-")
+	indexDir, err := tempown.MkdirTemp("", tempown.PrefixRescueIndex)
 	if err != nil {
 		return rescueArchive{}, fmt.Errorf("create scratch index dir: %w", err)
 	}
@@ -596,7 +597,7 @@ func writeRescuePatch(ctx context.Context, dir, path, base, tree string) (int64,
 // yield exactly tree. A patch that does not is no preservation, so the caller
 // keeps the workarea instead of reporting success.
 func verifyRescuePatch(ctx context.Context, dir, patchPath, base, tree string) error {
-	indexDir, err := os.MkdirTemp("", "rescue-verify-")
+	indexDir, err := tempown.MkdirTemp("", tempown.PrefixRescueVerifyIndex)
 	if err != nil {
 		return fmt.Errorf("create scratch index dir: %w", err)
 	}

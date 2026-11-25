@@ -256,7 +256,7 @@ function hasPgStartScript(dockerfileSource) {
   const executable = executableDockerfileText(dockerfileSource)
   return (
     executable.includes('/usr/local/bin/pg-start') &&
-    /pg_ctlcluster\s+17\s+main\s+start/.test(executable) &&
+    /pg_ctlcluster\s+(?:--skip-systemctl-redirect\s+)?17\s+main\s+start/.test(executable) &&
     executable.includes('pg_isready')
   )
 }
@@ -268,7 +268,28 @@ function hasBuildTimeVectorSmoke(dockerfileSource) {
   const executable = executableDockerfileText(dockerfileSource)
   return (
     /CREATE EXTENSION vector/.test(executable) &&
-    /pg_ctlcluster\s+17\s+main\s+stop/.test(executable)
+    /pg_ctlcluster\s+(?:--skip-systemctl-redirect\s+)?17\s+main\s+stop/.test(executable)
+  )
+}
+
+// hasSystemdSafePgControl reports whether the node-pg Dockerfile keeps the
+// cluster start and stop off systemd and startable by the sandbox account.
+// The E2B builder runs systemd, where a bare root pg_ctlcluster start is
+// redirected to systemctl and fails the build-time smoke (Job for
+// postgresql@17-main.service failed). Three settings are needed together:
+// every pg_ctlcluster start and stop passes --skip-systemctl-redirect; ssl is
+// off, because the default snakeoil key is readable only by the postgres
+// account and the server refuses to start as the sandbox account with it; and
+// start.conf says manual, so systemd never starts the cluster at boot and
+// races pg-start.
+function hasSystemdSafePgControl(dockerfileSource) {
+  const executable = executableDockerfileText(dockerfileSource)
+  const calls = executable.match(/pg_ctlcluster\s+[^&;'"\n]*?(?:start|stop)/g) || []
+  return (
+    calls.length > 0 &&
+    calls.every((call) => /pg_ctlcluster\s+--skip-systemctl-redirect\s/.test(call)) &&
+    /echo\s+"ssl = off"\s*>>\s*\/etc\/postgresql\/17\/main\/postgresql\.conf/.test(executable) &&
+    /echo\s+manual\s*>\s*\/etc\/postgresql\/17\/main\/start\.conf/.test(executable)
   )
 }
 
@@ -823,6 +844,7 @@ module.exports = {
   executableDockerfileText,
   formatFailure,
   hasBuildTimeVectorSmoke,
+  hasSystemdSafePgControl,
   hasCToolchainForRace,
   hasClusterOwnedBySandboxUser,
   hasE2bCompatibleGoPath,

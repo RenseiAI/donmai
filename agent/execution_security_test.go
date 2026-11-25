@@ -694,3 +694,40 @@ func TestExecutionSecurityRefusalFromErrorKeepsOnlyKnownDimensions(t *testing.T)
 		t.Fatal("an untyped error produced a refusal")
 	}
 }
+
+// TestExecutionSecurityFromOperationalPayloadReadsStartPermissionMode pins
+// that the pre-spawn reader every lane runs refuses a malformed
+// startPermissionMode with the same typed refusal as a malformed stamp,
+// naming the field, and accepts "bypass", null and absence.
+func TestExecutionSecurityFromOperationalPayloadReadsStartPermissionMode(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name    string
+		payload string
+		refused bool
+	}{
+		{name: "absent", payload: `{"sessionId":"s"}`},
+		{name: "bypass", payload: `{"sessionId":"s","startPermissionMode":"bypass"}`},
+		{name: "null", payload: `{"sessionId":"s","startPermissionMode":null}`},
+		{name: "empty string", payload: `{"sessionId":"s","startPermissionMode":""}`, refused: true},
+		{name: "unknown mode", payload: `{"sessionId":"s","startPermissionMode":"plan"}`, refused: true},
+		{name: "not a string", payload: `{"sessionId":"s","startPermissionMode":{"mode":"bypass"}}`, refused: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := agent.ExecutionSecurityFromOperationalPayload([]byte(tc.payload))
+			if !tc.refused {
+				if err != nil {
+					t.Fatalf("refused a well-formed payload: %v", err)
+				}
+				return
+			}
+			if agent.ExecutionSecurityErrorCode(err) != agent.ExecutionSecurityUnresolvable || !strings.Contains(err.Error(), "startPermissionMode") {
+				t.Fatalf("err = %v, want execution_security_unresolvable naming startPermissionMode", err)
+			}
+			if refusal := agent.ExecutionSecurityRefusalFromError(err); refusal == nil || len(refusal.Dimensions) != 0 {
+				t.Fatalf("typed refusal = %+v, want the code with no dimension", refusal)
+			}
+		})
+	}
+}

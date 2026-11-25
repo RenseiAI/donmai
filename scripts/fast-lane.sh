@@ -84,6 +84,10 @@ poll_seconds="${FAST_LANE_POLL_SECONDS:-15}"
 tag_wait_seconds="${FAST_LANE_TAG_WAIT_SECONDS:-900}"
 run_wait_seconds="${FAST_LANE_RUN_WAIT_SECONDS:-300}"
 cask_wait_seconds="${FAST_LANE_CASK_WAIT_SECONDS:-600}"
+# Pause between read-backs of the just-posted status: GitHub's combined-status
+# endpoint is eventually consistent. 6 reads, 5 pauses: ~35 s.
+readback_seconds="${FAST_LANE_READBACK_SECONDS:-7}"
+readback_attempts=6
 
 prog='fast-lane'
 mode=''
@@ -791,9 +795,16 @@ description="${platform}; ${gates_line}; ${duration}"
 gh_read "post the ${status_context} status" api --method POST "repos/${repo}/statuses/${sha}" \
   -f state=success -f context="${status_context}" -f description="${description:0:140}" >/dev/null ||
   fail "could not post the ${status_context} status on ${sha}"
-status_json="$(gh_read "read back the ${status_context} status" api "repos/${repo}/commits/${sha}/status")" ||
-  fail "could not read back the ${status_context} status on ${sha}"
-readback="$(jq -r --arg c "${status_context}" '[.statuses[]? | select(.context == $c)] | first | .state // ""' <<<"${status_json}")"
+# The combined status lags the POST, so a single immediate read races it:
+# re-read, bounded, until the context shows up as success.
+readback=''
+for ((attempt = 1; attempt <= readback_attempts; attempt++)); do
+  status_json="$(gh_read "read back the ${status_context} status" api "repos/${repo}/commits/${sha}/status")" ||
+    fail "could not read back the ${status_context} status on ${sha}"
+  readback="$(jq -r --arg c "${status_context}" '[.statuses[]? | select(.context == $c)] | first | .state // ""' <<<"${status_json}")"
+  [[ "${readback}" != success ]] || break
+  [[ ${attempt} -eq ${readback_attempts} ]] || sleep "${readback_seconds}"
+done
 [[ "${readback}" == success ]] || fail "the ${status_context} status on ${sha} reads back '${readback}'"
 log "posted ${status_context}=success on ${sha:0:12}: ${description:0:140}"
 

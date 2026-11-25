@@ -156,6 +156,8 @@ func translateSpecWithToolPolicy(qw QueuedWork, caps agent.Capabilities, in Spec
 		InitialContext:     in.InitialContext,
 		ProviderConfig:     copyProviderConfig(qw.ResolvedProfile.ProviderConfig),
 		Endpoint:           copyEndpointBinding(qw.ResolvedProfile.Endpoint),
+		AuthMode:           qw.ResolvedProfile.AuthMode,
+		StartInBypass:      resolveStartInBypass(qw, in),
 	}
 
 	// InitialContext is a legacy compatibility field. The typed PromptPlan
@@ -263,6 +265,48 @@ func resolveSandboxLevel(qw QueuedWork, logger *slog.Logger) agent.SandboxLevel 
 		}
 		return agent.SandboxWorkspaceWrite
 	}
+}
+
+// resolveStartInBypass decides agent.Spec.StartInBypass. It is true only
+// when all three hold:
+//
+//   - the work item asked for it (QueuedWork.StartPermissionMode "bypass");
+//   - the session is human-controlled — the same rule sessionPromptMode
+//     applies: a non-autonomous spec (the prepared lane derives Autonomous
+//     from the admitted cell's mode) or an interactive work item;
+//   - the work item carries a stamped executionSecurity section whose
+//     toolApproval level is "bypass". A work item without the section
+//     never qualifies: the request can only select a mode the stamp already
+//     grants, never stand in for the grant.
+//
+// Anything else is false. When the work item asked and is refused, one info
+// log names the reason; a work item that did not ask logs nothing, so the
+// field-absent path is unchanged. logger nil-safe.
+func resolveStartInBypass(qw QueuedWork, in SpecInputs) bool {
+	if qw.StartPermissionMode == "" {
+		return false
+	}
+	reason := ""
+	switch {
+	case qw.StartPermissionMode != StartPermissionModeBypass:
+		reason = "unknown startPermissionMode"
+	case in.Autonomous && !qw.isInteractive():
+		reason = "session is autonomous"
+	case qw.ExecutionSecurity == nil:
+		reason = "work item carries no executionSecurity section"
+	case qw.ExecutionSecurity.Levels.ToolApproval != agent.ToolApprovalBypass:
+		reason = "toolApproval is not bypass"
+	default:
+		return true
+	}
+	if in.Logger != nil {
+		in.Logger.Info("[runner] startPermissionMode not applied; session starts in the harness default mode",
+			"sessionId", qw.SessionID,
+			"startPermissionMode", string(qw.StartPermissionMode),
+			"reason", reason,
+		)
+	}
+	return false
 }
 
 // defaultDisallowedTools is the verbatim port of the legacy TS

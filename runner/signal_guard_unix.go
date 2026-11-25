@@ -7,6 +7,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"syscall"
+
+	"github.com/RenseiAI/donmai/tempown"
 )
 
 //go:embed signalguard/signal-guard.sh
@@ -70,13 +73,45 @@ type signalGuardLayout struct {
 	degraded bool
 }
 
+// writeSignalGuardFile installs one executable guard shim. The write
+// descriptor's whole lifetime is guarded by the fork lock: Linux refuses
+// execve of a file any process still holds open for writing (ETXTBSY),
+// and a concurrent fork in another goroutine would inherit the still-open
+// descriptor, so closing (and syncing) before exec alone does not suffice.
+// Holding the read side across open, write, sync and close guarantees no
+// forked child can inherit the writer, and the shim execs immediately
+// once the lock is released.
+func writeSignalGuardFile(path string, data []byte) error {
+	syscall.ForkLock.RLock()
+	defer syscall.ForkLock.RUnlock()
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600) //nolint:gosec // G304: path is the runner-owned guard dir from MkdirTemp, not user input.
+	if err != nil {
+		return fmt.Errorf("runner: create signal guard script: %w", err)
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("runner: write signal guard script: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("runner: sync signal guard script: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("runner: close signal guard script: %w", err)
+	}
+	if err := os.Chmod(path, 0o755); err != nil { //nolint:gosec // G306: guard shims are session-executed; they must carry the exec bit.
+		return fmt.Errorf("runner: secure signal guard script: %w", err)
+	}
+	return nil
+}
+
 // installSignalGuard writes the runner-provided pkill/killall guard into
 // a fresh runner-owned directory outside any checkout and returns the
 // layout the session env must carry. The guard ships with the runner
 // binary (go:embed), so it survives upgrades with no hand-installed step.
 // The caller removes layout.dir when the session ends.
 func installSignalGuard() (signalGuardLayout, error) {
-	dir, err := os.MkdirTemp("", "donmai-signal-guard-*")
+	dir, err := tempown.MkdirTemp("", tempown.PrefixSignalGuard)
 	if err != nil {
 		return signalGuardLayout{}, fmt.Errorf("runner: create signal guard dir: %w", err)
 	}
@@ -94,9 +129,9 @@ func installSignalGuard() (signalGuardLayout, error) {
 		killall:  filepath.Join(dir, "killall"),
 	}
 	for _, path := range []string{layout.pkill, layout.killall} {
-		if err := os.WriteFile(path, []byte(signalGuardScript), 0o755); err != nil { //nolint:gosec // G306: guard shims are session-executed; they must carry the exec bit.
+		if err := writeSignalGuardFile(path, []byte(signalGuardScript)); err != nil {
 			_ = os.RemoveAll(dir)
-			return signalGuardLayout{}, fmt.Errorf("runner: write signal guard script: %w", err)
+			return signalGuardLayout{}, err
 		}
 	}
 	return layout, nil

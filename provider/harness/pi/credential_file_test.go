@@ -260,7 +260,7 @@ func TestStop_RemovesSessionCredentialFiles(t *testing.T) {
 		PiKeyEnvVar:   credentialFileSentinel,
 		"ZAI_API_KEY": credentialFileSentinel,
 	}}
-	credPath, err := writeSessionCredentialFile(layout, sessionCredentialEntries(spec), nil)
+	credPath, err := writeSessionCredentialFile(layout, sessionCredentialEntries(spec), nil, nil)
 	if err != nil {
 		t.Fatalf("writeSessionCredentialFile: %v", err)
 	}

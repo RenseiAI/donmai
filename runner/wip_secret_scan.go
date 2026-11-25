@@ -21,12 +21,16 @@ import (
 
 // wipSecretContentRE matches common secret token shapes that must never
 // enter a remote WIP checkpoint: provider-issued tokens, cloud access-key
-// IDs, chat-platform tokens, PEM private-key blocks and connection-string
-// userinfo. The GitHub shape is intentionally wide (gh[a-z]_): it covers
-// ghp_/gho_/ghs_/ghr_/ghu_ and any future single-letter prefix without
-// another allow-list update. The sk- shape allows - and _ so project and
-// service keys (sk-proj-, sk-svcacct-) match like plain sk- keys.
-var wipSecretContentRE = regexp.MustCompile(`(?:gh[a-z]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-ant-[A-Za-z0-9_-]{10,}|sk-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|xox[abposr]-[A-Za-z0-9-]{10,}|-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----|://[^/\s]+:[^/\s]+@)`)
+// IDs, chat-platform tokens, PEM private-key blocks, connection-string
+// userinfo, JWTs, SECRET_KEY/SECRET_ACCESS_KEY assignments (env and ini),
+// docker auth entries, and netrc passwords. The GitHub shape is
+// intentionally wide (gh[a-z]_): it covers ghp_/gho_/ghs_/ghr_/ghu_ and any
+// future single-letter prefix without another allow-list update. The sk-
+// shape allows - and _ so project and service keys (sk-proj-, sk-svcacct-)
+// match like plain sk- keys. The transcript evidence redactor reuses this
+// expression as a fail-closed check on every decoding view, so an unknown
+// credential in one of these shapes never survives in an archived tail.
+var wipSecretContentRE = regexp.MustCompile(`(?:gh[a-z]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-ant-[A-Za-z0-9_-]{10,}|sk-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|xox[abposr]-[A-Za-z0-9-]{10,}|-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----|://[^/\s]+:[^/\s]+@|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}|(?i:SECRET(_ACCESS)?_KEY\s*["']?\s*[:=])|"auth"\s*:\s*"[A-Za-z0-9+/=_-]{8,}"|(?i:machine\s+[^\s]+\s+(?:login\s+[^\s]+\s+)?password\s+[^\s]+))`)
 
 // wipSecretEnvNameRE matches environment variable names whose process-env
 // values are treated as secrets by the content gate. Session env values

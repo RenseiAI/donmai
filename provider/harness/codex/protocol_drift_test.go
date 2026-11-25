@@ -6,8 +6,11 @@ import (
 	"go/parser"
 	"go/token"
 	"os"
+	"slices"
 	"strconv"
 	"testing"
+
+	"github.com/RenseiAI/donmai/agent"
 )
 
 // Read the actual dispatch switch, not a second list of "mapped" names which
@@ -82,6 +85,56 @@ func TestCodexProtocolDrift(t *testing.T) {
 			_, ignored := group.ignored[name]
 			if !group.mapped[name] && !ignored {
 				t.Errorf("protocol drift: %s is neither mapped nor explicitly ignored; regenerate and review the dispatch policy", name)
+			}
+		}
+	}
+}
+
+// TestCodexRequestParamDrift refuses a request key the installed Codex CLI
+// does not read. The app-server deserializes params leniently: an unknown key
+// is dropped without an error, so a misnamed param (turn/start once sent
+// reasoningEffort where the schema reads effort) silently loses its setting
+// on every session. Every key the builders emit for a fully populated Spec
+// must be a property of the vendored request param schema.
+func TestCodexRequestParamDrift(t *testing.T) {
+	t.Parallel()
+	raw, err := os.ReadFile("testdata/protocol-inventory.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var inventory struct {
+		RequestParams map[string][]string `json:"requestParams"`
+	}
+	if err := json.Unmarshal(raw, &inventory); err != nil {
+		t.Fatal(err)
+	}
+	spec := agent.Spec{
+		Cwd: "/tmp/w", Model: "gpt-5.6-sol", Effort: agent.EffortXHigh,
+		BaseInstructions: "base", SystemPromptAppend: "append",
+		SandboxLevel: agent.SandboxWorkspaceWrite, Autonomous: true,
+		ResponseSchema: json.RawMessage(`{"type":"object"}`),
+	}
+	plan := NewSpawnPlan(spec)
+	for _, request := range []struct {
+		method string
+		params map[string]any
+		must   []string
+	}{
+		{method: "thread/start", params: plan.ThreadStart, must: []string{"baseInstructions", "developerInstructions", "sandbox"}},
+		{method: "turn/start", params: turnStartParams("thread-1", spec, plan.PromptInput), must: []string{"effort", "sandboxPolicy", "outputSchema"}},
+	} {
+		known := inventory.RequestParams[request.method]
+		if len(known) == 0 {
+			t.Fatalf("protocol inventory has no %s params; regenerate it", request.method)
+		}
+		for _, key := range request.must {
+			if _, ok := request.params[key]; !ok {
+				t.Errorf("%s: fully populated spec emitted no %q, so this test no longer covers it", request.method, key)
+			}
+		}
+		for key := range request.params {
+			if !slices.Contains(known, key) {
+				t.Errorf("%s sends %q, which the vendored app-server schema for %s does not read (it would be dropped silently)", request.method, key, request.method)
 			}
 		}
 	}
