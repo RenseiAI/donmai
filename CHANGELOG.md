@@ -10,6 +10,12 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 No unreleased changes.
 
+## v0.73.16 — 2026-11-25
+
+### Chores
+
+- Report per-session chat readiness on the session status wire
+
 ## v0.73.15 — 2026-11-24
 
 ### Chores
