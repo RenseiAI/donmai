@@ -463,11 +463,12 @@ func (q *interactiveNoticeQueue) undelivered(buffered int) int {
 	return buffered
 }
 
-// hold parks a payload in the slot.
+// hold parks a payload in the slot. Outstanding-tool state survives across
+// hold: a tool that started before the notice arrived is still running, and
+// clearing it here would read a mid-build inject as idle silence.
 func (q *interactiveNoticeQueue) hold(text, deliveryID string) {
 	q.text, q.deliveryID = text, deliveryID
 	q.attempts, q.polls, q.idlePolls, q.offered = 0, 0, 0, false
-	q.pendingTools, q.pendingUnkeyed = nil, 0
 	q.claimed, q.claimPolls, q.claimReason = false, 0, ""
 }
 
@@ -482,17 +483,16 @@ func (q *interactiveNoticeQueue) clear() {
 // noteActivity records one sign of session life while a notice is held: a
 // handle event reached the supervisor, so the session is working, not idle.
 // It resets the idle clock without touching the long pull cap, which keeps
-// bounding the total wait. Calls with nothing held are no-ops, so the
-// supervisor can invoke it unconditionally on every event.
+// bounding the total wait. Calls with nothing held are no-ops except for
+// tool start/result tracking, so the supervisor can invoke it
+// unconditionally on every event.
 //
-// Tool starts and results are tracked as well as counted: a tool that has
-// started and not yet reported holds the idle clock at zero across silent
-// polls (see hasActiveTools), because a foreground build emits its
-// tool-start event and then nothing until it finishes minutes later.
+// Tool starts and results are tracked even while idle as well as counted:
+// a tool that started before the notice was held is still running, and a
+// foreground build emits its tool-start event and then nothing until it
+// finishes minutes later. A start without a matching result holds the idle
+// clock at zero across silent polls (see hasActiveTools).
 func (q *interactiveNoticeQueue) noteActivity(event agent.Event) {
-	if q.idle() {
-		return
-	}
 	switch e := event.(type) {
 	case agent.ToolUseEvent:
 		if e.ToolUseID != "" {
@@ -503,11 +503,21 @@ func (q *interactiveNoticeQueue) noteActivity(event agent.Event) {
 		} else {
 			q.pendingUnkeyed++
 		}
+		if q.idle() {
+			return
+		}
 	case agent.ToolResultEvent:
 		if e.ToolUseID != "" {
 			delete(q.pendingTools, e.ToolUseID)
 		} else if q.pendingUnkeyed > 0 {
 			q.pendingUnkeyed--
+		}
+		if q.idle() {
+			return
+		}
+	default:
+		if q.idle() {
+			return
 		}
 	}
 	q.idlePolls = 0
@@ -698,7 +708,7 @@ func (q *interactiveNoticeQueue) attemptPull(
 		detail := fmt.Sprintf("offered but with no session activity for %d polls over ~%s; "+
 			"the session is likely idle at an empty prompt where the hook has already fired — "+
 			"needs operator (retracted=%v)",
-			q.polls, time.Duration(q.polls)*interactiveNoticeRetry, retracted)
+			q.idlePolls, time.Duration(q.idlePolls)*interactiveNoticeRetry, retracted)
 		if rerr != nil {
 			detail += fmt.Sprintf("; retract failed: %v", rerr)
 		}

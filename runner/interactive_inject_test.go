@@ -1523,6 +1523,82 @@ func TestInteractive_PullChannelQuietToolRunDoesNotTripIdleBound(t *testing.T) {
 	}
 }
 
+// TestInteractive_PullChannelPreHoldToolRunDoesNotTripIdleBound is the
+// pre-hold ordering sibling: a tool that starts BEFORE the notice is held
+// must also hold the idle clock. The supervisor tracks starts even while
+// idle and hold preserves outstanding-tool state, so an inject arriving
+// mid-build survives quiet work instead of dead-lettering as needs-operator
+// and retracting the offer the next Stop would have collected.
+func TestInteractive_PullChannelPreHoldToolRunDoesNotTripIdleBound(t *testing.T) {
+	nch := &fakeNoticeChannel{retractOK: true}
+	d := startInteractiveDispatchWith(t, "sess-pull-prehold-tool", agent.NoticeDeliveryHook, nch)
+
+	// The Bash build starts before any notice is held, then the inject
+	// arrives mid-build. The send rendezvouses with the supervisor's
+	// receive, so the start is recorded before the hold parks the payload.
+	d.events <- agent.ToolUseEvent{ToolName: "Bash", ToolUseID: "toolu-pre"}
+	d.injectCh <- heartbeat.InjectPayload{DeliveryID: "dlv-pre", Text: "mid-build status?"}
+	nch.waitOffers(t, 1)
+
+	// Twice the idle bound of silence across the running build: no dead
+	// letter, no ack.
+	for range 2 * interactiveNoticeIdlePolls {
+		d.clock.waitArmed(t)
+		if got := d.pulser.deadLettered(); len(got) != 0 {
+			t.Fatalf("a notice arriving mid-build was dead-lettered as idle: %+v", got)
+		}
+		if got := d.pulser.acked(); len(got) != 0 {
+			t.Fatalf("a notice no turn has collected was acked: %v", got)
+		}
+		d.clock.fire(t)
+	}
+	d.clock.waitArmed(t)
+	if got := d.pulser.deadLettered(); len(got) != 0 {
+		t.Fatalf("a notice arriving mid-build was dead-lettered as idle: %+v", got)
+	}
+
+	// The build finishes and the hook collects at the next Stop: acked once,
+	// never dead-lettered.
+	nch.setConsumed(true)
+	d.events <- agent.ToolResultEvent{ToolName: "Bash", ToolUseID: "toolu-pre"}
+	d.clock.fire(t)
+	d.pulser.waitAcked(t, "dlv-pre")
+	if got := d.pulser.deadLettered(); len(got) != 0 {
+		t.Fatalf("a consumed notice was also dead-lettered: %+v", got)
+	}
+}
+
+// TestInteractive_PullChannelIdleDetailCountsSilentPolls pins the idle
+// receipt's wording: a session busy for 10 polls then silent for 60 must
+// report 60 polls of silence (the idle count), not the 70 total polls.
+func TestInteractive_PullChannelIdleDetailCountsSilentPolls(t *testing.T) {
+	nch := &fakeNoticeChannel{retractOK: true}
+	d := startInteractiveDispatchWith(t, "sess-pull-idle-detail", agent.NoticeDeliveryHook, nch)
+
+	d.injectCh <- heartbeat.InjectPayload{DeliveryID: "dlv-detail", Text: "detail check"}
+	nch.waitOffers(t, 1)
+
+	for range 10 {
+		d.clock.waitArmed(t)
+		d.events <- agent.SystemEvent{Subtype: "user_message", Message: "still working"}
+		d.clock.fire(t)
+	}
+	for range interactiveNoticeIdlePolls - 1 {
+		d.clock.waitArmed(t)
+		d.clock.fire(t)
+	}
+	if reason := d.pulser.waitDeadLettered(t, "dlv-detail"); reason != noticeDeadNeedsOperator {
+		t.Fatalf("dead-letter reason = %q; want %q", reason, noticeDeadNeedsOperator)
+	}
+	warns := strings.Join(d.res.PostSessionWarnings, "|")
+	if !strings.Contains(warns, "for 60 polls") {
+		t.Fatalf("PostSessionWarnings = %q; want the silent count (for 60 polls)", warns)
+	}
+	if strings.Contains(warns, "for 70 polls") {
+		t.Fatalf("PostSessionWarnings = %q; must not report total polls", warns)
+	}
+}
+
 // TestInteractive_PullChannelClaimBeforeIdleCutoffWaitsForAcceptance is the
 // B3 regression: when the hook claims the offer just before the idle cutoff
 // (Retract reports false) while the transcript acceptance record still lags,
