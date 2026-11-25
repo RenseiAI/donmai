@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/RenseiAI/donmai/agent"
 )
@@ -23,20 +24,53 @@ const sessionIDHeader = "Mcp-Session-Id"
 // maxHTTPResponseSize caps a single JSON-RPC response body / SSE stream.
 const maxHTTPResponseSize = 32 * 1024 * 1024
 
+// httpClientTimeout bounds MCP Streamable HTTP calls that arrive without a
+// caller deadline (dial handshake, tools/list, and tools/call without one):
+// the transport must never inherit http.DefaultClient's unbounded wait,
+// which lets one wedged server stall CLI calls for as long as the server
+// stays silent.
+//
+// A tools/call that DOES carry a caller deadline (the Gemini bridge wraps
+// every call in its 5-minute tool bound) runs under that deadline instead:
+// post() routes it to the unbounded client so the transport never imposes a
+// shorter bound than the harness that owns the call. A 30s transport ceiling
+// over a 5-minute tool call is how a healthy 32s test run reads as a client
+// timeout while the server completes it.
+var httpClientTimeout = 30 * time.Second
+
+// httpCloseTimeout bounds the best-effort session DELETE on Close so a
+// wedged server cannot stall teardown either.
+var httpCloseTimeout = 10 * time.Second
+
 // httpMCPClient is the Client implementation over the MCP Streamable HTTP
 // transport (2025-03-26): every JSON-RPC message is POSTed to the endpoint;
 // the server answers with application/json or a text/event-stream carrying
 // the response message.
 type httpMCPClient struct {
 	session
-	conn      *httpConn
+	conn *httpConn
+	// closeOnce guards the idempotent session DELETE.
 	closeOnce sync.Once
+	// closeTimeout bounds the best-effort session DELETE. It rides the
+	// client so tests can drive a short bound without mutating the package
+	// default (mutating a package var from a parallel test races the other
+	// parallel tests that dial through it).
+	closeTimeout time.Duration
 }
 
 // dialHTTP builds the transport and performs the handshake. The server's
 // Headers (typically the platform Authorization bearer) ride on every
 // request.
 func dialHTTP(ctx context.Context, server agent.MCPServerConfig) (Client, error) {
+	return dialHTTPTimeout(ctx, server, httpClientTimeout, httpCloseTimeout)
+}
+
+// dialHTTPTimeout is dialHTTP with explicit bounds: every call runs under
+// clientTimeout and Close's DELETE runs under closeTimeout. Production uses
+// the package defaults via dialHTTP; tests pass short bounds to prove the
+// timeouts fire without waiting out the production values (and without
+// mutating package state from parallel tests).
+func dialHTTPTimeout(ctx context.Context, server agent.MCPServerConfig, clientTimeout, closeTimeout time.Duration) (Client, error) {
 	if server.URL == "" {
 		return nil, fmt.Errorf("runtime/mcp: server %q (http) has empty URL", server.Name)
 	}
@@ -47,9 +81,13 @@ func dialHTTP(ctx context.Context, server agent.MCPServerConfig) (Client, error)
 	conn := &httpConn{
 		url:     server.URL,
 		headers: headers,
-		hc:      http.DefaultClient,
+		hc:      &http.Client{Timeout: clientTimeout},
+		// unbounded carries tools/call requests that already have a caller
+		// deadline: the caller's context is the bound, so no client ceiling
+		// may cut it short. Requests without a deadline never use it.
+		unbounded: &http.Client{},
 	}
-	c := &httpMCPClient{session: session{rpc: conn}, conn: conn}
+	c := &httpMCPClient{session: session{rpc: conn}, conn: conn, closeTimeout: closeTimeout}
 	if err := c.handshake(ctx); err != nil {
 		return nil, fmt.Errorf("runtime/mcp: server %q: %w", server.Name, err)
 	}
@@ -57,14 +95,22 @@ func dialHTTP(ctx context.Context, server agent.MCPServerConfig) (Client, error)
 }
 
 // Close terminates the server-side session (best-effort DELETE with the
-// session id, when one was assigned). Idempotent; always returns nil.
+// session id, when one was assigned). The DELETE runs under the client's
+// close bound so a server that never answers cannot stall teardown.
+// Idempotent; always returns nil.
 func (c *httpMCPClient) Close() error {
 	c.closeOnce.Do(func() {
 		sid := c.conn.session()
 		if sid == "" {
 			return
 		}
-		req, err := http.NewRequestWithContext(context.Background(), http.MethodDelete, c.conn.url, http.NoBody)
+		timeout := c.closeTimeout
+		if timeout <= 0 {
+			timeout = httpCloseTimeout
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		req, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.conn.url, http.NoBody)
 		if err != nil {
 			return
 		}
@@ -84,7 +130,11 @@ type httpConn struct {
 	url     string
 	headers map[string]string
 	hc      *http.Client
-	nextID  atomic.Int64
+	// unbounded serves tools/call when the caller set a deadline: the
+	// context bounds the request, and a client Timeout would only add a
+	// shorter competing ceiling. See post.
+	unbounded *http.Client
+	nextID    atomic.Int64
 
 	mu        sync.Mutex
 	sessionID string
@@ -131,7 +181,19 @@ func (c *httpConn) post(ctx context.Context, msg rpcRequest) (*http.Response, er
 		return nil, fmt.Errorf("build request: %w", err)
 	}
 	c.setHeaders(req)
-	resp, err := c.hc.Do(req)
+	// A tools/call with a caller deadline (the Gemini bridge's 5-minute tool
+	// bound) runs under that deadline on the unbounded client: the transport
+	// must not impose a shorter ceiling than the harness that owns the call.
+	// Every other request — and any call without a deadline — runs under the
+	// explicit client timeout, so a server that never answers still cannot
+	// stall the CLI.
+	hc := c.hc
+	if msg.Method == "tools/call" {
+		if _, ok := ctx.Deadline(); ok && c.unbounded != nil {
+			hc = c.unbounded
+		}
+	}
+	resp, err := hc.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", msg.Method, err)
 	}
