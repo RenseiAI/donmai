@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/RenseiAI/donmai/afclient"
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/attachclient"
 	"github.com/RenseiAI/donmai/attachwire"
@@ -441,6 +442,37 @@ func (r *Runner) dispatchInteractive(
 	retry := r.noticeRetryClock().NewTimer(interactiveNoticeRetry)
 	retry.Stop()
 	defer retry.Stop()
+
+	// Running chat-readiness reporter: posts status=running with
+	// chatReadiness on change and at least every 60s while live. Never
+	// on terminal posts; every failure is swallowed. Nil poster drops.
+	chatNow := r.now
+	if chatNow == nil {
+		chatNow = time.Now
+	}
+	chatReporter := newChatReadinessReporter(func(ctx context.Context, wire *afclient.SessionChatReadiness) error {
+		if r.poster == nil {
+			return nil
+		}
+		postCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		return r.poster.PostRunningChatReadiness(postCtx, qw.SessionID, wire)
+	}, chatNow, chatReadinessRefreshInterval)
+	// chatCtx bounds the background readiness POSTs to the session: the
+	// supervisor never waits for them (see the reporter), and the deferred
+	// cancel aborts an in-flight POST on return instead of posting running
+	// status past the terminal report.
+	chatCtx, chatCancel := context.WithCancel(interactiveCtx)
+	defer chatCancel()
+	chatReporter.maybeReport(chatCtx, notices.readiness(isess, noticeChannel))
+	// Sample the observable readiness every second: hook consumption and the
+	// alternate-screen modal flip between 60s ticks, and a change-driven post
+	// desynchronizes a 60s-grid ticker (the next tick lands <60s after the
+	// change and is skipped, stalling the receiver for ~2x the interval).
+	// The reporter still gates the wire to change-or-60s, so the fast poll is
+	// a cheap local read that only posts on news.
+	chatSampleTicker := time.NewTicker(chatReadinessSampleInterval)
+	defer chatSampleTicker.Stop()
 	defer func() {
 		// Held/buffered at session end is NOT dead-lettered: the payload is
 		// still unacked, so the producer re-offers it to a session that can
@@ -508,6 +540,7 @@ func (r *Runner) dispatchInteractive(
 			if notices.attempt(r, qw, res, isess, noticeChannel) == noticeHeld {
 				retry.Reset(interactiveNoticeRetry)
 			}
+			chatReporter.maybeReport(chatCtx, notices.readiness(isess, noticeChannel))
 			continue
 
 		case <-retry.Chan():
@@ -517,6 +550,11 @@ func (r *Runner) dispatchInteractive(
 			if notices.attempt(r, qw, res, isess, noticeChannel) == noticeHeld {
 				retry.Reset(interactiveNoticeRetry)
 			}
+			chatReporter.maybeReport(chatCtx, notices.readiness(isess, noticeChannel))
+			continue
+
+		case <-chatSampleTicker.C:
+			chatReporter.maybeReport(chatCtx, notices.readiness(isess, noticeChannel))
 			continue
 
 		case <-isess.Done():

@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/RenseiAI/donmai/afclient"
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/runtime/workarea"
 )
@@ -426,6 +427,34 @@ type statusRequest struct {
 	// the single-seat fold, kept as a summary so heartbeat and receipt
 	// readers share one shape.
 	SeatSummary *SeatStateSummary `json:"seatSummary,omitempty"`
+
+	// ChatReadiness is the optional per-session chat-readiness report for
+	// running interactive sessions. Terminal posts never set it, so the
+	// terminal wire stays byte-identical; old receivers ignore the key.
+	ChatReadiness *afclient.SessionChatReadiness `json:"chatReadiness,omitempty"`
+}
+
+// runningStatusRequest is the wire body for running status posts carrying
+// chat readiness. Additive and best-effort; failures never fail the session.
+type runningStatusRequest struct {
+	WorkerID      string                         `json:"workerId"`
+	Status        string                         `json:"status"`
+	ChatReadiness *afclient.SessionChatReadiness `json:"chatReadiness,omitempty"`
+}
+
+// PostRunningChatReadiness posts one best-effort running status carrying chat
+// readiness. Single attempt, no retry: failures return for the caller to
+// swallow so a readiness outage never fails the session.
+func (p *Poster) PostRunningChatReadiness(ctx context.Context, sessionID string, readiness *afclient.SessionChatReadiness) error {
+	if strings.TrimSpace(sessionID) == "" {
+		return errors.New("result: sessionID is required")
+	}
+	creds := p.credentials(ctx)
+	payload, err := json.Marshal(runningStatusRequest{WorkerID: creds.WorkerID, Status: "running", ChatReadiness: readiness})
+	if err != nil {
+		return fmt.Errorf("marshal running status body: %w", err)
+	}
+	return p.doOnce(ctx, p.urlFor(fmt.Sprintf("/api/sessions/%s/status", sessionID)), payload, creds.AuthToken)
 }
 
 // SeatStateSummary is the single-seat fold of a terminal seat report:
