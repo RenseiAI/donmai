@@ -320,6 +320,18 @@ type MCPServerConfig struct {
 	// Headers are HTTP headers to send on every MCP request. Typically
 	// holds the Authorization bearer for the platform's MCP route.
 	Headers map[string]string `json:"headers,omitempty"`
+	// RequestTimeoutSeconds bounds Streamable HTTP calls that arrive
+	// without a caller deadline (dial handshake, tools/list, and
+	// tools/call without one). Zero uses the transport default (30s);
+	// negative disables the fallback so a caller-owned context (cancel-only
+	// or an explicit deadline) is the only bound. A slow-but-healthy tool
+	// that outlives the default sets this higher instead of failing at the
+	// shared ceiling.
+	RequestTimeoutSeconds int `json:"requestTimeoutSeconds,omitempty"`
+	// CloseTimeoutSeconds bounds the best-effort session DELETE on Close.
+	// Zero uses the transport default (10s); negative disables the bound
+	// (the DELETE rides the caller's cancellation only).
+	CloseTimeoutSeconds int `json:"closeTimeoutSeconds,omitempty"`
 
 	// protectedRuntimeMCPHeadersHelper is process-owned spawn authority. It is
 	// deliberately absent from every serialized representation.

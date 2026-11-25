@@ -58,11 +58,37 @@ type httpMCPClient struct {
 	closeTimeout time.Duration
 }
 
+// resolveHTTPTimeouts maps one server's optional per-server bounds onto
+// concrete client and close timeouts. Zero selects the package default;
+// negative disables the bound (no client Timeout / no close deadline) so an
+// operator with a known-slow server opts out without forking the transport.
+// A non-positive client bound still leaves Background (uncancellable)
+// callers bounded by the default: only an explicit per-server value or a
+// caller-owned context lifts the ceiling.
+func resolveHTTPTimeouts(server agent.MCPServerConfig) (clientTimeout, closeTimeout time.Duration) {
+	clientTimeout = httpClientTimeout
+	closeTimeout = httpCloseTimeout
+	if server.RequestTimeoutSeconds > 0 {
+		clientTimeout = time.Duration(server.RequestTimeoutSeconds) * time.Second
+	} else if server.RequestTimeoutSeconds < 0 {
+		clientTimeout = -1
+	}
+	if server.CloseTimeoutSeconds > 0 {
+		closeTimeout = time.Duration(server.CloseTimeoutSeconds) * time.Second
+	} else if server.CloseTimeoutSeconds < 0 {
+		closeTimeout = -1
+	}
+	return clientTimeout, closeTimeout
+}
+
 // dialHTTP builds the transport and performs the handshake. The server's
 // Headers (typically the platform Authorization bearer) ride on every
-// request.
+// request. Per-server RequestTimeoutSeconds/CloseTimeoutSeconds override the
+// package defaults; a caller deadline on ctx already overrides the client
+// bound for the handshake itself (see post).
 func dialHTTP(ctx context.Context, server agent.MCPServerConfig) (Client, error) {
-	return dialHTTPTimeout(ctx, server, httpClientTimeout, httpCloseTimeout)
+	clientTimeout, closeTimeout := resolveHTTPTimeouts(server)
+	return dialHTTPTimeout(ctx, server, clientTimeout, closeTimeout)
 }
 
 // dialHTTPTimeout is dialHTTP with explicit bounds: every call runs under
@@ -78,13 +104,19 @@ func dialHTTPTimeout(ctx context.Context, server agent.MCPServerConfig, clientTi
 	for k, v := range server.Headers {
 		headers[k] = v
 	}
+	hcTimeout := clientTimeout
+	if hcTimeout < 0 {
+		hcTimeout = 0
+	}
 	conn := &httpConn{
 		url:     server.URL,
 		headers: headers,
-		hc:      &http.Client{Timeout: clientTimeout},
-		// unbounded carries tools/call requests that already have a caller
-		// deadline: the caller's context is the bound, so no client ceiling
-		// may cut it short. Requests without a deadline never use it.
+		hc:      &http.Client{Timeout: hcTimeout},
+		// unbounded carries requests whose caller owns the bound (an
+		// explicit deadline, or a cancel-only context): the caller's
+		// context is the bound, so no client ceiling may cut it short.
+		// Background callers (nothing to cancel, no deadline) take the
+		// bounded client above so a wedged server cannot stall the CLI.
 		unbounded: &http.Client{},
 	}
 	c := &httpMCPClient{session: session{rpc: conn}, conn: conn, closeTimeout: closeTimeout}
@@ -99,23 +131,52 @@ func dialHTTPTimeout(ctx context.Context, server agent.MCPServerConfig, clientTi
 // close bound so a server that never answers cannot stall teardown.
 // Idempotent; always returns nil.
 func (c *httpMCPClient) Close() error {
+	return c.CloseWithContext(context.Background())
+}
+
+// CloseWithContext terminates the server-side session under ctx: an explicit
+// caller deadline overrides the per-server close bound, so a caller that
+// already budgeted teardown is never cut short by the transport default.
+// Without a caller deadline the per-server (or package-default) close bound
+// applies; a cancel-only context rides the caller's cancellation with no
+// additional ceiling. Idempotent; always returns nil.
+func (c *httpMCPClient) CloseWithContext(ctx context.Context) error {
 	c.closeOnce.Do(func() {
 		sid := c.conn.session()
 		if sid == "" {
 			return
 		}
-		timeout := c.closeTimeout
-		if timeout <= 0 {
-			timeout = httpCloseTimeout
+		if ctx == nil {
+			ctx = context.Background()
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		defer cancel()
+		if _, ok := ctx.Deadline(); ok {
+			// Caller deadline wins outright.
+		} else if ctx.Done() != nil {
+			// Cancel-only: caller owns cancellation; no extra ceiling.
+		} else if c.closeTimeout < 0 {
+			// Explicit per-server opt-out: no bound beyond the caller's.
+		} else if c.closeTimeout > 0 {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, c.closeTimeout)
+			defer cancel()
+		} else {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, httpCloseTimeout)
+			defer cancel()
+		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.conn.url, http.NoBody)
 		if err != nil {
 			return
 		}
 		c.conn.setHeaders(req)
-		resp, err := c.conn.hc.Do(req)
+		// The DELETE rides ctx alone on the unbounded client: a client
+		// Timeout here would add a second, shorter ceiling that the caller
+		// deadline (or the per-server close bound above) cannot override.
+		doClient := c.conn.unbounded
+		if doClient == nil {
+			doClient = c.conn.hc
+		}
+		resp, err := doClient.Do(req)
 		if err != nil {
 			return
 		}
@@ -181,15 +242,22 @@ func (c *httpConn) post(ctx context.Context, msg rpcRequest) (*http.Response, er
 		return nil, fmt.Errorf("build request: %w", err)
 	}
 	c.setHeaders(req)
-	// A tools/call with a caller deadline (the Gemini bridge's 5-minute tool
-	// bound) runs under that deadline on the unbounded client: the transport
-	// must not impose a shorter ceiling than the harness that owns the call.
-	// Every other request — and any call without a deadline — runs under the
-	// explicit client timeout, so a server that never answers still cannot
-	// stall the CLI.
+	// A caller deadline overrides the transport ceiling for ANY method
+	// (the Gemini bridge wraps every tools/call in its 5-minute tool bound,
+	// and discovery callers budget initialize/tools/list the same way): the
+	// transport must not impose a shorter ceiling than the harness that owns
+	// the call. A cancel-only context (cancellable, no deadline) likewise
+	// rides the caller's cancellation with no extra ceiling, so a healthy
+	// slow tool (a 32s build with cancel-only) completes as it did before the
+	// bound existed. Only a Background context — no deadline and nothing to
+	// cancel — takes the explicit client timeout, so a server that never
+	// answers still cannot stall the CLI. Per-server RequestTimeoutSeconds
+	// tunes that fallback without forking the transport.
 	hc := c.hc
-	if msg.Method == "tools/call" {
-		if _, ok := ctx.Deadline(); ok && c.unbounded != nil {
+	if c.unbounded != nil {
+		if _, ok := ctx.Deadline(); ok {
+			hc = c.unbounded
+		} else if ctx.Done() != nil {
 			hc = c.unbounded
 		}
 	}

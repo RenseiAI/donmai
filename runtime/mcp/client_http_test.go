@@ -509,3 +509,189 @@ func TestHTTPClient_CallWithCallerDeadlineOutlivesClientBound(t *testing.T) {
 		}
 	})
 }
+
+// slowListServer answers initialize at once but tools/list after a delay: the
+// shape of a healthy-but-slow discovery surface under a harness call bound.
+type slowListServer struct {
+	listDelay time.Duration
+}
+
+func (s slowListServer) handler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		var req struct {
+			ID     *int64          `json:"id"`
+			Method string          `json:"method"`
+			Params json.RawMessage `json:"params"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if req.ID == nil {
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		if req.Method == "initialize" {
+			w.Header().Set(sessionIDHeader, "sess-slow-list")
+			writeRPC(w, false, map[string]any{"jsonrpc": "2.0", "id": *req.ID, "result": map[string]any{}})
+			return
+		}
+		if req.Method == "tools/list" {
+			select {
+			case <-time.After(s.listDelay):
+			case <-r.Context().Done():
+				return
+			}
+			writeRPC(w, false, map[string]any{"jsonrpc": "2.0", "id": *req.ID, "result": map[string]any{"tools": []any{}}})
+			return
+		}
+		writeRPC(w, false, map[string]any{"jsonrpc": "2.0", "id": *req.ID, "result": map[string]any{}})
+	}
+}
+
+// TestHTTPClient_CancelOnlySlowCallCompletes pins the library-caller fix: a
+// tools/call with a cancel-only context (cancellable, no deadline) rides the
+// caller's cancellation with no extra transport ceiling, so a healthy slow
+// tool completes as it did before the bound existed. Only a Background
+// context — nothing to cancel and no deadline — takes the fallback bound.
+// Drives the production transport (CallTool over real HTTP).
+func TestHTTPClient_CancelOnlySlowCallCompletes(t *testing.T) {
+	t.Parallel()
+	const clientBound = 150 * time.Millisecond
+	const callDelay = 500 * time.Millisecond
+	srv := httptest.NewServer(slowServer{callDelay: callDelay}.handler())
+	t.Cleanup(srv.Close)
+	c, err := dialHTTPTimeout(context.Background(),
+		agent.MCPServerConfig{Name: "slow", Type: "http", URL: srv.URL}, clientBound, clientBound)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	res, err := c.CallTool(ctx, "echo", nil)
+	if err != nil {
+		t.Fatalf("CallTool with cancel-only context failed past the %v fallback: %v", clientBound, err)
+	}
+	if res.Content != "slow ok" {
+		t.Fatalf("CallTool = %q; want %q", res.Content, "slow ok")
+	}
+}
+
+// TestHTTPClient_CallerDeadlineOverridesDiscovery pins the discovery half of
+// the override: a tools/list carrying a caller deadline longer than the
+// transport ceiling runs under that deadline, while the same call on a
+// Background context takes the fallback bound. Drives ListTools over real HTTP.
+func TestHTTPClient_CallerDeadlineOverridesDiscovery(t *testing.T) {
+	t.Parallel()
+	const clientBound = 150 * time.Millisecond
+	const listDelay = 500 * time.Millisecond
+	newListClient := func(t *testing.T) Client {
+		t.Helper()
+		srv := httptest.NewServer(slowListServer{listDelay: listDelay}.handler())
+		t.Cleanup(srv.Close)
+		c, err := dialHTTPTimeout(context.Background(),
+			agent.MCPServerConfig{Name: "slow-list", Type: "http", URL: srv.URL}, clientBound, clientBound)
+		if err != nil {
+			t.Fatalf("Dial: %v", err)
+		}
+		t.Cleanup(func() { _ = c.Close() })
+		return c
+	}
+	t.Run("deadline wins", func(t *testing.T) {
+		t.Parallel()
+		c := newListClient(t)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, err := c.ListTools(ctx); err != nil {
+			t.Fatalf("ListTools with a 5s caller deadline failed past the 150ms ceiling: %v", err)
+		}
+	})
+	t.Run("background takes the fallback", func(t *testing.T) {
+		t.Parallel()
+		c := newListClient(t)
+		start := time.Now()
+		if _, err := c.ListTools(context.Background()); err == nil {
+			t.Fatal("ListTools on Background succeeded past the ceiling; want a timeout error")
+		}
+		if elapsed := time.Since(start); elapsed > 10*time.Second {
+			t.Fatalf("ListTools took %v; want the explicit client timeout", elapsed)
+		}
+	})
+}
+
+// TestHTTPClient_PerServerTimeoutsTuneFallbackAndClose pins the explicit
+// declaration: RequestTimeoutSeconds tunes the Background fallback and
+// CloseTimeoutSeconds tunes teardown, both through the production dial path
+// (dialHTTP reading MCPServerConfig). A hanging server honours the
+// per-server bounds instead of the package defaults.
+func TestHTTPClient_PerServerTimeoutsTuneFallbackAndClose(t *testing.T) {
+	t.Parallel()
+	t.Run("request bound", func(t *testing.T) {
+		t.Parallel()
+		srv := httptest.NewServer(hangServer{hungMethod: "tools/list"}.handler())
+		t.Cleanup(srv.Close)
+		c, err := dialHTTP(context.Background(), agent.MCPServerConfig{
+			Name: "hung", Type: "http", URL: srv.URL, RequestTimeoutSeconds: 1,
+		})
+		if err != nil {
+			t.Fatalf("Dial: %v", err)
+		}
+		t.Cleanup(func() { _ = c.Close() })
+		start := time.Now()
+		if _, err := c.ListTools(context.Background()); err == nil {
+			t.Fatal("ListTools against a never-answering server succeeded; want a timeout error")
+		}
+		elapsed := time.Since(start)
+		if elapsed > 10*time.Second || elapsed < 900*time.Millisecond {
+			t.Fatalf("ListTools took %v; want ~1s per-server bound, not the 30s default", elapsed)
+		}
+	})
+	t.Run("close bound", func(t *testing.T) {
+		t.Parallel()
+		srv := httptest.NewServer(hangServer{hangDelete: true}.handler())
+		t.Cleanup(srv.Close)
+		c, err := dialHTTP(context.Background(), agent.MCPServerConfig{
+			Name: "hung-close", Type: "http", URL: srv.URL, CloseTimeoutSeconds: 1,
+		})
+		if err != nil {
+			t.Fatalf("Dial: %v", err)
+		}
+		t.Cleanup(func() { _ = c.Close() })
+		start := time.Now()
+		if err := c.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		if elapsed := time.Since(start); elapsed > 10*time.Second || elapsed < 900*time.Millisecond {
+			t.Fatalf("Close took %v against a never-answering DELETE; want ~1s per-server bound", elapsed)
+		}
+	})
+	t.Run("close caller deadline overrides", func(t *testing.T) {
+		t.Parallel()
+		srv := httptest.NewServer(hangServer{hangDelete: true}.handler())
+		t.Cleanup(srv.Close)
+		c, err := dialHTTPTimeout(context.Background(),
+			agent.MCPServerConfig{Name: "hung-close-override", Type: "http", URL: srv.URL}, 150*time.Millisecond, 30*time.Second)
+		if err != nil {
+			t.Fatalf("Dial: %v", err)
+		}
+		t.Cleanup(func() { _ = c.Close() })
+		hc, ok := c.(*httpMCPClient)
+		if !ok {
+			t.Fatalf("client is %T; want *httpMCPClient", c)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		start := time.Now()
+		if err := hc.CloseWithContext(ctx); err != nil {
+			t.Fatalf("CloseWithContext: %v", err)
+		}
+		if elapsed := time.Since(start); elapsed > 10*time.Second || elapsed < 900*time.Millisecond {
+			t.Fatalf("CloseWithContext took %v; want the ~1s caller deadline, not the 30s per-client bound", elapsed)
+		}
+	})
+}

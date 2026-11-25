@@ -472,11 +472,15 @@ func (q *interactiveNoticeQueue) hold(text, deliveryID string) {
 	q.claimed, q.claimPolls, q.claimReason = false, 0, ""
 }
 
-// clear frees the slot.
+// clear frees the slot. Outstanding-tool state survives across delivery:
+// a tool that started while the acked notice waited is still running, and
+// clearing it here would read the NEXT notice's quiet work as idle silence.
+// Tool results arriving later delete the entries (see noteActivity), and the
+// long pull cap still bounds a leaked start, so preserving never holds the
+// slot past the cap.
 func (q *interactiveNoticeQueue) clear() {
 	q.text, q.deliveryID = "", ""
 	q.attempts, q.polls, q.idlePolls, q.offered = 0, 0, 0, false
-	q.pendingTools, q.pendingUnkeyed = nil, 0
 	q.claimed, q.claimPolls, q.claimReason = false, 0, ""
 }
 
@@ -668,9 +672,10 @@ func (q *interactiveNoticeQueue) attemptPull(
 	// that fires between the claim and the record must not report the
 	// delivery dead. Keep asking the recipient's own record under the claim
 	// grace; a claim still silent past it reads as discarded output.
+	// A negative claim bound waits without expiring (operator opt-out).
 	if q.claimed {
 		q.claimPolls++
-		if q.claimPolls < interactiveNoticeClaimGracePolls {
+		if claimGrace := r.claimGracePolls(); claimGrace < 0 || q.claimPolls < claimGrace {
 			return noticeHeld
 		}
 		return q.deadLetter(r, qw, res, q.claimReason,
@@ -688,7 +693,7 @@ func (q *interactiveNoticeQueue) attemptPull(
 	} else {
 		q.idlePolls++
 	}
-	if q.idlePolls >= interactiveNoticeIdlePolls {
+	if idleBound := r.idleNoticePolls(); idleBound >= 0 && q.idlePolls >= idleBound {
 		// No sign of session life for the idle bound: no turn ended, no
 		// transcript event reached the supervisor, no tool outstanding. The
 		// session is likely idle at an empty prompt, where the Stop hook has
@@ -812,6 +817,26 @@ func declaredOrUndeclared(nd agent.NoticeDelivery) string {
 		return "<undeclared>"
 	}
 	return string(nd)
+}
+
+// idleNoticePolls resolves the idle shortcut bound for pull-channel
+// notices: the const default when unset, the operator's explicit poll count
+// when positive, and negative (disabled) when the operator opts to leave the
+// offer in place until the long pull cap.
+func (r *Runner) idleNoticePolls() int {
+	if r == nil || r.interactiveNoticeIdlePolls == 0 {
+		return interactiveNoticeIdlePolls
+	}
+	return r.interactiveNoticeIdlePolls
+}
+
+// claimGracePolls resolves the claim-grace bound the same way: default,
+// explicit count, or negative for wait-without-expiring.
+func (r *Runner) claimGracePolls() int {
+	if r == nil || r.interactiveNoticeClaimGracePolls == 0 {
+		return interactiveNoticeClaimGracePolls
+	}
+	return r.interactiveNoticeClaimGracePolls
 }
 
 // noticeRetryClock returns the clock the interactive supervisor arms its
