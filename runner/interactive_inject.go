@@ -672,10 +672,17 @@ func (q *interactiveNoticeQueue) attemptPull(
 	// that fires between the claim and the record must not report the
 	// delivery dead. Keep asking the recipient's own record under the claim
 	// grace; a claim still silent past it reads as discarded output.
-	// A negative claim bound waits without expiring (operator opt-out).
+	// A negative claim bound waits without expiring the grace (operator
+	// opt-out), but the single notice slot is still head-of-line blocking:
+	// even a claimed offer is bounded by the long pull cap so a claim whose
+	// record never arrives cannot starve later notices indefinitely.
 	if q.claimed {
 		q.claimPolls++
-		if claimGrace := r.claimGracePolls(); claimGrace < 0 || q.claimPolls < claimGrace {
+		if claimGrace := r.claimGracePolls(); claimGrace < 0 {
+			if q.polls < interactiveNoticePullMaxPolls {
+				return noticeHeld
+			}
+		} else if q.claimPolls < claimGrace {
 			return noticeHeld
 		}
 		return q.deadLetter(r, qw, res, q.claimReason,
@@ -831,7 +838,8 @@ func (r *Runner) idleNoticePolls() int {
 }
 
 // claimGracePolls resolves the claim-grace bound the same way: default,
-// explicit count, or negative for wait-without-expiring.
+// explicit count, or negative for wait-without-expiring (the long pull cap
+// still bounds the slot even while claimed).
 func (r *Runner) claimGracePolls() int {
 	if r == nil || r.interactiveNoticeClaimGracePolls == 0 {
 		return interactiveNoticeClaimGracePolls

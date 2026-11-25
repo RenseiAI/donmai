@@ -320,8 +320,10 @@ type Options struct {
 	// InteractiveNoticeClaimGracePolls bounds the wait after the harness
 	// claims an offer for the acceptance record to appear (see
 	// interactiveNoticeClaimGracePolls). Zero uses the default; a NEGATIVE
-	// value waits without expiring the grace (the long pull cap still
-	// bounds the slot when no claim is outstanding).
+	// value waits without expiring the grace, but the long pull cap still
+	// bounds the slot even while claimed so a record that never arrives
+	// cannot hold the single notice slot indefinitely and starve later
+	// notices.
 	InteractiveNoticeClaimGracePolls int
 
 	// MaxToolOutputBytes bounds one tool result's content (in bytes) the

@@ -624,6 +624,45 @@ func TestHTTPClient_CallerDeadlineOverridesDiscovery(t *testing.T) {
 	})
 }
 
+// TestResolveHTTPTimeoutsMapsZeroToDefaults pins the zero-to-default mapping:
+// an unset per-server bound selects the package default, a positive value is
+// used verbatim, and a negative value disables the bound. Changing the
+// positive check to >= 0 (zero becomes 0s instead of the 30s default) would
+// silently unbound the default transport, so this table must stay green.
+func TestResolveHTTPTimeoutsMapsZeroToDefaults(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name                  string
+		server                agent.MCPServerConfig
+		wantClient, wantClose time.Duration
+	}{
+		{
+			name: "zero selects defaults", server: agent.MCPServerConfig{},
+			wantClient: httpClientTimeout, wantClose: httpCloseTimeout,
+		},
+		{
+			name:       "positive is used verbatim",
+			server:     agent.MCPServerConfig{RequestTimeoutSeconds: 7, CloseTimeoutSeconds: 3},
+			wantClient: 7 * time.Second, wantClose: 3 * time.Second,
+		},
+		{
+			name:       "negative disables the bound",
+			server:     agent.MCPServerConfig{RequestTimeoutSeconds: -1, CloseTimeoutSeconds: -1},
+			wantClient: -1, wantClose: -1,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			gotClient, gotClose := resolveHTTPTimeouts(tc.server)
+			if gotClient != tc.wantClient || gotClose != tc.wantClose {
+				t.Fatalf("resolveHTTPTimeouts(%+v) = (%v, %v); want (%v, %v)",
+					tc.server, gotClient, gotClose, tc.wantClient, tc.wantClose)
+			}
+		})
+	}
+}
+
 // TestHTTPClient_PerServerTimeoutsTuneFallbackAndClose pins the explicit
 // declaration: RequestTimeoutSeconds tunes the Background fallback and
 // CloseTimeoutSeconds tunes teardown, both through the production dial path

@@ -149,20 +149,22 @@ func (c *httpMCPClient) CloseWithContext(ctx context.Context) error {
 		if ctx == nil {
 			ctx = context.Background()
 		}
-		if _, ok := ctx.Deadline(); ok {
-			// Caller deadline wins outright.
-		} else if ctx.Done() != nil {
-			// Cancel-only: caller owns cancellation; no extra ceiling.
-		} else if c.closeTimeout < 0 {
-			// Explicit per-server opt-out: no bound beyond the caller's.
-		} else if c.closeTimeout > 0 {
-			var cancel context.CancelFunc
-			ctx, cancel = context.WithTimeout(ctx, c.closeTimeout)
-			defer cancel()
-		} else {
-			var cancel context.CancelFunc
-			ctx, cancel = context.WithTimeout(ctx, httpCloseTimeout)
-			defer cancel()
+		// The transport bound applies only when the caller supplied no bound
+		// of its own (no deadline and nothing to cancel) and the operator
+		// has not opted out: a caller deadline wins outright, a cancel-only
+		// context rides the caller's cancellation, and a negative per-server
+		// bound disables the fallback. Every other case takes the explicit
+		// close bound below so a wedged server cannot stall teardown.
+		if _, hasDeadline := ctx.Deadline(); !hasDeadline && ctx.Done() == nil {
+			timeout := c.closeTimeout
+			if timeout == 0 {
+				timeout = httpCloseTimeout
+			}
+			if timeout > 0 {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, timeout)
+				defer cancel()
+			}
 		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.conn.url, http.NoBody)
 		if err != nil {

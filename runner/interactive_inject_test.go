@@ -1813,6 +1813,38 @@ func TestInteractive_PullChannelClaimGraceDisabledWaitsForAcceptance(t *testing.
 // B3 wait: a claim whose acceptance record never appears still cannot hold
 // the slot forever. Past the claim grace it reads as discarded output under
 // the cutoff's own reason.
+// TestInteractive_PullChannelClaimGraceDisabledBoundedByLongCap pins the
+// claimed opt-out bound: with a negative claim grace the runner waits without
+// expiring the grace, but the long pull cap still frees the single notice
+// slot so a claim whose acceptance record never arrives cannot starve later
+// notices indefinitely. Drives the production supervisor (dispatchInteractive)
+// with a Runner carrying InteractiveNoticeClaimGracePolls=-1.
+func TestInteractive_PullChannelClaimGraceDisabledBoundedByLongCap(t *testing.T) {
+	nch := &fakeNoticeChannel{retractOK: false}
+	d := startInteractiveDispatchWithBounds(t, "sess-pull-grace-off-cap", agent.NoticeDeliveryHook, nch, 0, -1)
+
+	d.injectCh <- heartbeat.InjectPayload{DeliveryID: "dlv-grace-off-cap", Text: "record never arrives"}
+	nch.waitOffers(t, 1)
+
+	// The idle cutoff claims the offer (Retract reports false); the disabled
+	// grace then holds past the default minute. Keep polling with no session
+	// life to the long pull cap: the slot must free under the cutoff's own
+	// reason instead of holding forever.
+	for range interactiveNoticePullMaxPolls - 1 {
+		d.clock.waitArmed(t)
+		d.clock.fire(t)
+	}
+	if reason := d.pulser.waitDeadLettered(t, "dlv-grace-off-cap"); reason != noticeDeadNeedsOperator {
+		t.Fatalf("dead-letter reason = %q; want %q (the idle cutoff that saw the claim, bounded by the long cap)", reason, noticeDeadNeedsOperator)
+	}
+	if got := nch.retractCount(); got != 1 {
+		t.Fatalf("Retract called %d times; want exactly 1 — a claimed offer must not be re-retracted", got)
+	}
+	if got := d.pulser.acked(); len(got) != 0 {
+		t.Fatalf("a never-accepted notice was acked: %v", got)
+	}
+}
+
 func TestInteractive_PullChannelClaimGraceExpiresAsDiscardedOutput(t *testing.T) {
 	nch := &fakeNoticeChannel{retractOK: false}
 	d := startInteractiveDispatchWith(t, "sess-pull-claim-lost", agent.NoticeDeliveryHook, nch)
