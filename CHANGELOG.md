@@ -10,6 +10,16 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 No unreleased changes.
 
+## v0.73.17 — 2026-11-25
+
+### Chores
+
+- Add atomic managed update policy storage and validation
+- Scope usage and status reads to one selected config home
+- Bind the isolated quota probe to its selected login and deadline
+- Wake idle hook-delivered interactive sessions; bound the MCP HTTP transport
+- Verify long role delivery at the runner and harness boundary
+
 ## v0.73.16 — 2026-11-25
 
 ### Chores
