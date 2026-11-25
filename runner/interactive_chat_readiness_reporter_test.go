@@ -544,3 +544,209 @@ func TestChatReadinessReporter_LostResponseCorrects(t *testing.T) {
 		t.Fatal("settled idle re-posted before the interval")
 	}
 }
+
+// TestChatReadinessReporter_PermanentErrorDoesNotStorm pins the permanent-
+// rejection fix: a typed 4xx (the receiver answered and did not apply the
+// update) must not mark the cache uncertain, so an unchanged read does not
+// re-POST on every 1s sample. Retries stay paced to change-or-interval.
+func TestChatReadinessReporter_PermanentErrorDoesNotStorm(t *testing.T) {
+	var mu sync.Mutex
+	var posts int
+	now := time.Now()
+	clock := func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
+	post := func(_ context.Context, _ *afclient.SessionChatReadiness) error {
+		mu.Lock()
+		defer mu.Unlock()
+		posts++
+		return &result.PermanentError{StatusCode: http.StatusConflict, Body: "conflict"}
+	}
+	c := newChatReadinessReporter(post, clock, 60*time.Second)
+	idle := agent.ChatReadiness{Channel: agent.NoticeDeliveryHook, State: agent.ChatStateIdle, LiveSupported: true, QueueSupported: true}
+	if !c.maybeReport(context.Background(), idle) {
+		t.Fatal("first read did not initiate a POST")
+	}
+	if !c.waitIdle(10 * time.Second) {
+		t.Fatal("background POST did not settle")
+	}
+	mu.Lock()
+	if n := posts; n != 1 {
+		mu.Unlock()
+		t.Fatalf("posts = %d; want 1 after first permanent rejection", n)
+	}
+	uncertain := c.uncertain
+	mu.Unlock()
+	if uncertain {
+		t.Fatal("permanent 4xx set uncertain; want the cache to stay certain")
+	}
+	// Same read on the next samples must stay quiet: no storm at the sample
+	// rate while the clock never reaches the refresh bound.
+	for i := 0; i < 5; i++ {
+		if c.maybeReport(context.Background(), idle) {
+			t.Fatalf("unchanged read re-posted on sample %d after a permanent rejection", i)
+		}
+	}
+	mu.Lock()
+	if n := posts; n != 1 {
+		mu.Unlock()
+		t.Fatalf("posts = %d; want still 1 with no clock advance", n)
+	}
+	now = now.Add(30 * time.Second)
+	mu.Unlock()
+	if c.maybeReport(context.Background(), idle) {
+		t.Fatal("unchanged read re-posted before the 60s refresh bound")
+	}
+	mu.Lock()
+	now = now.Add(30 * time.Second)
+	mu.Unlock()
+	if !c.maybeReport(context.Background(), idle) {
+		t.Fatal("refresh read did not initiate a POST after 60s")
+	}
+	if !c.waitIdle(10 * time.Second) {
+		t.Fatal("background POST did not settle")
+	}
+	mu.Lock()
+	n := posts
+	mu.Unlock()
+	if n != 2 {
+		t.Fatalf("posts = %d; want 2 (initial + 60s refresh)", n)
+	}
+	// A changed read still posts immediately: the new payload may be accepted
+	// even though the old one was rejected.
+	busy := idle
+	busy.State = agent.ChatStateBusy
+	if !c.maybeReport(context.Background(), busy) {
+		t.Fatal("change read did not initiate a POST after a permanent rejection")
+	}
+	if !c.waitIdle(10 * time.Second) {
+		t.Fatal("background POST did not settle")
+	}
+}
+
+// TestChatReadinessReporter_TransientBackoff pins the outage backoff: the
+// first transient failure still corrects immediately, but consecutive
+// failures wait 1s doubling up to the interval instead of retrying every
+// 1s sample.
+func TestChatReadinessReporter_TransientBackoff(t *testing.T) {
+	var mu sync.Mutex
+	var posts int
+	now := time.Now()
+	clock := func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
+	post := func(_ context.Context, _ *afclient.SessionChatReadiness) error {
+		mu.Lock()
+		defer mu.Unlock()
+		posts++
+		return errors.New("transient outage")
+	}
+	c := newChatReadinessReporter(post, clock, 60*time.Second)
+	idle := agent.ChatReadiness{Channel: agent.NoticeDeliveryHook, State: agent.ChatStateIdle, LiveSupported: true, QueueSupported: true}
+	if !c.maybeReport(context.Background(), idle) {
+		t.Fatal("first read did not initiate a POST")
+	}
+	if !c.waitIdle(10 * time.Second) {
+		t.Fatal("background POST did not settle")
+	}
+	// First failure corrects immediately on the next sample.
+	if !c.maybeReport(context.Background(), idle) {
+		t.Fatal("first transient failure did not allow an immediate corrective re-post")
+	}
+	if !c.waitIdle(10 * time.Second) {
+		t.Fatal("background POST did not settle")
+	}
+	// Second consecutive failure backs off: the same instant stays quiet.
+	if c.maybeReport(context.Background(), idle) {
+		t.Fatal("second consecutive transient failure re-posted without backoff")
+	}
+	mu.Lock()
+	now = now.Add(time.Second)
+	mu.Unlock()
+	if !c.maybeReport(context.Background(), idle) {
+		t.Fatal("backed-off re-post did not fire after 1s")
+	}
+	if !c.waitIdle(10 * time.Second) {
+		t.Fatal("background POST did not settle")
+	}
+	mu.Lock()
+	n := posts
+	mu.Unlock()
+	if n != 3 {
+		t.Fatalf("posts = %d; want 3 (initial + immediate + backed-off)", n)
+	}
+}
+
+// TestDispatchInteractive_Permanent409DoesNotStorm drives dispatchInteractive
+// against a receiver that rejects every running POST with 409 and proves the
+// reporter does not re-POST the unchanged read on every sample: at most two
+// POSTs over seconds of fast sampling with an hour refresh bound. Without
+// the permanent-rejection fix the same run emits about one POST per sample.
+func TestDispatchInteractive_Permanent409DoesNotStorm(t *testing.T) {
+	oldRefresh, oldSample := chatReadinessRefreshInterval, chatReadinessSampleInterval
+	chatReadinessRefreshInterval, chatReadinessSampleInterval = time.Hour, 50*time.Millisecond
+	t.Cleanup(func() { chatReadinessRefreshInterval, chatReadinessSampleInterval = oldRefresh, oldSample })
+
+	var mu sync.Mutex
+	var running int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		var body struct {
+			Status string `json:"status"`
+		}
+		if json.Unmarshal(b, &body) == nil && body.Status == "running" {
+			mu.Lock()
+			running++
+			mu.Unlock()
+			w.WriteHeader(http.StatusConflict)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	wtm, err := worktree.NewManager(worktree.Options{ParentDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := result.NewPoster(result.Options{PlatformURL: srv.URL, WorkerID: "wkr-chat-perm", AuthToken: "tok", HTTPClient: srv.Client(), BaseDelay: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := New(Options{Registry: NewRegistry(), WorktreeManager: wtm, Poster: p, HTTPClient: srv.Client(), MaxSessionDuration: -1, SkipBackstop: true, SkipSteering: true, SkipPostSession: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(envAttachURL, "")
+	t.Setenv(envAttachToken, "")
+	sess := liveRecordingInteractiveSession()
+	injectCh := make(chan heartbeat.InjectPayload, 8)
+	res := &Result{SessionID: "sess-chat-perm"}
+	done := make(chan error, 1)
+	handle := &testInteractiveHandle{Handle: &fakeHandle{events: make(chan agent.Event)}, session: sess}
+	qw := QueuedWork{QueuedWork: prompt.QueuedWork{SessionID: "sess-chat-perm", Mode: interactiveRunMode}}
+	go func() {
+		_, err := r.dispatchInteractive(context.Background(), handle, t.TempDir(), qw, res, &recordingSink{}, newFakeInteractivePulser(), injectCh, agent.NoticeDeliveryHook)
+		done <- err
+	}()
+	t.Cleanup(func() { close(sess.done); <-done })
+
+	// Wait for the initial POST, then sample for 1.5s at 50ms cadence: a
+	// storming reporter would emit ~30 unchanged re-POSTs in that window.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		mu.Lock()
+		got := running
+		mu.Unlock()
+		if got >= 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for the initial running POST")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	time.Sleep(1500 * time.Millisecond)
+	mu.Lock()
+	got := running
+	mu.Unlock()
+	if got > 2 {
+		t.Fatalf("permanent-409 receiver got %d unchanged running readiness POSTs in ~1.5s (refresh interval 1h); want <=2", got)
+	}
+}
