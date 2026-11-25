@@ -281,6 +281,7 @@ func applyPreparedSourceAuthority(target, source agent.Spec, plan *agent.Prepare
 	target.SessionName = source.SessionName
 	target.Prompt = source.Prompt
 	target.Autonomous = source.Autonomous
+	target.StartInBypass = source.StartInBypass
 	target.SandboxEnabled, target.SandboxLevel = source.SandboxEnabled, source.SandboxLevel
 	target.AllowedTools = append([]string(nil), source.AllowedTools...)
 	target.DisallowedTools = append([]string(nil), source.DisallowedTools...)

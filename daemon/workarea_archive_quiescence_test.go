@@ -21,10 +21,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -128,18 +130,31 @@ func TestArchiveQuiescence_QuietSourceCommitsOneStableGeneration(t *testing.T) {
 // stability sentinel so the release path keeps release-pending for a
 // bounded retry instead of disposing the only complete copy.
 //
-// Determinism note: the racing writer alternates a.txt between two
-// SAME-LENGTH generations in a tight loop from the moment the capture
-// reaches the before-copy seam until the capture returns. Same-length
-// bodies isolate the generation digest — per-file size guards observe
-// no torn read, so the pre/post/staged equality check is the guard
-// that fires (removing it would commit a mixed pair). The main test
-// holds the copy gate until it has COUNTED writer flips during the
-// hold (content changes observed, not wall-clock sleep), and a dense
-// stable file stretches the copy walk itself across writer
-// generations, so the staged copy provably spans generations while
-// the witness observes another — the mixed pair a real racing writer
-// produces.
+// Determinism note: the racing writer overwrites a.txt in place in a
+// tight loop from the moment the capture reaches the before-copy seam,
+// and every write is a DISTINCT same-length generation (a counter), so
+// two reads agree only if no write landed between them. Same length
+// and no truncation keep every size guard silent: the pre/post/staged
+// generation comparison is the guard that fires, and disabling it
+// commits the staged tree. The main test holds the copy gate until it
+// has COUNTED writer flips during the hold (content changes observed,
+// not wall-clock sleep), so the race is mid-flight when the copy walk
+// starts. Then the after-copy seam makes the outcome
+// certain rather than likely: it waits until the writer has completed
+// two more writes past the count it observed on entry, and then stops
+// the writer. The staged copy read a.txt before that seam, so it can
+// hold at most the generation that was in flight on entry; the
+// post-copy witness reads a strictly newer one, so the comparison
+// always observes a change.
+//
+// An earlier version alternated between only two generations and let
+// the writer run until the capture returned. Observations an even
+// number of writes apart were then byte-identical, so a capture whose
+// walks all happened to land on the same parity committed a genuine,
+// consistent generation and the test failed. That was the test's
+// assumption failing, not the guard. It also rewrote a.txt with
+// os.WriteFile, whose truncation trips the copy's size guards in most
+// runs, so the comparison this test is about rarely fired at all.
 func TestArchiveQuiescence_MutationDuringCaptureFailsClosedRetainingSource(t *testing.T) {
 	archiveRoot := t.TempDir()
 	source := t.TempDir()
@@ -151,11 +166,11 @@ func TestArchiveQuiescence_MutationDuringCaptureFailsClosedRetainingSource(t *te
 	if err := os.WriteFile(filepath.Join(source, "c.txt"), []byte("generation-two-c"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	// A dense stable file forces the copy walk to stream for longer
-	// than one writer alternation, so the copy provably spans writer
-	// generations even on a fast filesystem. 16MiB streams in tens
-	// of milliseconds — thousands of tight-loop alternations —
-	// without burdening the suite.
+	// A dense stable file sorts after a.txt, so every walk streams it
+	// between its read of a.txt and the next walk's: tens of
+	// milliseconds in which the writer lands many new generations. That
+	// keeps the race realistic across every observation; the after-copy
+	// barrier below is what makes the failure certain.
 	stablePath := filepath.Join(source, "slow-stable.bin")
 	stable, err := os.OpenFile(stablePath, os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
@@ -179,22 +194,39 @@ func TestArchiveQuiescence_MutationDuringCaptureFailsClosedRetainingSource(t *te
 	releaseCopy := make(chan struct{})
 	copyReached := make(chan struct{})
 	var copyReachedOnce sync.Once
-	// The capture parks inside the before-copy seam until the main
-	// test has counted writer flips during the hold (below); the
-	// writer runs from seam-arrival until the capture returns.
-	registry := NewWorkareaArchiveRegistry(WorkareaArchiveOptions{Root: archiveRoot, ArchiveHook: func(stage string) error {
-		if stage == "before-copy-archive-tree" {
-			copyReachedOnce.Do(func() { close(copyReached) })
-			<-releaseCopy
-			return nil
-		}
-		return nil
-	}})
-	done := make(chan error, 1)
 	stopWriter := make(chan struct{})
 	var stopWriterOnce sync.Once
 	closeStopWriter := func() { stopWriterOnce.Do(func() { close(stopWriter) }) }
 	t.Cleanup(closeStopWriter)
+	writerDone := make(chan struct{})
+	// writes counts the writer's completed writes; lastBody is its last
+	// completed generation, read only after writerDone is closed.
+	var writes atomic.Int64
+	var lastBody string
+	// The capture parks inside the before-copy seam until the main
+	// test has counted writer flips during the hold (below). The
+	// after-copy seam waits for two further completed writes and then
+	// stops the writer (see the determinism note above).
+	registry := NewWorkareaArchiveRegistry(WorkareaArchiveOptions{Root: archiveRoot, ArchiveHook: func(stage string) error {
+		switch stage {
+		case "before-copy-archive-tree":
+			copyReachedOnce.Do(func() { close(copyReached) })
+			<-releaseCopy
+		case "after-copy-archive-tree":
+			want := writes.Load() + 2
+			deadline := time.Now().Add(10 * time.Second)
+			for writes.Load() < want {
+				if time.Now().After(deadline) {
+					return fmt.Errorf("racing writer completed no new generation after the copy (have %d writes, want %d)", writes.Load(), want)
+				}
+				time.Sleep(100 * time.Microsecond)
+			}
+			closeStopWriter()
+			<-writerDone
+		}
+		return nil
+	}})
+	done := make(chan error, 1)
 	go func() {
 		done <- registry.ArchiveRoot(t.Context(), WorkareaRootArchiveSpec{
 			WorkareaID: "wa_unstable", SessionID: "unstable-session",
@@ -203,40 +235,48 @@ func TestArchiveQuiescence_MutationDuringCaptureFailsClosedRetainingSource(t *te
 		closeStopWriter()
 	}()
 	// Wait until the capture reaches the copy gate, then start the
-	// racing writer: it alternates a.txt between two generations in a
-	// tight loop until the capture returns (see above).
+	// racing writer: it rewrites a.txt with a new generation in a tight
+	// loop until it is stopped (see above).
 	select {
 	case <-copyReached:
 	case <-time.After(10 * time.Second):
 		t.Fatal("capture did not reach the copy gate")
 	}
-	writerDone := make(chan struct{})
 	go func() {
 		defer close(writerDone)
+		// Overwrite in place, never truncate: after the first write
+		// sets the generation length, a.txt's size never changes, so
+		// no torn-read size guard can fire and only the generation
+		// comparison observes the race. (A truncating writer is a
+		// torn copy instead; TestArchiveCopy_TruncatingWriterReportsCopyChanged
+		// pins that path.)
+		file, err := os.OpenFile(filepath.Join(source, "a.txt"), os.O_WRONLY, 0)
+		if err != nil {
+			return
+		}
+		defer func() { _ = file.Close() }()
 		for i := 0; ; i++ {
 			select {
 			case <-stopWriter:
 				return
 			default:
 			}
-			// Same-length generations: sizes never change, so no
-			// torn-read size guard can fire — only the
-			// generation equality check observes the race.
-			body := []byte("generation-two-a!")
-			if i%2 == 1 {
-				body = []byte("generation-two-a?")
-			}
-			if err := os.WriteFile(filepath.Join(source, "a.txt"), body, 0o600); err != nil {
+			// Same length, distinct content: every generation is
+			// unique, so equal observations prove no write landed
+			// between them.
+			body := fmt.Sprintf("generation-two-a-%08d", i)
+			if _, err := file.WriteAt([]byte(body), 0); err != nil {
 				return
 			}
+			lastBody = body
+			writes.Add(1)
 		}
 	}()
 	// Hold the copy gate until the writer has provably flipped
 	// generations DURING the hold: count observed content changes
 	// rather than sleeping a fixed window. Twenty flips take ~tens
 	// of milliseconds against a tight-loop writer and prove the
-	// race is mid-flight before the copy walk starts; the dense
-	// stable file then keeps the copy walk spanning generations.
+	// race is mid-flight before the copy walk starts.
 	flips := 0
 	previous, _ := os.ReadFile(filepath.Join(source, "a.txt"))
 	flipDeadline := time.Now().Add(15 * time.Second)
@@ -271,12 +311,13 @@ func TestArchiveQuiescence_MutationDuringCaptureFailsClosedRetainingSource(t *te
 	<-writerDone
 	// Source retained: the racing writer's bytes are intact — the only
 	// complete copy is untouched by the failed capture. a.txt holds
-	// one of the two raced generations; either is a writer byte, and
-	// the capture published neither as an archive.
-	switch got := sourceTreeFile(t, source, "a.txt"); got {
-	case "generation-two-a!", "generation-two-a?":
-	default:
-		t.Fatalf("source a.txt = %q after failed capture, want a raced generation-two byte", got)
+	// exactly the writer's last completed generation, which the
+	// capture did not publish as an archive.
+	if lastBody == "" {
+		t.Fatal("racing writer completed no generation")
+	}
+	if got := sourceTreeFile(t, source, "a.txt"); got != lastBody {
+		t.Fatalf("source a.txt = %q after failed capture, want the writer's last generation %q", got, lastBody)
 	}
 	if got := sourceTreeFile(t, source, "c.txt"); got != "generation-two-c" {
 		t.Fatalf("source c.txt = %q after failed capture, want generation-two-c", got)
@@ -284,6 +325,78 @@ func TestArchiveQuiescence_MutationDuringCaptureFailsClosedRetainingSource(t *te
 	if got := sourceTreeFile(t, source, "b.txt"); got != "generation-one-b" {
 		t.Fatalf("source b.txt = %q after failed capture, want generation-one-b", got)
 	}
+}
+
+// A writer that truncates and rewrites a file under the copy's open
+// descriptor (the O_TRUNC shape os.WriteFile produces) is a torn mid-copy
+// read. copyRootFile must report it with the copy-changed
+// marker that ArchiveRoot maps to ErrArchiveUnstableSource, never as a raw
+// io.EOF (io.CopyN ran short) or ENXIO (SEEK_HOLE past the shrunken end):
+// those surfaced as an opaque "copy complete tree: EOF" instead of the
+// stability sentinel. Each iteration must return either nil or the
+// marker. A nil copy may still hold a torn stage; catching that is the
+// capture's generation witness's job, not this function's. So the test
+// cannot fail on a correct implementation: the race only decides which
+// of the two outcomes each iteration sees.
+func TestArchiveCopy_TruncatingWriterReportsCopyChanged(t *testing.T) {
+	source := t.TempDir()
+	sourceRoot, err := os.OpenRoot(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = sourceRoot.Close() }()
+	destinationRoot, err := os.OpenRoot(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = destinationRoot.Close() }()
+	// A multi-block body keeps each copy streaming long enough for the
+	// writer's truncate to land inside it.
+	body := make([]byte, 256<<10)
+	for i := range body {
+		body[i] = byte(i%251) + 1
+	}
+	path := filepath.Join(source, "a.txt")
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stop := make(chan struct{})
+	writerDone := make(chan struct{})
+	go func() {
+		defer close(writerDone)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if err := os.WriteFile(path, body, 0o600); err != nil {
+				return
+			}
+		}
+	}()
+	defer func() { close(stop); <-writerDone }()
+	const iterations = 200
+	var copied, changed int
+	for i := 0; i < iterations; i++ {
+		info, err := sourceRoot.Lstat("a.txt")
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = copyRootFile(t.Context(), sourceRoot, destinationRoot, "a.txt", info)
+		switch {
+		case err == nil:
+			copied++
+		case isArchiveCopyChangedError(err):
+			changed++
+		default:
+			t.Fatalf("iteration %d: torn copy returned %v, want nil or the %q marker", i, err, errArchiveCopyChanged)
+		}
+		if err := destinationRoot.Remove("a.txt"); err != nil && !errors.Is(err, os.ErrNotExist) {
+			t.Fatal(err)
+		}
+	}
+	t.Logf("%d iterations: %d returned nil, %d copy-changed", iterations, copied, changed)
 }
 
 // An escaped descendant — double-forked so the owning generation no longer

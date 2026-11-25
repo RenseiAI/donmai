@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"errors"
 	"math"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -46,6 +47,8 @@ type RateLimitWindow struct {
 	UsedPercent        float64  `json:"usedPercent"`
 	ResetsAt           *float64 `json:"resetsAt,omitempty"`
 	WindowDurationMins *int     `json:"windowDurationMins,omitempty"`
+	UsedTokens         *float64 `json:"usedTokens,omitempty"`
+	Limit              *float64 `json:"limit,omitempty"`
 }
 
 // RateLimitSnapshot is the structural view of the app-server
@@ -57,6 +60,10 @@ type RateLimitSnapshot struct {
 	RateLimitReachedType *string          `json:"rateLimitReachedType,omitempty"`
 	Primary              *RateLimitWindow `json:"primary,omitempty"`
 	Secondary            *RateLimitWindow `json:"secondary,omitempty"`
+	BillingMode          *string          `json:"billingMode,omitempty"`
+	CreditBalance        *float64         `json:"creditBalance,omitempty"`
+	Scope                *string          `json:"scope,omitempty"`
+	UserID               *string          `json:"userId,omitempty"`
 }
 
 // ResetCreditEntry is one banked reset credit on the read response.
@@ -196,17 +203,86 @@ func ResetCreditsToContract(summary *ResetCreditsSummary) *agent.ResetCredits {
 	return out
 }
 
+// selectMainRateLimits prefers the main bucket; another limit never counts.
+func selectMainRateLimits(snapshot *RateLimitSnapshot, byLimitID map[string]*RateLimitSnapshot) *RateLimitSnapshot {
+	if byLimitID != nil {
+		if main, ok := byLimitID[CodexMainLimitID]; ok {
+			return main
+		}
+	}
+	return snapshot
+}
+
+func isSeatScope(scope *string) bool {
+	return scope != nil && strings.EqualFold(strings.TrimSpace(*scope), "seat")
+}
+
+// buildRateLimitsEvidence projects the selected allowance; raw reset and
+// duration stay absent when omitted, tokens need explicit usedTokens.
+func buildRateLimitsEvidence(account string, selected *RateLimitSnapshot) []agent.UsageMeterEvidence {
+	if selected == nil {
+		return nil
+	}
+	if selected.LimitID != nil && *selected.LimitID != "" && *selected.LimitID != CodexMainLimitID {
+		return nil
+	}
+	var plan, allowance string
+	if selected.PlanType != nil {
+		plan = *selected.PlanType
+	}
+	allowance = CodexMainLimitID
+	if selected.LimitID != nil && *selected.LimitID != "" {
+		allowance = *selected.LimitID
+	}
+	billing := agent.UsageBillingUnknown
+	if selected.BillingMode != nil {
+		billing = agent.ParseUsageBillingMode(*selected.BillingMode)
+	}
+	var user string
+	if isSeatScope(selected.Scope) && selected.UserID != nil {
+		user = *selected.UserID
+	}
+	var out []agent.UsageMeterEvidence
+	for _, p := range []struct {
+		id string
+		w  *RateLimitWindow
+	}{{"primary", selected.Primary}, {"secondary", selected.Secondary}} {
+		if p.w == nil {
+			continue
+		}
+		hasTokens := p.w.UsedTokens != nil
+		if hasTokens && (math.IsNaN(*p.w.UsedTokens) || math.IsInf(*p.w.UsedTokens, 0)) {
+			continue
+		}
+		if !hasTokens && (math.IsNaN(p.w.UsedPercent) || math.IsInf(p.w.UsedPercent, 0)) {
+			continue
+		}
+		unit, used := agent.UsageUnitPercent, p.w.UsedPercent
+		if hasTokens {
+			unit, used = agent.UsageUnitTokens, *p.w.UsedTokens
+		}
+		var resets *string
+		if p.w.ResetsAt != nil {
+			if iso := agent.ISOFromEpochSeconds(*p.w.ResetsAt); iso != "" {
+				resets = &iso
+			}
+		}
+		out = append(out, agent.UsageMeterEvidence{Provider: "codex", Plan: plan, Allowance: allowance, Window: p.id, Account: account, User: user, Unit: unit, Used: used, Limit: p.w.Limit, ResetsAt: resets, DurationMins: p.w.WindowDurationMins, Billing: billing, Balance: selected.CreditBalance})
+	}
+	return out
+}
+
 // RateLimitsToLimits maps one quota read onto the shared limits
 // snapshot. The bucket map selects the main allowance explicitly; a
 // legacy snapshot can name another limit, which never counts.
 func RateLimitsToLimits(snapshot *RateLimitSnapshot, byLimitID map[string]*RateLimitSnapshot, resetCredits *ResetCreditsSummary, checkedAt string) agent.UsageLimits {
-	selected := snapshot
-	if byLimitID != nil {
-		if main, ok := byLimitID[CodexMainLimitID]; ok {
-			selected = main
-		}
-	}
+	return rateLimitsToLimitsWithAccount(snapshot, byLimitID, resetCredits, "", checkedAt)
+}
+
+func rateLimitsToLimitsWithAccount(snapshot *RateLimitSnapshot, byLimitID map[string]*RateLimitSnapshot, resetCredits *ResetCreditsSummary, account, checkedAt string) agent.UsageLimits {
+	selected := selectMainRateLimits(snapshot, byLimitID)
 	out := agent.MakeUsageLimits(checkedAt, rateLimitsToWindows(selected))
+	out.Evidence = buildRateLimitsEvidence(account, selected)
 	if rc := ResetCreditsToContract(resetCredits); rc != nil {
 		out.ResetCredits = rc
 	}
@@ -389,7 +465,23 @@ func (p *RateLimitsProbe) ReadProbe(ctx context.Context, client *Client) agent.U
 	if err := json.Unmarshal(raw, &resp); err != nil {
 		return agent.MakeUnavailableUsageLimits(checkedAt, agent.UsageUnavailableProbeFailed, "Codex did not answer the usage request.")
 	}
-	return RateLimitsToLimits(resp.RateLimits, resp.RateLimitsByLimitID, resp.ResetCredits, checkedAt)
+	_, _, limits := decodeRateLimitsRead(resp, checkedAt)
+	return limits
+}
+
+// decodeRateLimitsRead projects one decoded read onto the account
+// identity, the selected plan and the mapped snapshot. Identity, plan
+// and usage come from the same reply so the account and the windows
+// can never describe different reads; the plan always rides the
+// selected bucket, never another bucket's plan.
+func decodeRateLimitsRead(resp rateLimitsReadResponse, checkedAt string) (string, string, agent.UsageLimits) {
+	selected := selectMainRateLimits(resp.RateLimits, resp.RateLimitsByLimitID)
+	var plan string
+	if selected != nil && selected.PlanType != nil {
+		plan = *selected.PlanType
+	}
+	limits := rateLimitsToLimitsWithAccount(resp.RateLimits, resp.RateLimitsByLimitID, resp.ResetCredits, resp.AccountID, checkedAt)
+	return resp.AccountID, plan, limits
 }
 
 // ProbeQuota performs one quota read against the provider's shared
@@ -408,42 +500,161 @@ func (p *Provider) ProbeQuota(ctx context.Context) (accountID, plan string, prob
 	if p == nil {
 		return "", "", agent.MakeUnavailableUsageLimits(agent.ISOTime(time.Now()), agent.UsageUnavailableProbeFailed, "Codex did not answer the usage request.")
 	}
-	if err := p.ensureProbeStarted(); err != nil {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	// The shared app-server outlives one probe attempt, so its startup
+	// runs under a detached context: a slow but healthy initialize that
+	// outlasts this attempt's deadline must not poison the shared
+	// Provider with a permanent shutdown. The read below stays bound to
+	// the caller, and a cancelled attempt still yields unknown before or
+	// after the read without touching shared startup state. The
+	// probe-owned ProbeQuotaForLogin below keeps the caller's deadline
+	// for startup because it owns its process from construction onward.
+	if err := p.ensureProbeStarted(context.Background()); err != nil {
 		return "", "", agent.MakeUnavailableUsageLimits(agent.ISOTime(time.Now()), agent.UsageUnavailableProbeFailed, RateLimitsFailureMessage(err))
 	}
 	p.startMu.Lock()
 	client := p.client
 	p.startMu.Unlock()
-	probed = NewRateLimitsProbe().ReadProbe(ctx, client)
-	if probed.Unavailable != nil {
-		return "", "", probed
-	}
-	return readAccountIdentity(ctx, client, probed)
-}
-
-// readAccountIdentity re-reads the raw response to lift the account
-// identity and plan slug the mapped snapshot drops. It runs under the
-// probe's own timeout; any failure keeps the mapped windows and
-// leaves the identity empty.
-func readAccountIdentity(ctx context.Context, client *Client, probed agent.UsageLimits) (string, string, agent.UsageLimits) {
 	if client == nil {
-		return "", "", probed
+		return "", "", agent.MakeUnavailableUsageLimits(agent.ISOTime(time.Now()), agent.UsageUnavailableProbeFailed, "Codex did not answer the usage request.")
 	}
+	if ctx.Err() != nil {
+		return "", "", agent.MakeUnavailableUsageLimits(agent.ISOTime(time.Now()), agent.UsageUnavailableProbeFailed, "Codex did not answer the usage request.")
+	}
+	checkedAt := agent.ISOTime(time.Now())
 	reqCtx, cancel := context.WithTimeout(ctx, RateLimitsProbeTimeout)
 	defer cancel()
 	raw, err := client.Request(reqCtx, "account/rateLimits/read", nil, RateLimitsProbeTimeout)
 	if err != nil {
-		return "", "", probed
+		out := agent.MakeUnavailableUsageLimits(checkedAt, agent.UsageUnavailableProbeFailed, RateLimitsFailureMessage(err))
+		out.Unavailable.Answered = answeredByAppServer(client, err)
+		return "", "", out
 	}
 	var resp rateLimitsReadResponse
 	if err := json.Unmarshal(raw, &resp); err != nil {
-		return "", "", probed
+		return "", "", agent.MakeUnavailableUsageLimits(checkedAt, agent.UsageUnavailableProbeFailed, "Codex did not answer the usage request.")
 	}
-	var plan string
-	if resp.RateLimits != nil && resp.RateLimits.PlanType != nil {
-		plan = *resp.RateLimits.PlanType
+	if ctx.Err() != nil {
+		return "", "", agent.MakeUnavailableUsageLimits(agent.ISOTime(time.Now()), agent.UsageUnavailableProbeFailed, "Codex did not answer the usage request.")
 	}
-	return resp.AccountID, plan, probed
+	return decodeRateLimitsRead(resp, checkedAt)
+}
+
+// ProbeQuotaForLogin reads quota for exactly one login through a probe-owned
+// app-server, bound by the caller's deadline from construction through
+// shutdown. sourceHome selects the login: empty preserves the default host
+// resolution, while any non-empty value is an explicit selector that must be
+// an absolute path whose auth.json is projected through the checked private
+// hard link. A blank or otherwise invalid explicit selector never falls back
+// to the default: it yields unknown. The child always starts with the private
+// CODEX_HOME and must confirm it; the source home is never passed to the
+// child and its files are never written. One quota read serves identity,
+// plan and windows together, so a login that answers once is published even
+// when a second read would fail. Cancellation at any point — including
+// during shutdown grace — yields an unknown snapshot with empty identity
+// and plan, superseding even a live login refusal; only an uncancelled
+// refusal stays answered. The private home is
+// joined before removal and retained when writer quiescence cannot be proved.
+func ProbeQuotaForLogin(ctx context.Context, opts Options, sourceHome string) (accountID, plan string, probed agent.UsageLimits) {
+	fail := func() (string, string, agent.UsageLimits) {
+		return "", "", agent.MakeUnavailableUsageLimits(agent.ISOTime(time.Now()), agent.UsageUnavailableProbeFailed, "Codex did not answer the usage request.")
+	}
+	if ctx == nil || ctx.Err() != nil {
+		return fail()
+	}
+	// Any non-empty selector is explicit: a blank selector is an invalid
+	// explicit login, not an omitted one, so it must not resolve the default.
+	explicit := sourceHome != ""
+	var hostAuthFile string
+	fileAuth := opts.HostSessionAuth
+	if explicit {
+		if !opts.HostSessionAuth {
+			return fail()
+		}
+		if strings.TrimSpace(sourceHome) == "" {
+			return fail()
+		}
+		// Resolve before constructing the private home and never consult
+		// the default: a valid explicit login must not depend on it.
+		resolved, err := explicitHostSessionAuthFile(sourceHome)
+		if err != nil {
+			return fail()
+		}
+		if _, err := os.Lstat(resolved); err != nil {
+			return fail()
+		}
+		hostAuthFile = resolved
+		fileAuth = true
+	} else if opts.HostSessionAuth {
+		resolved, err := resolveHostSessionAuthFile()
+		if err != nil {
+			return fail()
+		}
+		hostAuthFile = resolved
+	}
+	provider, err := newProviderWithHostAuth(opts, hostAuthFile, fileAuth)
+	if err != nil {
+		return fail()
+	}
+	// Own shutdown from construction onward under the attempt budget: the
+	// deferred Shutdown joins the owned group before the private home is
+	// removed, caps grace at the time remaining, and requests zero grace
+	// once the attempt is cancelled or expired. A cancellation that lands
+	// at any point — including during shutdown after a successful read or
+	// a live login refusal — supersedes every outcome with unknown: the
+	// daemon must not record a fresh login verdict for an attempt it
+	// cancelled. Only an uncancelled refusal stays answered.
+	defer func() {
+		_ = provider.Shutdown(ctx)
+		if ctx.Err() != nil {
+			accountID, plan, probed = fail()
+		}
+	}()
+	if err := provider.ensureProbeStarted(ctx); err != nil {
+		accountID, plan, probed = fail()
+		return accountID, plan, probed
+	}
+	provider.startMu.Lock()
+	client := provider.client
+	provider.startMu.Unlock()
+	if client == nil {
+		accountID, plan, probed = fail()
+		return accountID, plan, probed
+	}
+	if ctx.Err() != nil {
+		accountID, plan, probed = fail()
+		return accountID, plan, probed
+	}
+	// A single read serves identity, plan and windows from the same reply:
+	// discarding it for a second read would publish nothing on a cold cache
+	// when the backend fails between the two calls.
+	checkedAt := agent.ISOTime(time.Now())
+	reqCtx, cancel := context.WithTimeout(ctx, RateLimitsProbeTimeout)
+	defer cancel()
+	raw, err := client.Request(reqCtx, "account/rateLimits/read", nil, RateLimitsProbeTimeout)
+	if err != nil {
+		out := agent.MakeUnavailableUsageLimits(checkedAt, agent.UsageUnavailableProbeFailed, RateLimitsFailureMessage(err))
+		out.Unavailable.Answered = answeredByAppServer(client, err)
+		accountID, plan, probed = "", "", out
+		return accountID, plan, probed
+	}
+	var resp rateLimitsReadResponse
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		accountID, plan, probed = fail()
+		return accountID, plan, probed
+	}
+	if ctx.Err() != nil {
+		accountID, plan, probed = fail()
+		return accountID, plan, probed
+	}
+	accountID, plan, probed = decodeRateLimitsRead(resp, checkedAt)
+	if ctx.Err() != nil {
+		accountID, plan, probed = fail()
+		return accountID, plan, probed
+	}
+	return accountID, plan, probed
 }
 
 // rateLimitsRefusalCode is the JSON-RPC code the app-server answers a

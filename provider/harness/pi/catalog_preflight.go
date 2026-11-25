@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/tempown"
 )
 
 // DefaultCatalogProbeTimeout bounds the launch-time catalog preflight
@@ -77,7 +78,7 @@ type catalogProbeFunc func(ctx context.Context, binary, provider, model, credEnv
 //     agent dir (pi's own documented store), never the probe env — a
 //     same-user process listing renders the probe child's env too.
 func defaultCatalogProbe(ctx context.Context, binary, provider, model, credEnvVar, credEnvValue string) (string, error) {
-	agentDir, err := os.MkdirTemp("", "donmai-pi-catalog-probe-*")
+	agentDir, err := tempown.MkdirTemp("", tempown.PrefixPiCatalogProbe)
 	if err != nil {
 		return "", fmt.Errorf("pi --list-models: create isolated agent dir: %w", err)
 	}

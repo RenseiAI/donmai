@@ -174,9 +174,10 @@ func TestVerifySessionTmpOwner_ComparesUID(t *testing.T) {
 }
 
 // TestApplySessionTmpBindings pins the worker-env binding: the three temp
-// variables land on the directory exactly once, replacing whatever the
-// worker was otherwise configured with, while the advisory key and every
-// other entry pass through untouched.
+// variables and the advisory key land on the directory exactly once,
+// replacing whatever the worker was otherwise configured with — so a
+// session given a derived directory sees it named — while every other
+// entry passes through untouched.
 func TestApplySessionTmpBindings(t *testing.T) {
 	t.Parallel()
 	in := []string{
@@ -185,7 +186,7 @@ func TestApplySessionTmpBindings(t *testing.T) {
 		"TMP=/shared/host-tmp",
 		"TEMP=/shared/host-tmp",
 		"TMPDIR_EXTRA=keep",
-		SessionTmpDirEnv + "=/tmp/seat-9",
+		SessionTmpDirEnv + "=/tmp/seat-stale",
 		"BARE_TMPDIR_LIKE=1",
 	}
 	got := applySessionTmpBindings(in, "/tmp/seat-9")
@@ -199,12 +200,12 @@ func TestApplySessionTmpBindings(t *testing.T) {
 		}
 		counts[key]++
 	}
-	for _, key := range sessionTmpBindingKeys {
+	for _, key := range append([]string{SessionTmpDirEnv}, sessionTmpBindingKeys...) {
 		if counts[key] != 1 || values[key] != "/tmp/seat-9" {
 			t.Fatalf("%s bound %d times to %q (env %v), want exactly once to /tmp/seat-9", key, counts[key], values[key], got)
 		}
 	}
-	for _, want := range []string{"PATH=/usr/bin", "TMPDIR_EXTRA=keep", SessionTmpDirEnv + "=/tmp/seat-9", "BARE_TMPDIR_LIKE=1"} {
+	for _, want := range []string{"PATH=/usr/bin", "TMPDIR_EXTRA=keep", "BARE_TMPDIR_LIKE=1"} {
 		found := false
 		for _, kv := range got {
 			found = found || kv == want

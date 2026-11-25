@@ -52,7 +52,7 @@ brew install RenseiAI/homebrew-tap/donmai
 
 On Linux, use Go installation or a release archive below.
 
-### go install (requires Go 1.26.10+)
+### go install (requires Go 1.26.11+)
 
 ```bash
 go install github.com/RenseiAI/donmai/cmd/donmai@v0.72.74
@@ -291,6 +291,7 @@ donmai host pause                         # stop accepting new work
 donmai host resume
 donmai host drain                         # drain work; keep the daemon resumable
 donmai host doctor                        # health check: config, credentials, disk
+donmai host doctor temp [--fix]           # temp folder by producer; remove donmai's dead leftovers
 donmai host logs [--follow]               # tail daemon log (NDJSON / pretty)
 donmai host stats [--pool]                # capacity, sessions, pool state
 donmai host setup                         # first-run interactive wizard

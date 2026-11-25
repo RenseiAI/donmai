@@ -337,13 +337,16 @@ func (m *Model) pollTails() tea.Cmd {
 		for _, t := range tailers {
 			for budget := maxEventsPerTailerTick; budget > 0; {
 				evs, err := t.Poll()
-				if err != nil {
-					break // I/O hiccup — skip this tailer this tick
-				}
 				for i := range evs {
-					evs[i].source = t
+					e := &evs[i]
+					batch = append(batch, TailEvent{
+						source: t, SessionID: e.SessionID,
+						At: e.At, Offset: &e.Offset, Replay: e.Replay, Event: e.Event, Err: e.Err,
+					})
 				}
-				batch = append(batch, evs...)
+				if err != nil {
+					break // Retry I/O on the next tick after delivering any complete lines.
+				}
 				budget -= len(evs)
 				if len(evs) < maxEventsPerPoll {
 					break // drained to the end of the journal

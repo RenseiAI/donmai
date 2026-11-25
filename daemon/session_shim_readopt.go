@@ -538,10 +538,7 @@ func (d *Daemon) holdFixedAttemptsPastBudget(registry *sessionshim.Registry, cfg
 		return d.sessionShimReadoptionHeldPastWindow(ctx, cfg, id)
 	})
 	defer stopKeepalive()
-	backoffCap := policy.BackoffCap
-	if backoffCap <= 0 {
-		backoffCap = defaultSessionShimReadoptionBackoffCap
-	}
+	backoffCap := sessionShimHoldBackoffCap(policy)
 	backoff := policy.Backoff
 	if backoff <= 0 {
 		backoff = defaultSessionShimReadoptionBackoff

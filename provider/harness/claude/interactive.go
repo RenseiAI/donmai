@@ -128,12 +128,14 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 		if hook != nil {
 			hook.snapshotTranscriptPath()
 		}
+		// The relay directory is NOT removed here: ptycli runs this cleanup
+		// right after Done, concurrently with the usage tailer's final
+		// flush, so removing the events file here could drop a hook fire
+		// the child wrote after the last per-tick sweep. The wrapped
+		// handle removes it once that final flush has read it.
 		errs := []error{clijsonl.RemoveMCPConfig(mcpPath)}
 		if hook != nil {
 			errs = append(errs, hook.close())
-		}
-		if relay != nil {
-			errs = append(errs, relay.Close())
 		}
 		return errors.Join(errs...)
 	}
@@ -149,7 +151,7 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 	if hook == nil && relay == nil {
 		return h, nil
 	}
-	return wrapInteractiveHandle(h, hook, relayTailer(relay)), nil
+	return wrapInteractiveHandle(h, hook, relay), nil
 }
 
 // interactiveEventSlots sizes the wrapped handle's event channel. The coarse
@@ -181,16 +183,14 @@ const (
 // Teardown: every helper goroutine returns at session end whether or not the
 // caller drains Events — the tailer stops on Done and never blocks, and the
 // coarse sends always fit the reserved slots — after which Events closes.
-// relayTailer returns the activity tailer for relay, or nil when the
-// session runs without hook telemetry.
-func relayTailer(relay *activityrelay.Relay) *activityrelay.Tailer {
-	if relay == nil {
-		return nil
+// The handle owns relay (nil when the session runs without hook telemetry)
+// and removes its directory only after the final flush has read it, before
+// ActivityFlushed closes.
+func wrapInteractiveHandle(h *ptycli.Handle, hook *stopHookChannel, relay *activityrelay.Relay) *interactiveHandle {
+	var activity *activityrelay.Tailer
+	if relay != nil {
+		activity = activityrelay.NewTailer(relay.EventsPath())
 	}
-	return activityrelay.NewTailer(relay.EventsPath())
-}
-
-func wrapInteractiveHandle(h *ptycli.Handle, hook *stopHookChannel, activity *activityrelay.Tailer) *interactiveHandle {
 	w := &interactiveHandle{
 		Handle:          h,
 		notices:         hook,
@@ -268,6 +268,11 @@ func wrapInteractiveHandle(h *ptycli.Handle, hook *stopHookChannel, activity *ac
 	}()
 	go func() {
 		tailsWg.Wait()
+		if relay != nil {
+			// Best effort like the relay itself: the final flush already
+			// read every line, so a failed removal loses no telemetry.
+			_ = relay.Close()
+		}
 		close(w.activityFlushed)
 	}()
 	go func() {
@@ -381,6 +386,8 @@ func (h *interactiveHandle) ActivityFlushed() <-chan struct{} { return h.activit
 //	Model              → --model <id>
 //	Effort             → --effort <level>
 //	Autonomous         → --permission-mode bypassPermissions
+//	StartInBypass      → --permission-mode bypassPermissions (non-autonomous,
+//	                   toolApproval "bypass" stamp only)
 //	AllowedTools       → --allowedTools <comma-separated>
 //	DisallowedTools    → --disallowedTools <comma-separated>
 //	SystemPromptAppend → --append-system-prompt <text>
@@ -532,9 +539,17 @@ func interactiveArgsWith(spec agent.Spec, mcpConfigPath, settingsJSON string) []
 	// The CLI only offers that mode when it was started with this flag; the
 	// session itself starts in the CLI default mode. This matches the adapter's
 	// declared rendering (execution_security.go: index 0, prompts skipped).
+	//
+	// When the work item also asked to start in bypass (Spec.StartInBypass),
+	// the session starts there instead of in the CLI default mode; the
+	// operator can still leave it from the REPL. The request is honoured only
+	// under the same bypass grant, so it never widens the stamped level.
 	if !spec.Autonomous && spec.ExecutionSecurity != nil &&
 		spec.ExecutionSecurity.Levels.ToolApproval == agent.ToolApprovalBypass {
 		argv = append(argv, "--allow-dangerously-skip-permissions")
+		if spec.StartInBypass {
+			argv = append(argv, "--permission-mode", "bypassPermissions")
+		}
 	}
 
 	// SystemPromptAppend carries the composed session instructions assembled

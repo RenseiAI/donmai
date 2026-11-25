@@ -223,19 +223,17 @@ func spawnInteractivePreparedForGOOS(ctx context.Context, opts Options, spec age
 	// boundary validate() rejected — exactly the review-modal hang trust.go
 	// exists to prevent.
 	var relay *activityrelay.Relay
-	// closeRelay removes the relay directory exactly once. It runs on
-	// error paths and in the PTY cleanup, which ptycli may invoke from
-	// its own goroutine while this function still reads relay below —
-	// so it must not mutate relay itself. Relay.Close is idempotent
-	// (RemoveAll on a missing path succeeds), and a wrapped handle over
-	// an already-closed relay simply sweeps nothing.
-	var relayClose sync.Once
+	// The wrapped activity handle owns the relay directory once it is
+	// returned: the directory is removed only after the final flush has
+	// read it, before ActivityFlushed closes. ptycli runs the session
+	// cleanup right after Done, concurrently with that final flush, so
+	// removing the events file in the cleanup would drop a hook fire the
+	// child wrote after the last per-tick sweep. Error paths below close
+	// the relay directly because no handle takes ownership of it there.
 	closeRelay := func() {
-		relayClose.Do(func() {
-			if relay != nil {
-				_ = relay.Close()
-			}
-		})
+		if relay != nil {
+			_ = relay.Close()
+		}
 	}
 	if installActivityHooks(spec) {
 		newRelayFn := opts.interactiveActivityRelayNew
@@ -280,7 +278,6 @@ func spawnInteractivePreparedForGOOS(ctx context.Context, opts Options, spec age
 			recordResumeKey(config.home, spec.SessionName)
 		}
 		cleanup := func() error {
-			closeRelay()
 			return errors.Join(server.close(), config.remove())
 		}
 		handle, err := spawnNamedInteractivePTY(ctx, bin, opts, spec, launch, server, cleanup)
@@ -301,7 +298,6 @@ func spawnInteractivePreparedForGOOS(ctx context.Context, opts Options, spec age
 		(&Provider{}).Manifest(),
 		ptycli.SpawnOptions{
 			Cleanup: func() error {
-				closeRelay()
 				return config.remove()
 			},
 			TerminalCost: interactiveTerminalCost(config.home, nil),
@@ -752,6 +748,9 @@ func buildInteractiveLaunch(spec agent.Spec) (interactiveLaunch, error) {
 // lookup injected, so the hooks policy can be table-tested without mutating
 // process state (t.Setenv forbids the t.Parallel this package uses throughout).
 func buildInteractiveLaunchEnv(spec agent.Spec, getenv func(string) string) (interactiveLaunch, error) {
+	if err := interactiveCyberAccessRefusal(spec); err != nil {
+		return interactiveLaunch{}, err
+	}
 	env := cloneInteractiveEnv(spec.Env)
 	var args []string
 	hooks, err := codexHooksPolicy(getenv)
@@ -802,7 +801,7 @@ func buildInteractiveLaunchEnv(spec agent.Spec, getenv func(string) string) (int
 	}
 	// Reasoning effort rides the same process-local override as model:
 	// model_reasoning_effort is codex's own config.toml key, and the headless
-	// lane already sends the identical value as turn/start reasoningEffort
+	// lane already sends the identical value as turn/start effort
 	// (spec_translation.go). Empty emits nothing — no level is chosen on the
 	// session's behalf.
 	if effort := strings.TrimSpace(string(spec.Effort)); effort != "" {

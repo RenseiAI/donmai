@@ -1,16 +1,17 @@
 // Package kit — dependency_store.go: kit-declared dependency stores (D1).
 //
 // A kit declares each package manager it supports as one
-// [[provide.dependency_store]] entry. This file is the slice-1 engine:
-// validation of a single entry, composition of entries across kits (union
-// keyed by manager, conflict unless the composition lock selects one), and
-// selection of the applicable entry for a mutable leaf (by lockfile
-// presence, falling back to the leaf's own declaration or manager_ambiguous).
+// [[provide.dependency_store]] entry, or as several entries with disjoint
+// `versions` ranges when one manager changed its store layout between
+// majors. This file validates a single entry and composes entries across
+// kits (union keyed by manager and version range, conflict on overlapping
+// ranges unless the composition lock selects a kit).
 //
-// The keeper, filler, views, snapshots, budgets and events that consume the
-// composed result are later slices; this file only parses, validates,
-// composes and selects. Nothing here executes a manager command or touches
-// a store.
+// Selecting the entry that applies to a leaf (lockfile presence, the leaf's
+// own manager declaration, then the version its pin or the manager reports)
+// is not done here: runtime/depprep's Prepare owns it, because the version
+// may only be known by running the entry's version command in the leaf.
+// Nothing here executes a manager command or touches a store.
 package kit
 
 import (
@@ -20,9 +21,11 @@ import (
 	"errors"
 	"fmt"
 	"path"
+	"path/filepath"
 	"sort"
 	"strings"
 
+	"github.com/RenseiAI/donmai/internal/semverrange"
 	jsoncanonicalizer "github.com/cyberphone/json-canonicalization/go/src/webpki.org/jsoncanonicalizer"
 )
 
@@ -38,10 +41,17 @@ var (
 	// ErrDependencyStoreConflict marks two kits declaring the same
 	// manager without a composition-lock selection.
 	ErrDependencyStoreConflict = errors.New("kit dependency store conflict")
-	// ErrDependencyStoreAmbiguous marks two entries of one ecosystem
-	// matching a leaf with no leaf declaration to decide between them.
-	// The message carries the closed miss-reason token manager_ambiguous.
-	ErrDependencyStoreAmbiguous = errors.New("kit dependency store ambiguous")
+	// ErrDependencyStoreVersions marks a `versions` value that is not a
+	// valid range. It wraps ErrDependencyStoreInvalid.
+	ErrDependencyStoreVersions = errors.New("kit dependency store versions invalid")
+	// ErrDependencyStoreRangeOverlap marks two entries of one manager in
+	// one kit whose `versions` ranges overlap (a missing `versions`
+	// overlaps every range). It wraps ErrDependencyStoreInvalid.
+	ErrDependencyStoreRangeOverlap = errors.New("kit dependency store version ranges overlap")
+	// ErrPackagePathInvalid marks a package-relative path that is not
+	// contained in the kit's package root, or a composed entry that
+	// carries no verified package root.
+	ErrPackagePathInvalid = errors.New("kit package path invalid")
 )
 
 // Dependency-store integrity modes. Only on-use and on-fetch may back a
@@ -114,40 +124,73 @@ type DependencyStoreSnapshot struct {
 	RunsPackageCode bool     `json:"runsPackageCode,omitempty"`
 }
 
+// DependencyStoreNoCode is the [provide.dependency_store.no_code] block: the
+// settings that make every phase run no package code and no
+// repository-supplied manager hooks. A declared block with an empty Env is
+// valid (a manager whose fetch and install run no package code needs none);
+// an entry that declares no block cannot run where no confiner exists.
+type DependencyStoreNoCode struct {
+	Env map[string]string `json:"env,omitempty"`
+}
+
+// DependencyStoreCredentials is the [provide.dependency_store.credentials]
+// block. ConfigEnv names the variable that points the manager at the per-run
+// credential file, delivered to the fetch phase only.
+type DependencyStoreCredentials struct {
+	ConfigEnv string `json:"configEnv"`
+}
+
 // DependencyStoreView is one [[provide.dependency_store]] entry projected
 // into the daemon-independent view type. Commands holds the generic
 // command per name; CommandsOverride holds OS specializations that win
 // over the generic form for the same store owned by the same kit.
 type DependencyStoreView struct {
-	Manager          string                       `json:"manager"`
-	Ecosystem        string                       `json:"ecosystem,omitempty"`
-	Lockfiles        []string                     `json:"lockfiles,omitempty"`
-	Inputs           []string                     `json:"inputs,omitempty"`
-	Version          string                       `json:"version,omitempty"`
+	Manager   string   `json:"manager"`
+	Ecosystem string   `json:"ecosystem,omitempty"`
+	Lockfiles []string `json:"lockfiles,omitempty"`
+	Inputs    []string `json:"inputs,omitempty"`
+	Version   string   `json:"version,omitempty"`
+	// Versions is the semver range of manager versions this entry covers.
+	// Empty covers every version.
+	Versions         string                       `json:"versions,omitempty"`
 	Store            DependencyStoreLayout        `json:"store"`
 	ImportEnv        map[string]string            `json:"importEnv,omitempty"`
+	NoCode           *DependencyStoreNoCode       `json:"noCode,omitempty"`
+	Credentials      *DependencyStoreCredentials  `json:"credentials,omitempty"`
 	Commands         map[string]string            `json:"commands,omitempty"`
 	CommandsOverride map[string]map[string]string `json:"commandsOverride,omitempty"`
 	Snapshot         DependencyStoreSnapshot      `json:"snapshot"`
 	ProxyEnv         map[string]string            `json:"proxyEnv,omitempty"`
 }
 
-// ComposedDependencyStore is one manager's resolved store: the winning
-// kit's entry with commands specialized for the composition target OS.
+// ComposedDependencyStore is one resolved store entry: the winning kit's
+// entry for a (manager, version range) with commands specialized for the
+// composition target OS. A manager appears once per disjoint range.
 type ComposedDependencyStore struct {
-	Manager    string                  `json:"manager"`
-	KitID      string                  `json:"kitId"`
-	DigestKind string                  `json:"digestKind"`
-	Digest     string                  `json:"digest"`
-	Ecosystem  string                  `json:"ecosystem,omitempty"`
-	Lockfiles  []string                `json:"lockfiles,omitempty"`
-	Inputs     []string                `json:"inputs,omitempty"`
-	Version    string                  `json:"version,omitempty"`
-	Store      DependencyStoreLayout   `json:"store"`
-	ImportEnv  map[string]string       `json:"importEnv,omitempty"`
-	Commands   map[string]string       `json:"commands"`
-	Snapshot   DependencyStoreSnapshot `json:"snapshot"`
-	ProxyEnv   map[string]string       `json:"proxyEnv,omitempty"`
+	Manager    string `json:"manager"`
+	KitID      string `json:"kitId"`
+	DigestKind string `json:"digestKind"`
+	Digest     string `json:"digest"`
+	// PackageRoot is the verified root directory of the owning kit's
+	// package, empty for a kit with no verified package (a legacy
+	// manifest). A package-owned path in the entry (relocate) resolves only
+	// against it, through ResolvePackagePath. It is host-specific, so the
+	// composition digest excludes it.
+	PackageRoot string `json:"packageRoot,omitempty"`
+	// Versions is the entry's range of covered manager versions; empty
+	// covers every version.
+	Versions    string                      `json:"versions,omitempty"`
+	NoCode      *DependencyStoreNoCode      `json:"noCode,omitempty"`
+	Credentials *DependencyStoreCredentials `json:"credentials,omitempty"`
+	Ecosystem   string                      `json:"ecosystem,omitempty"`
+	Lockfiles   []string                    `json:"lockfiles,omitempty"`
+	Inputs      []string                    `json:"inputs,omitempty"`
+	Version     string                      `json:"version,omitempty"`
+	Store       DependencyStoreLayout       `json:"store"`
+	ImportEnv   map[string]string           `json:"importEnv,omitempty"`
+	Commands    map[string]string           `json:"commands"`
+	Snapshot    DependencyStoreSnapshot     `json:"snapshot"`
+	ProxyEnv    map[string]string           `json:"proxyEnv,omitempty"`
 }
 
 // DependencyStoreComposition is the canonical resolved store plan for one
@@ -173,14 +216,6 @@ type LockedDependencyBinding struct {
 	// refuses a binding whose kit digest moved.
 	SelectedDigestKind string `json:"selectedDigestKind"`
 	SelectedDigest     string `json:"selectedDigest"`
-}
-
-// LeafDependencyFacts are the mutable-leaf facts selection needs: which
-// repo-relative paths the leaf holds and the leaf's own manager
-// declaration (Node packageManager, "" when the ecosystem has none).
-type LeafDependencyFacts struct {
-	Files          []string
-	PackageManager string
 }
 
 // ValidateDependencyStore validates one entry. manager, lockfiles, fetch
@@ -326,25 +361,105 @@ func ValidateDependencyStore(store DependencyStoreView) error {
 	if relocation := store.Snapshot.Relocation; relocation != "" && relocation != "reconcile" && relocation != "none" {
 		return fmt.Errorf("%w: %s has unknown snapshot relocation %q", ErrDependencyStoreInvalid, store.Manager, relocation)
 	}
+	if _, err := parseVersions(store.Versions); err != nil {
+		return fmt.Errorf("%w: %w: %s versions: %w", ErrDependencyStoreInvalid, ErrDependencyStoreVersions, store.Manager, err)
+	}
+	return validateNoCodeAndCredentials(store)
+}
+
+// parseVersions parses an entry's `versions` value with the one range
+// grammar the preparer also selects by (internal/semverrange). A missing
+// value covers every version.
+func parseVersions(s string) (semverrange.Range, error) {
+	if strings.TrimSpace(s) == "" {
+		return semverrange.All(), nil
+	}
+	return semverrange.ParseRange(s)
+}
+
+// forbiddenProcessEnv reports a variable the preparer never lets a manifest
+// set: dynamic loader variables and node's option channel load code the
+// manager never asked for.
+func forbiddenProcessEnv(name string) bool {
+	return strings.HasPrefix(name, "DYLD_") || strings.HasPrefix(name, "LD_") || name == "NODE_OPTIONS"
+}
+
+// validateNoCodeAndCredentials checks the no_code and credentials blocks: env
+// names are POSIX names, no loader or option-channel variable, and the
+// credential variable collides with no other variable the entry sets.
+func validateNoCodeAndCredentials(store DependencyStoreView) error {
+	if store.NoCode != nil {
+		for name, value := range store.NoCode.Env {
+			if !validEnvName(name) {
+				return fmt.Errorf("%w: %s no_code.env key %q is not an environment variable name", ErrDependencyStoreInvalid, store.Manager, name)
+			}
+			if forbiddenProcessEnv(name) {
+				return fmt.Errorf("%w: %s no_code.env may not set %q", ErrDependencyStoreInvalid, store.Manager, name)
+			}
+			if strings.ContainsRune(value, 0) {
+				return fmt.Errorf("%w: %s no_code.env %q has a NUL in its value", ErrDependencyStoreInvalid, store.Manager, name)
+			}
+		}
+	}
+	if store.Credentials == nil {
+		return nil
+	}
+	name := store.Credentials.ConfigEnv
+	if name == "" {
+		return fmt.Errorf("%w: %s credentials.config_env is required", ErrDependencyStoreInvalid, store.Manager)
+	}
+	if !validEnvName(name) {
+		return fmt.Errorf("%w: %s credentials.config_env %q is not an environment variable name", ErrDependencyStoreInvalid, store.Manager, name)
+	}
+	if forbiddenProcessEnv(name) {
+		return fmt.Errorf("%w: %s credentials.config_env may not be %q", ErrDependencyStoreInvalid, store.Manager, name)
+	}
+	taken := map[string]string{}
+	for _, v := range store.Store.Env {
+		taken[v] = "store.env"
+	}
+	for v := range store.ImportEnv {
+		taken[v] = "import.env"
+	}
+	for v := range store.ProxyEnv {
+		taken[v] = "proxy.env"
+	}
+	if store.NoCode != nil {
+		for v := range store.NoCode.Env {
+			taken[v] = "no_code.env"
+		}
+	}
+	if where, clash := taken[name]; clash {
+		return fmt.Errorf("%w: %s credentials.config_env %q is also set by %s", ErrDependencyStoreInvalid, store.Manager, name, where)
+	}
 	return nil
 }
 
-// ValidateDependencyStores validates each entry of one kit and rejects a
-// kit declaring the same manager twice. Cross-kit duplicates are not a
-// validation error; they are composition conflicts resolved by the lock.
+// ValidateDependencyStores validates each entry of one kit. A kit may declare
+// one manager more than once only with non-overlapping `versions` ranges; an
+// entry with no `versions` covers every version, so it overlaps every other
+// entry of its manager. Cross-kit duplicates are not a validation error;
+// they are composition conflicts resolved by the lock.
 func ValidateDependencyStores(stores []DependencyStoreView) error {
-	seen := make(map[string]struct{}, len(stores))
+	byManager := make(map[string][]int, len(stores))
 	for i := range stores {
 		if err := ValidateDependencyStore(stores[i]); err != nil {
 			return err
 		}
-		if stores[i].Manager == "" {
-			continue
+		byManager[stores[i].Manager] = append(byManager[stores[i].Manager], i)
+	}
+	for i := range stores {
+		for _, j := range byManager[stores[i].Manager] {
+			if j <= i {
+				continue
+			}
+			a, _ := parseVersions(stores[i].Versions) // validated above
+			b, _ := parseVersions(stores[j].Versions)
+			if a.Overlaps(b) {
+				return fmt.Errorf("%w: %w: manager %q declares overlapping versions %q and %q in one kit",
+					ErrDependencyStoreInvalid, ErrDependencyStoreRangeOverlap, stores[i].Manager, a.String(), b.String())
+			}
 		}
-		if _, ok := seen[stores[i].Manager]; ok {
-			return fmt.Errorf("%w: duplicate manager %q in one kit", ErrDependencyStoreInvalid, stores[i].Manager)
-		}
-		seen[stores[i].Manager] = struct{}{}
 	}
 	return nil
 }
@@ -478,10 +593,13 @@ func ResolveDependencyStoreCommands(store DependencyStoreView, targetOS string) 
 }
 
 // ComposeDependencyStores composes every OS-applicable entry across kits
-// into a union keyed by manager. Two kits declaring the same manager
-// conflict unless the composition lock selects one kit for the target;
-// a lock selection naming a kit that does not declare the manager, or a
-// lock row for a manager no kit declares, fails closed.
+// into a union keyed by (manager, version range). One kit may declare a
+// manager several times with disjoint ranges. Two kits declaring the same
+// manager conflict when any of their ranges overlap, unless the composition
+// lock selects one kit for the target, in which case only that kit's
+// entries of the manager remain. A lock selection naming a kit that does
+// not declare the manager, or a lock row for a manager no kit declares,
+// fails closed.
 func ComposeDependencyStores(views []ManifestView, target CompositionTarget, lock *CompositionLock) (*DependencyStoreComposition, error) {
 	if target.OS == "" {
 		return nil, errors.New("kit dependency store compose: target OS is required")
@@ -496,17 +614,20 @@ func ComposeDependencyStores(views []ManifestView, target CompositionTarget, loc
 		if !supportsOS(view.SupportedOS, target.OS) {
 			continue
 		}
+		// Per-entry rules plus the same-kit range rule: a view need not
+		// have come through the manifest parser.
+		if err := ValidateDependencyStores(view.DependencyStores); err != nil {
+			return nil, fmt.Errorf("kit dependency store compose: kit %s: %w", view.ID, err)
+		}
 		for i := range view.DependencyStores {
 			store := view.DependencyStores[i]
-			if err := ValidateDependencyStore(store); err != nil {
-				return nil, fmt.Errorf("kit dependency store compose: kit %s: %w", view.ID, err)
-			}
 			identity := commandIdentityForView(view, "dependency-store")
 			byManager[store.Manager] = append(byManager[store.Manager], storeClaimant{
-				kitID:      view.ID,
-				digestKind: identity.DigestKind,
-				digest:     identity.Digest,
-				store:      store,
+				kitID:       view.ID,
+				digestKind:  identity.DigestKind,
+				digest:      identity.Digest,
+				packageRoot: view.PackageRoot,
+				store:       store,
 			})
 		}
 	}
@@ -518,26 +639,13 @@ func ComposeDependencyStores(views []ManifestView, target CompositionTarget, loc
 
 	plan := &DependencyStoreComposition{Schema: DependencyStoreCompositionSchema, Target: target}
 	for _, manager := range managers {
-		claimants := byManager[manager]
-		selected, err := resolveManagerClaimants(manager, claimants, target, lock)
+		selected, err := resolveManagerClaimants(manager, byManager[manager], target, lock)
 		if err != nil {
 			return nil, err
 		}
-		plan.Stores = append(plan.Stores, ComposedDependencyStore{
-			Manager:    manager,
-			KitID:      selected.kitID,
-			DigestKind: selected.digestKind,
-			Digest:     selected.digest,
-			Ecosystem:  selected.store.Ecosystem,
-			Lockfiles:  append([]string{}, selected.store.Lockfiles...),
-			Inputs:     append([]string{}, selected.store.Inputs...),
-			Version:    selected.store.Version,
-			Store:      selected.store.Store,
-			ImportEnv:  copyStringMap(selected.store.ImportEnv),
-			Commands:   ResolveDependencyStoreCommands(selected.store, target.OS),
-			Snapshot:   selected.store.Snapshot,
-			ProxyEnv:   copyStringMap(selected.store.ProxyEnv),
-		})
+		for _, claimant := range selected {
+			plan.Stores = append(plan.Stores, composeClaimant(manager, claimant, target))
+		}
 	}
 	if err := validateAppliedDependencyLock(plan.Stores, target, lock); err != nil {
 		return nil, err
@@ -550,44 +658,108 @@ func ComposeDependencyStores(views []ManifestView, target CompositionTarget, loc
 	return plan, nil
 }
 
-// storeClaimant is one kit's validated entry for a manager.
-type storeClaimant struct {
-	kitID      string
-	digestKind string
-	digest     string
-	store      DependencyStoreView
+func composeClaimant(manager string, selected storeClaimant, target CompositionTarget) ComposedDependencyStore {
+	return ComposedDependencyStore{
+		Manager:     manager,
+		KitID:       selected.kitID,
+		DigestKind:  selected.digestKind,
+		Digest:      selected.digest,
+		PackageRoot: selected.packageRoot,
+		Ecosystem:   selected.store.Ecosystem,
+		Lockfiles:   append([]string{}, selected.store.Lockfiles...),
+		Inputs:      append([]string{}, selected.store.Inputs...),
+		Version:     selected.store.Version,
+		Versions:    strings.TrimSpace(selected.store.Versions),
+		Store:       selected.store.Store,
+		ImportEnv:   copyStringMap(selected.store.ImportEnv),
+		NoCode:      copyNoCode(selected.store.NoCode),
+		Credentials: copyCredentials(selected.store.Credentials),
+		Commands:    ResolveDependencyStoreCommands(selected.store, target.OS),
+		Snapshot:    selected.store.Snapshot,
+		ProxyEnv:    copyStringMap(selected.store.ProxyEnv),
+	}
 }
 
-// resolveManagerClaimants selects one claimant: the sole entry, or the
-// lock-selected kit when several kits declare the manager. The lock
-// selection pins the kit digest, matching command bindings: a binding
-// whose kit digest moved is refused, even when the kit still declares
-// the manager.
-func resolveManagerClaimants(manager string, claimants []storeClaimant, target CompositionTarget, lock *CompositionLock) (storeClaimant, error) {
+func copyNoCode(in *DependencyStoreNoCode) *DependencyStoreNoCode {
+	if in == nil {
+		return nil
+	}
+	return &DependencyStoreNoCode{Env: copyStringMap(in.Env)}
+}
+
+func copyCredentials(in *DependencyStoreCredentials) *DependencyStoreCredentials {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	return &out
+}
+
+// storeClaimant is one kit's validated entry for a manager.
+type storeClaimant struct {
+	kitID       string
+	digestKind  string
+	digest      string
+	packageRoot string
+	store       DependencyStoreView
+}
+
+// resolveManagerClaimants returns the claimants that compose for a manager.
+// The lock-selected kit's entries win outright when a binding exists. The
+// lock selection pins the kit digest, matching command bindings: a binding
+// whose kit digest moved is refused, even when the kit still declares the
+// manager. With no binding, claimants from one kit all compose (validation
+// already made its ranges disjoint), and claimants from different kits
+// compose only when every cross-kit pair of ranges is disjoint.
+func resolveManagerClaimants(manager string, claimants []storeClaimant, target CompositionTarget, lock *CompositionLock) ([]storeClaimant, error) {
 	if locked, ok := lockedDependencySelection(lock, target, manager); ok {
+		var kept []storeClaimant
 		for _, claimant := range claimants {
 			if claimant.kitID != locked.SelectedKitID {
 				continue
 			}
 			if claimant.digestKind != locked.SelectedDigestKind || claimant.digest != locked.SelectedDigest {
-				return storeClaimant{}, fmt.Errorf("%w: binding for manager %q pins kit %q at digest %s:%s which no longer matches",
+				return nil, fmt.Errorf("%w: binding for manager %q pins kit %q at digest %s:%s which no longer matches",
 					ErrCompositionLockInvalid, manager, locked.SelectedKitID, locked.SelectedDigestKind, locked.SelectedDigest)
 			}
-			return claimant, nil
+			kept = append(kept, claimant)
 		}
-		return storeClaimant{}, fmt.Errorf("%w: binding for manager %q selects kit %q which does not declare it",
-			ErrCompositionLockInvalid, manager, locked.SelectedKitID)
+		if len(kept) == 0 {
+			return nil, fmt.Errorf("%w: binding for manager %q selects kit %q which does not declare it",
+				ErrCompositionLockInvalid, manager, locked.SelectedKitID)
+		}
+		return kept, nil
 	}
-	if len(claimants) == 1 {
-		return claimants[0], nil
+	conflicting := map[string]struct{}{}
+	for i := range claimants {
+		for j := i + 1; j < len(claimants); j++ {
+			if claimants[i].kitID == claimants[j].kitID {
+				continue
+			}
+			a, _ := parseVersions(claimants[i].store.Versions) // validated above
+			b, _ := parseVersions(claimants[j].store.Versions)
+			if a.Overlaps(b) {
+				conflicting[claimants[i].kitID] = struct{}{}
+				conflicting[claimants[j].kitID] = struct{}{}
+			}
+		}
 	}
-	owners := make([]string, 0, len(claimants))
-	for _, claimant := range claimants {
-		owners = append(owners, claimant.kitID)
+	if len(conflicting) > 0 {
+		owners := make([]string, 0, len(conflicting))
+		for owner := range conflicting {
+			owners = append(owners, owner)
+		}
+		sort.Strings(owners)
+		return nil, fmt.Errorf("%w: manager %q declared by [%s] with overlapping version ranges; add an exact operator lock binding for target os=%q workType=%q pathScope=%q",
+			ErrDependencyStoreConflict, manager, strings.Join(owners, ", "), target.OS, target.WorkType, target.PathScope)
 	}
-	sort.Strings(owners)
-	return storeClaimant{}, fmt.Errorf("%w: manager %q declared by [%s]; add an exact operator lock binding for target os=%q workType=%q pathScope=%q",
-		ErrDependencyStoreConflict, manager, strings.Join(owners, ", "), target.OS, target.WorkType, target.PathScope)
+	sort.SliceStable(claimants, func(i, j int) bool {
+		if claimants[i].store.Versions != claimants[j].store.Versions {
+			return claimants[i].store.Versions < claimants[j].store.Versions
+		}
+		return claimants[i].kitID < claimants[j].kitID
+	})
+	return claimants, nil
 }
 
 // lockedDependencySelection returns the lock-selected kit pin for a
@@ -616,18 +788,20 @@ func validateAppliedDependencyLock(stores []ComposedDependencyStore, target Comp
 	if lock == nil {
 		return nil
 	}
-	resolved := make(map[string]ComposedDependencyStore, len(stores))
-	for _, store := range stores {
-		resolved[store.Manager] = store
-	}
 	for _, entry := range lock.Targets {
 		if targetKey(entry.Target) != targetKey(target) {
 			continue
 		}
 		for _, binding := range entry.Dependencies {
-			selected, ok := resolved[binding.Manager]
-			if !ok || selected.KitID != binding.SelectedKitID ||
-				selected.DigestKind != binding.SelectedDigestKind || selected.Digest != binding.SelectedDigest {
+			found := false
+			for _, store := range stores {
+				if store.Manager == binding.Manager && store.KitID == binding.SelectedKitID &&
+					store.DigestKind == binding.SelectedDigestKind && store.Digest == binding.SelectedDigest {
+					found = true
+					break
+				}
+			}
+			if !found {
 				return fmt.Errorf("%w: stale or unused binding for manager %q",
 					ErrCompositionLockInvalid, binding.Manager)
 			}
@@ -636,86 +810,41 @@ func validateAppliedDependencyLock(stores []ComposedDependencyStore, target Comp
 	return nil
 }
 
-// SelectDependencyStores selects the applicable composed store per
-// ecosystem for a mutable leaf. An entry applies when the leaf holds one
-// of its lockfiles. When two entries of one ecosystem match, the leaf's
-// own declaration decides where the ecosystem has one; otherwise no entry
-// applies and selection reports manager_ambiguous.
-func SelectDependencyStores(stores []ComposedDependencyStore, leaf LeafDependencyFacts) ([]ComposedDependencyStore, error) {
-	present := make(map[string]struct{}, len(leaf.Files))
-	for _, file := range leaf.Files {
-		present[file] = struct{}{}
+// ResolvePackagePath resolves a package-relative path (relocate) against the
+// entry's verified package root and returns the absolute path. It refuses an
+// entry with no package root, and a path that is not one canonical relative
+// path contained in the root. The check is lexical; the caller opens the
+// result under the package's own verified inventory.
+func (c ComposedDependencyStore) ResolvePackagePath(rel string) (string, error) {
+	if c.PackageRoot == "" {
+		return "", fmt.Errorf("%w: %s entry from kit %s has no verified package root", ErrPackagePathInvalid, c.Manager, c.KitID)
 	}
-	byEcosystem := map[string][]ComposedDependencyStore{}
-	ecosystems := []string{}
-	for _, store := range stores {
-		matched := false
-		for _, lockfile := range store.Lockfiles {
-			if _, ok := present[lockfile]; ok {
-				matched = true
-				break
-			}
-		}
-		if !matched {
-			continue
-		}
-		group := store.Ecosystem
-		if group == "" {
-			group = "\x00" + store.Manager
-		}
-		if _, ok := byEcosystem[group]; !ok {
-			ecosystems = append(ecosystems, group)
-		}
-		byEcosystem[group] = append(byEcosystem[group], store)
+	if err := checkPackagePath(c.Manager, "", rel); err != nil {
+		return "", fmt.Errorf("%w: %w", ErrPackagePathInvalid, err)
 	}
-	sort.Strings(ecosystems)
-
-	var selected []ComposedDependencyStore
-	for _, group := range ecosystems {
-		candidates := byEcosystem[group]
-		if len(candidates) == 1 {
-			selected = append(selected, candidates[0])
-			continue
-		}
-		declared := leafManagerToken(leaf.PackageManager)
-		matched := -1
-		for i := range candidates {
-			if candidates[i].Manager == declared {
-				matched = i
-				break
-			}
-		}
-		if matched < 0 {
-			managers := make([]string, 0, len(candidates))
-			for _, candidate := range candidates {
-				managers = append(managers, candidate.Manager)
-			}
-			sort.Strings(managers)
-			return nil, fmt.Errorf("%w: manager_ambiguous: ecosystem %q matched by [%s] with no leaf declaration selecting one",
-				ErrDependencyStoreAmbiguous, candidates[0].Ecosystem, strings.Join(managers, ", "))
-		}
-		selected = append(selected, candidates[matched])
-	}
-	sort.Slice(selected, func(i, j int) bool { return selected[i].Manager < selected[j].Manager })
-	return selected, nil
+	return filepath.Join(c.PackageRoot, filepath.FromSlash(rel)), nil
 }
 
-// leafManagerToken reduces a leaf declaration such as "pnpm@10.1.0" to
-// its manager token "pnpm". Empty input selects nothing.
-func leafManagerToken(declaration string) string {
-	declaration = strings.TrimSpace(declaration)
-	if declaration == "" {
-		return ""
+// ResolveRelocate returns the absolute path of the entry's relocate command
+// for the composed target (already OS-specialized in Commands), resolved
+// against the package root. ok is false when the entry declares none.
+func (c ComposedDependencyStore) ResolveRelocate() (resolved string, ok bool, err error) {
+	rel, ok := c.Commands[DependencyStoreCommandRelocate]
+	if !ok || rel == "" {
+		return "", false, nil
 	}
-	if at := strings.Index(declaration, "@"); at >= 0 {
-		return declaration[:at]
-	}
-	return declaration
+	resolved, err = c.ResolvePackagePath(rel)
+	return resolved, true, err
 }
 
-// dependencyStoreDigest binds the resolved managers, owners and commands.
+// dependencyStoreDigest binds the resolved managers, owners and commands. The
+// package root is a host path, so it never enters the digest.
 func dependencyStoreDigest(plan DependencyStoreComposition) (string, error) {
 	plan.Digest = ""
+	plan.Stores = append([]ComposedDependencyStore(nil), plan.Stores...)
+	for i := range plan.Stores {
+		plan.Stores[i].PackageRoot = ""
+	}
 	raw, err := json.Marshal(plan)
 	if err != nil {
 		return "", err

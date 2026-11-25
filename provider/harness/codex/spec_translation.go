@@ -123,10 +123,21 @@ func threadStartParams(spec agent.Spec) map[string]any {
 	return params
 }
 
-// turnStartParams builds the JSON-RPC params for `turn/start`. The
-// legacy TS sets `threadId`, `input`, `cwd`, `approvalPolicy`,
-// `model`, optional `reasoningEffort`, and optional `sandboxPolicy`
-// (the rich form). We keep that shape verbatim.
+// turnStartParams builds the JSON-RPC params for `turn/start`:
+// `threadId`, `input`, `cwd`, `approvalPolicy`, `model`, optional
+// `effort`, and optional `sandboxPolicy` (the rich form).
+//
+// Spec.Effort rides as `effort` — TurnStartParams.effort, "Override the
+// reasoning effort for this turn and subsequent turns". It is the request key
+// in every release checked (codex-cli 0.58.0 through 0.170.0); no release reads
+// `reasoningEffort` on a request. That name is a RESPONSE field (thread/start,
+// thread/resume and Thread report the configured effort under it); sent on
+// turn/start it is an unknown field the app-server drops without an error,
+// so the turn silently runs at the model's default effort. Only `effort` is
+// sent: a second `reasoningEffort` key would reach no reader and would hide
+// this class of bug again.
+// testdata/protocol-inventory.json vendors the request param names so
+// TestCodexRequestParamDrift refuses any key the installed CLI does not read.
 //
 // Spec.ResponseSchema (the one-shot lane's structured-output schema)
 // rides as `outputSchema` — TurnStartParams.outputSchema, "Optional
@@ -151,13 +162,20 @@ func turnStartParams(threadID string, spec agent.Spec, input []map[string]any) m
 		"model":          resolveModel(spec),
 	}
 	if spec.Effort != "" {
-		params["reasoningEffort"] = string(spec.Effort)
+		params["effort"] = string(spec.Effort)
 	}
 	if policy := resolveSandboxPolicy(spec); policy != nil {
 		params["sandboxPolicy"] = policy
 	}
 	if len(spec.ResponseSchema) > 0 {
 		params["outputSchema"] = spec.ResponseSchema
+	}
+	// A declared cyber access program rides every turn of the session
+	// (turn/start scopes it to "this turn"). Spawn and Resume refuse an
+	// invalid declaration before any turn is built, so an error here can only
+	// mean an undeclared program, which emits nothing.
+	if program, err := resolveCyberAccessProgram(spec); err == nil && program != "" {
+		params["cyberAccessProgram"] = program
 	}
 	return params
 }
@@ -392,12 +410,17 @@ func ignoredSpecFields(spec agent.Spec) []SpecFieldNote {
 	}
 
 	// ProviderConfig: opaque per-provider extension bag. The codex
-	// provider has no defined keys today; the field is reserved.
-	if len(spec.ProviderConfig) > 0 {
+	// provider consumes only cyberAccessProgram (turn/start); any other key
+	// is recorded as ignored.
+	for key := range spec.ProviderConfig {
+		if key == providerConfigCyberAccessProgram {
+			continue
+		}
 		notes = append(notes, SpecFieldNote{
 			Field:  "ProviderConfig",
-			Reason: "codex defines no providerConfig keys today; field is reserved",
+			Reason: "codex consumes only providerConfig.cyberAccessProgram (turn/start); other keys are ignored",
 		})
+		break
 	}
 
 	// SubAgentProvider: only meaningful when the codex agent spawns
@@ -415,4 +438,9 @@ func ignoredSpecFields(spec agent.Spec) []SpecFieldNote {
 	// session with the shared pid so cost/heartbeat hooks still fire.
 	// This is documented as honored, not ignored.
 	return notes
+}
+
+// threadResumeParams builds the JSON-RPC params for `thread/resume`.
+func threadResumeParams(threadID string) map[string]any {
+	return map[string]any{"threadId": threadID, "personality": "pragmatic"}
 }

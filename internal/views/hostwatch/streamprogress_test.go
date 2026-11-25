@@ -117,3 +117,25 @@ func TestStreamProgress_PlainOutputStable(t *testing.T) {
 		t.Fatalf("plain view prints progress lines:\n%s", first)
 	}
 }
+
+func TestSummarizeEvent_V2Kinds(t *testing.T) {
+	two, one := 2, 1
+	cases := []struct {
+		ev         agent.Event
+		kind, summ string
+	}{
+		{agent.ReasoningEvent{Summary: "checking\nschema"}, "reasoning", "checking schema"},
+		{agent.ReasoningEvent{}, "", ""},
+		{agent.PlanEvent{Steps: []agent.PlanStep{{Text: "edit", Status: agent.PlanStepInProgress}}}, "plan", "Plan 0/1 · edit"},
+		{agent.FileChangeEvent{Files: []agent.FileChange{{Path: "a.go", Change: agent.FileUpdated, Additions: &two, Deletions: &one}}}, "file_change", "update a.go (+2 −1)"},
+		{agent.NoticeEvent{Severity: agent.NoticeWarning, Text: "model rerouted"}, "notice", "model rerouted"},
+		{agent.InteractiveRequestEvent{RequestKind: agent.RequestQuestion, Prompt: "Ship it?"}, "ask", "question: Ship it?"},
+		{agent.TurnEvent{Phase: agent.TurnCompleted}, "", ""},
+	}
+	for _, tc := range cases {
+		kind, summ := summarizeEvent(TailEvent{Event: tc.ev})
+		if kind != tc.kind || summ != tc.summ {
+			t.Errorf("summarizeEvent(%T) = (%q, %q), want (%q, %q)", tc.ev, kind, summ, tc.kind, tc.summ)
+		}
+	}
+}

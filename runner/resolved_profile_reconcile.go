@@ -24,6 +24,7 @@ type resolvedProfileWire struct {
 	ContextWindow   int                    `json:"contextWindow,omitempty"`
 	MaxOutputTokens int                    `json:"maxOutputTokens,omitempty"`
 	Endpoint        *agent.EndpointBinding `json:"endpoint,omitempty"`
+	AuthMode        string                 `json:"authMode,omitempty"`
 }
 
 // ReconcileResolvedProfile applies the platform's per-session model/provider
@@ -83,6 +84,7 @@ func ReconcileResolvedProfile(qw QueuedWork, modelProfileJSON, resolvedProfileJS
 			return qw, err
 		}
 		qw.ResolvedProfile.Endpoint = endpoint
+		qw.ResolvedProfile.AuthMode = agent.AuthMode(rp.AuthMode)
 		return qw, nil
 	}
 	if len(resolvedProfileJSON) == 0 {
@@ -105,6 +107,7 @@ func ReconcileResolvedProfile(qw QueuedWork, modelProfileJSON, resolvedProfileJS
 		CredentialID:   rp.CredentialID,
 		ProviderConfig: rp.foldLimits(rp.ProviderConfig, 0),
 		Endpoint:       endpoint,
+		AuthMode:       agent.AuthMode(rp.AuthMode),
 	}
 	return qw, nil
 }

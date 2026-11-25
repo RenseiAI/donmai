@@ -108,6 +108,43 @@ func TestSpec_RoundTrip(t *testing.T) {
 	}
 }
 
+// TestSpec_StartInBypassWire pins the Spec wire shape of StartInBypass:
+// "startInBypass":true round-trips when set, and false leaves the wire
+// byte-identical to a Spec that predates the field.
+func TestSpec_StartInBypassWire(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name     string
+		in       Spec
+		wantWire bool
+	}{
+		{name: "set", in: Spec{Prompt: "p", StartInBypass: true}, wantWire: true},
+		{name: "unset", in: Spec{Prompt: "p"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			raw, err := json.Marshal(tc.in)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			if got := strings.Contains(string(raw), `"startInBypass":true`); got != tc.wantWire {
+				t.Fatalf("startInBypass on wire = %v, want %v: %s", got, tc.wantWire, raw)
+			}
+			if !tc.wantWire && strings.Contains(string(raw), "startInBypass") {
+				t.Fatalf("unset field reached the wire: %s", raw)
+			}
+			var out Spec
+			if err := json.Unmarshal(raw, &out); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if out.StartInBypass != tc.in.StartInBypass {
+				t.Fatalf("round-trip StartInBypass = %v, want %v", out.StartInBypass, tc.in.StartInBypass)
+			}
+		})
+	}
+}
+
 // TestCapabilities_RoundTrip verifies camelCase JSON tags on
 // Capabilities (the values readers see on QueuedWork.resolvedProfile).
 func TestCapabilities_RoundTrip(t *testing.T) {

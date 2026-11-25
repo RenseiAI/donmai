@@ -19,6 +19,15 @@ import (
 // test compares captures whose .git metadata must be byte-identical.
 // The identity travels as -c flags (not process state) so the fixture
 // commits on machines with no global git identity, such as CI runners.
+//
+// Automatic maintenance is off for every invocation. Without that, each
+// commit spawns `git maintenance run --auto --detach`, a background
+// process that outlives this call and creates and removes
+// .git/objects/maintenance.lock while the test is already archiving the
+// checkout. The capture correctly refuses a source that changes under its
+// walk ("statat maintenance.lock: no such file or directory"), so the
+// fixture must not leave a writer of its own running. gc.auto=0 covers
+// older git, which runs `git gc --auto` instead.
 func excludeTestGit(t *testing.T, dir string, args ...string) string {
 	t.Helper()
 	if len(args) > 0 && args[0] == "commit" {
@@ -28,6 +37,7 @@ func excludeTestGit(t *testing.T, dir string, args ...string) string {
 			"-c", "commit.gpgsign=false",
 		}, args...)
 	}
+	args = append([]string{"-c", "maintenance.auto=false", "-c", "gc.auto=0"}, args...)
 	cmd := exec.Command("git", args...) //nolint:gosec // test fixture with caller-supplied args
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(),

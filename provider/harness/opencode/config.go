@@ -15,7 +15,7 @@ import (
 // boundary, never the worktree, and removes it after the child stops. The file
 // is 0600, regenerated per spawn, and never reused.
 //
-// The config enforces three Rensei routing guarantees:
+// The config enforces three routing guarantees:
 //
 //  1. §5.1 model pin — a single custom OpenAI-compatible "donmai" provider
 //     whose baseURL is the resolved EndpointBinding (the vendor's own compat
@@ -68,8 +68,9 @@ type ocProvider struct {
 }
 
 type ocProviderOptions struct {
-	BaseURL string `json:"baseURL,omitempty"`
-	APIKey  string `json:"apiKey,omitempty"`
+	BaseURL string            `json:"baseURL,omitempty"`
+	APIKey  string            `json:"apiKey,omitempty"`
+	Headers map[string]string `json:"headers,omitempty"`
 }
 
 // ocModelEntry is intentionally empty — the model id is the map key and the
@@ -124,6 +125,8 @@ func buildConfig(spec agent.Spec) ocConfig {
 	model := resolvedModel(spec)
 	if model != "" {
 		options := ocProviderOptions{BaseURL: resolvedBaseURL(spec)}
+		// Validated by applyEndpoint before any config is written.
+		options.Headers, _ = providerHeaders(spec.Env)
 		if spec.Endpoint == nil || spec.Endpoint.Mechanism == agent.AuthAPIKey {
 			options.APIKey = "{env:" + OCKeyEnvVar + "}"
 		}

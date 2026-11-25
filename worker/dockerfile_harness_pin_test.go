@@ -17,6 +17,7 @@ var workerImageDockerfiles = []struct {
 	{name: "worker/Dockerfile", path: "Dockerfile"},
 	{name: "worker/e2b/e2b.Dockerfile", path: "e2b/e2b.Dockerfile"},
 	{name: "worker/e2b/e2b.go.Dockerfile", path: "e2b/e2b.go.Dockerfile"},
+	{name: "worker/e2b/e2b.node-pg.Dockerfile", path: "e2b/e2b.node-pg.Dockerfile"},
 }
 
 // realCodexFixturePackage is the npm manifest CI installs for the real Codex

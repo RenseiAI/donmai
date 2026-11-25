@@ -1,19 +1,36 @@
 name: e2b-template
 
-# Builds the `donmai-worker` and `donmai-worker-go` E2B sandbox templates in CI.
+# Builds the `donmai-worker`, `donmai-worker-go`, and `donmai-worker-node-pg`
+# E2B sandbox templates in CI.
 #
 # The Dockerfile build authenticates non-interactively with E2B_API_KEY (the
 # org/team API key from https://e2b.dev/dashboard?tab=keys).
 #
 # Every release writes the verified semantic version to explicit E2B targets
-# such as `donmai-worker:v0.53.0` and `donmai-worker-go:v0.53.0`. Automatic
-# stable tag pushes also assign `default` to the same builds, preserving the
-# rolling targets. Prereleases and manual retries rebuild only the versioned
-# targets, so neither can move `default`.
+# such as `donmai-worker:v0.53.0`, `donmai-worker-go:v0.53.0`, and
+# `donmai-worker-node-pg:v0.53.0`. Automatic stable tag pushes also assign
+# `default` to the same builds, preserving the rolling targets. Prereleases
+# and manual retries rebuild only the versioned targets, so neither can move
+# `default`.
 #
-# `donmai-worker` keeps E2B's default build resources and has no Go toolchain.
+# `donmai-worker` keeps E2B's default build resources and has no extra toolchain.
 # `donmai-worker-go` layers the pinned Go toolchain, golangci-lint and gofumpt
 # on the same base and builds at 4 vCPU / 8 GiB for `go test -race ./...`.
+# `donmai-worker-node-pg` layers pinned pnpm, a warm pnpm store, and Postgres 17
+# with pgvector on the same base and builds at 8 vCPU / 8 GiB for large
+# TypeScript repositories (vitest, type checks, pgvector-backed suites). 8 GiB
+# is the E2B account's per-sandbox memory ceiling: a larger request is refused
+# with `400: Memory can't be higher than 8192 MiB` and fails the whole
+# publisher. Once E2B support raises the account limit, set the repository
+# variable E2B_NODE_PG_MEMORY_MB (for example 16384) to build larger without a
+# code change; unset, the build requests 8192.
+#
+# The node-pg build and its verification are non-fatal (continue-on-error):
+# nothing consumes `donmai-worker-node-pg` yet, and a failure there must not
+# fail the publisher and stop the release train behind it. A release can
+# therefore ship WITHOUT the node-pg template. That is never silent: the
+# summary step raises a workflow warning annotation and writes a job summary
+# line naming the failed step. The base and Go template steps stay fatal.
 #
 # @e2b/cli 2.13.3 help confirms `template create` accepts only an untagged name
 # constrained to lowercase letters, numbers, dashes, and underscores. E2B's
@@ -129,6 +146,22 @@ jobs:
             echo "Go template absent in this release checkout; Go build and verification will be skipped (base-only retry)."
           fi
 
+      # Releases that predate the node-pg template have no
+      # worker/e2b/e2b.node-pg.Dockerfile. Gate the node-pg build and
+      # verification on the file the release actually contains so a historical
+      # retry that predates it still rebuilds the templates it has.
+      - name: Detect node-pg template in release checkout
+        id: node-pg-template
+        run: |
+          set -euo pipefail
+          if node -e "process.exit(require(process.env.RUNNER_TEMP + '/build-e2b-template.cjs').hasNodePgDockerfile('worker/e2b') ? 0 : 1)"; then
+            echo "present=true" >> "${GITHUB_OUTPUT}"
+            echo "node-pg template present in this release checkout."
+          else
+            echo "present=false" >> "${GITHUB_OUTPUT}"
+            echo "node-pg template absent in this release checkout; node-pg build and verification will be skipped (pre-node-pg retry)."
+          fi
+
       - name: Guard - require E2B_API_KEY secret
         env:
           E2B_API_KEY: ${{ secrets.E2B_API_KEY }}
@@ -204,6 +237,32 @@ jobs:
           DONMAI_VERSION: ${{ steps.release.outputs.tag }}
         run: node "${RUNNER_TEMP}/verify-e2b-template.cjs"
 
+      # Non-fatal: see the header. The outcome is reported by the summary step.
+      - name: Build versioned E2B node-pg template
+        if: steps.node-pg-template.outputs.present == 'true'
+        id: template-node-pg
+        continue-on-error: true
+        working-directory: worker/e2b
+        env:
+          E2B_API_KEY: ${{ secrets.E2B_API_KEY }}
+          E2B_TEMPLATE_REF: donmai-worker-node-pg:${{ steps.release.outputs.tag }}
+          E2B_ADDITIONAL_TAGS: ${{ steps.release.outputs.e2b_additional_tags }}
+          E2B_DOCKERFILE: e2b.node-pg.Dockerfile
+          E2B_CPU_COUNT: 8
+          E2B_MEMORY_MB: ${{ vars.E2B_NODE_PG_MEMORY_MB || '8192' }}
+        run: node "${RUNNER_TEMP}/build-e2b-template.cjs"
+
+      # Non-fatal, and only meaningful when the build above published a target.
+      - name: Assert published E2B node-pg template toolchain
+        if: steps.node-pg-template.outputs.present == 'true' && steps.template-node-pg.outcome == 'success'
+        id: verify-node-pg
+        continue-on-error: true
+        env:
+          E2B_API_KEY: ${{ secrets.E2B_API_KEY }}
+          E2B_TEMPLATE_REF: ${{ steps.template-node-pg.outputs.template_ref }}
+          DONMAI_VERSION: ${{ steps.release.outputs.tag }}
+        run: node "${RUNNER_TEMP}/verify-e2b-template.cjs"
+
       - name: Summarize E2B template build
         env:
           TEMPLATE_REF: ${{ steps.template.outputs.template_ref }}
@@ -212,7 +271,21 @@ jobs:
           GO_TEMPLATE_REF: ${{ steps.template-go.outputs.template_ref }}
           GO_TEMPLATE_ID: ${{ steps.template-go.outputs.template_id }}
           GO_BUILD_ID: ${{ steps.template-go.outputs.build_id }}
+          NODE_PG_TEMPLATE_REF: ${{ steps.template-node-pg.outputs.template_ref }}
+          NODE_PG_TEMPLATE_ID: ${{ steps.template-node-pg.outputs.template_id }}
+          NODE_PG_BUILD_ID: ${{ steps.template-node-pg.outputs.build_id }}
+          NODE_PG_BUILD_OUTCOME: ${{ steps.template-node-pg.outcome }}
+          NODE_PG_VERIFY_OUTCOME: ${{ steps.verify-node-pg.outcome }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
         run: |
+          node_pg_failed_step=''
+          if [[ "${NODE_PG_BUILD_OUTCOME}" == failure ]]; then
+            node_pg_failed_step='Build versioned E2B node-pg template'
+            echo "::warning title=node-pg E2B template not published::Step '${node_pg_failed_step}' failed. ${RELEASE_TAG} ships without donmai-worker-node-pg:${RELEASE_TAG}; the base and Go templates are unaffected."
+          elif [[ "${NODE_PG_VERIFY_OUTCOME}" == failure ]]; then
+            node_pg_failed_step='Assert published E2B node-pg template toolchain'
+            echo "::warning title=node-pg E2B template failed verification::Step '${node_pg_failed_step}' failed. donmai-worker-node-pg:${RELEASE_TAG} was built but did not pass its toolchain checks; do not rely on it. The base and Go templates are unaffected."
+          fi
           {
             printf '## E2B template release\n\n'
             printf -- "- Target: \`%s\`\n" "${TEMPLATE_REF}"
@@ -224,5 +297,16 @@ jobs:
               printf -- "- Go build ID: \`%s\`\n" "${GO_BUILD_ID}"
             else
               printf -- "- Go template: not present in this release (base-only retry)\n"
+            fi
+            if [[ "${node_pg_failed_step}" == 'Build versioned E2B node-pg template' ]]; then
+              printf -- "- node-pg template: **NOT PUBLISHED**. Step \`%s\` failed (non-fatal); this release ships without \`donmai-worker-node-pg:%s\`\n" "${node_pg_failed_step}" "${RELEASE_TAG}"
+            elif [[ -n "${node_pg_failed_step}" ]]; then
+              printf -- "- node-pg template: **FAILED VERIFICATION**. Step \`%s\` failed (non-fatal); \`%s\` (template \`%s\`, build \`%s\`) was built but is unverified\n" "${node_pg_failed_step}" "${NODE_PG_TEMPLATE_REF}" "${NODE_PG_TEMPLATE_ID}" "${NODE_PG_BUILD_ID}"
+            elif [[ -n "${NODE_PG_TEMPLATE_REF}" ]]; then
+              printf -- "- node-pg target: \`%s\`\n" "${NODE_PG_TEMPLATE_REF}"
+              printf -- "- node-pg template ID: \`%s\`\n" "${NODE_PG_TEMPLATE_ID}"
+              printf -- "- node-pg build ID: \`%s\`\n" "${NODE_PG_BUILD_ID}"
+            else
+              printf -- "- node-pg template: not present in this release (pre-node-pg retry)\n"
             fi
           } >> "${GITHUB_STEP_SUMMARY}"

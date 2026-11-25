@@ -147,6 +147,22 @@ const (
 	// attempts, and the outer idle timeout still owns the seat.
 	DefaultProviderStallRetries = 2
 
+	// DefaultMaxToolOutputBytes bounds one tool result's content kept by
+	// the runner, applied when [Options.MaxToolOutputBytes] is zero or
+	// negative. A tool result larger than this is truncated around a
+	// marker that names the truncation (see truncateToolOutput) before
+	// the runner retains or forwards it, so an oversized result — a
+	// multi-megabyte CI log, escape-laden output that balloons
+	// downstream buffers — cannot balloon the runner's audit log,
+	// activity stream or pull request scan, and a turn that still dies
+	// after one names it in its terminal reason. It bounds the runner's
+	// copy only: the harness has already handed the full result to the
+	// model. 256 KiB keeps legitimate outputs (test logs, diffs) intact
+	// while bounding the pathological ones; the runner never fails a
+	// turn for oversize output alone. The daemon's maxToolOutputBytes
+	// setting and `agent run --max-tool-output-bytes` override it.
+	DefaultMaxToolOutputBytes = 256 * 1024
+
 	// DefaultStatusBeaconInterval bounds the runner's current-step beacon
 	// posts to the session progress endpoint: at most one POST per
 	// interval, no matter how often the step changes (the latest step
@@ -291,6 +307,38 @@ type Options struct {
 	// retries (a stall then behaves exactly like the idle watchdog
 	// cut-off it replaces).
 	ProviderStallRetries int
+
+	// InteractiveNoticeIdlePolls bounds how long one pull-channel notice
+	// may sit with no session life before it is reported as needs-operator
+	// (see interactiveNoticeIdlePolls). Zero uses the default; a NEGATIVE
+	// value disables the idle shortcut entirely so the offer waits for the
+	// next turn end under the long pull cap — the opt-out for an operator
+	// who returns just after the idle threshold and starts the turn that
+	// would still collect the offer.
+	InteractiveNoticeIdlePolls int
+
+	// InteractiveNoticeClaimGracePolls bounds the wait after the harness
+	// claims an offer for the acceptance record to appear (see
+	// interactiveNoticeClaimGracePolls). Zero uses the default; a NEGATIVE
+	// value waits without expiring the grace, but the long pull cap still
+	// bounds the slot even while claimed so a record that never arrives
+	// cannot hold the single notice slot indefinitely and starve later
+	// notices.
+	InteractiveNoticeClaimGracePolls int
+
+	// MaxToolOutputBytes bounds one tool result's content (in bytes) the
+	// runner retains per ToolResultEvent. A larger result is truncated
+	// around a marker naming the truncation (see truncateToolOutput)
+	// before the runner stores or forwards it (audit log, activity
+	// stream, pull request scan), and the seat keeps going. The harness
+	// emitted the event after its own tool loop handed the full result
+	// to the model, so this bounds the runner's copy, not the model's
+	// context. Zero or negative uses DefaultMaxToolOutputBytes; there is
+	// no unbounded setting — the cap is protective, never advisory. The
+	// daemon states it per worker from its maxToolOutputBytes setting
+	// (DONMAI_MAX_TOOL_OUTPUT_BYTES, read by `agent run
+	// --max-tool-output-bytes`).
+	MaxToolOutputBytes int
 
 	// PreserveWorktreeOnFailure keeps the worktree on disk after a
 	// failed Run for debugging. The operator surface is opt-in: `agent run
@@ -611,6 +659,10 @@ type Runner struct {
 	turnContinuationUndeliveredLimit int
 	// narrationNudgeLimit is Options.NarrationNudgeLimit.
 	narrationNudgeLimit int
+	// maxToolOutputBytes is Options.MaxToolOutputBytes, resolved to
+	// DefaultMaxToolOutputBytes when unset. It bounds one tool result's
+	// retained content (see truncateToolOutput).
+	maxToolOutputBytes int
 	// providerRetryBackoff spaces provider-error retries; nil uses
 	// defaultProviderRetryBackoff. Tests substitute a zero wait.
 	providerRetryBackoff func(attempt int) time.Duration
@@ -625,6 +677,16 @@ type Runner struct {
 	// the session pull request verifier. Nil uses captureHeadSHA; tests
 	// replace it.
 	pullRequestHeadLookup pullRequestHeadLookup
+
+	// interactiveNoticeIdlePolls is Options.InteractiveNoticeIdlePolls,
+	// resolved to interactiveNoticeIdlePolls when unset. Negative disables
+	// the idle shortcut (the offer waits under the long pull cap).
+	interactiveNoticeIdlePolls int
+	// interactiveNoticeClaimGracePolls is
+	// Options.InteractiveNoticeClaimGracePolls, resolved to
+	// interactiveNoticeClaimGracePolls when unset. Negative waits without
+	// expiring the claim grace.
+	interactiveNoticeClaimGracePolls int
 
 	// interactiveNoticeClock overrides the interactive supervisor's
 	// notice-retry clock. Nil in production (real time); tests substitute a
@@ -742,6 +804,7 @@ func New(opts Options) (*Runner, error) {
 		turnContinuationCeiling:           opts.TurnContinuationCeiling,
 		turnContinuationUndeliveredLimit:  opts.TurnContinuationUndeliveredLimit,
 		narrationNudgeLimit:               opts.NarrationNudgeLimit,
+		maxToolOutputBytes:                opts.MaxToolOutputBytes,
 		quotaReporterForSession:           opts.QuotaReporterForSession,
 		quotaReporters:                    map[string]*QuotaReporter{},
 		interactiveUsage:                  map[string]*interactiveUsageTotals{},
@@ -783,6 +846,19 @@ func New(opts Options) (*Runner, error) {
 	}
 	if r.providerStallRetries == 0 {
 		r.providerStallRetries = DefaultProviderStallRetries
+	}
+	if r.maxToolOutputBytes <= 0 {
+		r.maxToolOutputBytes = DefaultMaxToolOutputBytes
+	}
+	if opts.InteractiveNoticeIdlePolls == 0 {
+		r.interactiveNoticeIdlePolls = interactiveNoticeIdlePolls
+	} else {
+		r.interactiveNoticeIdlePolls = opts.InteractiveNoticeIdlePolls
+	}
+	if opts.InteractiveNoticeClaimGracePolls == 0 {
+		r.interactiveNoticeClaimGracePolls = interactiveNoticeClaimGracePolls
+	} else {
+		r.interactiveNoticeClaimGracePolls = opts.InteractiveNoticeClaimGracePolls
 	}
 	return r, nil
 }
@@ -1034,6 +1110,29 @@ func (r *Runner) run(ctx context.Context, qw QueuedWork, admission *HarnessAdmis
 		finalGate := !qw.isInteractive() || res == nil || res.Status != "completed"
 		if pres == nil && finalGate {
 			pres = r.newTeardownPreservation(qw.SessionID)
+		}
+		if pres != nil && finalGate && res != nil && res.Status == "failed" && len(res.terminalTranscripts) > 0 {
+			// Failed-session transcript tails share this teardown's directory
+			// with patches and descriptors. When the runner owns the
+			// teardown, tails are fail-closed: a tail failure keeps the
+			// workarea, and only this goroutine performs that teardown
+			// (below), so nothing can race the keep decision. A session
+			// that reached a terminal lease before failing (lease
+			// preparation flipped completed to failed) hands its workarea
+			// to the lease, whose disposition was durably fixed at
+			// acquisition and is executed by the lease reaper. The runner
+			// does not rewrite that disposition after the fact: a late
+			// rewrite races the reaper and cannot be made durable when the
+			// lease store itself is what failed. Tails there are
+			// best-effort and a failure is reported, never claimed retained.
+			if failed, ok := r.archiveFailedSessionEvidence(qw, res, pres.dirFor); !ok {
+				if leaseAcquired {
+					appendTranscriptEvidenceWarning(res, failed, "workarea follows its terminal lease")
+				} else {
+					teardownRequired = false
+					appendTranscriptEvidenceWarning(res, failed, "workarea retained")
+				}
+			}
 		}
 		if pres != nil && finalGate {
 			r.preserveTerminalEvidenceFinal(qw, res, pres)

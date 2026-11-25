@@ -20,6 +20,7 @@ import (
 	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 	"github.com/RenseiAI/donmai/runtime/workarea"
 	"github.com/RenseiAI/donmai/runtime/worktree"
+	"github.com/RenseiAI/donmai/tempown"
 )
 
 // Teardown deletes the session's workarea. Before it does, the runner checks
@@ -305,18 +306,29 @@ func (r *Runner) finalizeTeardownPreservation(qw QueuedWork, pres *teardownPrese
 // evidence when the terminal status owns preservation (failed or stopped):
 // the evidence shares this teardown's archive directory, so evidence-only
 // and patch-bearing attempts count together under rescueKeepPerSession.
-// Evidence is best-effort and never flips the return: a teardown with no
-// unpublished work still tears down when the evidence cannot be written.
+// Descriptor evidence is best-effort and never flips the return: a teardown
+// with no unpublished work still tears down when the descriptor evidence
+// cannot be written. For failed sessions it additionally archives bounded
+// redacted transcript tails into the same attempt; a tail failure is
+// fail-closed and keeps the workarea, including an evidence-only attempt
+// when there is no unpublished work.
 func (r *Runner) preserveUnpublishedWork(qw QueuedWork, res *Result) bool {
 	if res == nil {
 		return true
 	}
 	wantEvidence := shouldPreserveTerminalEvidence(res.Status) && len(res.terminalTranscripts) > 0
-	if len(res.rescueTargets) == 0 && !wantEvidence {
+	wantTails := res.Status == "failed" && len(res.terminalTranscripts) > 0
+	if len(res.rescueTargets) == 0 && !wantEvidence && !wantTails {
 		return true
 	}
 	pres := r.newTeardownPreservation(qw.SessionID)
 	preserved := r.preservePatches(qw, res, pres)
+	if wantTails {
+		if failed, ok := r.archiveFailedSessionEvidence(qw, res, pres.dirFor); !ok {
+			preserved = false
+			appendTranscriptEvidenceWarning(res, failed, "workarea retained")
+		}
+	}
 	if wantEvidence {
 		r.preserveTerminalEvidenceFinal(qw, res, pres)
 	}
@@ -450,7 +462,7 @@ func (r *Runner) rescueCheckout(sessionID string, dirFor func() (string, error),
 	// Stage the whole working state into a throw-away index, drop the paths
 	// that are not work, and write that state as a tree. The checkout's own
 	// index is never touched.
-	indexDir, err := os.MkdirTemp("", "rescue-index-")
+	indexDir, err := tempown.MkdirTemp("", tempown.PrefixRescueIndex)
 	if err != nil {
 		return rescueArchive{}, fmt.Errorf("create scratch index dir: %w", err)
 	}
@@ -585,7 +597,7 @@ func writeRescuePatch(ctx context.Context, dir, path, base, tree string) (int64,
 // yield exactly tree. A patch that does not is no preservation, so the caller
 // keeps the workarea instead of reporting success.
 func verifyRescuePatch(ctx context.Context, dir, patchPath, base, tree string) error {
-	indexDir, err := os.MkdirTemp("", "rescue-verify-")
+	indexDir, err := tempown.MkdirTemp("", tempown.PrefixRescueVerifyIndex)
 	if err != nil {
 		return fmt.Errorf("create scratch index dir: %w", err)
 	}

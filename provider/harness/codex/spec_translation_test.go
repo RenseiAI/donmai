@@ -54,6 +54,9 @@ func TestSpecFieldCoverage(t *testing.T) {
 	// coverage check works regardless of input.
 	ignoredFields := []string{
 		"toolLifecycleProfileID", // process-only selection consumed before provider translation
+		// Instructions (the interaction contract's normalized intents) are
+		// not yet translated by this adapter; its translator lands next.
+		"Instructions",
 		// SessionName is consumed by the spawn lifecycle rather than encoded in
 		// thread/start: fresh headless sessions issue thread/name/set after the
 		// thread id exists and before turn/start; named interactive sessions use
@@ -98,6 +101,10 @@ func TestSpecFieldCoverage(t *testing.T) {
 		// is the zero value. Registered here (the static coverage mirror) so
 		// this guard rail stays green; NewSpawnPlan is unchanged.
 		"Endpoint",
+		// AuthMode selects which credential surface a harness child may see.
+		// The codex child's credential is decided by its own CODEX_HOME and
+		// env composition (codex.go), never a JSON-RPC param.
+		"AuthMode",
 		// Interactive (W4, interactive-attach-v1) is INTENTIONALLY IGNORED by
 		// NewSpawnPlan/this JSON-RPC translation layer: Provider.Spawn
 		// (codex.go) branches on Spec.Interactive != nil BEFORE NewSpawnPlan
@@ -142,6 +149,12 @@ func TestSpecFieldCoverage(t *testing.T) {
 		// any stamped level this adapter cannot render. Codex renders index 0
 		// only, so nothing in the JSON-RPC translation depends on it.
 		"ExecutionSecurity",
+		// StartInBypass asks a human-controlled interactive session to start
+		// in its bypass permission mode. The codex interactive lane already
+		// runs with approvals off by default (approvals_seed.go), and this
+		// JSON-RPC translation never sees interactive specs, so there is
+		// nothing to translate.
+		"StartInBypass",
 		// DependencyPreparation is the digest-exempt post-admission install
 		// outcome: agent.ApplyPreparedHarness projects its failed/timed_out
 		// recovery handoff onto the adapted prompt surfaces after the
@@ -317,11 +330,41 @@ func TestNewSpawnPlan_SandboxLevels(t *testing.T) {
 	}
 }
 
+// TestNewSpawnPlan_EffortPropagatesToTurn pins the turn/start wire key for
+// Spec.Effort. The app-server reads TurnStartParams.effort; an unknown key
+// such as reasoningEffort is dropped without an error and the turn runs at the
+// model's default effort, so the legacy key must never come back.
 func TestNewSpawnPlan_EffortPropagatesToTurn(t *testing.T) {
 	t.Parallel()
-	plan := NewSpawnPlan(agent.Spec{Cwd: "/tmp", Effort: agent.EffortHigh})
-	if plan.TurnStart["reasoningEffort"] != "high" {
-		t.Fatalf("expected reasoningEffort=high, got %v", plan.TurnStart["reasoningEffort"])
+	cases := []struct {
+		effort agent.EffortLevel
+		want   string // "" => no effort key at all
+	}{
+		{effort: agent.EffortLow, want: "low"},
+		{effort: agent.EffortMedium, want: "medium"},
+		{effort: agent.EffortHigh, want: "high"},
+		{effort: agent.EffortXHigh, want: "xhigh"},
+		{effort: agent.EffortMax, want: "max"},
+		{effort: ""},
+	}
+	for _, tc := range cases {
+		plan := NewSpawnPlan(agent.Spec{Cwd: "/tmp", Effort: tc.effort})
+		got, ok := plan.TurnStart["effort"]
+		if tc.want == "" {
+			if ok {
+				t.Errorf("effort unset: turn/start carries effort=%v, want no key", got)
+			}
+		} else if !ok || got != tc.want {
+			t.Errorf("effort %q: turn/start effort = %v (present=%t), want %q", tc.effort, got, ok, tc.want)
+		}
+		if legacy, ok := plan.TurnStart["reasoningEffort"]; ok {
+			t.Errorf("effort %q: turn/start carries reasoningEffort=%v, a key the app-server ignores", tc.effort, legacy)
+		}
+		for _, key := range []string{"effort", "reasoningEffort"} {
+			if v, ok := plan.ThreadStart[key]; ok {
+				t.Errorf("effort %q: thread/start carries %s=%v; effort is a turn/start param", tc.effort, key, v)
+			}
+		}
 	}
 }
 
