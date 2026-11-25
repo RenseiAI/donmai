@@ -123,3 +123,22 @@ harness-native controls are separate facts.
 | stub | subagent_control.dispatchSpawnedWorkspaces | unverified |  |
 | stub | subagent_control.harnessNativeControls | unverified |  |
 | stub | token_cost_accuracy | unverified |  |
+
+## Subscription providers
+
+Defaults that never grant; harnesses are a ceiling; unlisted plans are uncatalogued.
+
+| provider | kind | plan | allowance | low-cap | guard | harnesses | models | billing modes |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| anthropic-claude | direct | pro | percent windows | yes | 50% | claude-code | anthropic/claude-sonnet-5 | allowance > overage > api-metered |
+| anthropic-claude | direct | max | percent windows | no | 0% | claude-code | anthropic/claude-sonnet-5 | allowance > overage > api-metered |
+| anthropic-claude | direct | team | percent windows | no | 0% | claude-code | anthropic/claude-sonnet-5 | allowance > overage > api-metered |
+| anthropic-claude | direct | enterprise | percent windows | no | 0% | claude-code | anthropic/claude-sonnet-5 | allowance > overage > api-metered |
+| openai-chatgpt | direct | free | monthly percent | yes | 50% | codex | openai/gpt-6-sol | allowance > credits |
+| openai-chatgpt | direct | go | monthly percent | yes | 50% | codex | openai/gpt-6-sol | allowance > credits |
+| openai-chatgpt | direct | plus | percent windows | yes | 50% | codex | openai/gpt-6-sol | allowance > credits |
+| openai-chatgpt | direct | pro | percent windows | no | 0% | codex | openai/gpt-6-sol | allowance > credits |
+| openai-chatgpt | direct | team | percent windows | yes | 50% | codex | openai/gpt-6-sol | allowance > credits |
+| openai-chatgpt | direct | business | percent windows | yes | 50% | codex | openai/gpt-6-sol | allowance > credits |
+| openai-chatgpt | direct | enterprise | percent windows | no | 0% | codex | openai/gpt-6-sol | allowance > credits |
+| openai-chatgpt | direct | edu | percent windows | no | 0% | codex | openai/gpt-6-sol | allowance > credits |

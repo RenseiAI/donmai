@@ -14,6 +14,10 @@ var (
 	// on a provider with SupportsSessionResume=false).
 	ErrUnsupported = errors.New("agent: capability not supported by provider")
 
+	// ErrInstructionUnsupported is returned before spawn when a required
+	// instruction translates to "unsupported" on the selected harness.
+	ErrInstructionUnsupported = errors.New("agent: required instruction unsupported by harness")
+
 	// ErrNoProvider is returned when the runner cannot resolve a
 	// Provider for a requested ProviderName (e.g. an org's profile
 	// names a provider not registered with the running binary).
@@ -55,4 +59,19 @@ var (
 	// lacks access). Wrapped alongside ErrSpawnFailed like
 	// ErrNotAuthenticated.
 	ErrModelNotEntitled = errors.New("agent: model not entitled for this account")
+
+	// ErrPolicyExtensionSlowStart classifies a spawn failure where a
+	// healthy policy extension started too slowly to complete its
+	// handshake within the attempt deadline. It is retryable: the
+	// extension is not known-broken, only slow. Wrapped alongside
+	// ErrSpawnFailed so callers can tell it apart from a broken
+	// extension without parsing prose.
+	ErrPolicyExtensionSlowStart = errors.New("agent: policy extension slow start")
+
+	// ErrPolicyExtensionBroken classifies a spawn failure where the
+	// policy extension is known-bad: it exited, rejected the
+	// handshake, or spoke malformed protocol data. It is
+	// non-retryable. Wrapped alongside ErrSpawnFailed so callers can
+	// tell it apart from a slow start without parsing prose.
+	ErrPolicyExtensionBroken = errors.New("agent: policy extension broken")
 )

@@ -247,6 +247,10 @@ type AssistantTextEvent struct {
 	// know the parent — adapters never guess.
 	ParentToolUseID string `json:"parentToolUseId,omitempty"`
 
+	// Phase separates working commentary from the final answer when the
+	// harness says which it is; empty otherwise.
+	Phase AssistantPhase `json:"phase,omitempty"`
+
 	// Raw is the provider-native event payload.
 	Raw any `json:"raw,omitempty"`
 }
@@ -751,6 +755,11 @@ type ToolProgressEvent struct {
 	// ElapsedSeconds is how long the tool has been running.
 	ElapsedSeconds float64 `json:"elapsedSeconds"`
 
+	// ItemID is the tool-use id of the call this tick belongs to, so a
+	// consumer advances that call's indicator instead of appending a row.
+	// Empty when the harness does not say; adapters never guess.
+	ItemID string `json:"itemId,omitempty"`
+
 	// Raw is the provider-native event payload.
 	Raw any `json:"raw,omitempty"`
 }
@@ -1017,6 +1026,9 @@ func UnmarshalEvent(data []byte) (Event, error) {
 	case "":
 		return nil, fmt.Errorf("agent: missing kind discriminator on event JSON")
 	default:
+		if ev, ok, err := unmarshalV2Event(head.Kind, data); ok {
+			return ev, err
+		}
 		return nil, fmt.Errorf("agent: unknown event kind %q", head.Kind)
 	}
 }

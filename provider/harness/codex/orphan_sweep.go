@@ -223,9 +223,11 @@ type SweepOptions struct {
 	// sweep will act on the STRONGEST evidence it can have: a verified
 	// manifest whose owner is dead and whose pinned child identity it can
 	// check directly. It is deliberately the only floor short enough to
-	// matter within one daemon's uptime, and it applies only on that path —
-	// every weaker verdict goes through UnverifiedMinAge instead. Empty
-	// means 1 hour.
+	// matter within one daemon's uptime. It also governs one other path: a
+	// codex home no codex process was ever handed (owner identity confirmed
+	// dead, only pre-spawn entries present; see holdsOnlyPreSpawnEntries),
+	// measured across the whole tree. Every weaker verdict goes through
+	// UnverifiedMinAge instead. Empty means 1 hour.
 	MinAge time.Duration
 	// UnverifiedMinAge is the SEPARATE, much larger age floor required
 	// before the sweep will act at all on a directory it cannot fully
@@ -313,6 +315,14 @@ type SweepOptions struct {
 	// symlink-resolved spelling of each candidate (see isProtectedHome); an
 	// empty set protects nothing.
 	ProtectedHomes map[string]struct{}
+	// NeverUsedOnly restricts the call to codex homes no codex process was
+	// ever handed and whose owner identity is confirmed dead (see
+	// neverUsedHome). Such a home holds no resume key and no process uses
+	// it, so it is safe to reclaim from a process that cannot compute
+	// ProtectedHomes (an operator CLI). The call never signals a process and
+	// never touches any other entry; those count as SkippedOutOfScope and
+	// stay with the daemon's full sweep.
+	NeverUsedOnly bool
 
 	// processAlive / processLooksLikeCodex / identityAlive / now / startAt
 	// are test seams; production leaves them nil and gets the real
@@ -331,8 +341,8 @@ type SweepOptions struct {
 // logging/metrics; every field is also emitted as a structured field on the
 // summary log line SweepOrphans itself writes.
 type SweepReport struct {
-	Scanned   int
-	Reclaimed int
+	Scanned   int `json:"scanned"`
+	Reclaimed int `json:"reclaimed"`
 	// PartiallyReclaimed counts a directory whose declared-deletable entries
 	// were removed but which still holds something donmai never declared it
 	// created — resumable session state, or any codex artifact this package
@@ -340,36 +350,41 @@ type SweepReport struct {
 	// climb over time is the intended signal that retained state is
 	// accumulating and its own lifecycle policy (not this sweep) needs to
 	// exist. See declaredDeletableEntries.
-	PartiallyReclaimed int
+	PartiallyReclaimed int `json:"partiallyReclaimed"`
 	// Acted counts entries that consumed the MaxEntries budget — ones the
 	// sweep read from, deleted inside, or signalled a process for. Every
 	// other outcome resolves an entry and leaves it alone, and is free.
-	Acted int
+	Acted int `json:"acted"`
 	// SkippedUnowned counts a non-empty directory this process could not
 	// prove it exclusively owns, so NOTHING inside it was read or deleted.
 	// On a shared os.TempDir() this is the expected count for another user's
 	// donmai-named directory.
-	SkippedUnowned int
+	SkippedUnowned int `json:"skippedUnowned"`
 	// SkippedIrreducible counts a directory of ours holding nothing this
 	// sweep may delete — either state donmai never created, or resume keys
 	// it is deliberately preserving. Nothing is left to do for it, now or on
 	// any future sweep while it stays in that shape: it is free, and it is
 	// the count an operator watches to see retained state accumulating.
-	SkippedIrreducible int
+	SkippedIrreducible int `json:"skippedIrreducible"`
 	// ExpiredRetained counts retained homes (resumable session state present)
 	// reclaimed in full because their whole-tree idle age passed
 	// RetainedHomeTTL. The operator watches this climb to confirm the
 	// retention budget is actually reaping instead of accumulating.
-	ExpiredRetained int
+	ExpiredRetained int `json:"expiredRetained"`
 	// SkippedProtected counts entries left alone because their absolute path
 	// appears in ProtectedHomes — a live adopted session still references
 	// the home via its resume key.
-	SkippedProtected int
-	Terminated       int
-	SkippedYoung     int // MinAge or UnverifiedMinAge gate — "too young to judge yet", never a liveness signal.
-	SkippedLive      int // a verified-or-fallback-live owner (or, historically, child) — "still owned", not age.
-	SkippedAmbiguous int // a live PID that failed identity or binary-identity verification — never touched.
-	Errors           int
+	SkippedProtected int `json:"skippedProtected"`
+	// NeverUsed counts homes reclaimed (a subset of Reclaimed) because no
+	// codex process was ever handed them and their owner is confirmed dead.
+	NeverUsed int `json:"neverUsed"`
+	// SkippedOutOfScope counts entries a NeverUsedOnly call left alone.
+	SkippedOutOfScope int `json:"skippedOutOfScope"`
+	Terminated        int `json:"terminated"`
+	SkippedYoung      int `json:"skippedYoung"`     // MinAge or UnverifiedMinAge gate — "too young to judge yet", never a liveness signal.
+	SkippedLive       int `json:"skippedLive"`      // a verified-or-fallback-live owner (or, historically, child) — "still owned", not age.
+	SkippedAmbiguous  int `json:"skippedAmbiguous"` // a live PID that failed identity or binary-identity verification — never touched.
+	Errors            int `json:"errors"`
 }
 
 func (opts SweepOptions) withDefaults() SweepOptions {
@@ -460,8 +475,10 @@ func (opts SweepOptions) withDefaults() SweepOptions {
 //     gates a different thing: with a manifest the sweep may act on the
 //     short MinAge floor and may signal a process; without one it may still
 //     act, but only on the far larger idle floor and never on a process.
-//  2. Age: MinAge for a verified-dead owner with a pinned child; the much
-//     larger UnverifiedMinAge for anything without that liveness proof (no
+//  2. Age: MinAge for a verified-dead owner with a pinned child, and for a
+//     codex home whose verified-dead owner never handed it to a codex
+//     process (only pre-spawn entries present); the much larger
+//     UnverifiedMinAge for anything else without a liveness proof (no
 //     manifest, or a dead owner with no tracked child). The larger floor is
 //     measured across the whole tree, not the top-level mtime — a live
 //     session's CODEX_HOME stops moving minutes in, so top-level mtime is
@@ -579,6 +596,8 @@ func SweepOrphans(ctx context.Context, opts SweepOptions) SweepReport {
 		"terminated", report.Terminated,
 		"expiredRetained", report.ExpiredRetained,
 		"skippedProtected", report.SkippedProtected,
+		"neverUsed", report.NeverUsed,
+		"skippedOutOfScope", report.SkippedOutOfScope,
 		"skippedYoung", report.SkippedYoung,
 		"skippedLive", report.SkippedLive,
 		"skippedAmbiguous", report.SkippedAmbiguous,
@@ -673,6 +692,14 @@ func (opts SweepOptions) sweepOne(ctx context.Context, path, kind string, report
 		opts.reclaimEmptyDirectoryOnly(path, kind, report)
 		return false
 	}
+	if opts.NeverUsedOnly {
+		manifest, ok := opts.readVerifiedDonmaiOwnerManifest(path)
+		if !ok || !opts.neverUsedHome(path, kind, manifest) {
+			report.SkippedOutOfScope++
+			return false
+		}
+		return opts.reclaimNeverUsed(path, kind, info, report)
+	}
 	// LIVENESS second, and only from a manifest: who owns this directory
 	// NOW. Its presence is what lets the sweep act on the short floor.
 	if manifest, ok := opts.readVerifiedDonmaiOwnerManifest(path); ok {
@@ -722,6 +749,19 @@ func (opts SweepOptions) sweepManifested(ctx context.Context, path, kind string,
 		return false
 	}
 	if manifest.ChildIdentity.PID <= 0 {
+		// A home no codex process was ever handed: the provider was built
+		// (which creates the home) and its owner died or exited without a
+		// Shutdown, before any spawn. Every agent-run registry build and every
+		// test binary that builds one creates such a home, and they were the
+		// bulk of a real host's population — all held for the 24-hour floor
+		// below although nothing could be using them. The proof that nothing
+		// is: the owner's pinned identity is confirmed dead (not the bare-PID
+		// fallback), and the home holds only what donmai writes before a
+		// spawn — codex writes its own state at the top level the moment it
+		// starts. Such a home is reclaimable on the short floor.
+		if opts.neverUsedHome(path, kind, manifest) {
+			return opts.reclaimNeverUsed(path, kind, info, report)
+		}
 		// Owner is gone, but no child was ever tracked for this directory
 		// shape (the PTY session case — ptycli exposes no child PID at
 		// all). A live orphaned codex process could still be using it;
@@ -856,6 +896,111 @@ func (opts SweepOptions) idleLongerThan(path string, info os.FileInfo, floor tim
 		return nil
 	})
 	return proven
+}
+
+// neverUsedHome reports whether path is a codex home no codex process was
+// ever handed, owned by a process confirmed dead: no child was ever pinned,
+// the owner's pinned identity is dead, and the home holds only what donmai
+// writes before a spawn. The caller has already proven provenance.
+func (opts SweepOptions) neverUsedHome(path, kind string, manifest donmaiOwnerManifest) bool {
+	return kind == sweepKindCodexHome &&
+		manifest.ChildIdentity.PID <= 0 &&
+		opts.ownerIdentityProvenDead(manifest) &&
+		holdsOnlyPreSpawnEntries(path)
+}
+
+// reclaimNeverUsed reclaims a neverUsedHome once its whole tree has been idle
+// past MinAge.
+func (opts SweepOptions) reclaimNeverUsed(path, kind string, info os.FileInfo, report *SweepReport) bool {
+	if !opts.idleLongerThan(path, info, opts.MinAge) {
+		report.SkippedYoung++
+		return false
+	}
+	before := report.Reclaimed
+	acted := opts.reclaim(path, kind, info, report)
+	if report.Reclaimed > before {
+		report.NeverUsed++
+	}
+	return acted
+}
+
+// HomeShape classifies a codex home for operator reports.
+type HomeShape string
+
+const (
+	// HomeShapeNeverUsed means only pre-spawn entries are present; no codex process ran here.
+	HomeShapeNeverUsed HomeShape = "never-used"
+	// HomeShapeRetained means the home holds resumable session state the retention rule
+	// keeps until DefaultRetainedHomeTTL.
+	HomeShapeRetained HomeShape = "retained"
+	// HomeShapeUsed means codex ran here, with no session state.
+	HomeShapeUsed HomeShape = "used"
+	// HomeShapeUnreadable means the home could not be listed.
+	HomeShapeUnreadable HomeShape = "unreadable"
+)
+
+// ClassifyHome reports the shape of the codex home at path. It reads
+// directory listings only, never file contents.
+func ClassifyHome(path string) HomeShape {
+	if _, err := os.ReadDir(path); err != nil {
+		return HomeShapeUnreadable
+	}
+	if holdsOnlyPreSpawnEntries(path) {
+		return HomeShapeNeverUsed
+	}
+	if has, err := dirHasEntries(filepath.Join(path, codexSessionStateSubdir)); err != nil || has {
+		return HomeShapeRetained
+	}
+	return HomeShapeUsed
+}
+
+// IsArtifactName reports whether a base name is in the sweep's naming fence:
+// a codex home or a bootstrap app-server socket directory.
+func IsArtifactName(name string) bool {
+	return strings.HasPrefix(name, codexHomePrefix) || strings.HasPrefix(name, codexAppSocketPrefix)
+}
+
+// IsHomeName reports whether a base name is a codex home.
+func IsHomeName(name string) bool {
+	return strings.HasPrefix(name, codexHomePrefix)
+}
+
+// ownerIdentityProvenDead reports whether manifest's pinned owner identity is
+// confirmed dead: identity pinning was available when the home was created and
+// the check answers "not alive" without error. A bare-PID manifest, or an
+// identity check that errors, is never proof.
+func (opts SweepOptions) ownerIdentityProvenDead(manifest donmaiOwnerManifest) bool {
+	if manifest.OwnerIdentity.PID <= 0 {
+		return false
+	}
+	alive, err := opts.identityAlive(manifest.OwnerIdentity)
+	return err == nil && !alive
+}
+
+// preSpawnEntries are the only top-level entries a codex home holds before a
+// codex process is handed it: the owner manifest, the private config.toml,
+// and the plugin cache donmai seeds at construction. The auth link is placed
+// only on the spawn path, and codex writes its own state (installation id,
+// state databases, sessions/) at the top level as soon as it starts.
+var preSpawnEntries = map[string]bool{
+	donmaiOwnerManifestName: true,
+	codexConfigFileName:     true,
+	codexPluginCacheSubdir:  true,
+}
+
+// holdsOnlyPreSpawnEntries reports whether home holds nothing but
+// preSpawnEntries. An unreadable home answers false.
+func holdsOnlyPreSpawnEntries(home string) bool {
+	entries, err := os.ReadDir(home)
+	if err != nil {
+		return false
+	}
+	for _, entry := range entries {
+		if !preSpawnEntries[entry.Name()] {
+			return false
+		}
+	}
+	return true
 }
 
 // ownerAlive reports whether manifest's owner is still running. A pinned

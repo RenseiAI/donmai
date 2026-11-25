@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/tempown"
 )
 
 // This file implements agent.NoticeDeliveryHook for the Claude Code harness:
@@ -159,7 +160,7 @@ var _ agent.NoticeChannel = (*stopHookChannel)(nil)
 // accepts its --settings as a JSON STRING, so nothing about this channel needs
 // to exist inside the workspace.
 func newStopHookChannel() (*stopHookChannel, error) {
-	dir, err := os.MkdirTemp("", "donmai-stophook-")
+	dir, err := tempown.MkdirTemp("", tempown.PrefixClaudeStopHook)
 	if err != nil {
 		return nil, fmt.Errorf("stop-hook channel: create drop dir: %w", err)
 	}
@@ -507,7 +508,11 @@ func (c *stopHookChannel) Retract() (bool, error) {
 		c.text, c.deliveryID = "", ""
 		return true, nil
 	case errors.Is(err, os.ErrNotExist):
-		c.text, c.deliveryID = "", ""
+		// Already claimed: the hook renamed pending.json and the
+		// acceptance record lands on the transcript asynchronously.
+		// Preserve the match state so Consumed can still read it;
+		// clearing here is how a claim just before a cutoff died
+		// before its record could acknowledge it.
 		return false, nil
 	default:
 		return false, fmt.Errorf("stop-hook channel: retract offer: %w", err)

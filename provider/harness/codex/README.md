@@ -223,6 +223,19 @@ authority. A rejected id surfaces as codex's own nonzero exit (or, for the
 headless lane, a JSON-RPC error), never a silent fallback to a different
 model.
 
+### Cyber access program (`Spec.ProviderConfig.cyberAccessProgram`)
+
+`cyberAccessProgram` is the one `Spec.ProviderConfig` key this provider
+consumes. A model profile declares it (`standard`, `daybreakBlue` or
+`daybreakRed`, the app-server's `CyberAccessProgram` values), and the
+headless lane forwards it as `turn/start`'s experimental `cyberAccessProgram`
+param on every turn of that session. It is never written to a config file or
+inferred from the host. A declared value outside that set fails the spawn with
+`agent.ErrSpawnFailed` before any thread opens. The interactive TUI has no
+per-session flag for it, so an interactive launch that declares it is refused.
+Authorization stays with the model provider: an account or model that is not
+approved fails the turn with the provider's error.
+
 ## Skills (headless app-server lane)
 
 A work item's skills reach Codex natively through the Provider's private

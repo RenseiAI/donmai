@@ -35,8 +35,10 @@
 #   template ships, including an unprivileged start as the sandbox account.
 #
 # Seats running tsc on large repositories should export
-# NODE_OPTIONS=--max-old-space-size=12288 (12 GiB of the 16 GiB box). It is
-# intentionally NOT set here so the provider CLIs keep their default heaps.
+# NODE_OPTIONS=--max-old-space-size=6144 (6 GiB of the 8 GiB box; scale it to
+# about three quarters of the box when E2B_NODE_PG_MEMORY_MB raises the build
+# memory). It is intentionally NOT set here so the provider CLIs keep their
+# default heaps.
 #
 # The donmai binary is built OUTSIDE this Dockerfile (see build.sh / README.md)
 # and copied in, exactly like e2b.Dockerfile. Do NOT commit the binary.
@@ -44,11 +46,13 @@
 # Single-stage only: the E2B template build SDK rejects multi-stage
 # Dockerfiles, so this file must keep exactly one FROM and no COPY --from.
 #
-# Build resources are set at build time (8 vCPU / 16 GiB) via E2B_CPU_COUNT /
+# Build resources are set at build time (8 vCPU / 8 GiB) via E2B_CPU_COUNT /
 # E2B_MEMORY_MB in e2b-template.yml — E2B's defaults (2 vCPU / 1 GiB) are too
-# small for `vitest` plus a type check with a 12 GiB heap on a large
-# TypeScript repository. The base `donmai-worker` template keeps E2B's
-# defaults; the Go template builds at 4 vCPU / 8 GiB.
+# small for `vitest` plus a type check on a large TypeScript repository.
+# 8 GiB is the E2B account's per-sandbox memory ceiling; the repository
+# variable E2B_NODE_PG_MEMORY_MB raises the request once the account limit
+# is lifted. The base `donmai-worker` template keeps E2B's defaults; the Go
+# template builds at 4 vCPU / 8 GiB.
 FROM debian:bookworm-slim
 
 # Unprivileged sandbox account. The E2B build SDK appends USER user when the
@@ -108,6 +112,14 @@ RUN curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
 # stats_temp_directory here: PostgreSQL 15 removed it and 17 refuses to
 # start when postgresql.conf names it (FATAL: unrecognized configuration
 # parameter), which fails the build-time pg-start smoke below.
+# ssl = off and start.conf = manual belong to the same ownership transfer.
+# The packaged cluster enables TLS with the snakeoil key, which only the
+# postgres account can read, so a server started as user dies with
+# "could not access private key file ... Permission denied"; every client
+# here is a local trust connection, so TLS is turned off. start.conf manual
+# keeps systemd from starting the cluster at boot (the E2B builder and
+# sandbox run systemd): an auto-started unit races pg-start, which then sees
+# "Cluster is already running" and fails. pg-start is the only start path.
 # NOTE: no backslashes in any RUN command body. The E2B template build SDK
 # parses the Dockerfile with dockerfile-ast and re-emits each RUN joined by
 # single spaces, which strips every single backslash before the builder
@@ -120,6 +132,8 @@ RUN sed -i \
       /etc/postgresql/17/main/pg_hba.conf \
     && grep -E '^(local|host)' /etc/postgresql/17/main/pg_hba.conf \
     && echo "unix_socket_directories = '/tmp'" >> /etc/postgresql/17/main/postgresql.conf \
+    && echo "ssl = off" >> /etc/postgresql/17/main/postgresql.conf \
+    && echo manual > /etc/postgresql/17/main/start.conf \
     && chown -R user:user /var/lib/postgresql /etc/postgresql /var/log/postgresql /var/run/postgresql \
     && ls -ld /var/lib/postgresql/17/main
 
@@ -128,6 +142,10 @@ RUN sed -i \
 # unconditionally, and it waits for readiness instead of returning while the
 # server is still starting. Lives in /usr/local/bin so it resolves under
 # `bash -l -c`, the shell E2B uses for build steps and SDK version checks.
+# pg_ctlcluster always gets --skip-systemctl-redirect, here and in the smoke
+# below: under systemd a root start or stop is otherwise handed to systemctl,
+# whose unit does not fit a user-owned cluster with a /tmp socket and fails
+# with "Job for postgresql@17-main.service failed".
 # Runs unprivileged: the cluster is owned by user (see above) and the
 # socket lives in /tmp, so pg_ctlcluster accepts the sandbox account with
 # no sudo. Written with echo (no heredoc): the SDK joins each RUN into one
@@ -140,7 +158,7 @@ RUN echo '#!/bin/sh' > /usr/local/bin/pg-start \
     && echo 'if pg_lsclusters 17 main 2>/dev/null | grep -q " online"; then' >> /usr/local/bin/pg-start \
     && echo 'echo "postgres 17/main already online"' >> /usr/local/bin/pg-start \
     && echo 'else' >> /usr/local/bin/pg-start \
-    && echo 'pg_ctlcluster 17 main start' >> /usr/local/bin/pg-start \
+    && echo 'pg_ctlcluster --skip-systemctl-redirect 17 main start' >> /usr/local/bin/pg-start \
     && echo 'fi' >> /usr/local/bin/pg-start \
     && echo 'for _ in $(seq 1 30); do' >> /usr/local/bin/pg-start \
     && echo 'if pg_isready -h /tmp -U postgres >/dev/null 2>&1; then' >> /usr/local/bin/pg-start \
@@ -228,11 +246,11 @@ RUN pg-start \
     && createdb -h /tmp -U postgres build_probe \
     && psql -h /tmp -U postgres -d build_probe -c 'CREATE EXTENSION vector' \
     && psql -h /tmp -U postgres -d postgres -c 'DROP DATABASE build_probe' \
-    && pg_ctlcluster 17 main stop \
+    && pg_ctlcluster --skip-systemctl-redirect 17 main stop \
     && su user -s /bin/sh -c 'pg-start' \
     && su user -s /bin/sh -c "psql -h /tmp -U postgres -d postgres -tAc 'SHOW server_version'" \
     && su user -s /bin/sh -c "psql -h /tmp -U postgres -d postgres -c 'DROP DATABASE IF EXISTS build_probe_user'" \
     && su user -s /bin/sh -c 'createdb -h /tmp -U postgres build_probe_user' \
     && su user -s /bin/sh -c "psql -h /tmp -U postgres -d build_probe_user -c 'CREATE EXTENSION vector'" \
     && su user -s /bin/sh -c "psql -h /tmp -U postgres -d postgres -c 'DROP DATABASE build_probe_user'" \
-    && pg_ctlcluster 17 main stop
+    && pg_ctlcluster --skip-systemctl-redirect 17 main stop

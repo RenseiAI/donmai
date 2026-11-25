@@ -380,6 +380,38 @@ func TestStopHookChannel_RetractDistinguishesUnclaimedFromClaimed(t *testing.T) 
 	})
 }
 
+// TestStopHookChannel_ClaimSurvivesRetractForLateAcceptance pins the idle-cutoff
+// race: the hook claims the offer just before the runner's cutoff retracts it,
+// and the CLI appends the acceptance record on the next tick. Retract must
+// report already-claimed WITHOUT clearing the match state, so the late record
+// still acknowledges the delivery instead of dead-lettering it as discarded.
+func TestStopHookChannel_ClaimSurvivesRetractForLateAcceptance(t *testing.T) {
+	const text = "late acceptance after claim"
+	c := newTestStopHookChannel(t)
+	if err := c.Offer("dlv-late", text); err != nil {
+		t.Fatalf("Offer: %v", err)
+	}
+	// Transcript starts empty; the hook claims immediately.
+	path := writeTranscript(t, nil)
+	fireHook(t, c, hookStdin(path, false))
+	// The cutoff retracts after the claim: already-claimed, not withdrawn.
+	if retracted, err := c.Retract(); err != nil || retracted {
+		t.Fatalf("Retract() = %v, %v after the hook claimed; want false, nil", retracted, err)
+	}
+	// No record yet: not consumed (the ordinary waiting state).
+	if got, err := c.Consumed(); err != nil || got {
+		t.Fatalf("Consumed() = %v, %v before the acceptance record; want false, nil", got, err)
+	}
+	// The CLI appends the acceptance record on the next tick.
+	appendTranscript(t, path, jsonLine(t, map[string]any{
+		"type": "user", "isMeta": true,
+		"message": map[string]any{"role": "user", "content": "Stop hook feedback:\n" + text},
+	}))
+	if got, err := c.Consumed(); err != nil || !got {
+		t.Fatalf("Consumed() = %v, %v after the late acceptance record; want true, nil", got, err)
+	}
+}
+
 // TestStopHookChannel_OfferClearsThePreviousDeliverysEvidence stops the
 // cheapest possible false ack: a fresh offer answered by the last delivery's
 // claim receipt, which would report the new message consumed before the harness

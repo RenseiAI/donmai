@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -168,6 +169,13 @@ type Options struct {
 	// mentions it — never does.
 	CodexOrphanSweeper CodexOrphanSweepFunc
 
+	// TempJanitor reclaims the temp artefacts probes, harness sessions and
+	// the runner record under the system temp folder (tempown owner-tagged
+	// names) once their owner process is gone — once per Start beside the
+	// codex sweep, then hourly. Nil makes it a no-op; only the production
+	// entry point (afcli/daemon_run.go) sets it, to tempown.Sweep.
+	TempJanitor TempJanitorFunc
+
 	// TrustLedgerSweeper undoes seeded workspace-trust entries whose owning
 	// session is no longer live, once per Start, after shim adoption and
 	// before registration — see sweepSeededTrustLedger. Nil (the default
@@ -193,6 +201,13 @@ type Options struct {
 	// afcli.ResolveQuotaProbeBinaries() to resolve the same set from
 	// PATH for its own daemon.
 	QuotaProbeBinaries map[string]string
+
+	// ObservationPolicyDir holds each registration's last applied
+	// observations.policy push, so a restarted daemon keeps enforcing it.
+	// Empty (the default for every test and embedder that does not set it)
+	// keeps pushed policy in memory only. The production entry point
+	// (afcli/daemon_run.go) sets it under the state home.
+	ObservationPolicyDir string
 
 	// EnableSubscriptionWindowExhaustionRefusal arms the subscription-window
 	// exhaustion claim admission: the host-wide pre-claim gate consulted by
@@ -572,6 +587,14 @@ type Daemon struct {
 	// stopped by Stop.
 	quotaPoller *quotaPoller
 
+	// observationScan bounds host-observation rescans and remembers the
+	// last two completed scans for the new marks.
+	observationScan observationScanner
+
+	// observationPolicies holds each registration's pushed observed-item
+	// policy (observations.policy), applied at claim time.
+	observationPolicies observationPolicies
+
 	// credentials is the single refresher every lane draws its worker identity
 	// from, constructed in Start once registration has produced one. A durable-
 	// session composition that lands after startup re-declares this daemon's
@@ -711,6 +734,17 @@ type Daemon struct {
 	// a restart plus redelivery to run a second swap.
 	hostUpgradeDurableBroken bool
 	hostUpgradeDurableError  string
+
+	// managedTrustMu synchronizes managed update-trust replacement with
+	// verification so the updater sees either the complete old pair or
+	// the complete new pair. Writers (heartbeat projection application)
+	// take the write lock; verifier derivation takes the read lock and
+	// copies the active pointer before building the verifier outside it.
+	managedTrustMu            sync.RWMutex
+	managedTrustActive        *managedUpdateTrustPolicy
+	managedTrustBlocked       bool
+	managedTrustBlockedReason string
+	managedTrustLoaded        bool
 }
 
 // New constructs a Daemon. Call Start() to bring it online.
@@ -761,6 +795,7 @@ func New(opts Options) *Daemon {
 			return rulesetSnapshotWireStatus(snapshotClient)
 		})
 	}
+	d.loadObservationPolicies()
 	d.state.Store(StateStopped)
 	return d
 }
@@ -1715,6 +1750,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 	// reach again. Runs after adoption so live sessions' resume-keyed homes
 	// are protected, and never fails startup — see sweepCodexOrphans.
 	d.sweepCodexOrphans(ctx)
+	d.sweepTempArtifacts(ctx)
 	// Undo seeded workspace trust whose owning session died before its
 	// cleanup ran. Runs after adoption so live sessions' ledger rows are
 	// protected, and never fails startup — see sweepSeededTrustLedger.
@@ -1776,6 +1812,16 @@ func (d *Daemon) Start(ctx context.Context) error {
 			spawnerOpts.BaseEnv[runtimeenv.KeepFailedWorktreeEnv] = "1"
 		}
 	}
+	// Carry the operator's tool-output bound the same way: a positive
+	// maxToolOutputBytes states DONMAI_MAX_TOOL_OUTPUT_BYTES, which
+	// `agent run` reads as its --max-tool-output-bytes default. Unset
+	// leaves the runner default; an embedder-composed BaseEnv keeps
+	// priority, and a work item cannot override it (host-owned).
+	if cfg.MaxToolOutputBytes > 0 {
+		if _, ok := spawnerOpts.BaseEnv[runtimeenv.MaxToolOutputBytesEnv]; !ok {
+			spawnerOpts.BaseEnv[runtimeenv.MaxToolOutputBytesEnv] = strconv.Itoa(cfg.MaxToolOutputBytes)
+		}
+	}
 	// Tell every worker this daemon spawns where this daemon actually lives.
 	// Resolved per spawn rather than snapshotted here: the control listener may
 	// still be binding an ephemeral port at this point, and ControlURL is the
@@ -1799,6 +1845,27 @@ func (d *Daemon) Start(ctx context.Context) error {
 	if spawnerOpts.SessionTmpRecordDir == "" {
 		spawnerOpts.SessionTmpRecordDir = statepath.Resolve("session-tmp-record", "/tmp/.donmai/session-tmp-record")
 	}
+	// Whether a session that declares no scratch directory gets one the
+	// daemon derives (/tmp/donmai-<random>) rather than the host's shared
+	// per-user temp — which its tools would otherwise fill, and which macOS
+	// empties at boot before any user process may start — is the operator's
+	// sessionScratch.derive setting, on unless daemon.yaml says false. Off
+	// clears any prefix, so an undeclared session keeps the daemon's own
+	// TMPDIR exactly as before derivation existed; on keeps an
+	// embedder-pinned prefix and otherwise uses the default one. A declared
+	// value binds either way. See daemon/README.md.
+	if cfg.SessionScratch.DeriveEnabled() {
+		if spawnerOpts.SessionTmpDerivedPrefix == "" {
+			spawnerOpts.SessionTmpDerivedPrefix = DefaultSessionTmpDerivedPrefix
+		}
+	} else {
+		spawnerOpts.SessionTmpDerivedPrefix = ""
+	}
+	slog.Info("daemon: per-session scratch directories",
+		"setting", SessionScratchDeriveKey,
+		"derive", cfg.SessionScratch.DeriveEnabled(),
+		"prefix", spawnerOpts.SessionTmpDerivedPrefix,
+	)
 	// Default WorktreeParentDir to the same statepath-resolved worktrees
 	// directory the spawned `donmai agent run` worker uses when no
 	// --worktree-dir override is passed (afcli/agent_run.go). Keeping the
@@ -2062,8 +2129,14 @@ func (d *Daemon) Start(ctx context.Context) error {
 			// provider and merged with turn-driven updates. Nil-safe:
 			// a host with no quota state omits the key.
 			GetQuota: d.QuotaSnapshot,
+			// Observations: the same quota state as subscription-login
+			// items; nil, and omitted, when there is no quota state.
+			DrainDeferredAcks: d.drainDeferredScanAcks,
+			GetObservations:   d.ObservationReport,
 			// Phase 2c: handle platform-queued mutations.
 			OnPendingMutations: d.applyPendingMutations,
+			// Managed update trust: heartbeat-carried signer/root rotation.
+			OnManagedUpdateTrust: d.applyManagedUpdateTrustProjection,
 			// Phase 2e: surface hostStatus signals (pool_deleted etc.)
 			// to af daemon stats. The latest observed status is stored
 			// in d.hostStatus; callers read via Daemon.HostStatus().
@@ -2169,6 +2242,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 		// entry point runs (see afcli/daemon_run.go), which likewise
 		// end with their parent context rather than with Stop.
 		d.startCodexOrphanSweepLoop(ctx)
+		d.startTempJanitorLoop(ctx)
 
 		// Poll loop — the binding constraint that makes the daemon actually
 		// receive work. Without this the platform's heartbeat-only sidecar
@@ -2712,6 +2786,12 @@ func (d *Daemon) Stop(ctx context.Context) error {
 	heartbeat := d.heartbeat
 	refresher := d.tokenRefresher
 	d.lifecycleMu.Unlock()
+	// The observations.scan queue observes Stop only once Stop owns the
+	// lifecycle: a Stop that never acquires the lease (contended owner,
+	// expired caller context) must leave scans enabled. The worker and the
+	// slot wait observe the scanner's context, pending requests fail closed,
+	// and the worker exits.
+	d.cancelObservationScans()
 	d.mu.RLock()
 	reloadCancel := d.registrationReloadCancel
 	credentials := d.credentials
@@ -2970,6 +3050,11 @@ func (d *Daemon) handlePollWorkItem(item PollWorkItem, orchestratorURL string) e
 	// branch, the sole release call.
 	if quotaErr := d.quotaClaimAdmission(spec); quotaErr != nil {
 		return d.nackRejectedClaim(item, quotaErr, orchestratorURL)
+	}
+	// Observation viability under the registration's pushed policy; a
+	// registration with no pushed policy passes through.
+	if obsErr := d.ObservationClaimAdmission(primaryObservationRegistration, spec, time.Now()); obsErr != nil {
+		return d.nackRejectedClaim(item, obsErr, orchestratorURL)
 	}
 
 	// Advertise worker capabilities only when a provider is wired, so the nil
@@ -3233,7 +3318,18 @@ func (d *Daemon) acceptWorkWithDetail(spec SessionSpec, detail *SessionDetail, p
 	var configGeneration uint64
 	configReserved := false
 	configLeaseTransferred := false
+	// receiptCommitted reports whether this accept published (or replayed) a
+	// durable preflight receipt for the session. Only receipt-bearing accepts
+	// arm the spawn marker below; legacy detail-free work leaves no receipt
+	// to protect.
+	receiptCommitted := false
+	var detailLease sessionDetailLease
+	detailReserved := false
+	detailTransferred := false
 	defer func() {
+		if detailReserved && !detailTransferred && d.sessionDetails != nil {
+			d.sessionDetails.DeleteIfOwner(detailLease)
+		}
 		if configReserved && !configLeaseTransferred && d.preflightConfigs != nil {
 			d.preflightConfigs.cleanupIfOwner(spec.SessionID, configGeneration)
 		}
@@ -3329,6 +3425,23 @@ func (d *Daemon) acceptWorkWithDetail(spec SessionSpec, detail *SessionDetail, p
 		// seat's deny at an arbitrary host file.
 		if path := strings.TrimSpace(d.opts.ControlTokenPath); path != "" {
 			detail.ControlTokenPath = path
+		}
+		// Reserve the session before compiling or publishing its receipt and
+		// hold the lease through spawn and marker completion. The
+		// reservation is invisible: no detail is published yet, so the
+		// accept builds its private detail copy without sharing it with
+		// concurrent readers or the runtime-token refresher. Publish
+		// installs the fully built copy just before spawn. A contender
+		// that loses this reservation returns before touching the durable
+		// receipt, so concurrent deliveries cannot leave the winner's worker
+		// holding the loser's bytes.
+		if d.sessionDetails != nil {
+			var stored bool
+			detailLease, stored = d.sessionDetails.Reserve(spec.SessionID, detail.WorkerID, detail.AuthToken)
+			if !stored {
+				return nil, fmt.Errorf("session %q already has an active detail", spec.SessionID)
+			}
+			detailReserved = true
 		}
 		if len(detail.AdmissionReceipt) > 0 {
 			// The narrow-only claim gate runs first: for a claim-bound
@@ -3674,34 +3787,15 @@ func (d *Daemon) acceptWorkWithDetail(spec SessionSpec, detail *SessionDetail, p
 				return nil, fmt.Errorf("execution adaptation preflight: %w", preflightErr)
 			}
 			detail.HostAdaptationReceipt = append(json.RawMessage(nil), persistedReceipt...)
-		}
-	}
-	var detailLease sessionDetailLease
-	if detail != nil && d.sessionDetails != nil {
-		var stored bool
-		detailLease, stored = d.sessionDetails.StoreIfAbsent(detail)
-		if !stored {
-			return nil, fmt.Errorf("session %q already has an active detail", spec.SessionID)
+			receiptCommitted = len(persistedReceipt) > 0
 		}
 	}
 	if localPreflightRequest != nil && localPreflightResponse != nil && preflightReplay != nil {
 		if err := preflightReplay.BeginExecutionPreflightStart(context.Background(), *localPreflightRequest, *localPreflightResponse); err != nil {
-			if detailLease.generation != 0 {
-				d.sessionDetails.DeleteIfOwner(detailLease)
-			}
-			if configReserved {
-				d.preflightConfigs.cleanupIfOwner(spec.SessionID, configGeneration)
-			}
 			return nil, fmt.Errorf("consume host execution preflight start authority: %w", err)
 		}
 		if localPreflight != nil {
 			if err := localPreflight.beginExecutionPreflightStart(context.Background(), *localPreflightRequest, *localPreflightResponse); err != nil {
-				if detailLease.generation != 0 {
-					d.sessionDetails.DeleteIfOwner(detailLease)
-				}
-				if configReserved {
-					d.preflightConfigs.cleanupIfOwner(spec.SessionID, configGeneration)
-				}
 				retireErr := preflightReplay.RetireExecutionPreflight(context.Background(), spec.SessionID)
 				if retireErr != nil {
 					return nil, errors.Join(fmt.Errorf("consume local execution preflight start authority: %w", err), fmt.Errorf("retire host execution preflight start: %w", retireErr))
@@ -3710,14 +3804,17 @@ func (d *Daemon) acceptWorkWithDetail(spec SessionSpec, detail *SessionDetail, p
 			}
 		}
 	}
+	// Publish the fully built detail before spawn. The private copy above is
+	// no longer mutated after this point, so readers observe either nothing
+	// or the complete struct — never a half-built one. Any credential refresh
+	// that landed on the reservation mid-accept is folded in by Publish.
+	if detailReserved {
+		if d.sessionDetails == nil || !d.sessionDetails.Publish(detailLease, detail) {
+			return nil, fmt.Errorf("session %q already has an active detail", spec.SessionID)
+		}
+	}
 	handle, err := d.spawner.AcceptWork(spec)
 	if err != nil {
-		if detailLease.generation != 0 {
-			d.sessionDetails.DeleteIfOwner(detailLease)
-		}
-		if configReserved {
-			d.preflightConfigs.cleanupIfOwner(spec.SessionID, configGeneration)
-		}
 		if localPreflight != nil {
 			if retireErr := localPreflight.retireExecutionPreflight(context.Background(), spec.SessionID); retireErr != nil {
 				return nil, errors.Join(err, fmt.Errorf("retire failed local execution preflight start: %w", retireErr))
@@ -3729,6 +3826,23 @@ func (d *Daemon) acceptWorkWithDetail(spec SessionSpec, detail *SessionDetail, p
 			}
 		}
 		return nil, err
+	}
+	// The spawn committed: record it so the session's receipt turns immutable
+	// from here on. A redelivery can still replace the receipt of an attempt
+	// that never got this far, but never the receipt of a live worker. The
+	// marker is bookkeeping, not authority: the worker is already running, so
+	// a marker failure is logged and the accept still succeeds rather than
+	// orphaning a live child behind a false rejection.
+	if receiptCommitted {
+		if tracker, ok := d.opts.ExecutionPreflightStore.(ExecutionPreflightSpawnTracker); ok {
+			if markErr := tracker.MarkExecutionPreflightSpawned(spec.SessionID); markErr != nil {
+				slog.Warn("daemon accept: spawn marker not recorded; receipt stays replaceable",
+					"session_id", spec.SessionID, "error", markErr.Error())
+			}
+		}
+	}
+	if detailReserved {
+		detailTransferred = true
 	}
 	if configReserved {
 		configLeaseTransferred = true
@@ -4033,6 +4147,7 @@ func (a *updateAttempt) run(ctx context.Context) (*UpdateResult, error) {
 		CurrentVersion: d.EffectiveVersion(),
 		Config:         cfg.AutoUpdate,
 		CDNBase:        effectiveUpdateCDNBase(cfg.AutoUpdate),
+		Verifier:       d.managedUpdateVerifier(cfg.AutoUpdate),
 		SkipExit:       true, // HTTP-driven update: caller decides to exit.
 	})
 	return updater.RunUpdate(ctx)

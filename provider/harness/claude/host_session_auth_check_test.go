@@ -105,3 +105,41 @@ printf '{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty"}\n'
 		t.Fatalf("relative native config locator lost: %v", err)
 	}
 }
+
+// TestIsClaudeLoginRefusal_PathFragmentIsNotRefusal pins the corrupt-config
+// shape: a diagnostic quoting an operator-selected directory whose name
+// holds the refusal phrase (split across a line break in the directory
+// name) must not read as logged out, while the CLI's own refusal sentences
+// still do.
+func TestIsClaudeLoginRefusal_PathFragmentIsNotRefusal(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		stderr string
+		want   bool
+	}{
+		{
+			"corrupt config quoting phrase-named directory",
+			"not logged in - archived/.claude.json: JSON Parse error: Expected '}'\n",
+			false,
+		},
+		{
+			"error-prefixed corrupt config quoting phrase-named directory",
+			"Error: not logged in - archived/.claude.json: JSON Parse error: Expected '}'\n",
+			false,
+		},
+		{
+			"windows path quoting phrase-named directory",
+			"not logged in - archived\\.claude.json: JSON Parse error\n",
+			false,
+		},
+		{"bare refusal", "Not logged in\n", true},
+		{"refusal sentence", "Not logged in. Run claude auth login to authenticate.\n", true},
+		{"error-prefixed refusal", "Error: Not logged in\n", true},
+		{"unrelated output", "Configuration error: unexpected token\n", false},
+		{"empty", "", false},
+	} {
+		if got := isClaudeLoginRefusal(tc.stderr); got != tc.want {
+			t.Errorf("%s: isClaudeLoginRefusal = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}

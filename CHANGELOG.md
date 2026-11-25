@@ -10,6 +10,128 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 No unreleased changes.
 
+## v0.73.16 — 2026-11-25
+
+### Chores
+
+- Report per-session chat readiness on the session status wire
+
+## v0.73.15 — 2026-11-24
+
+### Chores
+
+- Preserve successful turn result when isolated config cleanup fails
+- Pi handshake: retry one slow start, classify broken extensions
+
+## v0.73.14 — 2026-11-24
+
+### Features
+
+- Expose a Go reader for replaying the current run’s local session journal and following live events.
+
+## v0.73.13 — 2026-11-24
+
+### Features
+
+- Honour a profile-declared cyber access program per turn
+- Shared tool presentation rules for every harness
+- Normalized instructions, translation report, effective settings
+
+### Fixes
+
+- Keep a completed turn's result when MCP cleanup is contained
+
+### Chores
+
+- Preserve provider metering evidence for probed logins
+- Auto-recovered session work
+- Expose per-session chat readiness and prove hook delivery
+- Harden transcript-tail redaction for failed sessions
+- Report a failed turn's provider error instead of the last progress note
+
+## v0.73.12 — 2026-11-23
+
+### Chores
+
+- The fast lane's `local-verify` status read-back now retries for about 35 seconds instead of reading the eventually consistent combined status once.
+
+## v0.73.11 — 2026-11-21
+
+### Features
+
+- Handle event model v2 kinds
+
+## v0.73.10 — 2026-11-21
+
+### Features
+
+- Event model v2 kinds and item ids
+
+### Fixes
+
+- Send reasoning effort as turn/start effort
+
+### Chores
+
+- Publish subscription plan definitions in capability catalog
+- Withdraw the flat subscription plan catalog
+- SubscriptionProviders catalog section
+
+## v0.73.9 — 2026-11-16
+
+### Fixes
+
+- Fit the requested output into the context window
+
+## v0.73.8 — 2026-11-15
+
+### Features
+
+- A work item can ask a human-controlled session to start in bypass permission mode with the optional `startPermissionMode` field. The only value is `"bypass"`. It is honoured only when the work item's `executionSecurity` section already stamps `toolApproval` at `"bypass"`: the Claude interactive lane then starts with `--permission-mode bypassPermissions` (it still passes `--allow-dangerously-skip-permissions`, so the operator can leave the mode), and the Muse interactive lane starts with `--approval-mode never`. Without the field, or under a stricter `toolApproval` level, or without the section, the session starts in the CLI default mode as before and the runner logs why at info level. Autonomous sessions are unchanged. The field is part of the operational payload and its digest; a work item without it projects and hashes exactly as before. The request is also bound into the prepared-harness authority digest when set; plans compiled without it keep their digest. Any other present value, including the empty string, is refused before spawn exactly as a malformed `executionSecurity` section is: `execution_security_unresolvable`, reported as a terminal session failure (failure mode `execution-security`, reason naming `startPermissionMode`) instead of being requeued. JSON `null` reads as absent.
+
+## v0.73.7 — 2026-11-13
+
+### Fixes
+
+- A continue-mode turn that ends abnormally (the harness exits or is killed, reports a failed result, or ends on a provider or harness error) now records that cause as the terminal reason with its stable failure mode (`silent-exit`, `provider-error`) instead of the "continued pull request is still a draft" contract message, on every turn including continuation turns. The draft message is kept for a turn that completed normally and delivered no code. A continuation turn that dies after the continued pull request already carries the session's delivered code still completes, with the death recorded as a post-session warning.
+- The runner truncates an oversized tool result around a marker before it retains or forwards it (audit log, activity stream, pull request scan), keeping the head and the tail; the seat keeps going and the session records a warning, and a turn that still dies names the oversize in its terminal reason. The bound applies to the runner's copy: the harness has already handed the full result to the model. The default is 256 KiB (`runner.DefaultMaxToolOutputBytes`); operators set `maxToolOutputBytes` in the daemon configuration (stated to each worker as `DONMAI_MAX_TOOL_OUTPUT_BYTES`, read by `agent run --max-tool-output-bytes`), and embedders set `runner.Options.MaxToolOutputBytes`.
+- E2B template publisher: build `donmai-worker-node-pg` at 8 vCPU / 8 GiB instead of 16 GiB. The E2B account refuses any sandbox above 8192 MiB (`400: Memory can't be higher than 8192 MiB`), so the node-pg build has failed on every release since the template first shipped in v0.73.3, failing the publisher and the release train stages behind it. The memory request now comes from the repository variable `E2B_NODE_PG_MEMORY_MB` and defaults to 8192, so it can be raised without a code change once E2B lifts the account limit. Type checks in this template should use a 6 GiB heap (`NODE_OPTIONS=--max-old-space-size=6144`) instead of 12 GiB. The base and Go templates are unchanged.
+- E2B node-pg template: the Postgres build-time smoke now passes on a builder that runs systemd. With the memory request accepted, the build failed next at `pg-start` with `Job for postgresql@17-main.service failed`: as root under systemd, `pg_ctlcluster 17 main start` hands the start to `systemctl`, and the server then refused to start as the unprivileged sandbox account because the default TLS key belongs to the `postgres` account. `pg-start` and the smoke's stop calls now pass `--skip-systemctl-redirect`, the cluster sets `ssl = off` (local trust connections only, as before) and its `start.conf` is `manual`, so systemd never starts the cluster at boot and `pg-start` stays the only way it comes up.
+
+### Chores
+
+- E2B template publisher: the `donmai-worker-node-pg` build and verification steps are now non-fatal. A release can ship without the node-pg template: the publisher run concludes success, and the release train continues, when only that template fails. The failure is not silent. The run carries a workflow warning annotation and a job summary line (`NOT PUBLISHED` or `FAILED VERIFICATION`) naming the failed step. Nothing consumes the template yet; anything that starts to must check the publisher summary for its release. The base and Go template steps stay fatal.
+
+## v0.73.6 — 2026-11-12
+
+### Features
+
+- Add `runtime/depprep`, a session-independent entry point that prepares a plain checkout's dependencies through the kit dependency-store entries that select it. Any caller, including a non-agent executor in another Go module, calls `New(Config)` and `Prepare(ctx, Request)`. Without a keeper it runs a two-phase frozen install (fetch, then an offline install) into a per-run cache under the caller's scratch directory, with an environment built from nothing, install-time package code off unless a confiner is supplied, the 60-second online floor and 15-second reserve, and nine closed error codes. A leaf no entry selects returns `not_applicable` and runs nothing. The runner's own install is unchanged.
+- Kit manifests (`api = "donmai.dev/v2"`) gain three dependency-store keys: `versions` (a semver range of package-manager versions an entry covers), `[provide.dependency_store.no_code] env` (settings that make every phase run no package code) and `[provide.dependency_store.credentials] config_env` (the variable that names the per-run credential file). A kit may now declare one manager more than once when the `versions` ranges are disjoint, for example pnpm `>=9 <10` and `>=10 <11`; overlapping ranges within a kit are a validation error, and across kits they conflict unless the composition lock selects one. Composition now keys entries by manager and range, and carries each installed kit package's verified root so a package-owned path resolves against it. Daemons built before this change reject a manifest carrying the new keys.
+- The daemon's kit registry is now an entry source for `runtime/depprep` (`KitRegistry.Entries`). For a checkout it returns the dependency-store entries of every enabled kit that supports the host OS and declares an entry whose lockfiles the checkout holds, whether or not the kit's detect rules match, so a plain JavaScript repository with `package.json` and `pnpm-lock.yaml` and no `tsconfig.json` gets the TypeScript kit's pnpm entries. The registry selects nothing: `Prepare` picks the manager (the leaf's `packageManager` decides within an ecosystem) and then the entry whose `versions` range covers the pinned version, or the version the entry's version command reports, or fails with `toolchain_mismatch`. Manifest validation and selection now share one `versions` range grammar, in which a pre-release belongs to its release line (`10.0.0-rc.1` is covered by `>=10 <11`, not by `>=9 <10`) and npm x-ranges (`9.x`, `*`) are accepted.
+
+### Fixes
+
+- Raise the Go toolchain to 1.26.11, which fixes GO-2026-6859 (HTTP/1 server crash from a `MaxBytesReader` header race in `net/http`); the `Go vuln scan` check passes again. Toolchain pins in `go.mod`, the Makefile, the signing-integration workflow, the worker, E2B and upgrade-acceptance images, and the contributor docs move together.
+- Kit hooks: a relative `post_acquire` or `pre_release` path (a single token with a path separator, such as `bin/setup.sh`) now runs the file inside the kit's verified package, never the repository's file of that name. Before, `sh -c bin/setup.sh` ran in the repository worktree: a repository without that file failed provisioning, and a repository with one had its own script run in the kit's name. An absolute path, a path that escapes the package (`..` or a symlink), a missing file, or a relative path in a manifest with no verified package root (a flat, non-package kit) is refused at composition with `ErrHookPathInvalid`. Inline shell text (a command with arguments, `make setup`, `npm ci`, a bare word with no separator) is unchanged and still runs in the repository. A kit that relied on a hook naming the repository's own script must use inline text such as `sh ./bin/setup.sh`, or ship the script in its package.
+
+## v0.73.5 — 2026-11-11
+
+### Chores
+
+- Allow redelivery to replace a never-spawned preflight receipt
+
+## v0.73.4 — 2026-11-10
+
+### Features
+
+- Add `host doctor temp`: reports the user temp folder by producer (donmai artefacts, codex homes, donmai caches, shared tool caches) with sampled counts and sizes, flat-directory warnings and a boot-cleanup estimate; `--fix` removes donmai artefacts whose owner is gone, and `--fix --include-tool-caches` removes shared tool caches after confirmation with no seat running. The report and fix are a Go API (`tempdoctor`) an embedding product can wrap.
+- Record the owning process in the name of every temp artefact probes, harness sessions and the runner create, and reclaim them at daemon start and hourly once the owner is gone.
+
+### Fixes
+
+- Reclaim codex homes that no codex process ever used once their owner is confirmed dead, instead of holding them for the 24-hour unverified floor.
+
 ## v0.73.3 — 2026-11-06
 
 ### Chores

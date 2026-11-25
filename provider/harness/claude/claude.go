@@ -149,6 +149,9 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}
+	if spec.Env, err = withProviderHTTPHeaders(spec.Env); err != nil {
+		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
+	}
 	// Reasoning effort is fixed through the environment only for stamped
 	// headless sessions (effort.go): the configured level, or the model's
 	// own default when none is configured — never a level saved in the
@@ -160,6 +163,11 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 		spec.Env = withEffortEnv(spec.Env, spec.Effort)
 	}
 	spec.Env = withAutoMemoryDisabledEnv(spec.Env)
+	// A host-login session (host-session/local) must authenticate with the
+	// host's own CLI login: strip every model-provider key and billing
+	// redirect from the spec layer here, and from the composed child env in
+	// spawn (auth_mode.go).
+	spec, unsetEnv := applyAuthMode(spec)
 	// Interactive spawn mode (W4): capability-gated on the live manifest, not
 	// a static branch — a future edit that flips SupportsInteractivePTY back
 	// to false makes this a silent no-op fallthrough to the headless path
@@ -175,7 +183,7 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}
-	return p.spawn(ctx, spec, "", ownedSessionID)
+	return p.spawn(ctx, spec, "", ownedSessionID, unsetEnv)
 }
 
 // spawn is the internal Provider.Spawn/Resume implementation. It writes
@@ -188,7 +196,7 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 // On any failure prior to the subprocess being started, the driver
 // cleans up the MCP tmpfile and returns an error wrapping
 // agent.ErrSpawnFailed.
-func (p *Provider) spawn(ctx context.Context, spec agent.Spec, resumeSessionID, ownedSessionID string) (agent.Handle, error) {
+func (p *Provider) spawn(ctx context.Context, spec agent.Spec, resumeSessionID, ownedSessionID string, unsetEnv []string) (agent.Handle, error) {
 	// Materialize the session's native skills on EVERY spawn, fresh and
 	// resumed alike, into a new plugin directory, verified against the
 	// plan before the child starts (skills.go).
@@ -222,7 +230,7 @@ func (p *Provider) spawn(ctx context.Context, spec agent.Spec, resumeSessionID, 
 	// driver admits exactly that pair beside the pin), and is removed when
 	// the handle stops.
 	resumeExtra := append(resumePinArgs(spec), skills.Args...)
-	handle, err := clijsonl.SpawnBinaryWithOwnedSessionID(ctx, p.binary, argv, stdinPrompt, mcpPath, resumeExtra, spec.Cwd, spec.Env, spec.OnProcessSpawned, ownedSessionIDForHandle(resumeSessionID, ownedSessionID))
+	handle, err := clijsonl.SpawnBinaryWithOwnedSessionID(ctx, p.binary, argv, stdinPrompt, mcpPath, resumeExtra, spec.Cwd, spec.Env, spec.OnProcessSpawned, ownedSessionIDForHandle(resumeSessionID, ownedSessionID), unsetEnv...)
 	if err != nil {
 		releaseSkills()
 		return nil, err
@@ -266,11 +274,15 @@ func (p *Provider) Resume(ctx context.Context, sessionID string, spec agent.Spec
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}
+	if spec.Env, err = withProviderHTTPHeaders(spec.Env); err != nil {
+		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
+	}
 	if forceEffortEnv(spec) {
 		spec.Env = withEffortEnv(spec.Env, spec.Effort)
 	}
 	spec.Env = withAutoMemoryDisabledEnv(spec.Env)
-	return p.spawn(ctx, spec, sessionID, "")
+	spec, unsetEnv := applyAuthMode(spec)
+	return p.spawn(ctx, spec, sessionID, "", unsetEnv)
 }
 
 // Shutdown is a no-op for the CLI shell-out provider. Each session is

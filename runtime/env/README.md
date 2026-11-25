@@ -88,6 +88,39 @@ DONMAI_INJECTED_ENV_KEYS=GEMINI_API_KEY,OPENAI_API_KEY
 Helpers: `ParseInjectedEnvKeys(value)`, `InjectedEnvKeysFrom(entries []string)`,
 `InjectedEnvKeysFromMap(map[string]string)`, and `InjectedEnvKeySet.Allows(key)`.
 
+## `DONMAI_PROVIDER_HTTP_HEADERS` — provider request headers
+
+A session env var, not blocklisted, that declares extra HTTP headers a harness
+sends on every request to its model provider (app attribution for a model
+gateway, say). The value is newline-separated `Name: Value` lines, the format
+the Claude Code CLI reads from `ANTHROPIC_CUSTOM_HEADERS`:
+
+```
+DONMAI_PROVIDER_HTTP_HEADERS=http-referer: https://example.com
+x-title: Example App
+```
+
+`agent.ParseProviderHTTPHeaders` validates it: lines are trimmed, blank lines
+skipped, each splits on its first `:`. Names must be unique RFC 7230 tokens;
+values printable ASCII. At most 16 headers. Names that would override auth or
+transport are refused (`authorization`, `proxy-authorization`, `cookie`,
+`host`, `content-length`, `content-type`, `x-api-key`, `anthropic-api-key`,
+`api-key`, `transfer-encoding`, `connection`, `te`, `upgrade`, `x-goog-api*`).
+A malformed value refuses the session with `*agent.ProviderHTTPHeadersError`;
+headers are never silently dropped. Absent or blank changes nothing.
+
+| Harness | Where the headers go |
+|---|---|
+| claude | merged into `ANTHROPIC_CUSTOM_HEADERS`: existing lines kept, names not already present appended |
+| codex | `http_headers` on the gateway `model_providers` block (sessions with an endpoint base URL) |
+| pi | `headers` on the injected provider, and a header-only override on a natively pinned built-in provider; values escaped so pi's `$NAME` and `!command` syntax stays literal. The values ride the owner-only session credential file, never the exec environment |
+| opencode | `options.headers` on the injected provider; values holding `{env:` or `{file:` are refused |
+
+On claude the declared values reach the CLI child's exec environment through
+`ANTHROPIC_CUSTOM_HEADERS`, because that child receives `Spec.Env` there, so a
+same-user process listing can read them: header values are not secret-safe on
+claude.
+
 ## Heuristic helpers
 
 - `IsBlocked(key string) bool` — exact match against the effective blocklist.

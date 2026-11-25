@@ -1164,6 +1164,11 @@ func TestPersistExecutionPreflightV2ReaffirmsExactBytes(t *testing.T) {
 	if err != nil || string(got) != string(receipt) {
 		t.Fatalf("exact replay = %s, %v", got, err)
 	}
+	// Once the spawn commits, a changed replay is refused even though a
+	// never-spawned receipt may be replaced on redelivery.
+	if err := store.MarkExecutionPreflightSpawned("session-1"); err != nil {
+		t.Fatalf("mark spawned: %v", err)
+	}
 	changed := slices.Clone(receipt)
 	changed = append(changed[:len(changed)-1], ' ', '}')
 	if _, err := persistExecutionPreflightV2(store, "session-1", changed); err == nil {

@@ -8,6 +8,7 @@ import (
 
 	"charm.land/lipgloss/v2"
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/agent/present"
 	"github.com/RenseiAI/tui-components/theme"
 )
 
@@ -189,6 +190,25 @@ func summarizeEvent(ev TailEvent) (kind, summary string) {
 		return "result", truncateRunes(collapseWS(msg), maxStreamSummary)
 	case agent.ErrorEvent:
 		return "error", truncateRunes(collapseWS(e.Message), maxStreamSummary)
+	case agent.ReasoningEvent:
+		txt := strings.TrimSpace(e.Summary)
+		if txt == "" {
+			txt = strings.TrimSpace(e.Text)
+		}
+		if txt == "" {
+			return "", ""
+		}
+		return "reasoning", truncateRunes(collapseWS(txt), maxStreamSummary)
+	case agent.PlanEvent:
+		return "plan", truncateRunes(collapseWS(e.Summary()), maxStreamSummary)
+	case agent.FileChangeEvent:
+		return "file_change", truncateRunes(collapseWS(e.Summary()), maxStreamSummary)
+	case agent.NoticeEvent:
+		return "notice", truncateRunes(collapseWS(e.Text), maxStreamSummary)
+	case agent.InteractiveRequestEvent:
+		return "ask", truncateRunes(collapseWS(string(e.RequestKind)+": "+e.Prompt), maxStreamSummary)
+	case agent.TurnEvent:
+		return "", "" // a boundary, not content
 	default:
 		return string(ev.Event.Kind()), ""
 	}
@@ -208,50 +228,11 @@ func contentFreeSubtype(subtype string) bool {
 	return false
 }
 
-// toolUseSummary renders a tool-use event as "Tool: arg" — a local
-// re-implementation of the activity poster's summarizeToolUse (which is
-// package-private to runtime/activity), keeping hostwatch dependency-free of
-// that package.
+// toolUseSummary renders a tool-use event as "Tool: arg" through the shared
+// presentation rules, so the stream labels a call exactly as the activity
+// poster summarizes it.
 func toolUseSummary(e agent.ToolUseEvent) string {
-	name := e.ToolName
-	if name == "" {
-		name = "tool"
-	}
-	var arg string
-	switch {
-	case strings.EqualFold(name, "Bash"):
-		arg = strArg(e.Input, "command")
-	case strings.EqualFold(name, "Read"), strings.EqualFold(name, "Edit"),
-		strings.EqualFold(name, "Write"), strings.EqualFold(name, "NotebookEdit"):
-		arg = strArg(e.Input, "file_path")
-	case strings.EqualFold(name, "Grep"), strings.EqualFold(name, "Glob"):
-		arg = strArg(e.Input, "pattern")
-	case strings.EqualFold(name, "Agent"), strings.EqualFold(name, "Task"):
-		arg = strArg(e.Input, "description")
-		if arg == "" {
-			arg = strArg(e.Input, "prompt")
-		}
-	}
-	if arg == "" {
-		return name
-	}
-	return name + ": " + collapseWS(arg)
-}
-
-// strArg returns the trimmed string value of input[key], or "".
-func strArg(input map[string]any, key string) string {
-	if input == nil {
-		return ""
-	}
-	v, ok := input[key]
-	if !ok {
-		return ""
-	}
-	s, ok := v.(string)
-	if !ok {
-		return ""
-	}
-	return strings.TrimSpace(s)
+	return present.DescribeTool(e.ToolName, e.Input).Summary()
 }
 
 // llmCallSummary renders one model call as a compact token/cost line:

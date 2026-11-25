@@ -26,6 +26,9 @@ import (
 // azure host) is not routable — silently spawning against a default would
 // mis-bill and mis-route.
 func applyEndpoint(spec agent.Spec) (agent.Spec, error) {
+	if _, err := providerHeaders(spec.Env); err != nil {
+		return spec, err
+	}
 	ep := spec.Endpoint
 	if ep == nil {
 		return spec, nil
@@ -78,6 +81,28 @@ func applyEndpoint(spec agent.Spec) (agent.Spec, error) {
 	}
 	spec.Env = env
 	return spec, nil
+}
+
+// providerHeaders returns the session's declared provider headers
+// (agent.ProviderHTTPHeadersEnv) for the injected provider's options.headers,
+// which opencode documents as custom headers sent with each request; nil when
+// none are declared. opencode substitutes "{env:NAME}" and "{file:path}"
+// anywhere in its config text, so a value carrying either token is refused:
+// written as is, it would send an environment value or a file's contents to
+// the provider.
+func providerHeaders(env map[string]string) (map[string]string, error) {
+	declared, err := agent.ProviderHTTPHeadersFromEnv(env)
+	if err != nil || len(declared) == 0 {
+		return nil, err
+	}
+	out := make(map[string]string, len(declared))
+	for _, h := range declared {
+		if strings.Contains(h.Value, "{env:") || strings.Contains(h.Value, "{file:") {
+			return nil, &agent.ProviderHTTPHeadersError{Reason: fmt.Sprintf("header %q value carries an opencode config substitution", strings.ToLower(h.Name))}
+		}
+		out[h.Name] = h.Value
+	}
+	return out, nil
 }
 
 func exactBoundAPIKey(env map[string]string) (string, error) {

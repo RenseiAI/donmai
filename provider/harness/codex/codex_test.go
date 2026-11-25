@@ -557,8 +557,11 @@ func TestProvider_WaitsForMCPInventoryBeforeThreadStart(t *testing.T) {
 	if err := h.Stop(t.Context()); err != nil {
 		t.Fatalf("Stop: %v", err)
 	}
-	if got := cleanupStatusCalls.Load(); got != 2 {
-		t.Fatalf("cleanup status calls = %d, want 2 (retired server present then absent)", got)
+	// The clear is retried with a short bounded backoff, so a transient
+	// timeout under the tight per-test RPC deadline may add attempts: require
+	// at least the present-then-absent pair, not exactly two.
+	if got := cleanupStatusCalls.Load(); got < 2 {
+		t.Fatalf("cleanup status calls = %d, want at least 2 (retired server present then absent)", got)
 	}
 }
 

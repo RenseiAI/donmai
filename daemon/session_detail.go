@@ -597,6 +597,16 @@ type SessionModelProfile struct {
 // to spawned `donmai agent run` processes. Concurrent-safe; the spawner
 // writes on AcceptWork and the HTTP server reads on
 // /api/daemon/sessions/<id>.
+//
+// Reservation and publication are split so an accept never publishes a
+// struct it is still mutating: Reserve installs an invisible ownership
+// marker (no detail is visible yet), the accept builds its private detail
+// copy, then Publish atomically installs the completed copy. A contender
+// that loses the reservation never touches the durable receipt, and
+// readers never observe a half-built struct. All stored and returned
+// details are copies — the store never aliases a caller-owned pointer and
+// never hands out its live pointer — so the runtime-token refresher and
+// the HTTP/detail readers cannot race the accept path.
 type sessionDetailStore struct {
 	mu             sync.RWMutex
 	details        map[string]*SessionDetail
@@ -606,11 +616,30 @@ type sessionDetailStore struct {
 	// time. It authorizes exactly one route — the session-detail GET for
 	// the session named beside it — and is never served on any response.
 	readTokens map[string]string
+	// reserved holds invisible session reservations installed by Reserve
+	// and consumed by Publish or DeleteIfOwner. A reserved id has no
+	// visible detail yet: Get reports it absent until Publish installs
+	// the completed copy. The reservation carries the latest known
+	// worker credentials so a runtime-token refresh that lands during
+	// the accept window is not lost when the completed detail publishes.
+	reserved map[string]*pendingSessionReservation
 }
+
+// pendingSessionReservation is the invisible ownership marker Reserve
+// installs. It names the accepting generation and the latest worker
+// credentials observed for it, whether stamped at reserve time or applied
+// later by UpdateRuntimeCredentials while the accept is still building
+// its private detail copy.
 
 type sessionDetailLease struct {
 	sessionID  string
 	generation uint64
+}
+
+type pendingSessionReservation struct {
+	generation uint64
+	workerID   string
+	authToken  string
 }
 
 // newSessionDetailStore returns an empty store.
@@ -619,12 +648,14 @@ func newSessionDetailStore() *sessionDetailStore {
 		details:     make(map[string]*SessionDetail),
 		generations: make(map[string]uint64),
 		readTokens:  make(map[string]string),
+		reserved:    make(map[string]*pendingSessionReservation),
 	}
 }
 
-// Set stores the detail under d.SessionID. Overwrites any prior entry.
-// Runtime admission uses StoreIfAbsent instead so a retry cannot replace an
-// already-running session's detail. Like StoreIfAbsent, Set mints the
+// Set stores a copy of the detail under d.SessionID. Overwrites any prior entry.
+// Runtime admission uses Reserve/Publish instead so a retry cannot replace an
+// already-running session's detail and readers never observe a half-built
+// struct. Like StoreIfAbsent, Set mints the
 // per-session read credential when the session names none yet, so a
 // detail installed through this path never serves its credentials to the
 // operator token while leaving the spawned worker with no credential of
@@ -635,8 +666,12 @@ func (s *sessionDetailStore) Set(d *SessionDetail) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.details[d.SessionID] = d
+	cp := *d
+	s.details[d.SessionID] = &cp
 	s.generations[d.SessionID] = s.nextGenerationLocked()
+	if s.reserved != nil {
+		delete(s.reserved, d.SessionID)
+	}
 	if s.readTokens == nil {
 		s.readTokens = make(map[string]string)
 	}
@@ -651,9 +686,88 @@ func (s *sessionDetailStore) Set(d *SessionDetail) {
 	}
 }
 
-// StoreIfAbsent installs d only when its session id is not already owned. The
+// Reserve installs an invisible ownership marker for sessionID without
+// publishing any detail. The accept path reserves before compiling or
+// publishing its receipt and holds the lease through spawn, so a contender
+// that loses the reservation returns before touching the durable receipt.
+// The returned lease identifies this exact reservation so a failed attempt
+// can roll itself back without deleting a later generation. A reserved id
+// stays invisible to Get until Publish installs the completed copy.
+func (s *sessionDetailStore) Reserve(sessionID, workerID, authToken string) (sessionDetailLease, bool) {
+	if sessionID == "" {
+		return sessionDetailLease{}, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, exists := s.details[sessionID]; exists {
+		return sessionDetailLease{}, false
+	}
+	if s.reserved != nil {
+		if _, exists := s.reserved[sessionID]; exists {
+			return sessionDetailLease{}, false
+		}
+	} else {
+		s.reserved = make(map[string]*pendingSessionReservation)
+	}
+	generation := s.nextGenerationLocked()
+	s.reserved[sessionID] = &pendingSessionReservation{generation: generation, workerID: workerID, authToken: authToken}
+	if s.readTokens == nil {
+		s.readTokens = make(map[string]string)
+	}
+	// Mint the per-session read credential at reservation time so the
+	// spawner can state it in the worker environment once the completed
+	// detail publishes. A retry that finds the id already owned keeps
+	// the first token, so at most one live credential ever names this
+	// session generation.
+	if _, ok := s.readTokens[sessionID]; !ok {
+		if tok := mintSessionReadToken(); tok != "" {
+			s.readTokens[sessionID] = tok
+		}
+	}
+	return sessionDetailLease{sessionID: sessionID, generation: generation}, true
+}
+
+// Publish atomically installs the completed detail for a reservation
+// previously installed by Reserve. The store keeps a copy so the caller
+// cannot mutate the published value after publication, and readers
+// observe either the absent id or the fully built detail — never a
+// half-mutated struct. Any credential refresh that landed on the
+// reservation while the accept was building its private copy is folded
+// into the published value so it is not lost. Reports false when the
+// lease does not own the reservation (stale rollback or a later
+// generation already published).
+func (s *sessionDetailStore) Publish(lease sessionDetailLease, d *SessionDetail) bool {
+	if d == nil || lease.sessionID == "" || lease.generation == 0 {
+		return false
+	}
+	if d.SessionID != lease.sessionID {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	pending, ok := s.reserved[lease.sessionID]
+	if !ok || pending == nil || pending.generation != lease.generation {
+		return false
+	}
+	if _, exists := s.details[lease.sessionID]; exists {
+		return false
+	}
+	cp := *d
+	// Fold in the latest credentials observed on the reservation. The
+	// private copy may predate a refresh that arrived mid-accept; the
+	// reservation holds the newest values under the same lock.
+	cp.WorkerID = pending.workerID
+	cp.AuthToken = pending.authToken
+	s.details[lease.sessionID] = &cp
+	s.generations[lease.sessionID] = lease.generation
+	delete(s.reserved, lease.sessionID)
+	return true
+}
+
+// StoreIfAbsent installs a copy of d only when its session id is not already owned. The
 // returned lease identifies this exact installation so a failed attempt can
-// roll itself back without deleting a later generation.
+// roll itself back without deleting a later generation. A reserved id counts
+// as owned so a direct install cannot slip in beside an in-flight accept.
 func (s *sessionDetailStore) StoreIfAbsent(d *SessionDetail) (sessionDetailLease, bool) {
 	if d == nil || d.SessionID == "" {
 		return sessionDetailLease{}, false
@@ -663,8 +777,14 @@ func (s *sessionDetailStore) StoreIfAbsent(d *SessionDetail) (sessionDetailLease
 	if _, exists := s.details[d.SessionID]; exists {
 		return sessionDetailLease{}, false
 	}
+	if s.reserved != nil {
+		if _, exists := s.reserved[d.SessionID]; exists {
+			return sessionDetailLease{}, false
+		}
+	}
 	generation := s.nextGenerationLocked()
-	s.details[d.SessionID] = d
+	cp := *d
+	s.details[d.SessionID] = &cp
 	s.generations[d.SessionID] = generation
 	if s.readTokens == nil {
 		s.readTokens = make(map[string]string)
@@ -688,13 +808,24 @@ func (s *sessionDetailStore) nextGenerationLocked() uint64 {
 	return s.nextGeneration
 }
 
-// Get returns the detail for the given session id, or (nil, false)
-// when absent.
+// Get returns a copy of the detail for the given session id, or (nil, false)
+// when absent. The copy is made under the store lock so a concurrent
+// UpdateRuntimeCredentials cannot race a reader dereferencing the returned
+// value: callers own the copy and must not expect mutations to reach the
+// store. A reserved-but-unpublished id reports absent — readers observe
+// either nothing or the fully built detail, never a half-mutated struct.
 func (s *sessionDetailStore) Get(id string) (*SessionDetail, bool) {
+	if id == "" {
+		return nil, false
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	detail, ok := s.details[id]
-	return detail, ok
+	if !ok || detail == nil {
+		return nil, false
+	}
+	cp := *detail
+	return &cp, true
 }
 
 // UpdateRuntimeCredentials refreshes the worker credentials exposed to the
@@ -730,6 +861,23 @@ func (s *sessionDetailStore) UpdateRuntimeCredentials(prevWorkerID, workerID, au
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	updated := 0
+	// Reservations carry the latest credentials so a refresh that lands
+	// mid-accept is folded into the published detail instead of lost.
+	// The reservation update is sequenced under the same lock as the
+	// publish that consumes it, so the accept's private copy never races
+	// the refresher.
+	for _, pending := range s.reserved {
+		if pending == nil || pending.workerID != prevWorkerID {
+			continue
+		}
+		if workerID != "" {
+			pending.workerID = workerID
+		}
+		if authToken != "" {
+			pending.authToken = authToken
+		}
+		updated++
+	}
 	for _, d := range s.details {
 		if d == nil || d.WorkerID != prevWorkerID {
 			continue
@@ -747,12 +895,19 @@ func (s *sessionDetailStore) UpdateRuntimeCredentials(prevWorkerID, workerID, au
 
 // Delete removes the detail for the given session id (idempotent).
 // Called by the daemon when a session terminates so stale auth tokens
-// don't linger in memory.
+// don't linger in memory. It also clears any lingering reservation for
+// the id so a terminated session never blocks a later generation.
 func (s *sessionDetailStore) Delete(id string) {
+	if id == "" {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.details, id)
 	delete(s.generations, id)
+	if s.reserved != nil {
+		delete(s.reserved, id)
+	}
 	// The read credential dies with the detail it names: a terminated
 	// session's credential must not outlive the session.
 	delete(s.readTokens, id)
@@ -760,18 +915,38 @@ func (s *sessionDetailStore) Delete(id string) {
 
 // DeleteIfOwner removes only the generation installed by lease. It is the
 // rollback path for a rejected spawn attempt; a stale rollback must never
-// remove a detail installed by a later attempt for the same session id.
+// remove a detail installed by a later attempt for the same session id. It
+// removes either the invisible reservation (accept failed before Publish)
+// or the published detail (accept failed after Publish) that carries the
+// lease's generation.
 func (s *sessionDetailStore) DeleteIfOwner(lease sessionDetailLease) bool {
 	if lease.sessionID == "" || lease.generation == 0 {
 		return false
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.reserved != nil {
+		if pending, ok := s.reserved[lease.sessionID]; ok && pending != nil && pending.generation == lease.generation {
+			delete(s.reserved, lease.sessionID)
+			// Roll back the credential minted for this exact reservation
+			// with it: a failed attempt must not leave a live credential
+			// behind, and a later generation mints its own on reserve.
+			// Only delete the token when no published detail still names
+			// the id; a published detail keeps its own credential.
+			if _, exists := s.details[lease.sessionID]; !exists {
+				delete(s.readTokens, lease.sessionID)
+			}
+			return true
+		}
+	}
 	if _, ok := s.details[lease.sessionID]; !ok || s.generations[lease.sessionID] != lease.generation {
 		return false
 	}
 	delete(s.details, lease.sessionID)
 	delete(s.generations, lease.sessionID)
+	if s.reserved != nil {
+		delete(s.reserved, lease.sessionID)
+	}
 	// Roll back the credential minted for this exact installation with it:
 	// a failed attempt must not leave a live credential behind, and a
 	// later generation mints its own on install.

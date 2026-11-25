@@ -2,6 +2,7 @@ package runner
 
 import (
 	"encoding/json"
+	"fmt"
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/executioncell"
@@ -106,6 +107,25 @@ type QueuedWork struct {
 	//
 	// Wire shape: "executionSecurity" (camelCase, omitempty).
 	ExecutionSecurity *agent.ExecutionSecurity `json:"executionSecurity,omitempty"`
+
+	// StartPermissionMode asks a human-controlled session to START in a
+	// wider permission mode than the harness CLI's default. The only value
+	// is [StartPermissionModeBypass]. Any other present value is refused
+	// exactly as a malformed executionSecurity section is: the daemon's
+	// pre-spawn check (agent.ExecutionSecurityFromOperationalPayload) and
+	// this field's closed decoder both return the typed
+	// execution_security_unresolvable refusal, which the daemon reports as a
+	// terminal session failure instead of requeueing the work item. JSON
+	// null reads as absent. It is a request, never a grant:
+	// translateSpec honours it only for a human-controlled session whose
+	// stamped toolApproval level is already "bypass", so it can never widen
+	// what the execution-security levels allow. It is part of the
+	// operational payload (and so of the admission digest).
+	//
+	// Wire shape: "startPermissionMode" (camelCase, omitempty). Absent is
+	// the pre-field behaviour byte-for-byte: a human-controlled session
+	// starts in the CLI default mode.
+	StartPermissionMode StartPermissionMode `json:"startPermissionMode,omitempty"`
 
 	// Branch is the working branch name the runner should use when
 	// provisioning the worktree. Empty falls back to "agent/<sessionID>".
@@ -259,6 +279,30 @@ const (
 	PermissionProfileAutonomous PermissionProfile = "autonomous"
 )
 
+// StartPermissionMode is the permission mode a human-controlled session
+// asks to start in — see QueuedWork.StartPermissionMode. The zero value is
+// "no request".
+type StartPermissionMode string
+
+// StartPermissionModeBypass asks a human-controlled session to start in the
+// harness's bypass (never-ask) permission mode. The wire literal is spelled
+// once, in agent.StartPermissionModeBypass.
+const StartPermissionModeBypass StartPermissionMode = agent.StartPermissionModeBypass
+
+// UnmarshalJSON is the closed decoder for QueuedWork.startPermissionMode. It
+// delegates to agent.ParseStartPermissionMode, the same decoder the daemon's
+// pre-spawn check runs: JSON null reads as absent, and any other value that
+// is not exactly "bypass" fails the decode with the typed
+// execution_security_unresolvable refusal.
+func (m *StartPermissionMode) UnmarshalJSON(raw []byte) error {
+	value, err := agent.ParseStartPermissionMode(raw)
+	if err != nil {
+		return fmt.Errorf("startPermissionMode: %w", err)
+	}
+	*m = StartPermissionMode(value)
+	return nil
+}
+
 // ResolvedProfile names the profile knobs the platform resolved for
 // this session. Mirrors F.1.1 §4 ResolvedProfile shape.
 //
@@ -308,6 +352,13 @@ type ResolvedProfile struct {
 
 	// Endpoint is the resolved serving binding forwarded to agent.Spec.
 	Endpoint *agent.EndpointBinding `json:"endpoint,omitempty"`
+
+	// AuthMode is the auth mode the control plane resolved for this session,
+	// taken from the session detail's resolved profile and forwarded to
+	// agent.Spec.AuthMode. It is deliberately excluded from JSON ("-"): it is
+	// never read from the operational payload, so the canonical payload
+	// projection (and every admission digest over it) stays byte-identical.
+	AuthMode agent.AuthMode `json:"-"`
 }
 
 // interactiveRunMode is the QueuedWork.Mode value that activates the

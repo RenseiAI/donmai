@@ -23,6 +23,7 @@ const {
   assertVersionOutput,
   executableDockerfileText,
   hasBuildTimeVectorSmoke,
+  hasSystemdSafePgControl,
   hasCToolchainForRace,
   hasClusterOwnedBySandboxUser,
   hasE2bCompatibleGoPath,
@@ -2068,7 +2069,11 @@ test('release workflow gates node-pg verification on the release checkout', () =
     'node-pg template build must be gated on the release containing the node-pg Dockerfile'
   )
   assert.match(nodePgBuild, /E2B_CPU_COUNT:\s*8/, 'node-pg template build must request 8 vCPU')
-  assert.match(nodePgBuild, /E2B_MEMORY_MB:\s*16384/, 'node-pg template build must request 16384 MB')
+  assert.match(
+    nodePgBuild,
+    /E2B_MEMORY_MB:\s*\$\{\{\s*vars\.E2B_NODE_PG_MEMORY_MB\s*\|\|\s*'8192'\s*\}\}/,
+    'node-pg template build must request vars.E2B_NODE_PG_MEMORY_MB, defaulting to 8192 MB'
+  )
   assert.match(nodePgBuild, /E2B_DOCKERFILE:\s*e2b\.node-pg\.Dockerfile/, 'node-pg build must select the node-pg Dockerfile')
   const baseVerify = workflowStepBlock(workflow, 'Assert published E2B template binary version')
   assert.doesNotMatch(
@@ -2311,4 +2316,46 @@ test('e2b.node-pg.Dockerfile proves an unprivileged start at build time', () => 
   const executable = executableDockerfileText(dockerfile)
   assert.match(executable, /su user -s \/bin\/sh -c 'pg-start'/)
   assert.match(executable, /su user -s \/bin\/sh -c "[^"]*CREATE EXTENSION vector/)
+})
+
+test('e2b.node-pg.Dockerfile keeps Postgres start and stop off systemd', () => {
+  // The E2B builder runs systemd. A bare root `pg_ctlcluster 17 main start`
+  // is redirected to systemctl there and fails the build-time smoke with
+  // "Job for postgresql@17-main.service failed"; the server also refuses to
+  // start as the sandbox account while ssl is on (the snakeoil key belongs
+  // to the postgres account), and an auto-started unit races pg-start.
+  const repoRoot = testRepoRoot()
+  const dockerfile = fs.readFileSync(
+    path.join(repoRoot, 'worker', 'e2b', 'e2b.node-pg.Dockerfile'),
+    'utf8'
+  )
+  assert.equal(hasSystemdSafePgControl(dockerfile), true)
+  assert.equal(hasPgStartScript(dockerfile), true)
+  assert.equal(hasBuildTimeVectorSmoke(dockerfile), true)
+
+  const good = [
+    'FROM x',
+    'RUN echo "ssl = off" >> /etc/postgresql/17/main/postgresql.conf && echo manual > /etc/postgresql/17/main/start.conf',
+    "RUN echo 'pg_ctlcluster --skip-systemctl-redirect 17 main start' >> /usr/local/bin/pg-start",
+    'RUN pg-start && pg_ctlcluster --skip-systemctl-redirect 17 main stop',
+    '',
+  ].join('\n')
+  assert.equal(hasSystemdSafePgControl(good), true)
+  assert.equal(
+    hasSystemdSafePgControl(good.replace('pg_ctlcluster --skip-systemctl-redirect 17 main start', 'pg_ctlcluster 17 main start')),
+    false,
+    'a start without the flag is redirected to systemctl'
+  )
+  assert.equal(
+    hasSystemdSafePgControl(good.replace('pg_ctlcluster --skip-systemctl-redirect 17 main stop', 'pg_ctlcluster 17 main stop')),
+    false,
+    'a stop without the flag is redirected to systemctl'
+  )
+  assert.equal(hasSystemdSafePgControl(good.replace('echo "ssl = off"', 'echo "ssl = on"')), false)
+  assert.equal(hasSystemdSafePgControl(good.replace('echo manual >', 'echo auto >')), false)
+  assert.equal(
+    hasSystemdSafePgControl('# pg_ctlcluster --skip-systemctl-redirect 17 main start\n# echo "ssl = off" >> /etc/postgresql/17/main/postgresql.conf\nFROM x\n'),
+    false,
+    'comments do not count'
+  )
 })

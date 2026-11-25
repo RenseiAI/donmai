@@ -344,8 +344,9 @@ func TestFixedHoldCancelMidHoldReturnsShutdown(t *testing.T) {
 
 // TestFixedHoldConfigValidation pins the config gate: a fixed-attempt policy
 // may hold past its budget only when the composing layer holds the lineage on
-// unbounded terms, and the keepalive and cap fields stay refused in fixed
-// mode — the hold runs on the default cap and the derived interval.
+// unbounded terms, the backoff ceiling is configurable for that hold, and the
+// keepalive interval stays refused in fixed mode — the hold derives it from
+// the orphan deadline.
 func TestFixedHoldConfigValidation(t *testing.T) {
 	t.Parallel()
 	orphan := sessionshim.OrphanPolicy{Deadline: 90 * time.Second, TerminationGrace: 5 * time.Second}
@@ -365,9 +366,12 @@ func TestFixedHoldConfigValidation(t *testing.T) {
 	if err := unheld.validateReadoptionAgainstOrphanPolicy(); !errors.Is(err, ErrSessionShimReadoptionPolicy) {
 		t.Fatalf("fixed hold without LineageLive validate = %v, want ErrSessionShimReadoptionPolicy", err)
 	}
+	// The backoff ceiling is configurable in both modes (see
+	// DefaultSessionShimReadoptionBackoffCap): a fixed hold past its budget
+	// retries with capped backoff, so the cap is meaningful there too.
 	capped := SessionShimReadoptionPolicy{BackoffCap: time.Second}
-	if err := capped.Validate(); !errors.Is(err, ErrSessionShimReadoptionPolicy) {
-		t.Fatalf("fixed BackoffCap Validate = %v, want ErrSessionShimReadoptionPolicy", err)
+	if err := capped.Validate(); err != nil {
+		t.Fatalf("fixed BackoffCap Validate = %v, want nil", err)
 	}
 	interval := SessionShimReadoptionPolicy{KeepaliveInterval: time.Second}
 	if err := interval.Validate(); !errors.Is(err, ErrSessionShimReadoptionPolicy) {
@@ -534,13 +538,18 @@ func TestFixedHoldBackoffStaysCapped(t *testing.T) {
 	go func() {
 		done <- f.daemon.readoptSessionShimAfterControllerLoss(f.id, lost, 0)
 	}()
-	deadline := time.Now().Add(10 * time.Second)
+	// The waits are virtual, but every attempt between them is a real dial
+	// and durable-adoption round trip. Six of them under a loaded parallel
+	// -race run can take well over ten seconds of wall time, so the backstop
+	// only catches a hold that makes no progress at all; the schedule
+	// assertions below are what this test pins.
+	deadline := time.Now().Add(2 * time.Minute)
 	for {
 		if waits := clock.requestedWaits(); len(waits) >= 6 {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("the hold did not sleep six backoffs within 10s")
+			t.Fatal("the hold did not sleep six backoffs within 2m")
 		}
 		time.Sleep(2 * time.Millisecond)
 	}

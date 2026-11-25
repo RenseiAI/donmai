@@ -320,6 +320,18 @@ type MCPServerConfig struct {
 	// Headers are HTTP headers to send on every MCP request. Typically
 	// holds the Authorization bearer for the platform's MCP route.
 	Headers map[string]string `json:"headers,omitempty"`
+	// RequestTimeoutSeconds bounds Streamable HTTP calls that arrive
+	// without a caller deadline (dial handshake, tools/list, and
+	// tools/call without one). Zero uses the transport default (30s);
+	// negative disables the fallback so a caller-owned context (cancel-only
+	// or an explicit deadline) is the only bound. A slow-but-healthy tool
+	// that outlives the default sets this higher instead of failing at the
+	// shared ceiling.
+	RequestTimeoutSeconds int `json:"requestTimeoutSeconds,omitempty"`
+	// CloseTimeoutSeconds bounds the best-effort session DELETE on Close.
+	// Zero uses the transport default (10s); negative disables the bound
+	// (the DELETE rides the caller's cancellation only).
+	CloseTimeoutSeconds int `json:"closeTimeoutSeconds,omitempty"`
 
 	// protectedRuntimeMCPHeadersHelper is process-owned spawn authority. It is
 	// deliberately absent from every serialized representation.
@@ -451,6 +463,16 @@ type Spec struct {
 	// authority digest.
 	ExecutionSecurity *ExecutionSecurity `json:"executionSecurity,omitempty"`
 
+	// StartInBypass asks a human-controlled (non-Autonomous) interactive
+	// session to start in the harness's bypass permission mode instead of
+	// the CLI default. The runner sets it only when the work item requested
+	// it AND the stamped toolApproval level is already "bypass"; harnesses
+	// honour it only when Autonomous is false and re-check that stamp, so it
+	// never widens what ExecutionSecurity allows. Autonomous sessions
+	// already start in bypass and ignore it. False (the zero value) is the
+	// pre-field behaviour.
+	StartInBypass bool `json:"startInBypass,omitempty"`
+
 	// RepositoryAuthority is the executor-owned per-repository filesystem
 	// policy. Nil is the legacy singular-worktree path. Providers that do not
 	// positively attest the named protocol/enforcement are denied before spawn.
@@ -523,6 +545,21 @@ type Spec struct {
 	// guarantee (P1-SPEC §6). nil is the canonical "unset" sentinel.
 	Endpoint *EndpointBinding `json:"endpoint,omitempty"`
 
+	// AuthMode is the auth mode the control plane resolved for this session
+	// (byok, metered, shared, host-session or local). Empty when the dispatch
+	// stamped none; harnesses then keep their historical behavior.
+	//
+	// A harness whose native CLI can authenticate either with a host login or
+	// with a model-provider key reads it to decide which credential surface
+	// its child may see. Under host-session or local the child authenticates
+	// with the host's own CLI login, so no model-provider key and no
+	// billing-redirecting base URL may reach it from ANY layer, a
+	// supervisor-declared injection included: a key that rides along would
+	// silently move the session onto API billing. Under byok, metered or
+	// shared the declared credential is the session's auth and rides the
+	// usual trusted layers. Read site: provider/harness/claude (auth_mode.go).
+	AuthMode AuthMode `json:"authMode,omitempty"`
+
 	// Effort is the normalized reasoning-effort tier. Honored only
 	// when Capabilities.SupportsReasoningEffort is true.
 	Effort EffortLevel `json:"effort,omitempty"`
@@ -539,6 +576,11 @@ type Spec struct {
 	// for every existing producer, and interactive (non-one-shot) Spawns
 	// never set it.
 	ResponseSchema json.RawMessage `json:"responseSchema,omitempty"`
+
+	// Instructions carries the harness-neutral intents of the interaction
+	// contract (plan mode, approvals, tool policy). Nil means none; each
+	// adapter's TranslateInstructions reports how it honours each one.
+	Instructions *Instructions `json:"instructions,omitempty"`
 
 	// Interactive requests spawn-under-PTY with a live interactive
 	// session surface (interactive-attach-v1; see agent/interactive.go).

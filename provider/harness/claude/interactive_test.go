@@ -868,3 +868,62 @@ func TestInteractiveArgs_BypassGrantAllowsOperatorBypass(t *testing.T) {
 		})
 	}
 }
+
+// TestInteractiveArgs_StartInBypass pins that a human-controlled session
+// asking to start in bypass launches with --permission-mode
+// bypassPermissions only under a toolApproval "bypass" stamp, keeps the
+// operator's --allow-dangerously-skip-permissions escape hatch, and that
+// every other spec renders exactly as it did before the field existed.
+func TestInteractiveArgs_StartInBypass(t *testing.T) {
+	t.Parallel()
+
+	const allow = "--allow-dangerously-skip-permissions"
+	grant := func(level agent.ExecutionSecurityLevel) *agent.ExecutionSecurity {
+		return &agent.ExecutionSecurity{Version: 1, Levels: agent.ExecutionSecurityLevels{ToolApproval: level}}
+	}
+	cases := []struct {
+		name string
+		spec agent.Spec
+		want []string
+	}{
+		{
+			name: "bypass stamp and request start in bypass",
+			spec: agent.Spec{Prompt: "hi", StartInBypass: true, ExecutionSecurity: grant(agent.ToolApprovalBypass)},
+			want: []string{allow, "--permission-mode", "bypassPermissions", "--", "hi"},
+		},
+		{
+			name: "bypass stamp without request keeps the CLI default mode",
+			spec: agent.Spec{Prompt: "hi", ExecutionSecurity: grant(agent.ToolApprovalBypass)},
+			want: []string{allow, "--", "hi"},
+		},
+		{
+			name: "deny-list stamp ignores the request",
+			spec: agent.Spec{Prompt: "hi", StartInBypass: true, ExecutionSecurity: grant(agent.ToolApprovalDenyList)},
+			want: []string{"--", "hi"},
+		},
+		{
+			name: "human-approval stamp ignores the request",
+			spec: agent.Spec{Prompt: "hi", StartInBypass: true, ExecutionSecurity: grant(agent.ToolApprovalHumanApprovalForWrites)},
+			want: []string{"--", "hi"},
+		},
+		{
+			name: "no section ignores the request",
+			spec: agent.Spec{Prompt: "hi", StartInBypass: true},
+			want: []string{"--", "hi"},
+		},
+		{
+			name: "autonomous session is already bypass and adds nothing",
+			spec: agent.Spec{Prompt: "hi", Autonomous: true, StartInBypass: true, ExecutionSecurity: grant(agent.ToolApprovalBypass)},
+			want: []string{"--permission-mode", "bypassPermissions", "--disallowedTools", strings.Join(dedupAndSort(append([]string(nil), linearMCPDisallowList...)), ","), "--", "hi"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := interactiveArgs(tc.spec)
+			if !slices.Equal(got, tc.want) {
+				t.Fatalf("interactiveArgs = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}

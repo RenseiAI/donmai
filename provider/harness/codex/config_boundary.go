@@ -169,6 +169,35 @@ func resolveHostSessionAuthFile() (string, error) {
 	return filepath.Join(codexHome, codexAuthFileName), nil
 }
 
+// explicitHostSessionAuthFile resolves an explicit source home's auth.json
+// without consulting the default host home. The result must still be
+// projected through linkHostSessionAuth so mode, inode and symlink checks
+// apply. It carries no credential bytes and never names the default home.
+func explicitHostSessionAuthFile(sourceHome string) (string, error) {
+	if !filepath.IsAbs(sourceHome) {
+		return "", errors.New("explicit Codex source home must be absolute")
+	}
+	// Filesystem-resolve the source directory before joining auth.json.
+	// Cleaning first would drop a symlink component and ".." before
+	// the kernel resolves them (for example a "current" symlink inside
+	// "/profiles" pointing elsewhere), selecting a different home's
+	// credential when both homes hold valid auth files. EvalSymlinks
+	// follows the same resolution the kernel applies, so the probe
+	// projects exactly the selected login. Only the directory is
+	// resolved: the auth.json name itself stays lexical so a symlinked
+	// credential file still reaches linkHostSessionAuth as a symlink and
+	// is rejected there.
+	resolvedDir, err := filepath.EvalSymlinks(sourceHome)
+	if err != nil {
+		return "", fmt.Errorf("resolve explicit Codex source home: %w", err)
+	}
+	resolvedDir = filepath.Clean(resolvedDir)
+	if !filepath.IsAbs(resolvedDir) {
+		return "", errors.New("explicit Codex source home must be absolute")
+	}
+	return filepath.Join(resolvedDir, codexAuthFileName), nil
+}
+
 // linkHostSessionAuth projects exactly the host login into the private Codex
 // home. A hard link is deliberate: unlike a copy it keeps refresh-token writes
 // coherent, and unlike reusing the host CODEX_HOME it does not expose ambient
@@ -242,7 +271,13 @@ func removeAuthLink(path string) error {
 // silently spawning against the default endpoint. The model still travels
 // through thread/start (resolveModel); the provider id here only names the
 // block.
+//
+// A malformed provider-header declaration (agent.ProviderHTTPHeadersEnv)
+// refuses every session here, routed or not, before any side effect.
 func gatewayBinding(spec agent.Spec) (baseURL, key string, ok bool, err error) {
+	if _, err := agent.ProviderHTTPHeadersFromEnv(spec.Env); err != nil {
+		return "", "", false, fmt.Errorf("codex: %w", err)
+	}
 	ep := spec.Endpoint
 	if ep == nil || strings.TrimSpace(ep.BaseURL) == "" {
 		return "", "", false, nil
@@ -286,12 +321,16 @@ func (b *codexConfigBoundary) appendGatewayProviderBlock(baseURL, key string, sp
 	if strings.Contains(string(body), codexGatewayProviderID) {
 		return projectGatewayKey(specEnv, key), b.validate()
 	}
+	headers, err := gatewayHTTPHeadersLine(specEnv)
+	if err != nil {
+		return nil, err
+	}
 	block := "model_provider = " + tomlBasicString(codexGatewayProviderID) + "\n" +
 		"[model_providers." + codexGatewayProviderID + "]\n" +
 		"name = " + tomlBasicString(codexGatewayProviderID) + "\n" +
 		"base_url = " + tomlBasicString(baseURL) + "\n" +
 		"env_key = " + tomlBasicString(codexGatewayEnvKey) + "\n" +
-		"wire_api = \"responses\"\n"
+		"wire_api = \"responses\"\n" + headers
 	f, err := os.OpenFile(b.configPath, os.O_WRONLY|os.O_APPEND, codexConfigMode)
 	if err != nil {
 		return nil, fmt.Errorf("append gateway provider block: %w", err)
@@ -307,6 +346,22 @@ func (b *codexConfigBoundary) appendGatewayProviderBlock(baseURL, key string, sp
 		return nil, fmt.Errorf("secure isolated Codex config: %w", err)
 	}
 	return projectGatewayKey(specEnv, key), b.validate()
+}
+
+// gatewayHTTPHeadersLine renders the session's declared provider headers
+// (agent.ProviderHTTPHeadersEnv) as the provider block's http_headers inline
+// table: codex sends those literal values on every request to the provider.
+// No declaration renders nothing, so the block stays byte-identical.
+func gatewayHTTPHeadersLine(specEnv map[string]string) (string, error) {
+	headers, err := agent.ProviderHTTPHeadersFromEnv(specEnv)
+	if err != nil || len(headers) == 0 {
+		return "", err
+	}
+	pairs := make([]string, 0, len(headers))
+	for _, h := range headers {
+		pairs = append(pairs, tomlBasicString(h.Name)+" = "+tomlBasicString(h.Value))
+	}
+	return "http_headers = { " + strings.Join(pairs, ", ") + " }\n", nil
 }
 
 // appendUntrustedProjects records each dir as an untrusted project in the
