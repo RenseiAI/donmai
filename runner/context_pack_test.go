@@ -496,10 +496,16 @@ func TestRunContextPackRefusesSymlinkedContextParent(t *testing.T) {
 // `git status`, unstaged by the backstop, and absent from both the backstop
 // commit and any WIP checkpoint — even when force-staged into the index.
 //
-// RED (with the `.workarea` row removed from the shared harness-state
-// table): `git status` reports `?? .workarea/`, `git add -A` stages the
-// documents, the backstop commits them, and the WIP scratch index keeps
-// them, so every assertion below fails.
+// The exclusion is scoped to this session's own pack directory: the pack's
+// ignore file hides it from Git, and the session-scoped prefix on the
+// backstop and the rescue target drops it even when force-staged. No
+// session-less rule names .workarea/ (see
+// TestWorkareaEditsStayWorkWithoutSessionDocuments).
+//
+// RED (with the pack ignore file no longer written): `git status` reports
+// `?? .workarea/` and `git add -A` stages the documents. RED (with the
+// session-scoped prefix dropped from the backstop): the force-staged
+// documents enter the backstop commit.
 func TestRunContextPackStaysOutOfRepositoryCommits(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not on PATH")
@@ -619,7 +625,8 @@ func TestRunContextPackStaysOutOfRepositoryCommits(t *testing.T) {
 	// WIP production path: with no work beyond the excluded documents,
 	// no checkpoint is created, so no reserved ref can carry them.
 	head := gitRun(t, checkout, "rev-parse", "HEAD")
-	checkpoint, warnings, err := createWIPCheckpoint(ctx, qw, rescueTarget{path: checkout, base: head}, "refs/wip/"+qw.SessionID+"/1")
+	target := rescueTarget{path: checkout, base: head, sessionDocuments: sessionDocumentPrefix(res, checkout)}
+	checkpoint, warnings, err := createWIPCheckpoint(ctx, qw, target, "refs/wip/"+qw.SessionID+"/1")
 	if err != nil {
 		t.Fatalf("createWIPCheckpoint: %v (warnings %v)", err, warnings)
 	}

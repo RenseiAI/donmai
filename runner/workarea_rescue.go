@@ -50,6 +50,35 @@ type rescueTarget struct {
 	path string
 	// base is HEAD right after provisioning; "" when it could not be read.
 	base string
+	// sessionDocuments is the checkout-relative pack directory (with a
+	// trailing slash) this session published negotiated documents into,
+	// or "" when it published none inside this checkout. Only that exact
+	// directory is session machinery; every other path keeps the
+	// session-less rules. See sessionDocumentPrefix.
+	sessionDocuments string
+}
+
+// excludesFromBackstop reports whether path is not work in this checkout:
+// the shared backstop rules, plus this session's own published pack.
+func (t rescueTarget) excludesFromBackstop(path string) bool {
+	return shouldExcludeFromBackstop(path) || underSessionDocuments(t.sessionDocuments, path)
+}
+
+// excludesFromWIPCheckpoint is excludesFromBackstop for the WIP checkpoint's
+// stricter secret filter.
+func (t rescueTarget) excludesFromWIPCheckpoint(path string) bool {
+	return shouldExcludeFromWIPCheckpoint(path) || underSessionDocuments(t.sessionDocuments, path)
+}
+
+// meaningfulPaths drops the paths this checkout's backstop would never commit.
+func (t rescueTarget) meaningfulPaths(paths []string) []string {
+	var out []string
+	for _, path := range paths {
+		if !t.excludesFromBackstop(strings.TrimSuffix(path, "/")) {
+			out = append(out, path)
+		}
+	}
+	return out
 }
 
 // rescueGitTimeout bounds the whole rescue of one checkout.
@@ -110,6 +139,7 @@ func recordRescueTargets(ctx context.Context, res *Result, targets []rescueTarge
 			targets[i].base = sha
 		}
 		cancel()
+		targets[i].sessionDocuments = sessionDocumentPrefix(res, targets[i].path)
 	}
 	res.rescueTargets = targets
 }
@@ -449,7 +479,7 @@ func (r *Runner) rescueCheckout(sessionID string, dirFor func() (string, error),
 	if err != nil {
 		return rescueArchive{}, fmt.Errorf("git status: %w", err)
 	}
-	changed := meaningfulPaths(porcelainPaths(status))
+	changed := target.meaningfulPaths(porcelainPaths(status))
 
 	unpushed, err := unpushedCommits(ctx, target)
 	if err != nil {
@@ -481,7 +511,7 @@ func (r *Runner) rescueCheckout(sessionID string, dirFor func() (string, error),
 	}
 	var excluded []string
 	for _, path := range strings.Split(staged, "\x00") {
-		if path != "" && shouldExcludeFromBackstop(path) {
+		if path != "" && target.excludesFromBackstop(path) {
 			excluded = append(excluded, path)
 		}
 	}
@@ -653,17 +683,6 @@ func porcelainPaths(out string) []string {
 		}
 	}
 	return paths
-}
-
-// meaningfulPaths drops the paths the backstop would never commit.
-func meaningfulPaths(paths []string) []string {
-	var out []string
-	for _, path := range paths {
-		if !shouldExcludeFromBackstop(strings.TrimSuffix(path, "/")) {
-			out = append(out, path)
-		}
-	}
-	return out
 }
 
 // rescueLabel names a checkout in logs and archive file names.

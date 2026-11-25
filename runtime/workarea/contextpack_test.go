@@ -268,7 +268,7 @@ func TestMaterializeContextPackRefusesLimits(t *testing.T) {
 
 func TestMaterializeContextPackRefusesSymlinkEscape(t *testing.T) {
 	root := RootPath(t.TempDir())
-	finalRel := ContextPackDir(root, "pack1")
+	finalRel := ContextPackDir("pack1")
 	finalAbs := filepath.Join(string(root), filepath.FromSlash(finalRel))
 	if err := os.MkdirAll(filepath.Dir(finalAbs), 0o700); err != nil {
 		t.Fatal(err)
@@ -278,8 +278,15 @@ func TestMaterializeContextPackRefusesSymlinkEscape(t *testing.T) {
 		t.Fatal(err)
 	}
 	pack := ContextPackV1{Version: ContextPackProtocol, PackID: "pack1", Documents: []ContextDocumentV1{testPackDoc(t, "doc.md", "x")}}
-	if _, err := MaterializeContextPack(root, pack); err == nil {
+	_, err := MaterializeContextPack(root, pack)
+	if err == nil {
 		t.Fatal("symlink-occupied pack accepted")
+	}
+	// The pack-directory guard refuses with a typed reason before any
+	// open follows the link.
+	var packErr *ContextPackError
+	if !errors.As(err, &packErr) || packErr.Reason != ReasonContextPackUnsafe {
+		t.Fatalf("symlink-occupied refusal = %v; want a typed %q refusal", err, ReasonContextPackUnsafe)
 	}
 	if entries, _ := os.ReadDir(target); len(entries) != 0 {
 		t.Fatal("symlink target changed")
@@ -312,7 +319,7 @@ func redeliverMustRefuse(t *testing.T, root RootPath, pack ContextPackV1, what s
 // or symlinked document must refuse instead of reporting the original
 // digest as still included.
 func TestMaterializeContextPackRedeliveryReprovesDocuments(t *testing.T) {
-	finalRel := ContextPackDir(RootPath("."), "pack1")
+	finalRel := ContextPackDir("pack1")
 	tamper := map[string]func(t *testing.T, abs string){
 		"deleted": func(t *testing.T, abs string) {
 			if err := os.Remove(abs); err != nil {
@@ -359,7 +366,7 @@ func TestMaterializeContextPackRefusesForgedMarker(t *testing.T) {
 	for _, forge := range []func(*ContextPackReport){func(r *ContextPackReport) { r.Dir = "../../outside" }, func(r *ContextPackReport) { r.Version = "unrecognized-version" }} {
 		root := RootPath(t.TempDir())
 		pack := publishPackForRedelivery(t, root)
-		markerAbs := filepath.Join(string(root), filepath.FromSlash(ContextPackDir(root, pack.PackID)), ContextPackMarkerName)
+		markerAbs := filepath.Join(string(root), filepath.FromSlash(ContextPackDir(pack.PackID)), ContextPackMarkerName)
 		raw, err := os.ReadFile(markerAbs)
 		if err != nil {
 			t.Fatal(err)
@@ -395,7 +402,7 @@ func TestMaterializeContextPackRefusesPlantedMarker(t *testing.T) {
 	planted, err := json.Marshal(ContextPackReport{
 		PackID:  "pack1",
 		Version: ContextPackProtocol,
-		Dir:     ContextPackDir(root, "pack1"),
+		Dir:     ContextPackDir("pack1"),
 		Included: []ContextPackIncluded{
 			{Path: "doc.md", Bytes: 1, Digest: digest},
 		},
@@ -403,7 +410,7 @@ func TestMaterializeContextPackRefusesPlantedMarker(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	plantDir := filepath.Join(string(root), filepath.FromSlash(ContextPackDir(root, "pack1")))
+	plantDir := filepath.Join(string(root), filepath.FromSlash(ContextPackDir("pack1")))
 	if err := os.MkdirAll(plantDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -422,7 +429,7 @@ func TestMaterializeContextPackRefusesPlantedMarker(t *testing.T) {
 func TestMaterializeContextPackMarkerFIFORefusesWithoutBlocking(t *testing.T) {
 	root := RootPath(t.TempDir())
 	pack := ContextPackV1{Version: ContextPackProtocol, PackID: "pack1", Documents: []ContextDocumentV1{testPackDoc(t, "doc.md", "x")}}
-	packDir := filepath.Join(string(root), filepath.FromSlash(ContextPackDir(root, "pack1")))
+	packDir := filepath.Join(string(root), filepath.FromSlash(ContextPackDir("pack1")))
 	if err := os.MkdirAll(packDir, 0o700); err != nil {
 		t.Fatal(err)
 	}

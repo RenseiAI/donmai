@@ -2,6 +2,8 @@ package runner
 
 import (
 	"log/slog"
+	"path/filepath"
+	"strings"
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/runtime/workarea"
@@ -52,4 +54,31 @@ func (r *Runner) materializeContextPack(qw QueuedWork, workareaRoot string, res 
 		)
 	}
 	return nil
+}
+
+// sessionDocumentPrefix returns the checkout-relative pack directory, with a
+// trailing slash, that this session published negotiated documents into
+// INSIDE checkout, or "" when there is none. Only the flat layout puts the
+// pack inside a checkout (the checkout is the workarea root); a declared
+// layout publishes beside its repository leaves. A session that carried no
+// pack, or whose pack was refused, gets "" and keeps exactly the
+// session-less exclusion rules: nothing else under .workarea/, and no
+// nested sub/.workarea/, is ever treated as session machinery.
+func sessionDocumentPrefix(res *Result, checkout string) string {
+	if res == nil || res.ContextPack == nil || res.ContextPack.Dir == "" || checkout == "" || res.WorkareaRoot == "" {
+		return ""
+	}
+	if filepath.Clean(checkout) != filepath.Clean(res.WorkareaRoot) {
+		return ""
+	}
+	return strings.TrimSuffix(res.ContextPack.Dir, "/") + "/"
+}
+
+// underSessionDocuments reports whether the checkout-relative path is the
+// session's pack directory or inside it. An empty prefix matches nothing.
+func underSessionDocuments(prefix, path string) bool {
+	if prefix == "" || path == "" {
+		return false
+	}
+	return path == strings.TrimSuffix(prefix, "/") || strings.HasPrefix(path, prefix)
 }

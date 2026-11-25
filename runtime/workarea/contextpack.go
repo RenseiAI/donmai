@@ -14,6 +14,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"unicode"
 )
 
 // ContextPackProtocol is the exact versioned carrier the runner materializes.
@@ -24,6 +25,16 @@ const (
 	ContextPackDirName = "context"
 	// ContextPackMarkerName records the published pack identity.
 	ContextPackMarkerName = "pack.json"
+	// ContextPackIgnoreName is the ignore file written into every pack
+	// directory. In the flat layout the workarea root IS the Git checkout,
+	// so the pack directory sits inside it; this file (content
+	// ContextPackIgnoreContent) keeps exactly that directory out of
+	// `git status` and `git add -A` without touching the tracked
+	// .gitignore, the shared exclude file, or any other .workarea path.
+	ContextPackIgnoreName = ".gitignore"
+	// ContextPackIgnoreContent ignores everything in the pack directory,
+	// the ignore file included.
+	ContextPackIgnoreContent = "*\n"
 
 	// MaxContextPackDocuments bounds one pack.
 	MaxContextPackDocuments = 32
@@ -106,19 +117,12 @@ type ContextPackIncluded struct {
 	Digest string `json:"digest"`
 }
 
-// ContextPackExcluded is one rejected document.
-type ContextPackExcluded struct {
-	Path   string `json:"path"`
-	Reason string `json:"reason"`
-}
-
 // ContextPackReport is the sanitized materialization diagnostic.
 type ContextPackReport struct {
 	PackID   string                `json:"packId"`
 	Version  string                `json:"version"`
 	Dir      string                `json:"dir,omitempty"`
 	Included []ContextPackIncluded `json:"included"`
-	Excluded []ContextPackExcluded `json:"excluded,omitempty"`
 }
 
 // DecodeContextPack validates the raw carrier and returns the pack.
@@ -167,6 +171,14 @@ func ValidateContextPack(pack ContextPackV1) error {
 		// they are distinct strings. Pinned by
 		// TestValidateContextPackRefusesCaseVariantCollision.
 		key := strings.ToLower(clean)
+		// The marker and the ignore file share the pack directory with
+		// the documents: a document at (or under) either name would
+		// overwrite or shadow them, so both names are reserved, folded
+		// for the same case-insensitive reason as above.
+		top, _, _ := strings.Cut(key, "/")
+		if top == ContextPackMarkerName || top == ContextPackIgnoreName {
+			return &ContextPackError{Reason: ReasonContextPackCollision, Path: doc.Path, Detail: "reserved destination"}
+		}
 		if _, dup := seen[key]; dup {
 			return &ContextPackError{Reason: ReasonContextPackCollision, Path: doc.Path, Detail: "duplicate destination"}
 		}
@@ -181,6 +193,11 @@ func cleanContextPackPath(p string) (string, error) {
 	}
 	if path.IsAbs(p) {
 		return "", &ContextPackError{Reason: ReasonContextPackUnsafe, Path: p, Detail: "absolute path"}
+	}
+	// Control characters never name a document and would corrupt the
+	// diagnostics that echo the path (res.Error and the report).
+	if strings.ContainsFunc(p, unicode.IsControl) {
+		return "", &ContextPackError{Reason: ReasonContextPackUnsafe, Detail: "control character in path"}
 	}
 	if strings.Contains(p, "\\") {
 		return "", &ContextPackError{Reason: ReasonContextPackUnsafe, Path: p, Detail: "backslash in path"}
@@ -219,8 +236,8 @@ func SupportsContextPack(protocols []string) bool {
 	return false
 }
 
-// ContextPackDir returns the publish path for one pack under the root.
-func ContextPackDir(_ RootPath, packID string) string {
+// ContextPackDir returns the root-relative publish path for one pack.
+func ContextPackDir(packID string) string {
 	return DeclarationDirName + "/" + ContextPackDirName + "/" + packID
 }
 
@@ -315,7 +332,7 @@ func MaterializeContextPack(root RootPath, pack ContextPackV1) (ContextPackRepor
 		}
 		return ContextPackReport{}, fmt.Errorf("runtime/workarea: create context directory: %w", err)
 	}
-	finalRel := ContextPackDir(root, pack.PackID)
+	finalRel := ContextPackDir(pack.PackID)
 	if existing, readErr := readContextPackMarker(rootHandle, finalRel); readErr == nil {
 		// Redelivery trusts nothing it has not re-proved: the marker
 		// must name exactly this pack (identity, version, directory
@@ -329,6 +346,9 @@ func MaterializeContextPack(root RootPath, pack ContextPackV1) (ContextPackRepor
 			existing.Dir != finalRel ||
 			!sameIncludedDigests(existing.Included, included) {
 			return ContextPackReport{}, &ContextPackError{Reason: ReasonContextPackConflict, Path: pack.PackID, Detail: "different pack occupies context directory"}
+		}
+		if err := verifyContextPackIgnore(rootHandle, finalRel); err != nil {
+			return ContextPackReport{}, err
 		}
 		if err := verifyContextPackDocuments(rootHandle, finalRel, included); err != nil {
 			return ContextPackReport{}, err
@@ -356,6 +376,11 @@ func MaterializeContextPack(root RootPath, pack ContextPackV1) (ContextPackRepor
 		return ContextPackReport{}, fmt.Errorf("runtime/workarea: open staging: %w", err)
 	}
 	defer func() { _ = stagingRoot.Close() }()
+	// The ignore file goes in first, so even a staging directory a crash
+	// leaves behind is invisible to Git in a flat checkout.
+	if err := writeContextPackFile(stagingRoot, ContextPackIgnoreName, []byte(ContextPackIgnoreContent)); err != nil {
+		return ContextPackReport{}, fmt.Errorf("runtime/workarea: write ignore file: %w", err)
+	}
 	for _, doc := range stagedDocs {
 		if dir := path.Dir(doc.rel); dir != "." {
 			if err := stagingRoot.MkdirAll(dir, 0o700); err != nil {
@@ -538,4 +563,48 @@ func contextStagingName() (string, error) {
 		return "", fmt.Errorf("runtime/workarea: staging name: %w", err)
 	}
 	return ".staging-" + hex.EncodeToString(random[:]), nil
+}
+
+// writeContextPackFile creates name exclusively under root and writes body.
+func writeContextPackFile(root *os.Root, name string, body []byte) error {
+	file, err := root.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := file.Write(body); err != nil {
+		_ = file.Close()
+		return err
+	}
+	return file.Close()
+}
+
+// verifyContextPackIgnore re-proves the pack directory's ignore file on
+// redelivery: it must still be a regular file holding exactly
+// ContextPackIgnoreContent. A removed or rewritten ignore file would let a
+// flat checkout's `git add -A` stage the published documents, so it refuses
+// like any other tampered publication.
+func verifyContextPackIgnore(root *os.Root, finalRel string) error {
+	packRoot, err := root.OpenRoot(finalRel)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = packRoot.Close() }()
+	ident, err := packRoot.Lstat(ContextPackIgnoreName)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return &ContextPackError{Reason: ReasonContextPackInvalid, Path: ContextPackIgnoreName, Detail: "published ignore file missing"}
+		}
+		return err
+	}
+	if !ident.Mode().IsRegular() || ident.Size() != int64(len(ContextPackIgnoreContent)) {
+		return &ContextPackError{Reason: ReasonContextPackUnsafe, Path: ContextPackIgnoreName, Detail: "published ignore file changed"}
+	}
+	body, err := packRoot.ReadFile(ContextPackIgnoreName)
+	if err != nil {
+		return err
+	}
+	if string(body) != ContextPackIgnoreContent {
+		return &ContextPackError{Reason: ReasonContextPackUnsafe, Path: ContextPackIgnoreName, Detail: "published ignore file changed"}
+	}
+	return nil
 }

@@ -1045,7 +1045,7 @@ func (r *Runner) run(ctx context.Context, qw QueuedWork, admission *HarnessAdmis
 					inspectionCtx, inspectionCancel := context.WithTimeout(context.Background(), 30*time.Second)
 					var assessment worktree.PublicationAssessment
 					lease, assessment, acquireErr = r.wt.AcquireInteractiveTerminalLease(
-						inspectionCtx, interactivePublicationSpec(qw), acquireSpec, leaseRequested,
+						inspectionCtx, interactivePublicationSpec(qw, sessionDocumentPrefix(res, res.WorktreePath)), acquireSpec, leaseRequested,
 					)
 					inspectionCancel()
 					r.logger.Info("interactive workarea publication disposition",
