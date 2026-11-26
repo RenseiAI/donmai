@@ -611,8 +611,35 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 			res.PostSessionWarnings = append(res.PostSessionWarnings, warning)
 		}
 	}
-	runnerStatePath := wpath
+	// Negotiated documents land before the first executor turn: the versioned
+	// carrier is validated, decoded and published under the session-owned
+	// context directory. Any refusal fails before spawn so rejected documents
+	// are never claimed as included.
 	selectedRepositoryReadOnly := repositoryDeclaration != nil && repositoryDeclaration.Selected.Authority == workarea.RepositoryReadOnly
+	if err := r.materializeContextPack(qw, res.WorkareaRoot, res, provider, r.logger); err != nil {
+		// A refusal still owns the provisioned checkouts: record their
+		// bases (reseeding re-entered generations) so teardown can
+		// preserve unrelated repository work instead of deleting the
+		// workarea without archiving it. The refusal itself is unchanged.
+		switch {
+		case repositoryFree:
+		case repositoryDeclaration != nil:
+			targets := make([]rescueTarget, 0, len(repositoryDeclaration.Repositories))
+			for _, repository := range repositoryDeclaration.Repositories {
+				if repository.Authority == workarea.RepositoryMutable {
+					if path := declaredRepositoryPaths[repository.Name]; path != "" {
+						targets = append(targets, rescueTarget{name: repository.Name, path: path})
+					}
+				}
+			}
+			recordRescueTargets(ctx, res, targets)
+			reseedRescueBasesFromDeclaration(ctx, res, res.WorkareaRoot, r.wt, qw.SessionID, r.logger)
+		case !selectedRepositoryReadOnly:
+			recordRescueTargets(ctx, res, []rescueTarget{{path: wpath}})
+		}
+		return res, err
+	}
+	runnerStatePath := wpath
 	if selectedRepositoryReadOnly {
 		runnerStatePath = filepath.Join(res.WorkareaRoot, workarea.DeclarationDirName, "runner")
 		root, err := os.OpenRoot(res.WorkareaRoot)
