@@ -290,10 +290,17 @@ func (s *autoUpdateScheduler) attemptOnce() {
 	if cfg == nil || !autoUpdateSchedulerWanted(cfg) {
 		return
 	}
+	// Consent stays local (above); the channel and origin resolve once per
+	// tick through the effective precedence (host-local, then the heartbeat
+	// system snapshot, then the compiled default). The pre-check and the
+	// Update below share this one snapshot: re-resolving for the Update
+	// would let a pre-check on one channel drain the host for an Update
+	// that then finds a different channel current and strands it draining.
+	autoCfg := d.effectiveAutoUpdateConfig(cfg)
 	bound := d.drainTimeout() + d.autoUpdateRunBoundOrDefault()
 	ctx, cancel := context.WithTimeout(s.ctx, bound)
 	defer cancel()
-	manifest, err := d.checkAutoUpdateRelease(ctx, cfg)
+	manifest, err := d.checkAutoUpdateRelease(ctx, autoCfg)
 	if err != nil {
 		slog.Warn("daemon: scheduled auto-update check failed", "error", err)
 		return
@@ -302,12 +309,13 @@ func (s *autoUpdateScheduler) attemptOnce() {
 		// Up-to-date: no lifecycle transition, the machine never drains.
 		return
 	}
-	// Reuse the pre-checked snapshot so a live reload cannot change the
-	// trust root between the pre-check construction and the Update
+	// Reuse the pre-checked snapshot so neither a live reload nor a
+	// heartbeat landing mid-tick can change the trust root, channel or
+	// origin between the pre-check construction and the Update
 	// construction. Construction is non-blocking (see
 	// checkAutoUpdateRelease), so the attempt deadline only bounds the
 	// network half.
-	result, err := d.updateWithConfig(ctx, cfg, true)
+	result, err := d.updateWithConfig(ctx, autoCfg, true)
 	if err != nil {
 		// Update leaves the daemon draining on every exit path; never
 		// resume here — a failed attempt must not silently abandon a
@@ -356,11 +364,11 @@ func (s *autoUpdateScheduler) attemptOnce() {
 // hold the attempt past its bound and no construction goroutine can leak.
 // The manifest fetch below already observes ctx (per-request client
 // bound plus the attempt deadline), so no waiter goroutine is needed.
-func (d *Daemon) checkAutoUpdateRelease(ctx context.Context, cfg *Config) (*VersionManifest, error) {
+func (d *Daemon) checkAutoUpdateRelease(ctx context.Context, autoCfg AutoUpdateConfig) (*VersionManifest, error) {
 	u := NewUpdater(UpdaterOptions{
 		CurrentVersion: d.EffectiveVersion(),
-		Config:         cfg.AutoUpdate,
-		CDNBase:        effectiveUpdateCDNBase(cfg.AutoUpdate),
+		Config:         autoCfg,
+		CDNBase:        effectiveUpdateCDNBase(autoCfg),
 		SkipExit:       true,
 	})
 	return u.CheckForUpdate(ctx)

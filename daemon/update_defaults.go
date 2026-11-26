@@ -270,9 +270,18 @@ func (d *Daemon) EffectiveUpdateCDNBase() (string, UpdateOrigin) {
 // Signing trust, schedule, and timeouts always come from the local file:
 // the system layer can never change verification behavior.
 func (d *Daemon) EffectiveAutoUpdateConfig() AutoUpdateConfig {
+	return d.effectiveAutoUpdateConfig(d.Config())
+}
+
+// effectiveAutoUpdateConfig resolves one effective auto-update snapshot
+// from the given local config (nil means none loaded) and the current
+// system snapshot. Update paths call it once per attempt and thread the
+// result through every construction so the pre-check, updater and
+// verifier never observe two different resolutions.
+func (d *Daemon) effectiveAutoUpdateConfig(cfg *Config) AutoUpdateConfig {
 	var local AutoUpdateConfig
 	localExplicit := false
-	if cfg := d.Config(); cfg != nil {
+	if cfg != nil {
 		local = cfg.AutoUpdate
 		localExplicit = cfg.autoUpdateChannelAuthored
 	}

@@ -2524,7 +2524,12 @@ func (d *Daemon) onYamlChanged(cfg *Config) {
 	// the previous generation stays), so checking for the change here only
 	// decides whether the reload path runs at all.
 	registrationTokenChanged := d.credentials != nil && cfg.Orchestrator.AuthToken != "" && cfg.Orchestrator.AuthToken != d.config.Orchestrator.AuthToken
-	autoUpdateChanged := !reflect.DeepEqual(d.config.AutoUpdate, cfg.AutoUpdate)
+	// The authored bit is part of the block: an operator adding or removing
+	// an explicit "channel: stable" leaves AutoUpdate DeepEqual-unchanged
+	// (the default fill is also stable), yet flips whether the local value
+	// masks the system snapshot and whether WriteConfig keeps the line.
+	autoUpdateChanged := !reflect.DeepEqual(d.config.AutoUpdate, cfg.AutoUpdate) ||
+		d.config.autoUpdateChannelAuthored != cfg.autoUpdateChannelAuthored
 	if !projectsChanged && !localChanged && !capacityChanged && !seatBudgetChanged && !seatQoSChanged && !registrationTokenChanged && !usagePingChanged && !autoUpdateChanged {
 		d.mu.Unlock()
 		releasePolicy()
@@ -2603,6 +2608,7 @@ func (d *Daemon) onYamlChanged(cfg *Config) {
 		// watcher file was already validated on load, so adoption is
 		// unconditional.
 		d.config.AutoUpdate = cfg.AutoUpdate
+		d.config.autoUpdateChannelAuthored = cfg.autoUpdateChannelAuthored
 		if cfg.AutoUpdate.Signers != nil {
 			signers := make([]UpdateSigner, len(cfg.AutoUpdate.Signers))
 			copy(signers, cfg.AutoUpdate.Signers)
@@ -4219,30 +4225,29 @@ func (d *Daemon) Update(ctx context.Context) (*UpdateResult, error) {
 	// owns a restart handoff (exit code 3) that gives a fenced swap a
 	// completion owner. A fenced manual swap would leave the old process
 	// draining with no restart and an explicit resume refused.
-	return d.updateWithConfig(ctx, cfg, false)
+	return d.updateWithConfig(ctx, d.effectiveAutoUpdateConfig(cfg), false)
 }
 
-// updateWithConfig runs one update attempt against a snapshot config. The
-// scheduled tick passes the snapshot it pre-checked so a live reload
-// cannot change the trust root between the pre-check construction and the
-// Update construction; the manual door passes the live config. fenceSwap
+// updateWithConfig runs one update attempt against a resolved effective
+// auto-update snapshot (host-local over the heartbeat system layer, see
+// effectiveAutoUpdateConfig). The scheduled tick passes the snapshot it
+// pre-checked so neither a live reload nor a heartbeat landing mid-tick
+// can change the trust root, channel or origin between the pre-check and
+// the Update; the manual door resolves the live config once. fenceSwap
 // is true only for the scheduled loop: a fenced swap latches
 // updateSwapApplied so Resume refuses and the restart handoff owns
 // completion. Manual updates leave the latch clear so the retained
 // manual-update contract (swap on disk, daemon draining, explicit resume
 // reopens admission) still holds.
-func (d *Daemon) updateWithConfig(ctx context.Context, cfg *Config, fenceSwap bool) (*UpdateResult, error) {
+func (d *Daemon) updateWithConfig(ctx context.Context, autoCfg AutoUpdateConfig, fenceSwap bool) (*UpdateResult, error) {
 	if ctx == nil {
 		ctx = context.Background()
-	}
-	if cfg == nil {
-		return nil, errors.New("no config loaded")
 	}
 	attempt, err := d.beginUpdate(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return attempt.runWithConfig(ctx, cfg, fenceSwap)
+	return attempt.runWithConfig(ctx, autoCfg, fenceSwap)
 }
 
 // updateAttempt transfers the one lifecycle lease from synchronous restart
@@ -4298,10 +4303,11 @@ func (a *updateAttempt) run(ctx context.Context) (*UpdateResult, error) {
 		return nil, errors.New("no config loaded")
 	}
 	// The manual HTTP door never fences: see updateWithConfig.
-	return a.runWithConfig(ctx, cfg, false)
+	return a.runWithConfig(ctx, d.effectiveAutoUpdateConfig(cfg), false)
 }
 
-// runWithConfig executes the leased update against a snapshot config with a
+// runWithConfig executes the leased update against an effective auto-update
+// snapshot with a
 // single post-swap fence shared by both the test-injected prepared-update
 // path and the production updater path, so the fence cannot disappear
 // from one path without the other's tests detecting it. fenceSwap is true
@@ -4312,7 +4318,7 @@ func (a *updateAttempt) run(ctx context.Context) (*UpdateResult, error) {
 // non-blocking (loadUpdateTrustRoot refuses non-regular files without
 // opening them), so no waiter goroutine or attempt-deadline select is
 // needed here.
-func (a *updateAttempt) runWithConfig(ctx context.Context, cfg *Config, fenceSwap bool) (*UpdateResult, error) {
+func (a *updateAttempt) runWithConfig(ctx context.Context, autoCfg AutoUpdateConfig, fenceSwap bool) (*UpdateResult, error) {
 	if a == nil || a.daemon == nil {
 		return nil, errors.New("update attempt is not initialized")
 	}
@@ -4324,16 +4330,13 @@ func (a *updateAttempt) runWithConfig(ctx context.Context, cfg *Config, fenceSwa
 	// A failed, unavailable, or completed self-update does not silently abandon
 	// the prepared stop authorization. finish leaves the daemon draining;
 	// external holds remain in force until explicit resume.
-	if cfg == nil {
-		return nil, errors.New("no config loaded")
-	}
 	var res *UpdateResult
 	var err error
 	if d.runPreparedUpdate != nil {
-		res, err = d.runPreparedUpdate(ctx, d.EffectiveAutoUpdateConfig(), d.EffectiveVersion())
+		res, err = d.runPreparedUpdate(ctx, autoCfg, d.EffectiveVersion())
 	} else {
 		var updater *Updater
-		updater, err = d.newUpdaterWithContext(ctx)
+		updater, err = d.newUpdaterWithContext(ctx, autoCfg)
 		if err != nil {
 			return nil, err
 		}
@@ -4365,10 +4368,12 @@ func (a *updateAttempt) runWithConfig(ctx context.Context, cfg *Config, fenceSwa
 // non-blocking (see loadUpdateTrustRoot), so this returns directly with
 // no waiter goroutine to leak and no attempt-deadline select: the
 // returned updater's network calls observe ctx themselves.
-func (d *Daemon) newUpdaterWithContext(_ context.Context) (*Updater, error) {
+//
+// autoCfg is the caller's resolved effective snapshot (heartbeat-supplied
+// defaults below host-local config); it is never re-read here, so the
+// updater, its verifier and its origin all come from the one snapshot.
+func (d *Daemon) newUpdaterWithContext(_ context.Context, autoCfg AutoUpdateConfig) (*Updater, error) {
 	currentVersion := d.EffectiveVersion()
-	// Heartbeat-supplied defaults sit below host-local config.
-	autoCfg := d.EffectiveAutoUpdateConfig()
 	// Managed trust (when opted in) or local config selects the verifier;
 	// a test-injected verifier overrides both.
 	verifier := d.managedUpdateVerifier(autoCfg)

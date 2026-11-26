@@ -863,7 +863,7 @@ func (d *Daemon) executeHostUpgrade(ctx context.Context) (*UpdateResult, error) 
 	if cfg == nil {
 		return nil, fmt.Errorf("no config loaded")
 	}
-	effective := d.EffectiveAutoUpdateConfig()
+	effective := d.effectiveAutoUpdateConfig(cfg)
 	if d.runPreparedUpdate != nil {
 		return d.runPreparedUpdate(ctx, effective, d.EffectiveVersion())
 	}
