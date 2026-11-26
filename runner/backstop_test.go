@@ -326,6 +326,13 @@ func TestShouldExcludeFromWIPCheckpoint_Secrets(t *testing.T) {
 		{"sub/.scratch/notes.md", true},
 		{"sub/.claude/settings.json", true},
 		{"sub/.codex/history.jsonl", true},
+		// The workarea metadata leaf is not harness state: without a
+		// session that published negotiated documents there, a
+		// .workarea/ path at any depth is project content the checkpoint
+		// keeps (session-scoped exclusion lives on the rescue target).
+		{".workarea/project-state.txt", false},
+		{".workarea/context/pack1/brief.md", false},
+		{"sub/.workarea/context/pack1/brief.md", false},
 		// The backstop layer still applies through the same helper.
 		{"node_modules/index.js", true},
 		{".agent/state.json", true},
@@ -386,6 +393,15 @@ func TestShouldExcludeFromBackstop_Table(t *testing.T) {
 		{".agents/skills/conventions/SKILL.md", false},
 		{"app/.agents/skills/donmai-review/SKILL.md", false},
 		{".codex/history.jsonl", true},
+		// The workarea metadata leaf is not harness state: a repository
+		// may track .workarea/ content, and the session-less filter must
+		// keep committing it. Only a session that published negotiated
+		// documents excludes its own pack directory, through
+		// sessionDocumentPrefix.
+		{".workarea/project-state.txt", false},
+		{".workarea/context/pack1/brief.md", false},
+		{"sub/.workarea/context/pack1/brief.md", false},
+		{".workarea", false},
 		// A directory that merely shares a prefix with a state dir is
 		// ordinary project content.
 		{".pi-cache/blob", false},

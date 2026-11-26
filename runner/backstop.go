@@ -593,8 +593,9 @@ func (r *Runner) runBackstop(ctx context.Context, qw QueuedWork, branch string, 
 	staged := strings.Split(strings.TrimSpace(stagedOut), "\n")
 	staged = filterEmpty(staged)
 	toUnstage := make([]string, 0, len(staged))
+	sessionDocuments := sessionDocumentPrefix(res, worktreePath)
 	for _, p := range staged {
-		if shouldExcludeFromBackstop(p) {
+		if shouldExcludeFromBackstop(p) || underSessionDocuments(sessionDocuments, p) {
 			toUnstage = append(toUnstage, p)
 		}
 	}

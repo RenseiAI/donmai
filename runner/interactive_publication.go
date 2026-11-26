@@ -7,7 +7,11 @@ import (
 	"github.com/RenseiAI/donmai/runtime/worktree"
 )
 
-func interactivePublicationSpec(qw QueuedWork) worktree.InteractivePublicationSpec {
+// interactivePublicationSpec binds the disposition check to the session's
+// mutable repositories. sessionDocuments is the flat checkout's own published
+// pack directory (sessionDocumentPrefix), "" for every other session; it is
+// set only on the flat target, the one checkout the pack can sit inside.
+func interactivePublicationSpec(qw QueuedWork, sessionDocuments string) worktree.InteractivePublicationSpec {
 	spec := worktree.InteractivePublicationSpec{SessionID: qw.SessionID}
 	branch := trimRef(qw.Ref)
 	allowRemoteHEAD := branch == ""
@@ -24,7 +28,7 @@ func interactivePublicationSpec(qw QueuedWork) worktree.InteractivePublicationSp
 		}
 		spec.Repositories = []worktree.PublicationTarget{{
 			Name: name, Repository: qw.Repository, Branch: branch,
-			AllowRemoteHEAD: allowRemoteHEAD,
+			AllowRemoteHEAD: allowRemoteHEAD, SessionDocuments: sessionDocuments,
 		}}
 		return spec
 	}
