@@ -8,20 +8,25 @@ import (
 	"sort"
 )
 
+// Access-program identifiers reported by ProbeAccessPrograms.
 const (
 	AccessProgramDaybreak = "daybreak"
 	AccessProgramTierBlue = "blue"
 	AccessProgramTierRed  = "red"
 )
 
+// AccessProgramState is the probe's verdict for one group of models.
 type AccessProgramState string
 
+// AccessProgramState values.
 const (
 	AccessProgramEnabled    AccessProgramState = "enabled"
 	AccessProgramNotEnabled AccessProgramState = "notEnabled"
 	AccessProgramUnknown    AccessProgramState = "unknown"
 )
 
+// AccessProgramGroup lists the allowlisted models that share one program
+// state and tier.
 type AccessProgramGroup struct {
 	Program string             `json:"program"`
 	State   AccessProgramState `json:"state"`
@@ -29,9 +34,14 @@ type AccessProgramGroup struct {
 	Models  []string           `json:"models"`
 }
 
-var errAccessProgramScan = errors.New("codex: access program scan did not complete")
-var builtInModelAllowlist = map[string]bool{"gpt-6.2-sol": true, "gpt-6.2-astra": true, "gpt-6-astra": true, "gpt-6.1-sol": true, "gpt-6.1-terra": true, "gpt-6-sol": true, "gpt-6-luna": true, "gpt-5.6-sol": true, "gpt-5.6-terra": true, "gpt-5.6-luna": true, "gpt-daybreak-blue-latest": true, "gpt-daybreak-red-latest": true, "gpt-5.5": true, "codex-auto-review": true}
+var (
+	errAccessProgramScan  = errors.New("codex: access program scan did not complete")
+	builtInModelAllowlist = map[string]bool{"gpt-6.2-sol": true, "gpt-6.2-astra": true, "gpt-6-astra": true, "gpt-6.1-sol": true, "gpt-6.1-terra": true, "gpt-6-sol": true, "gpt-6-luna": true, "gpt-5.6-sol": true, "gpt-5.6-terra": true, "gpt-5.6-luna": true, "gpt-daybreak-blue-latest": true, "gpt-daybreak-red-latest": true, "gpt-5.5": true, "codex-auto-review": true}
+)
 
+// ProbeAccessPrograms scans the app-server model catalog (model/list) and
+// groups allowlisted models by their access-program state. Any incomplete or
+// malformed scan returns errAccessProgramScan and no groups.
 func (p *Provider) ProbeAccessPrograms(ctx context.Context) ([]AccessProgramGroup, error) {
 	if p == nil || ctx.Err() != nil {
 		return nil, errAccessProgramScan
@@ -196,6 +206,7 @@ func parseModelListPage(raw json.RawMessage) ([]*modelEntry, *string, bool) {
 	}
 	return out, nx, true
 }
+
 func groupAccessObservations(obs map[string]*modelObservation) []AccessProgramGroup {
 	var bl, rd, ne, un []string
 	for m, o := range obs {

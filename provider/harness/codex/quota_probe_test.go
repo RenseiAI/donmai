@@ -36,7 +36,7 @@ type quotaProbeModelStep struct {
 	delay  time.Duration
 }
 
-func serveQuotaProbeFake(t *testing.T, fs *quotaProbeFakeServer, read map[string]any, refuse bool) {
+func serveQuotaProbeFake(t *testing.T, fs *quotaProbeFakeServer, refuse bool) {
 	t.Helper()
 	go func() {
 		dec := json.NewDecoder(fs.stdin)
@@ -65,11 +65,12 @@ func serveQuotaProbeFake(t *testing.T, fs *quotaProbeFakeServer, read map[string
 					st = fs.modelSteps[idx]
 				}
 				time.Sleep(st.delay)
-				if st.rpcErr != nil {
+				switch {
+				case st.rpcErr != nil:
 					writeQuotaProbeLine(t, fs.stdout, map[string]any{"jsonrpc": "2.0", "id": idRaw, "error": st.rpcErr})
-				} else if st.result != nil {
+				case st.result != nil:
 					writeQuotaProbeLine(t, fs.stdout, map[string]any{"jsonrpc": "2.0", "id": idRaw, "result": st.result})
-				} else {
+				default:
 					writeQuotaProbeLine(t, fs.stdout, map[string]any{"jsonrpc": "2.0", "id": idRaw, "result": map[string]any{"data": []any{}}})
 				}
 			case "account/rateLimits/read":
@@ -91,7 +92,7 @@ func startQuotaProbeFake(t *testing.T, read map[string]any, refuse bool) (*Provi
 	stdinReader, stdinWriter := io.Pipe()
 	stdoutReader, stdoutWriter := io.Pipe()
 	fs := &quotaProbeFakeServer{stdin: stdinReader, stdout: stdoutWriter, read: read}
-	serveQuotaProbeFake(t, fs, read, refuse)
+	serveQuotaProbeFake(t, fs, refuse)
 	p, err := New(Options{
 		skipProcess:    true,
 		stdinOverride:  stdinWriter,

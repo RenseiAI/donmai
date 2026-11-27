@@ -13,7 +13,7 @@ func scriptedAccess(t *testing.T, steps []quotaProbeModelStep, d, hs, rpc time.D
 	sr, sw := io.Pipe()
 	rr, rw := io.Pipe()
 	fs := &quotaProbeFakeServer{stdin: sr, stdout: rw, initDelay: d, modelSteps: steps}
-	serveQuotaProbeFake(t, fs, nil, false)
+	serveQuotaProbeFake(t, fs, false)
 	p, err := New(Options{skipProcess: true, stdinOverride: sw, stdoutOverride: rr, configTempDir: t.TempDir(), HandshakeTimeout: hs, RPCTimeout: rpc})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -26,6 +26,7 @@ func scriptedAccess(t *testing.T, steps []quotaProbeModelStep, d, hs, rpc time.D
 		_ = rw.Close()
 	}
 }
+
 func accRow(m string, c []string, a string) map[string]any {
 	r := map[string]any{"id": "x-" + m, "model": m}
 	ap := map[string]any{}
@@ -42,6 +43,7 @@ func accRow(m string, c []string, a string) map[string]any {
 	r["availableAccessPrograms"] = ap
 	return r
 }
+
 func findGroup(gs []AccessProgramGroup, s AccessProgramState, tr string) *AccessProgramGroup {
 	for i := range gs {
 		if gs[i].State == s && gs[i].Tier == tr {
@@ -50,9 +52,10 @@ func findGroup(gs []AccessProgramGroup, s AccessProgramState, tr string) *Access
 	}
 	return nil
 }
+
 func TestMappingsSingleScan(t *testing.T) {
 	t.Parallel()
-	mk := func(m string, c []string, a string) map[string]any { return accRow(m, c, a) }
+	mk := accRow
 	p1 := []any{mk("gpt-5.6-sol", []string{"standard"}, "enrollmentRequired"), mk("gpt-6-sol", []string{"daybreakBlue"}, "unavailableForModel"), map[string]any{"id": "x", "model": "gpt-6-astra"}, mk("gpt-5.6-terra", []string{"daybreakGreen"}, "available"), mk("private-alias", []string{"daybreakBlue"}, "available"), mk("gpt-6-luna", []string{"daybreakBlue"}, "available"), mk("gpt-5.6-luna", []string{"daybreakBlue"}, "available"), mk("gpt-5.6-luna", []string{"daybreakBlue"}, "available"), mk("gpt-daybreak-blue-latest", []string{"daybreakBlue", "daybreakRed"}, "available"), mk("gpt-6.2-sol", []string{"standard"}, "available"), mk("gpt-5.5", []string{"standard"}, "default")}
 	p2 := []any{mk("gpt-6-luna", []string{"daybreakRed"}, "available"), mk("gpt-5.6-terra", []string{"daybreakBlue"}, "default"), mk("gpt-6.1-sol", []string{"daybreakBlue"}, "available")}
 	s := []quotaProbeModelStep{{result: map[string]any{"data": p1, "nextCursor": "c"}}, {result: map[string]any{"data": p2}}}
@@ -90,6 +93,7 @@ func TestMappingsSingleScan(t *testing.T) {
 		t.Fatalf("transcript %v", fs.modelReqs)
 	}
 }
+
 func TestConflictLoopPartialIsolation(t *testing.T) {
 	t.Parallel()
 	mk := func(m string) []any { return []any{accRow(m, []string{"daybreakBlue"}, "available")} }
