@@ -52,6 +52,12 @@ type fakeServer struct {
 	// set it after acquire to prove the final release fits one shared
 	// budget instead of holding the terminal past the run deadline.
 	hangBatchWrite bool
+
+	// realThreadWire switches thread/start to the codex-cli 0.171+ wire:
+	// the response carries the full ThreadStartResponse field set and is
+	// followed by a thread/started whose only param is the Thread object
+	// (no top-level threadId); turn/start then sends no thread/started.
+	realThreadWire bool
 }
 
 func newFakeServer() (*fakeServer, *io.PipeWriter, *io.PipeReader) {
@@ -209,11 +215,20 @@ func (fs *fakeServer) run(t *testing.T, threadID string) {
 			fs.mu.Lock()
 			fs.threads[threadID] = true
 			fs.mu.Unlock()
-			fs.write(t, map[string]any{
-				"jsonrpc": "2.0",
-				"id":      idRaw,
-				"result":  map[string]any{"thread": map[string]any{"id": threadID}},
-			})
+			fs.mu.Lock()
+			realWire := fs.realThreadWire
+			fs.mu.Unlock()
+			if !realWire {
+				fs.write(t, map[string]any{
+					"jsonrpc": "2.0",
+					"id":      idRaw,
+					"result":  map[string]any{"thread": map[string]any{"id": threadID}},
+				})
+				continue
+			}
+			thread := realWireThread(threadID)
+			fs.write(t, map[string]any{"jsonrpc": "2.0", "id": idRaw, "result": realWireThreadStartResponse(thread)})
+			fs.write(t, map[string]any{"jsonrpc": "2.0", "method": "thread/started", "params": map[string]any{"thread": thread}})
 		case method == "thread/name/set" && hasID:
 			params, _ := msg["params"].(map[string]any)
 			threadID, _ := params["threadId"].(string)
@@ -235,11 +250,16 @@ func (fs *fakeServer) run(t *testing.T, threadID string) {
 		case method == "turn/start" && hasID:
 			fs.replyOK(t, idRaw)
 			// Drive a canned event sequence on the stream.
-			fs.write(t, map[string]any{
-				"jsonrpc": "2.0",
-				"method":  "thread/started",
-				"params":  map[string]any{"threadId": threadID, "thread": map[string]any{"id": threadID}},
-			})
+			fs.mu.Lock()
+			realWire := fs.realThreadWire
+			fs.mu.Unlock()
+			if !realWire {
+				fs.write(t, map[string]any{
+					"jsonrpc": "2.0",
+					"method":  "thread/started",
+					"params":  map[string]any{"threadId": threadID, "thread": map[string]any{"id": threadID}},
+				})
+			}
 			fs.write(t, map[string]any{
 				"jsonrpc": "2.0",
 				"method":  "turn/started",
@@ -288,6 +308,33 @@ func (fs *fakeServer) run(t *testing.T, threadID string) {
 		case hasID:
 			fs.replyOK(t, idRaw)
 		}
+	}
+}
+
+// realWireThread is a Thread as codex-cli 0.171 reports it
+// (v2/ThreadStartResponse.json definitions.Thread, required fields plus
+// model and reasoningEffort).
+func realWireThread(id string) map[string]any {
+	return map[string]any{
+		"id": id, "sessionId": id, "projectId": nil, "cliVersion": "0.171.0",
+		"createdAt": 1764200000, "updatedAt": 1764200000, "cwd": "/tmp/wt",
+		"ephemeral": false, "modelProvider": "openai", "model": "gpt-5.6-sol",
+		"reasoningEffort": "medium", "preview": "", "source": "appServer",
+		"status": map[string]any{"type": "idle"}, "turns": []any{},
+	}
+}
+
+// realWireThreadStartResponse is a v2/ThreadStartResponse: every required
+// field (approvalPolicy, approvalsReviewer, cwd, model, modelProvider,
+// sandbox, thread) plus reasoningEffort, which reports the thread's
+// configured default (model_reasoning_effort), never a requested effort:
+// thread/start carries no effort parameter.
+func realWireThreadStartResponse(thread map[string]any) map[string]any {
+	return map[string]any{
+		"thread": thread, "model": "gpt-5.6-sol", "modelProvider": "openai",
+		"cwd": "/tmp/wt", "approvalPolicy": "on-request", "approvalsReviewer": "user",
+		"sandbox":         map[string]any{"type": "workspaceWrite", "writableRoots": []any{}, "networkAccess": false},
+		"reasoningEffort": "medium",
 	}
 }
 

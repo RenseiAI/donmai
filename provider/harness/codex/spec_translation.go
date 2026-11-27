@@ -93,6 +93,11 @@ func resolveSandboxPolicy(spec agent.Spec) map[string]any {
 // resolveApprovalPolicy mirrors resolveApprovalPolicy in the legacy TS.
 // Codex v0.117+ uses kebab-case approval policy strings.
 func resolveApprovalPolicy(spec agent.Spec) string {
+	if spec.Instructions != nil {
+		if policy := codexApproval(spec.Instructions.Approvals); policy != "" {
+			return policy
+		}
+	}
 	if spec.Autonomous {
 		return "on-request"
 	}

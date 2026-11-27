@@ -47,6 +47,10 @@ func TestSpecFieldCoverage(t *testing.T) {
 		// protocol (codex-cli 0.139.0 generate-json-schema). See
 		// turnStartParams for the degrade path on older binaries.
 		"ResponseSchema",
+		// Instructions: approvals ride thread/start.approvalPolicy; plan
+		// mode and tool policy are reported unsupported by
+		// TranslateInstructions (instructions.go).
+		"Instructions",
 	}
 
 	// All fields ignoredSpecFields can return — independent of
@@ -54,9 +58,6 @@ func TestSpecFieldCoverage(t *testing.T) {
 	// coverage check works regardless of input.
 	ignoredFields := []string{
 		"toolLifecycleProfileID", // process-only selection consumed before provider translation
-		// Instructions (the interaction contract's normalized intents) are
-		// not yet translated by this adapter; its translator lands next.
-		"Instructions",
 		// SessionName is consumed by the spawn lifecycle rather than encoded in
 		// thread/start: fresh headless sessions issue thread/name/set after the
 		// thread id exists and before turn/start; named interactive sessions use

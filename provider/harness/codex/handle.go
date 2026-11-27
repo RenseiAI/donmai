@@ -38,6 +38,11 @@ type Handle struct {
 	// emitted once, right after the InitEvent the event contract keeps first.
 	denyNotice *agent.SystemEvent
 
+	// initEmitted keeps the InitEvent single: a fresh thread emits it from
+	// the thread/start response, and a thread/started that does reach the
+	// subscription afterwards is a duplicate.
+	initEmitted atomic.Bool
+
 	// Per-call request timeout for thread/start, turn/start, etc.
 	rpcTimeout time.Duration
 
@@ -350,6 +355,17 @@ func (h *Handle) start(ctx context.Context, plan SpawnPlan, resumeThreadID strin
 		h.threadID = resp.Thread.ID
 		h.idMu.Unlock()
 		h.client.Subscribe(resp.Thread.ID, provisionalSub)
+		// The response carries the thread id, so the InitEvent is emitted
+		// here. The real thread/started notification keys the id under
+		// params.thread, not a top-level threadId, so the client routes it
+		// to the global handler rather than this subscription; it also
+		// races the Subscribe above. Neither can be what delivers Init.
+		var initRaw map[string]any
+		_ = json.Unmarshal(raw, &initRaw)
+		h.emitInit(agent.InitEvent{SessionID: resp.Thread.ID, Raw: initRaw})
+		if settings, ok := effectiveSettings(h.spec, raw); ok {
+			h.emit(settings)
+		}
 		if h.spec.SessionName != "" {
 			if _, err := h.client.RequestWithRetry(ctx, "thread/name/set", map[string]any{
 				"threadId": resp.Thread.ID,
@@ -502,11 +518,11 @@ func (h *Handle) handleNotification(n notification) bool {
 			}
 			return true
 		}
-		h.emit(ev)
-		if ev.Kind() == agent.EventInit && h.denyNotice != nil {
-			h.emit(*h.denyNotice)
-			h.denyNotice = nil
+		if ev.Kind() == agent.EventInit {
+			h.emitInit(ev)
+			continue
 		}
+		h.emit(ev)
 	}
 	return false
 }
@@ -748,4 +764,18 @@ func emptyToUnknown(s string) string {
 		return "unknown"
 	}
 	return s
+}
+
+// emitInit publishes the session's single InitEvent and, right behind it,
+// the deny notice. A later InitEvent (a thread/started after the
+// thread/start response already emitted one) is dropped.
+func (h *Handle) emitInit(ev agent.Event) {
+	if !h.initEmitted.CompareAndSwap(false, true) {
+		return
+	}
+	h.emit(ev)
+	if h.denyNotice != nil {
+		h.emit(*h.denyNotice)
+		h.denyNotice = nil
+	}
 }
