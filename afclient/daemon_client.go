@@ -10,8 +10,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -58,7 +60,10 @@ func (c DaemonConfig) BaseURL() string {
 	if port == 0 {
 		port = 7734
 	}
-	return fmt.Sprintf("http://%s:%d", host, port)
+	// JoinHostPort brackets an IPv6 literal; trimming first keeps an
+	// already-bracketed host ("[::1]") working, so `--host ::1` and
+	// `--host '[::1]'` both reach http://[::1]:<port>.
+	return "http://" + net.JoinHostPort(strings.TrimSuffix(strings.TrimPrefix(host, "["), "]"), strconv.Itoa(port))
 }
 
 // ── Daemon API request/response types ────────────────────────────────────────
@@ -911,6 +916,29 @@ func (c *DaemonClient) SetCapacityConfig(key, value string) (*SetCapacityRespons
 	var resp SetCapacityResponse
 	if err := c.post("/api/daemon/capacity", body, &resp); err != nil {
 		return nil, fmt.Errorf("daemon set capacity: %w", err)
+	}
+	return &resp, nil
+}
+
+// HostObservations reads the daemon's current host observations without
+// scanning (GET /api/daemon/observations).
+func (c *DaemonClient) HostObservations() (*HostObservations, error) {
+	var resp HostObservations
+	if err := c.get("/api/daemon/observations", &resp); err != nil {
+		return nil, fmt.Errorf("daemon observations: %w", err)
+	}
+	return &resp, nil
+}
+
+// ScanHostObservations runs a full rescan of kinds, all kinds when empty
+// (POST /api/daemon/observations/scan). The daemon allows one a minute
+// and answers a refused scan with 429, which wraps ErrRateLimited.
+func (c *DaemonClient) ScanHostObservations(ctx context.Context, kinds []string) (*HostObservations, error) {
+	scanClient := *c.httpClient
+	scanClient.Timeout = 45 * time.Second
+	var resp HostObservations
+	if err := c.postContext(ctx, &scanClient, "/api/daemon/observations/scan", map[string][]string{"kinds": kinds}, &resp); err != nil {
+		return nil, fmt.Errorf("daemon observations scan: %w", err)
 	}
 	return &resp, nil
 }

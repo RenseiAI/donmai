@@ -183,6 +183,13 @@ func turnStartParams(threadID string, spec agent.Spec, input []map[string]any) m
 	if len(spec.ResponseSchema) > 0 {
 		params["outputSchema"] = spec.ResponseSchema
 	}
+	// A declared cyber access program rides every turn of the session
+	// (turn/start scopes it to "this turn"). Spawn and Resume refuse an
+	// invalid declaration before any turn is built, so an error here can only
+	// mean an undeclared program, which emits nothing.
+	if program, err := resolveCyberAccessProgram(spec); err == nil && program != "" {
+		params["cyberAccessProgram"] = program
+	}
 	return params
 }
 
@@ -434,12 +441,17 @@ func ignoredSpecFields(spec agent.Spec) []SpecFieldNote {
 	}
 
 	// ProviderConfig: opaque per-provider extension bag. The codex
-	// provider has no defined keys today; the field is reserved.
-	if len(spec.ProviderConfig) > 0 {
+	// provider consumes only cyberAccessProgram (turn/start); any other key
+	// is recorded as ignored.
+	for key := range spec.ProviderConfig {
+		if key == providerConfigCyberAccessProgram {
+			continue
+		}
 		notes = append(notes, SpecFieldNote{
 			Field:  "ProviderConfig",
-			Reason: "codex defines no providerConfig keys today; field is reserved",
+			Reason: "codex consumes only providerConfig.cyberAccessProgram (turn/start); other keys are ignored",
 		})
+		break
 	}
 
 	// SubAgentProvider: only meaningful when the codex agent spawns

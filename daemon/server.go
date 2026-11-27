@@ -304,6 +304,8 @@ func (s *Server) register(mux *http.ServeMux) {
 	// credential) instead. Every other leaf keeps the gate.
 	mux.HandleFunc("/api/daemon/sessions/", s.handleSessionSubrouteAuth)
 	mux.HandleFunc("/api/daemon/heartbeat", s.method(http.MethodGet, s.handleHeartbeat))
+	mux.HandleFunc("/api/daemon/observations", s.method(http.MethodGet, s.handleObservations))
+	mux.HandleFunc("/api/daemon/observations/scan", s.requireControlAuth(s.method(http.MethodPost, s.handleObservationScan)))
 	mux.HandleFunc("/api/daemon/doctor", s.method(http.MethodGet, s.handleDoctor))
 	// providers (Wave 9)
 	mux.HandleFunc("/api/daemon/gateway", s.method(http.MethodGet, s.handleGateway))

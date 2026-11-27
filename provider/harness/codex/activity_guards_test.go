@@ -91,10 +91,21 @@ func TestSpawnInteractive_ActivityAppendValidateFailureFailsClosed(t *testing.T)
 	root := t.TempDir()
 	boundaryRoot := filepath.Join(root, "session-boundaries")
 	workdir := filepath.Join(root, "work")
-	for _, dir := range []string{boundaryRoot, workdir} {
+	// ambientHome stands in for the CODEX_HOME a parent session hands to
+	// this test process (a review running the package's own tests inside a
+	// live Codex session inherits that session's private home). The child
+	// env carries it next to the owned home, and the fixture must never
+	// touch it.
+	ambientHome := filepath.Join(root, "ambient-codex-home")
+	for _, dir := range []string{boundaryRoot, workdir, ambientHome} {
 		if err := os.Mkdir(dir, 0o700); err != nil {
 			t.Fatalf("mkdir %s: %v", dir, err)
 		}
+	}
+	t.Setenv("CODEX_HOME", ambientHome)
+	ownedParent, err := filepath.EvalSymlinks(boundaryRoot)
+	if err != nil {
+		t.Fatalf("resolve boundary root: %v", err)
 	}
 	mcpServers := []agent.MCPServerConfig{{
 		Name: "donmai-platform",
@@ -111,11 +122,15 @@ func TestSpawnInteractive_ActivityAppendValidateFailureFailsClosed(t *testing.T)
 			return nil, err
 		}
 		// Widen the private home after a successful inventory readback, so
-		// the subsequent hooks append fails its boundary validate().
+		// the subsequent hooks append fails its boundary validate(). Only the
+		// home this spawn owns (under boundaryRoot) is widened; an inherited
+		// CODEX_HOME entry may be a live session's private home.
 		for _, entry := range env {
-			if home, ok := strings.CutPrefix(entry, "CODEX_HOME="); ok && home != "" {
-				_ = os.Chmod(home, 0o750) //nolint:gosec // fixture widens the home to trip the boundary validator
+			home, ok := strings.CutPrefix(entry, "CODEX_HOME=")
+			if !ok || filepath.Dir(filepath.Clean(home)) != ownedParent {
+				continue
 			}
+			_ = os.Chmod(home, 0o750) //nolint:gosec // fixture widens the owned home to trip the boundary validator
 		}
 		return body, nil
 	}
@@ -145,6 +160,13 @@ func TestSpawnInteractive_ActivityAppendValidateFailureFailsClosed(t *testing.T)
 	}
 	if entries, rerr := os.ReadDir(boundaryRoot); rerr != nil || len(entries) != 0 {
 		t.Fatalf("validate-failure spawn leaked its private boundary: err=%v entries=%v", rerr, entries)
+	}
+	info, err := os.Stat(ambientHome)
+	if err != nil {
+		t.Fatalf("stat ambient CODEX_HOME: %v", err)
+	}
+	if info.Mode().Perm() != codexHomeMode {
+		t.Fatalf("fixture widened the inherited CODEX_HOME to %04o; a live session's cleanup would reject it", info.Mode().Perm())
 	}
 }
 

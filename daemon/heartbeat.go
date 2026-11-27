@@ -15,6 +15,7 @@ import (
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/daemon/seatstate"
+	"github.com/RenseiAI/donmai/observation"
 	"github.com/RenseiAI/donmai/sessionshim"
 )
 
@@ -116,6 +117,16 @@ type HeartbeatOptions struct {
 	// hashes; never put an address in them.
 	GetQuota func() []agent.UsageAccount
 
+	// DrainDeferredAcks returns mutation acknowledgements that completed
+	// outside a heartbeat response (a deferred observations.scan). It runs
+	// before GetObservations, so an acknowledgement rides a beat whose
+	// report already reflects the work it acknowledges.
+	DrainDeferredAcks func() (applied []string, failures []HeartbeatMutationFailure, report *observation.Report)
+
+	// GetObservations returns the host-observation report for this beat.
+	// Optional, like GetQuota: nil, or a nil report, omits the key.
+	GetObservations func() *observation.Report
+
 	// GetAllowlist returns the daemon's current project allowlist entries
 	// (derived from cfg.Projects). Called every beat so a hot yaml reload
 	// (when that lands) or in-process mutation reflects in the next
@@ -159,6 +170,25 @@ type HeartbeatOptions struct {
 	//
 	// Optional — leave nil to ignore. Phase 2e.
 	OnHostStatus func(detail HostStatusDetail)
+
+	// OnUpdateDefaults consumes the heartbeat reply's update-defaults
+	// member. The argument is the raw member: nil when the server omitted
+	// it (older server), JSON null for an explicit whole-snapshot clear,
+	// or an object for per-field updates. Malformed members preserve the
+	// last-known-good snapshot with a typed diagnostic and never fail
+	// the beat. Optional — leave nil to ignore platform-provided
+	// defaults and keep serving from local configuration only.
+	OnUpdateDefaults func(raw json.RawMessage)
+
+	// OnManagedUpdateTrust is invoked when the heartbeat response carries
+	// a managedUpdateTrust projection. Nil (absent) projections never
+	// reach this callback: unconfigured leaves local policy unchanged.
+	// Non-nil projections (valid, invalid, or explicit unavailable) are
+	// applied atomically by the daemon when opted-in and ignored when
+	// opted-out.
+	//
+	// Optional — leave nil to ignore remote trust rotations.
+	OnManagedUpdateTrust func(projection *ManagedUpdateTrustProjection)
 
 	// GetSeatStates returns one three-axis report per in-flight seat for
 	// this beat (session presence, activity with its decided-by rung,
@@ -237,6 +267,15 @@ type HeartbeatService struct {
 	// so they re-ride the next attempt.
 	pendingApplied  []string
 	pendingFailures []HeartbeatMutationFailure
+	// pendingScanReport is the exact report of the scan that answered the
+	// pending observations.scan acknowledgements. It rides every beat, in
+	// place of the generic report, until a successful POST confirms them.
+	pendingScanReport *observation.Report
+	// pendingScanUnacked is true while a drained scan batch awaits
+	// confirmation. While set the next beat holds its drain, so a later
+	// scan's report never answers an earlier request on a failed-beat
+	// retry: one batch rides one report, oldest-first.
+	pendingScanUnacked bool
 
 	// shimProjection / shimAcknowledged are the session-shim hooks, seeded from
 	// opts and REPLACEABLE afterwards (SetSessionShimProjection). A daemon whose
@@ -539,6 +578,40 @@ func (h *HeartbeatService) sendOneSerialized(ctx context.Context) error {
 			payload.Quota = q
 		}
 	}
+	if h.opts.DrainDeferredAcks != nil {
+		h.mu.Lock()
+		hold := h.pendingScanReport != nil || h.pendingScanUnacked
+		h.mu.Unlock()
+		// While a drained scan batch still awaits confirmation, hold the
+		// next drain: every batch rides its own report, oldest-first, so
+		// a failed beat followed by a second completion never sends both
+		// acknowledgements with only the latest report.
+		if !hold {
+			if applied, failures, report := h.opts.DrainDeferredAcks(); len(applied) > 0 || len(failures) > 0 || report != nil {
+				h.mu.Lock()
+				h.pendingApplied = append(h.pendingApplied, applied...)
+				h.pendingFailures = append(h.pendingFailures, failures...)
+				if report != nil {
+					h.pendingScanReport = report
+				}
+				h.pendingScanUnacked = true
+				h.mu.Unlock()
+			}
+		}
+	}
+	h.mu.Lock()
+	sentScanReport := h.pendingScanReport
+	// A pending scan failure batch carries no report of its own: while it
+	// awaits confirmation the beat omits observations instead of
+	// substituting the generic snapshot, so the failure acknowledgement
+	// never rides a report its scan did not produce.
+	scanFailuresPending := h.pendingScanUnacked && sentScanReport == nil && len(h.pendingFailures) > 0
+	h.mu.Unlock()
+	if sentScanReport != nil {
+		payload.Observations = sentScanReport
+	} else if !scanFailuresPending && h.opts.GetObservations != nil {
+		payload.Observations = h.opts.GetObservations()
+	}
 
 	// Three-axis seat state rides every beat when configured. A nil
 	// callback omits the seat keys entirely (a host that does not track
@@ -607,6 +680,8 @@ func (h *HeartbeatService) sendOneSerialized(ctx context.Context) error {
 		// Successful POST — drop the ACKs we just confirmed, then process
 		// the platform's response (hostStatus + pendingMutations).
 		h.dropConfirmedAcks(ackApplied, ackFailures)
+		h.dropConfirmedScanReport(sentScanReport)
+		h.clearPendingScanUnacked()
 		h.handleHeartbeatResponse(ctx, resp)
 		if payload.SessionShim != nil && onSessionShimAcknowledged != nil {
 			onSessionShimAcknowledged(cloneSessionShimHeartbeatProjection(*payload.SessionShim))
@@ -659,6 +734,8 @@ func (h *HeartbeatService) sendOneSerialized(ctx context.Context) error {
 			return validationErr
 		}
 		h.dropConfirmedAcks(ackApplied, ackFailures)
+		h.dropConfirmedScanReport(sentScanReport)
+		h.clearPendingScanUnacked()
 		h.handleHeartbeatResponse(ctx, retryResp)
 		return nil
 	}
@@ -744,7 +821,7 @@ func (h *HeartbeatService) projectAdmissionReport() (ProjectAdmissionReport, boo
 //
 //	{ status?, activeCount, activeInteractiveCount?, maxSessions?, load?,
 //	  allowlistHash?, allowlist?, appliedMutations?, mutationFailures?,
-//	  quota?, seats?, seatSummary? }
+//	  quota?, observations?, seats?, seatSummary? }
 //
 // activeInteractiveCount is the interactive-occupancy split of activeCount:
 // live Mode == "interactive" or legacy Mode == "interview" sessions count,
@@ -787,6 +864,9 @@ type heartbeatRequestBody struct {
 	// accounts. Omitted when the daemon reports no quota state; account
 	// IDs ride as opaque values the platform hashes.
 	Quota []agent.UsageAccount `json:"quota,omitempty"`
+	// Observations is the host-observation report beside quota. Omitted
+	// when the daemon has no quota state; it never carries a raw id.
+	Observations *observation.Report `json:"observations,omitempty"`
 	// Seats is the per-seat three-axis report (session presence, activity
 	// with its decided-by rung, resumability, plus needs-input). Nil
 	// omits the key: a host that does not track seat state sends no key
@@ -888,6 +968,14 @@ type heartbeatResponseBody struct {
 	HostStatus       *HostStatusDetail               `json:"hostStatus,omitempty"`
 	PendingMutations []PendingMutation               `json:"pendingMutations,omitempty"`
 	SessionShim      *SessionShimHeartbeatProjection `json:"sessionShim,omitempty"`
+	// UpdateDefaults carries the platform-provided system snapshot for
+	// update configuration. Raw so absence (nil, older server) stays
+	// distinct from an explicit null (clear) and from malformed data.
+	// Additive: older servers omit it and newer daemons ignore unknown
+	// members inside it.
+	UpdateDefaults json.RawMessage `json:"updateDefaults,omitempty"`
+	// ManagedUpdateTrust carries the managed update-trust projection.
+	ManagedUpdateTrust *ManagedUpdateTrustProjection `json:"managedUpdateTrust,omitempty"`
 }
 
 func (h *HeartbeatService) callEndpoint(
@@ -926,6 +1014,7 @@ func (h *HeartbeatService) callEndpoint(
 		QuarantinedSessions:    payload.QuarantinedSessions,
 		SessionShim:            payload.SessionShim,
 		Quota:                  payload.Quota,
+		Observations:           payload.Observations,
 		Seats:                  payload.Seats,
 		SeatSummary:            payload.SeatSummary,
 	}
@@ -987,6 +1076,29 @@ func validateHeartbeatSessionShimResponse(
 	return nil
 }
 
+// dropConfirmedScanReport clears the pending scan report once a beat that
+// carried it was accepted, unless a newer scan replaced it meanwhile.
+func (h *HeartbeatService) dropConfirmedScanReport(sent *observation.Report) {
+	if sent == nil {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.pendingScanReport == sent {
+		h.pendingScanReport = nil
+	}
+}
+
+// clearPendingScanUnacked releases the drain hold after a beat carrying the
+// drained scan batch was accepted. The hold guarantees at most one
+// unconfirmed scan batch, so the single batch just confirmed is the one
+// the hold was waiting on.
+func (h *HeartbeatService) clearPendingScanUnacked() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.pendingScanUnacked = false
+}
+
 // dropConfirmedAcks removes the ACK entries the platform just accepted
 // from the pending buffer. Compares by mutation id so concurrent applies
 // landing during the in-flight beat don't get lost.
@@ -1027,8 +1139,19 @@ func (h *HeartbeatService) handleHeartbeatResponse(ctx context.Context, resp *he
 	if resp == nil {
 		return
 	}
+	// The production consumer for platform-provided update defaults.
+	// Runs on every successful beat, including beats from older servers
+	// whose reply omits the member (raw == nil, a no-op preserve) and
+	// beats that carry an explicit clear or malformed data (preserve
+	// last-good with a typed diagnostic, never fail the beat).
+	if h.opts.OnUpdateDefaults != nil && resp.UpdateDefaults != nil {
+		h.opts.OnUpdateDefaults(resp.UpdateDefaults)
+	}
 	if resp.HostStatus != nil && h.opts.OnHostStatus != nil {
 		h.opts.OnHostStatus(*resp.HostStatus)
+	}
+	if resp.ManagedUpdateTrust != nil && h.opts.OnManagedUpdateTrust != nil {
+		h.opts.OnManagedUpdateTrust(resp.ManagedUpdateTrust)
 	}
 	if len(resp.PendingMutations) > 0 && h.opts.OnPendingMutations != nil {
 		applied, failures := h.opts.OnPendingMutations(ctx, resp.PendingMutations)

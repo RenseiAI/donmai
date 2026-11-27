@@ -611,8 +611,35 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 			res.PostSessionWarnings = append(res.PostSessionWarnings, warning)
 		}
 	}
-	runnerStatePath := wpath
+	// Negotiated documents land before the first executor turn: the versioned
+	// carrier is validated, decoded and published under the session-owned
+	// context directory. Any refusal fails before spawn so rejected documents
+	// are never claimed as included.
 	selectedRepositoryReadOnly := repositoryDeclaration != nil && repositoryDeclaration.Selected.Authority == workarea.RepositoryReadOnly
+	if err := r.materializeContextPack(qw, res.WorkareaRoot, res, provider, r.logger); err != nil {
+		// A refusal still owns the provisioned checkouts: record their
+		// bases (reseeding re-entered generations) so teardown can
+		// preserve unrelated repository work instead of deleting the
+		// workarea without archiving it. The refusal itself is unchanged.
+		switch {
+		case repositoryFree:
+		case repositoryDeclaration != nil:
+			targets := make([]rescueTarget, 0, len(repositoryDeclaration.Repositories))
+			for _, repository := range repositoryDeclaration.Repositories {
+				if repository.Authority == workarea.RepositoryMutable {
+					if path := declaredRepositoryPaths[repository.Name]; path != "" {
+						targets = append(targets, rescueTarget{name: repository.Name, path: path})
+					}
+				}
+			}
+			recordRescueTargets(ctx, res, targets)
+			reseedRescueBasesFromDeclaration(ctx, res, res.WorkareaRoot, r.wt, qw.SessionID, r.logger)
+		case !selectedRepositoryReadOnly:
+			recordRescueTargets(ctx, res, []rescueTarget{{path: wpath}})
+		}
+		return res, err
+	}
+	runnerStatePath := wpath
 	if selectedRepositoryReadOnly {
 		runnerStatePath = filepath.Join(res.WorkareaRoot, workarea.DeclarationDirName, "runner")
 		root, err := os.OpenRoot(res.WorkareaRoot)
@@ -2378,7 +2405,21 @@ tailRecovery:
 		} else {
 			res.Status = "failed"
 			if res.FailureMode == "" {
-				res.FailureMode = FailureSilentExit
+				// A failed terminal ResultEvent can carry the provider's
+				// own failure text in Errors (codex turn/completed
+				// status failed). Surface it as the failure reason with
+				// a provider-error mode so the terminal reason names the
+				// provider refusal instead of falling back to the last
+				// progress note. A failed terminal with no error text
+				// keeps silent-exit.
+				if msg := terminalProviderErrorMessage(streamRes.terminalEvent); msg != "" {
+					res.FailureMode = FailureProviderError
+					if res.Error == "" {
+						res.Error = msg
+					}
+				} else {
+					res.FailureMode = FailureSilentExit
+				}
 			}
 		}
 	}
@@ -4050,6 +4091,54 @@ func classifyWorktreeErr(err error) string {
 	default:
 		return FailureWorktreeProvision
 	}
+}
+
+// terminalProviderErrorMessage reports the provider's failure text from a
+// failed terminal ResultEvent. It joins the non-empty Errors entries, but
+// ignores the harness-synthesized fallbacks ("Turn failed",
+// "Turn was interrupted") the mappers emit when the provider reported no
+// error text, the finish-reason stops (ErrorSubtype "finish_*") a
+// mapper reports when the model hit a cap or policy finish reason instead
+// of a provider failure (for example Gemini "MAX_TOKENS"), the
+// interruption stops (ErrorSubtype "interrupted") a host reports when
+// the turn was cancelled before a tool ran, and the turn-cap stops
+// (ErrorSubtype "error_max_turns") a harness reports when the model hit
+// its configured turn ceiling: none of those carry a provider diagnostic,
+// so a failed terminal with only that text keeps silent-exit instead of
+// provider-error. The OutputTail fallback still preserves the diagnostic
+// tail.
+func terminalProviderErrorMessage(ev *agent.ResultEvent) string {
+	if ev == nil || ev.Success || len(ev.Errors) == 0 {
+		return ""
+	}
+	// A finish-reason stop is a cap or policy truncation, not a provider
+	// failure: the retry-bearing provider-error mode (resumable, deferred
+	// failure transition, provider-error retries) must not apply to it.
+	if strings.HasPrefix(ev.ErrorSubtype, "finish_") {
+		return ""
+	}
+	// An interrupted turn (user or operator cancel) and a turn-cap stop
+	// are not provider failures either: they must stay silent-exit so the
+	// run is not resumable and still takes its declared failure
+	// transition. Only a genuine provider refusal or endpoint failure
+	// (for example Codex turn_failed with the provider's error text)
+	// promotes to provider-error.
+	switch ev.ErrorSubtype {
+	case "interrupted", "error_max_turns":
+		return ""
+	}
+	var kept []string
+	for _, e := range ev.Errors {
+		trimmed := strings.TrimSpace(e)
+		if trimmed == "" || trimmed == "Turn failed" || trimmed == "Turn was interrupted" {
+			continue
+		}
+		kept = append(kept, trimmed)
+	}
+	if len(kept) == 0 {
+		return ""
+	}
+	return strings.Join(kept, "\n")
 }
 
 // boundedFailureTail redacts secret-shaped values then applies the
