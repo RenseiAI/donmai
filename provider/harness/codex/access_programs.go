@@ -36,22 +36,7 @@ func (p *Provider) ProbeAccessPrograms(ctx context.Context) ([]AccessProgramGrou
 	if p == nil || ctx.Err() != nil {
 		return nil, errAccessProgramScan
 	}
-	p.startMu.Lock()
-	select {
-	case <-p.shutdown:
-		p.startMu.Unlock()
-		return nil, errAccessProgramScan
-	default:
-	}
-	if p.hostAuthFile != "" && !p.started {
-		if err := p.config.linkHostSessionAuth(p.hostAuthFile); err != nil {
-			p.startMu.Unlock()
-			return nil, errAccessProgramScan
-		}
-	}
-	se := p.startLockedWithContext(ctx, nil)
-	p.startMu.Unlock()
-	if se != nil {
+	if err := p.ensureProbeStarted(ctx); err != nil {
 		return nil, errAccessProgramScan
 	}
 	p.startMu.Lock()

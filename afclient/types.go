@@ -955,3 +955,22 @@ type HostObservationMark struct {
 	New     bool   `json:"new"`
 	Enabled bool   `json:"enabled"`
 }
+
+// SessionChatReadinessVersion is the only chat-readiness wire version the
+// runner emits. Consumers ignore reports with an unknown version.
+const SessionChatReadinessVersion = 1
+
+// SessionChatReadiness is the optional per-session chat-readiness report on
+// POST /api/sessions/{id}/status. It mirrors the runner's readiness read:
+// Channel names the declared mechanism, State is the input state, and
+// LiveSupported/QueueSupported split live delivery from mailbox queueing.
+// Reason is empty when live and ObservedAt is RFC3339 UTC.
+type SessionChatReadiness struct {
+	Version        int    `json:"version"`
+	Channel        string `json:"channel"`
+	State          string `json:"state"`
+	LiveSupported  bool   `json:"liveSupported"`
+	QueueSupported bool   `json:"queueSupported"`
+	Reason         string `json:"reason"`
+	ObservedAt     string `json:"observedAt"`
+}

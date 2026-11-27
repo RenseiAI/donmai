@@ -188,6 +188,10 @@ type interactiveDispatch struct {
 	res      *Result
 	done     chan error
 	stop     sync.Once
+	// events is the handle's live event channel: sending on it models
+	// harness activity (a turn ending, transcript tail events) reaching
+	// the supervisor, which resets the pull channel's idle clock.
+	events chan agent.Event
 }
 
 // startInteractiveDispatch runs dispatchInteractive against a live recording
@@ -224,12 +228,60 @@ func startInteractiveDispatchWith(
 		pulser:   newFakeInteractivePulser(),
 		res:      &Result{SessionID: sessionID},
 		done:     make(chan error, 1),
+		events:   make(chan agent.Event),
 	}
 	r := minimalRunner(t)
 	r.interactiveNoticeClock = d.clock
 
 	var handle agent.InteractiveCapable = &testInteractiveHandle{
-		Handle:  &fakeHandle{events: make(chan agent.Event)},
+		Handle:  &fakeHandle{events: d.events},
+		session: d.session,
+	}
+	if nch != nil {
+		handle = &testNoticeChannelHandle{InteractiveCapable: handle, channel: nch}
+	}
+	qw := QueuedWork{QueuedWork: prompt.QueuedWork{
+		SessionID: sessionID,
+		Mode:      interactiveRunMode,
+	}}
+	go func() {
+		_, err := r.dispatchInteractive(
+			context.Background(), handle, t.TempDir(), qw, d.res, &recordingSink{}, d.pulser, d.injectCh, channel,
+		)
+		d.done <- err
+	}()
+	t.Cleanup(func() { d.finish(t) })
+	return d
+}
+
+// startInteractiveDispatchWithBounds is startInteractiveDispatchWith with an
+// explicit idle/claim bound: negative disables that bound (the operator opt-out
+// that leaves the offer in place). It drives the same production supervisor
+// (dispatchInteractive); only the Runner's resolved bounds differ.
+func startInteractiveDispatchWithBounds(
+	t *testing.T, sessionID string, channel agent.NoticeDelivery, nch agent.NoticeChannel,
+	idlePolls, claimPolls int,
+) *interactiveDispatch {
+	t.Helper()
+	t.Setenv(envAttachURL, "")
+	t.Setenv(envAttachToken, "")
+
+	d := &interactiveDispatch{
+		session:  liveRecordingInteractiveSession(),
+		injectCh: make(chan heartbeat.InjectPayload, 8),
+		clock:    newNoticeRetryClock(),
+		pulser:   newFakeInteractivePulser(),
+		res:      &Result{SessionID: sessionID},
+		done:     make(chan error, 1),
+		events:   make(chan agent.Event),
+	}
+	r := minimalRunner(t)
+	r.interactiveNoticeClock = d.clock
+	r.interactiveNoticeIdlePolls = idlePolls
+	r.interactiveNoticeClaimGracePolls = claimPolls
+
+	var handle agent.InteractiveCapable = &testInteractiveHandle{
+		Handle:  &fakeHandle{events: d.events},
 		session: d.session,
 	}
 	if nch != nil {
@@ -1108,6 +1160,15 @@ func (c *fakeNoticeChannel) setConsumed(v bool) {
 	c.consumed = v
 }
 
+// setRetractOK flips what the next Retract reports: true while the offer is
+// still outstanding (it is withdrawn), false once the hook has claimed it
+// (pending.json is gone; only the acceptance record can settle the delivery).
+func (c *fakeNoticeChannel) setRetractOK(v bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.retractOK = v
+}
+
 func (c *fakeNoticeChannel) offered() []fakeOffer {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -1261,30 +1322,37 @@ func TestInteractive_PullChannelWaitsPastTheRefusalCap(t *testing.T) {
 	d.pulser.waitAcked(t, "dlv-patient")
 }
 
-// TestInteractive_PullChannelDeadLettersAtThePollCap is the other half: bounded
-// is not the same as patient.
+// TestInteractive_PullChannelIdleDeadLettersAsNeedsOperator is the idle
+// half of the pull boundedness contract: a notice offered on a hook channel
+// that sees no session life must not hold the slot to the 15-minute cap.
 //
-// The rail allows ONE notice in flight per session, so a channel nobody ever
-// collects from would hold the slot for the life of the session and starve
-// every later payload invisibly. At the cap the offer is WITHDRAWN first — a
-// message reported dead must not still be collectable — and only then reported,
-// so the producer gets it back instead of watching it stay eternally in flight.
-func TestInteractive_PullChannelDeadLettersAtThePollCap(t *testing.T) {
+// A session idle at an empty prompt has already fired its Stop hook and will
+// not fire another until a human interacts, so the offered message waits
+// while the producer hears nothing. After interactiveNoticeIdlePolls of
+// silence the supervisor withdraws the offer (a message reported dead must
+// not stay collectable) and reports the typed needs-operator receipt, so the
+// producer learns an operator nudge — not another silent wait — is what will
+// move the message. The receipt reports which happened: needs-operator here,
+// not-consumed for a session that stayed busy to the long cap (see the
+// activity test below).
+func TestInteractive_PullChannelIdleDeadLettersAsNeedsOperator(t *testing.T) {
 	nch := &fakeNoticeChannel{retractOK: true}
-	d := startInteractiveDispatchWith(t, "sess-pull-cap", agent.NoticeDeliveryHook, nch)
+	d := startInteractiveDispatchWith(t, "sess-pull-idle", agent.NoticeDeliveryHook, nch)
 
 	d.injectCh <- heartbeat.InjectPayload{DeliveryID: "dlv-stuck", Text: "never collected"}
 	d.injectCh <- heartbeat.InjectPayload{DeliveryID: "dlv-behind", Text: "starved behind it"}
 	nch.waitOffers(t, 1)
 
-	// The first poll happens on receipt; the rest ride the retry timer.
-	for range interactiveNoticePullMaxPolls - 1 {
+	// The first poll happens on receipt; the rest ride the retry timer. No
+	// handle event ever arrives, so the idle clock trips long before the
+	// pull cap would.
+	for range interactiveNoticeIdlePolls - 1 {
 		d.clock.waitArmed(t)
 		d.clock.fire(t)
 	}
 
-	if reason := d.pulser.waitDeadLettered(t, "dlv-stuck"); reason != noticeDeadNotConsumed {
-		t.Fatalf("dead-letter reason = %q; want %q", reason, noticeDeadNotConsumed)
+	if reason := d.pulser.waitDeadLettered(t, "dlv-stuck"); reason != noticeDeadNeedsOperator {
+		t.Fatalf("dead-letter reason = %q; want %q (an idle hook session needs an operator, not a longer wait)", reason, noticeDeadNeedsOperator)
 	}
 	if got := nch.retractCount(); got != 1 {
 		t.Fatalf("Retract called %d times; want exactly 1 — a message reported dead must not stay collectable", got)
@@ -1292,11 +1360,47 @@ func TestInteractive_PullChannelDeadLettersAtThePollCap(t *testing.T) {
 	if got := d.pulser.acked(); len(got) != 0 {
 		t.Fatalf("a never-consumed notice was acked: %v", got)
 	}
+	if warns := strings.Join(d.res.PostSessionWarnings, "|"); !strings.Contains(warns, noticeDeadNeedsOperator) || !strings.Contains(warns, "dlv-stuck") {
+		t.Fatalf("PostSessionWarnings = %q; want the typed needs-operator receipt naming dlv-stuck", warns)
+	}
 
 	// The slot freed, so the payload behind it got its own offer.
 	offers := nch.waitOffers(t, 2)
 	if offers[1].deliveryID != "dlv-behind" {
 		t.Fatalf("second offer = %+v; want the payload that was queued behind the stuck one", offers[1])
+	}
+}
+
+// TestInteractive_PullChannelActivityDefersTheIdleBound is the busy half:
+// session life resets the idle clock, so a notice offered to a working
+// session still waits for the next turn end under the long pull cap instead
+// of being reported needs-operator mid-turn.
+func TestInteractive_PullChannelActivityDefersTheIdleBound(t *testing.T) {
+	nch := &fakeNoticeChannel{retractOK: true}
+	d := startInteractiveDispatchWith(t, "sess-pull-busy", agent.NoticeDeliveryHook, nch)
+
+	d.injectCh <- heartbeat.InjectPayload{DeliveryID: "dlv-busy", Text: "long turn running"}
+	nch.waitOffers(t, 1)
+
+	// A handle event before every poll keeps the session looking busy: the
+	// supervisor resets the idle clock on each one, so the notice must
+	// survive the idle bound and die only at the long pull cap. The send
+	// rendezvouses with the supervisor's receive, so the reset lands before
+	// the fired tick is processed.
+	for range interactiveNoticePullMaxPolls - 1 {
+		d.clock.waitArmed(t)
+		d.events <- agent.SystemEvent{Subtype: "user_message", Message: "turn still running"}
+		d.clock.fire(t)
+	}
+
+	if reason := d.pulser.waitDeadLettered(t, "dlv-busy"); reason != noticeDeadNotConsumed {
+		t.Fatalf("dead-letter reason = %q; want %q (a busy session waits out the long cap)", reason, noticeDeadNotConsumed)
+	}
+	if got := nch.retractCount(); got != 1 {
+		t.Fatalf("Retract called %d times; want exactly 1", got)
+	}
+	if got := d.pulser.acked(); len(got) != 0 {
+		t.Fatalf("a never-consumed notice was acked: %v", got)
 	}
 }
 
@@ -1420,5 +1524,361 @@ func TestNoticeRoutingIsKeyedOnTheDeclarationNotTheHarness(t *testing.T) {
 				t.Fatal("a mechanism cannot be pull-driven without being driven")
 			}
 		})
+	}
+}
+
+// TestInteractive_PullChannelQuietToolRunDoesNotTripIdleBound is the B1
+// regression: a turn that emits its tool-start event and then runs a
+// foreground build quiet for minutes must not read as idle. Silence with a
+// tool outstanding is work — the idle clock holds at zero until the result
+// lands — while the long pull cap keeps bounding regardless.
+func TestInteractive_PullChannelQuietToolRunDoesNotTripIdleBound(t *testing.T) {
+	nch := &fakeNoticeChannel{retractOK: true}
+	d := startInteractiveDispatchWith(t, "sess-pull-quiet-tool", agent.NoticeDeliveryHook, nch)
+
+	d.injectCh <- heartbeat.InjectPayload{DeliveryID: "dlv-tool", Text: "is the build green?"}
+	nch.waitOffers(t, 1)
+
+	// The Bash build starts, then emits nothing until it finishes. Run twice
+	// the idle bound of silence across it: no dead letter, no ack.
+	d.events <- agent.ToolUseEvent{ToolName: "Bash", ToolUseID: "toolu-build"}
+	for range 2 * interactiveNoticeIdlePolls {
+		d.clock.waitArmed(t)
+		if got := d.pulser.deadLettered(); len(got) != 0 {
+			t.Fatalf("a notice offered to a turn with a running tool was dead-lettered mid-turn: %+v", got)
+		}
+		if got := d.pulser.acked(); len(got) != 0 {
+			t.Fatalf("a notice no turn has collected was acked: %v", got)
+		}
+		d.clock.fire(t)
+	}
+	// The final fire above is buffered; wait until the supervisor has consumed
+	// it so every quiet poll above definitively saw the outstanding tool.
+	d.clock.waitArmed(t)
+	if got := d.pulser.deadLettered(); len(got) != 0 {
+		t.Fatalf("a notice offered to a turn with a running tool was dead-lettered mid-turn: %+v", got)
+	}
+
+	// The build finishes and the hook collects at the next Stop: acked once,
+	// never dead-lettered.
+	nch.setConsumed(true)
+	d.events <- agent.ToolResultEvent{ToolName: "Bash", ToolUseID: "toolu-build"}
+	d.clock.fire(t)
+	d.pulser.waitAcked(t, "dlv-tool")
+	if got := d.pulser.deadLettered(); len(got) != 0 {
+		t.Fatalf("a consumed notice was also dead-lettered: %+v", got)
+	}
+}
+
+// TestInteractive_PullChannelPreHoldToolRunDoesNotTripIdleBound is the
+// pre-hold ordering sibling: a tool that starts BEFORE the notice is held
+// must also hold the idle clock. The supervisor tracks starts even while
+// idle and hold preserves outstanding-tool state, so an inject arriving
+// mid-build survives quiet work instead of dead-lettering as needs-operator
+// and retracting the offer the next Stop would have collected.
+func TestInteractive_PullChannelPreHoldToolRunDoesNotTripIdleBound(t *testing.T) {
+	nch := &fakeNoticeChannel{retractOK: true}
+	d := startInteractiveDispatchWith(t, "sess-pull-prehold-tool", agent.NoticeDeliveryHook, nch)
+
+	// The Bash build starts before any notice is held, then the inject
+	// arrives mid-build. The send rendezvouses with the supervisor's
+	// receive, so the start is recorded before the hold parks the payload.
+	d.events <- agent.ToolUseEvent{ToolName: "Bash", ToolUseID: "toolu-pre"}
+	d.injectCh <- heartbeat.InjectPayload{DeliveryID: "dlv-pre", Text: "mid-build status?"}
+	nch.waitOffers(t, 1)
+
+	// Twice the idle bound of silence across the running build: no dead
+	// letter, no ack.
+	for range 2 * interactiveNoticeIdlePolls {
+		d.clock.waitArmed(t)
+		if got := d.pulser.deadLettered(); len(got) != 0 {
+			t.Fatalf("a notice arriving mid-build was dead-lettered as idle: %+v", got)
+		}
+		if got := d.pulser.acked(); len(got) != 0 {
+			t.Fatalf("a notice no turn has collected was acked: %v", got)
+		}
+		d.clock.fire(t)
+	}
+	d.clock.waitArmed(t)
+	if got := d.pulser.deadLettered(); len(got) != 0 {
+		t.Fatalf("a notice arriving mid-build was dead-lettered as idle: %+v", got)
+	}
+
+	// The build finishes and the hook collects at the next Stop: acked once,
+	// never dead-lettered.
+	nch.setConsumed(true)
+	d.events <- agent.ToolResultEvent{ToolName: "Bash", ToolUseID: "toolu-pre"}
+	d.clock.fire(t)
+	d.pulser.waitAcked(t, "dlv-pre")
+	if got := d.pulser.deadLettered(); len(got) != 0 {
+		t.Fatalf("a consumed notice was also dead-lettered: %+v", got)
+	}
+}
+
+// TestInteractive_PullChannelSecondNoticeSurvivesAckClearedBuild pins the
+// ack-clears-build race: the hook records acceptance of notice A and starts
+// a quiet Bash build before the runner polls A's receipt. A's ack must not
+// clear the live tool ID, or notice B queued during that build is retracted
+// at the idle threshold instead of remaining available for the next Stop.
+// Drives the production supervisor (dispatchInteractive) end to end.
+func TestInteractive_PullChannelSecondNoticeSurvivesAckClearedBuild(t *testing.T) {
+	nch := &fakeNoticeChannel{retractOK: true}
+	d := startInteractiveDispatchWith(t, "sess-pull-second-build", agent.NoticeDeliveryHook, nch)
+
+	d.injectCh <- heartbeat.InjectPayload{DeliveryID: "dlv-A", Text: "first"}
+	nch.waitOffers(t, 1)
+	// The Bash build starts while A waits; the start rendezvouses before the
+	// receipt poll below.
+	d.events <- agent.ToolUseEvent{ToolName: "Bash", ToolUseID: "toolu-build-2"}
+	// The hook records A; the next poll acks it while the build still runs.
+	nch.setConsumed(true)
+	d.clock.waitArmed(t)
+	d.clock.fire(t)
+	d.pulser.waitAcked(t, "dlv-A")
+	if got := d.pulser.deadLettered(); len(got) != 0 {
+		t.Fatalf("first notice dead-lettered: %+v", got)
+	}
+	// B arrives mid-build (still no result). The offer must survive quiet
+	// work past the idle bound instead of retracting as needs-operator.
+	nch.setConsumed(false)
+	d.injectCh <- heartbeat.InjectPayload{DeliveryID: "dlv-B", Text: "second"}
+	nch.waitOffers(t, 2)
+	for range 2 * interactiveNoticeIdlePolls {
+		d.clock.waitArmed(t)
+		if got := d.pulser.deadLettered(); len(got) != 0 {
+			t.Fatalf("second notice retracted while Bash still running: %+v; ack=%v", got, d.pulser.acked())
+		}
+		d.clock.fire(t)
+	}
+	d.clock.waitArmed(t)
+	if got := d.pulser.deadLettered(); len(got) != 0 {
+		t.Fatalf("second notice retracted while Bash still running: %+v", got)
+	}
+	// The build finishes and the hook collects B: acked once, never
+	// dead-lettered.
+	nch.setConsumed(true)
+	d.events <- agent.ToolResultEvent{ToolName: "Bash", ToolUseID: "toolu-build-2"}
+	d.clock.fire(t)
+	d.pulser.waitAcked(t, "dlv-B")
+	if got := d.pulser.deadLettered(); len(got) != 0 {
+		t.Fatalf("a consumed second notice was also dead-lettered: %+v", got)
+	}
+}
+
+// TestInteractive_PullChannelIdleDetailCountsSilentPolls pins the idle
+// receipt's wording: a session busy for 10 polls then silent for 60 must
+// report 60 polls of silence (the idle count), not the 70 total polls.
+func TestInteractive_PullChannelIdleDetailCountsSilentPolls(t *testing.T) {
+	nch := &fakeNoticeChannel{retractOK: true}
+	d := startInteractiveDispatchWith(t, "sess-pull-idle-detail", agent.NoticeDeliveryHook, nch)
+
+	d.injectCh <- heartbeat.InjectPayload{DeliveryID: "dlv-detail", Text: "detail check"}
+	nch.waitOffers(t, 1)
+
+	for range 10 {
+		d.clock.waitArmed(t)
+		d.events <- agent.SystemEvent{Subtype: "user_message", Message: "still working"}
+		d.clock.fire(t)
+	}
+	for range interactiveNoticeIdlePolls - 1 {
+		d.clock.waitArmed(t)
+		d.clock.fire(t)
+	}
+	if reason := d.pulser.waitDeadLettered(t, "dlv-detail"); reason != noticeDeadNeedsOperator {
+		t.Fatalf("dead-letter reason = %q; want %q", reason, noticeDeadNeedsOperator)
+	}
+	warns := strings.Join(d.res.PostSessionWarnings, "|")
+	if !strings.Contains(warns, "for 60 polls") {
+		t.Fatalf("PostSessionWarnings = %q; want the silent count (for 60 polls)", warns)
+	}
+	if strings.Contains(warns, "for 70 polls") {
+		t.Fatalf("PostSessionWarnings = %q; must not report total polls", warns)
+	}
+}
+
+// TestInteractive_PullChannelClaimBeforeIdleCutoffWaitsForAcceptance is the
+// B3 regression: when the hook claims the offer just before the idle cutoff
+// (Retract reports false) while the transcript acceptance record still lags,
+// the runner must keep asking the recipient's own record — not report the
+// delivery dead and clear it before the record can acknowledge it.
+func TestInteractive_PullChannelClaimBeforeIdleCutoffWaitsForAcceptance(t *testing.T) {
+	nch := &fakeNoticeChannel{retractOK: true}
+	d := startInteractiveDispatchWith(t, "sess-pull-claim", agent.NoticeDeliveryHook, nch)
+
+	d.injectCh <- heartbeat.InjectPayload{DeliveryID: "dlv-claim", Text: "status update"}
+	nch.waitOffers(t, 1)
+
+	// Run to the cutoff poll with no session life, then claim between polls.
+	for range interactiveNoticeIdlePolls - 2 {
+		d.clock.waitArmed(t)
+		d.clock.fire(t)
+	}
+	d.clock.waitArmed(t)
+	nch.setRetractOK(false)
+	d.clock.fire(t)
+	d.clock.waitArmed(t)
+	if got := d.pulser.deadLettered(); len(got) != 0 {
+		t.Fatalf("a notice the hook claimed before the cutoff was dead-lettered before its acceptance record landed: %+v", got)
+	}
+
+	// The acceptance record lands: acked once, never dead-lettered, and the
+	// claimed offer was withdrawn exactly once, never re-retracted.
+	nch.setConsumed(true)
+	d.clock.fire(t)
+	d.pulser.waitAcked(t, "dlv-claim")
+	if got := d.pulser.deadLettered(); len(got) != 0 {
+		t.Fatalf("a claimed-and-accepted notice was also dead-lettered: %+v", got)
+	}
+	if got := nch.retractCount(); got != 1 {
+		t.Fatalf("Retract called %d times; want exactly 1 — a claimed offer must not be re-retracted", got)
+	}
+}
+
+// TestInteractive_PullChannelIdleBoundDisabledWaitsForLongCap pins the
+// operator opt-out: with the idle shortcut disabled the offer survives idle
+// silence past the default two-minute bound and reports only at the long pull
+// cap — so an operator who returns just after the threshold and starts the
+// turn that would collect the offer does not lose it. Drives the production
+// supervisor with a Runner carrying InteractiveNoticeIdlePolls=-1.
+func TestInteractive_PullChannelIdleBoundDisabledWaitsForLongCap(t *testing.T) {
+	nch := &fakeNoticeChannel{retractOK: true}
+	d := startInteractiveDispatchWithBounds(t, "sess-pull-idle-off", agent.NoticeDeliveryHook, nch, -1, 0)
+
+	d.injectCh <- heartbeat.InjectPayload{DeliveryID: "dlv-idle-off", Text: "operator returns soon"}
+	nch.waitOffers(t, 1)
+
+	// Past the default idle bound with no session life: still held, not
+	// dead-lettered, because the idle shortcut is disabled.
+	for range 2 * interactiveNoticeIdlePolls {
+		d.clock.waitArmed(t)
+		if got := d.pulser.deadLettered(); len(got) != 0 {
+			t.Fatalf("idle-disabled offer dead-lettered at the idle bound: %+v", got)
+		}
+		d.clock.fire(t)
+	}
+	d.clock.waitArmed(t)
+	if got := d.pulser.deadLettered(); len(got) != 0 {
+		t.Fatalf("idle-disabled offer dead-lettered at the idle bound: %+v", got)
+	}
+
+	// The operator returns after the threshold and the hook collects at the
+	// next Stop: acked once, never dead-lettered.
+	nch.setConsumed(true)
+	d.clock.fire(t)
+	d.pulser.waitAcked(t, "dlv-idle-off")
+	if got := d.pulser.deadLettered(); len(got) != 0 {
+		t.Fatalf("a collected offer was also dead-lettered: %+v", got)
+	}
+}
+
+// TestInteractive_PullChannelClaimGraceDisabledWaitsForAcceptance pins the
+// claim-grace opt-out: with a negative grace the runner keeps asking the
+// recipient's own record past the default minute instead of reporting the
+// claimed offer as discarded output.
+func TestInteractive_PullChannelClaimGraceDisabledWaitsForAcceptance(t *testing.T) {
+	nch := &fakeNoticeChannel{retractOK: false}
+	d := startInteractiveDispatchWithBounds(t, "sess-pull-grace-off", agent.NoticeDeliveryHook, nch, 0, -1)
+
+	d.injectCh <- heartbeat.InjectPayload{DeliveryID: "dlv-grace-off", Text: "slow acceptance"}
+	nch.waitOffers(t, 1)
+
+	for range interactiveNoticeIdlePolls - 1 {
+		d.clock.waitArmed(t)
+		d.clock.fire(t)
+	}
+	d.clock.waitArmed(t)
+	if got := d.pulser.deadLettered(); len(got) != 0 {
+		t.Fatalf("a claimed offer was dead-lettered inside its disabled grace: %+v", got)
+	}
+	// Past the default grace with still no record: still held.
+	for range 2 * interactiveNoticeClaimGracePolls {
+		d.clock.fire(t)
+		d.clock.waitArmed(t)
+		if got := d.pulser.deadLettered(); len(got) != 0 {
+			t.Fatalf("a claimed offer was dead-lettered inside its disabled grace: %+v", got)
+		}
+	}
+	nch.setConsumed(true)
+	d.clock.fire(t)
+	d.pulser.waitAcked(t, "dlv-grace-off")
+	if got := d.pulser.deadLettered(); len(got) != 0 {
+		t.Fatalf("a claimed-and-accepted notice was also dead-lettered: %+v", got)
+	}
+	if got := nch.retractCount(); got != 1 {
+		t.Fatalf("Retract called %d times; want exactly 1", got)
+	}
+}
+
+// TestInteractive_PullChannelClaimGraceExpiresAsDiscardedOutput bounds the
+// B3 wait: a claim whose acceptance record never appears still cannot hold
+// the slot forever. Past the claim grace it reads as discarded output under
+// the cutoff's own reason.
+// TestInteractive_PullChannelClaimGraceDisabledBoundedByLongCap pins the
+// claimed opt-out bound: with a negative claim grace the runner waits without
+// expiring the grace, but the long pull cap still frees the single notice
+// slot so a claim whose acceptance record never arrives cannot starve later
+// notices indefinitely. Drives the production supervisor (dispatchInteractive)
+// with a Runner carrying InteractiveNoticeClaimGracePolls=-1.
+func TestInteractive_PullChannelClaimGraceDisabledBoundedByLongCap(t *testing.T) {
+	nch := &fakeNoticeChannel{retractOK: false}
+	d := startInteractiveDispatchWithBounds(t, "sess-pull-grace-off-cap", agent.NoticeDeliveryHook, nch, 0, -1)
+
+	d.injectCh <- heartbeat.InjectPayload{DeliveryID: "dlv-grace-off-cap", Text: "record never arrives"}
+	nch.waitOffers(t, 1)
+
+	// The idle cutoff claims the offer (Retract reports false); the disabled
+	// grace then holds past the default minute. Keep polling with no session
+	// life to the long pull cap: the slot must free under the cutoff's own
+	// reason instead of holding forever.
+	for range interactiveNoticePullMaxPolls - 1 {
+		d.clock.waitArmed(t)
+		d.clock.fire(t)
+	}
+	if reason := d.pulser.waitDeadLettered(t, "dlv-grace-off-cap"); reason != noticeDeadNeedsOperator {
+		t.Fatalf("dead-letter reason = %q; want %q (the idle cutoff that saw the claim, bounded by the long cap)", reason, noticeDeadNeedsOperator)
+	}
+	if got := nch.retractCount(); got != 1 {
+		t.Fatalf("Retract called %d times; want exactly 1 — a claimed offer must not be re-retracted", got)
+	}
+	if got := d.pulser.acked(); len(got) != 0 {
+		t.Fatalf("a never-accepted notice was acked: %v", got)
+	}
+}
+
+func TestInteractive_PullChannelClaimGraceExpiresAsDiscardedOutput(t *testing.T) {
+	nch := &fakeNoticeChannel{retractOK: false}
+	d := startInteractiveDispatchWith(t, "sess-pull-claim-lost", agent.NoticeDeliveryHook, nch)
+
+	d.injectCh <- heartbeat.InjectPayload{DeliveryID: "dlv-claim-lost", Text: "never accepted"}
+	nch.waitOffers(t, 1)
+
+	// The receipt poll plus the idle bound trips the cutoff with the offer
+	// already claimed: grace, not death.
+	for range interactiveNoticeIdlePolls - 1 {
+		d.clock.waitArmed(t)
+		d.clock.fire(t)
+	}
+	d.clock.waitArmed(t)
+	if got := d.pulser.deadLettered(); len(got) != 0 {
+		t.Fatalf("a claimed offer was dead-lettered inside its grace: %+v", got)
+	}
+
+	// The grace expires with no acceptance record: dead under the idle
+	// cutoff's own reason, withdrawn exactly once. Each grace fire re-arms
+	// (held), so fire-then-wait pairs chain; the final fire spends the grace
+	// and settles terminally with no re-arm.
+	for range interactiveNoticeClaimGracePolls - 1 {
+		d.clock.fire(t)
+		d.clock.waitArmed(t)
+	}
+	d.clock.fire(t)
+	if reason := d.pulser.waitDeadLettered(t, "dlv-claim-lost"); reason != noticeDeadNeedsOperator {
+		t.Fatalf("dead-letter reason = %q; want %q (the cutoff that saw the claim)", reason, noticeDeadNeedsOperator)
+	}
+	if got := nch.retractCount(); got != 1 {
+		t.Fatalf("Retract called %d times; want exactly 1", got)
+	}
+	if got := d.pulser.acked(); len(got) != 0 {
+		t.Fatalf("a never-accepted notice was acked: %v", got)
 	}
 }

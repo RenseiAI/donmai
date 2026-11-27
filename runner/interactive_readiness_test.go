@@ -332,9 +332,12 @@ func TestInteractiveReadiness_SameSessionStructuredTurn(t *testing.T) {
 
 // TestInteractiveReadiness_QueuedAppliedDeadLetteredReceipts pins the three
 // durable receipts: queued stays unacked while outstanding, applied acks once
-// on consumption, and dead-lettered reports once with the not-consumed reason
-// after withdrawing the offer so a late collection cannot deliver a message
-// already reported dead.
+// on consumption, and dead-lettered reports once with the needs-operator
+// reason for an idle hook session after withdrawing the offer so a late
+// collection cannot deliver a message already reported dead. The busy-path
+// not-consumed receipt past the long cap is pinned by the pull-channel
+// activity suite; this suite pins the no-activity path that trips the idle
+// bound first.
 func TestInteractiveReadiness_QueuedAppliedDeadLetteredReceipts(t *testing.T) {
 	nch := &fakeNoticeChannel{retractOK: true}
 	d := startInteractiveDispatchWith(t, "sess-receipts", agent.NoticeDeliveryHook, nch)
@@ -355,14 +358,15 @@ func TestInteractiveReadiness_QueuedAppliedDeadLetteredReceipts(t *testing.T) {
 		d.clock.fire(t)
 	}
 
-	// Dead-lettered: the wait is spent, the offer is withdrawn first, and the
-	// producer learns instead of watching eternal in-flight.
-	for range interactiveNoticePullMaxPolls - 4 {
+	// Dead-lettered: with no session life the idle bound trips first, the
+	// offer is withdrawn first, and the producer learns an operator nudge is
+	// needed instead of watching eternal in-flight.
+	for range interactiveNoticeIdlePolls - 4 {
 		d.clock.waitArmed(t)
 		d.clock.fire(t)
 	}
-	if reason := d.pulser.waitDeadLettered(t, "dlv-receipt-stuck"); reason != noticeDeadNotConsumed {
-		t.Fatalf("dead-letter reason = %q; want %q", reason, noticeDeadNotConsumed)
+	if reason := d.pulser.waitDeadLettered(t, "dlv-receipt-stuck"); reason != noticeDeadNeedsOperator {
+		t.Fatalf("dead-letter reason = %q; want %q", reason, noticeDeadNeedsOperator)
 	}
 	if got := nch.retractCount(); got != 1 {
 		t.Fatalf("Retract called %d times; want exactly 1", got)

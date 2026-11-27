@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -32,6 +33,10 @@ type Handle struct {
 	client   *Client
 	bridge   *ApprovalBridge
 	spec     agent.Spec
+
+	// denyNotice reports the denies Codex does not enforce as asked; it is
+	// emitted once, right after the InitEvent the event contract keeps first.
+	denyNotice *agent.SystemEvent
 
 	// Per-call request timeout for thread/start, turn/start, etc.
 	rpcTimeout time.Duration
@@ -185,7 +190,7 @@ func (h *Handle) Stop(ctx context.Context) error {
 	})
 	cleanupErr := h.releaseMCPConfig()
 	if cleanupErr != nil {
-		h.emit(mcpCleanupErrorEvent())
+		h.emitCoarse(mcpCleanupErrorEvent())
 	}
 	// Broadcast shutdown + close events; both are idempotent guards
 	// (closedOnce / eventsClosed) so the call is safe even if the
@@ -210,9 +215,9 @@ func (h *Handle) failNow(err error) {
 	// eventsClosed is already set. Posting BEFORE we close lets the
 	// runner observe the failure rather than racing with closure.
 	if cleanupErr != nil {
-		h.emit(mcpCleanupErrorEvent())
+		h.emitCoarse(mcpCleanupErrorEvent())
 	} else {
-		h.emit(agent.ErrorEvent{
+		h.emitCoarse(agent.ErrorEvent{
 			Message: fmt.Sprintf("codex provider failure: %s", err.Error()),
 			Code:    "app_server_crashed",
 		})
@@ -297,13 +302,19 @@ func (h *Handle) start(ctx context.Context, plan SpawnPlan, resumeThreadID strin
 	// Subscribe BEFORE thread/start to catch the immediate
 	// thread/started notification.
 	provisionalSub := func(n notification) { h.notifyCh <- n }
+	if plan.DenyErr != nil {
+		return plan.DenyErr
+	}
+	h.denyNotice = plan.denyNotice
 
 	if resumeThreadID != "" {
 		h.client.Subscribe(resumeThreadID, provisionalSub)
 		h.idMu.Lock()
 		h.threadID = resumeThreadID
 		h.idMu.Unlock()
-		params := threadResumeParams(resumeThreadID)
+		params := threadResumeParams(resumeThreadID, denyPlan{})
+		maps.Copy(params, plan.ThreadResume)
+		params["threadId"] = resumeThreadID
 		if _, err := h.client.RequestWithRetry(ctx, "thread/resume", params, h.rpcTimeout); err != nil {
 			h.client.Unsubscribe(resumeThreadID)
 			// A rejected resume is not a fresh spawn: when the backend
@@ -406,7 +417,7 @@ func (h *Handle) forward(ctx context.Context) {
 			ctxStop, cancel := context.WithTimeout(context.Background(), h.rpcTimeout)
 			_ = h.Stop(ctxStop)
 			cancel()
-			h.emit(agent.ErrorEvent{Message: "session cancelled: " + ctx.Err().Error(), Code: "context_cancelled"})
+			h.emitCoarse(agent.ErrorEvent{Message: "session cancelled: " + ctx.Err().Error(), Code: "context_cancelled"})
 			return
 		case <-h.closed:
 			return
@@ -455,37 +466,104 @@ func (h *Handle) handleNotification(n notification) bool {
 				h.provider.unregisterHandle(h)
 			}
 			if err := h.releaseMCPConfig(); err != nil {
-				if ev.Kind() == agent.EventResult && mcpCleanupContained(err) {
-					// The turn already finished and its result is real; the
-					// failed clear is contained (Provider poisoned, writer
-					// stopped, home removed or retained by the owner's
-					// retention rule). Report the result and surface the
-					// cleanup failure as a warning instead of discarding a
-					// completed turn.
+				if result, ok := ev.(agent.ResultEvent); ok && result.Success {
+					// The turn finished successfully and its result is real.
+					// A cleanup failure (contained or not) never replaces a
+					// successful result: report the result and surface the
+					// cleanup failure as a warning with its own reason
+					// (codex_warning carrying the bounded release detail).
+					// The Provider is poisoned for later leases and the private
+					// home went through the retention/sweep path. Only a
+					// contained removal proves the writer stopped; otherwise
+					// shutdown stays unconfirmed and the warning says so.
+					contained := mcpCleanupContained(err)
+					if contained {
+						slog.Warn("codex: isolated MCP config cleanup failed after the turn completed; app-server stopped, provider refuses new sessions",
+							"threadId", h.SessionID(), "err", err)
+					} else {
+						slog.Warn("codex: isolated MCP config cleanup failed after the turn completed; app-server shutdown unconfirmed (writer may still be live), provider refuses new sessions",
+							"threadId", h.SessionID(), "err", err)
+					}
+					h.emitTerminalWithWarning(mcpCleanupWarningEvent(err, contained), ev)
+				} else if ev.Kind() == agent.EventResult && mcpCleanupContained(err) {
+					// A failed turn whose clear is contained keeps its own
+					// result alongside the warning; anything else fails
+					// closed so an unfinished turn never reports success.
+					// Contained removal proves the writer stopped, so the
+					// stopped claim is accurate here.
 					slog.Warn("codex: isolated MCP config cleanup failed after the turn completed; app-server stopped, provider refuses new sessions",
 						"threadId", h.SessionID(), "err", err)
-					h.emit(mcpCleanupWarningEvent(err))
-					h.emit(ev)
+					h.emitTerminalWithWarning(mcpCleanupWarningEvent(err, true), ev)
 				} else {
-					h.emit(mcpCleanupErrorEvent())
+					h.emitCoarse(mcpCleanupErrorEvent())
 				}
 			} else {
-				h.emit(ev)
+				h.emitCoarse(ev)
 			}
 			return true
 		}
 		h.emit(ev)
+		if ev.Kind() == agent.EventInit && h.denyNotice != nil {
+			h.emit(*h.denyNotice)
+			h.denyNotice = nil
+		}
 	}
 	return false
 }
 
-// mcpCleanupWarningEvent reports a contained cleanup failure. The detail is
-// the bounded release error (codexMCPConfigFailureDetail never carries config
-// values), so the cause is visible without leaking the session's MCP config.
-func mcpCleanupWarningEvent(err error) agent.SystemEvent {
+// mcpCleanupWarningEvent reports a cleanup failure that accompanies the
+// turn's own result. The detail is the bounded release error
+// (codexMCPConfigFailureDetail never carries config values), so the cause is
+// visible without leaking the session's MCP config. writerStopped reports
+// whether owner removal proved the writer stopped (contained): only then does
+// the message claim the app-server was stopped, otherwise it reports shutdown
+// as unconfirmed so a live writer is never described as stopped.
+func mcpCleanupWarningEvent(err error, writerStopped bool) agent.SystemEvent {
+	if writerStopped {
+		return agent.SystemEvent{
+			Subtype: "codex_warning",
+			Message: "codex isolated MCP configuration cleanup failed after the turn completed; the app-server was stopped and this provider refuses new sessions: " + err.Error(),
+		}
+	}
 	return agent.SystemEvent{
 		Subtype: "codex_warning",
-		Message: "codex isolated MCP configuration cleanup failed after the turn completed; the app-server was stopped and this provider refuses new sessions: " + err.Error(),
+		Message: "codex isolated MCP configuration cleanup failed after the turn completed; app-server shutdown unconfirmed and this provider refuses new sessions: " + err.Error(),
+	}
+}
+
+// terminalReservedSlots holds the coarse Init/Result contract: stream deltas
+// never take these slots, so the terminal warning plus result always fit
+// without discarding queued history. Mirrors the interactive lane's
+// coarse-slot reservation (interactive.go).
+const terminalReservedSlots = 2
+
+// emitTerminalWithWarning emits a cleanup warning plus the turn's terminal
+// outcome without discarding queued history. Stream deltas never fill the
+// reserved slots (see emit), so both normally fit; when only one slot
+// remains the terminal outcome wins and the warning is dropped (it stays in
+// the logs). A completely full buffer can only happen when the channel was
+// filled bypassing emit (tiny test buffers, direct sends): the terminal then
+// waits for the consumer to drain rather than discarding the oldest queued
+// event, which carries the session identity the runner needs for the result
+// and recovery state.
+func (h *Handle) emitTerminalWithWarning(warning agent.SystemEvent, terminal agent.Event) {
+	if cap(h.events)-len(h.events) >= 2 {
+		h.emitCoarse(warning)
+		h.emitCoarse(terminal)
+		return
+	}
+	if cap(h.events)-len(h.events) == 1 {
+		h.emitCoarse(terminal)
+		return
+	}
+	h.eventsMu.RLock()
+	defer h.eventsMu.RUnlock()
+	if h.eventsClosed.Load() {
+		return
+	}
+	select {
+	case h.events <- terminal:
+	case <-h.closed:
 	}
 }
 
@@ -581,10 +659,11 @@ func (h *Handle) handleServerRequest(n notification) {
 	})
 }
 
-// emit publishes an event on the events channel without blocking. If
-// the channel is full, the event is dropped silently — the runner is
-// expected to keep up; emitting backpressure into the JSON-RPC stream
-// would deadlock the codex side.
+// emit publishes a stream-delta event on the events channel without
+// blocking. Deltas never take the terminalReservedSlots held for the
+// terminal warning plus result; once only those remain the delta is dropped
+// silently — the runner is expected to keep up, and emitting backpressure
+// into the JSON-RPC stream would deadlock the codex side.
 //
 // Close-protocol invariant: emit holds eventsMu.RLock for
 // the duration of the send and aborts early when eventsClosed is set.
@@ -594,6 +673,31 @@ func (h *Handle) handleServerRequest(n notification) {
 // selected against so a slow send unblocks promptly when shutdown
 // begins, even if the closer has not yet acquired the write lock.
 func (h *Handle) emit(ev agent.Event) {
+	h.eventsMu.RLock()
+	defer h.eventsMu.RUnlock()
+	if h.eventsClosed.Load() {
+		return
+	}
+	// Never take a slot reserved for the terminal warning plus result:
+	// with at most terminalReservedSlots coarse sends over the handle's
+	// life, the coarse senders below always fit what deltas left free.
+	// When the consumer is slow the delta is dropped rather than stalling
+	// the forwarder or displacing queued history.
+	if len(h.events) >= cap(h.events)-terminalReservedSlots {
+		return
+	}
+	select {
+	case h.events <- ev:
+	case <-h.closed:
+	default:
+	}
+}
+
+// emitCoarse publishes a terminal event (every Result/Error terminal above
+// plus the Stop/failNow/cancel paths below) without the delta reservation:
+// the reserved slots exist exactly so these sends fit. Non-blocking with the
+// same close-protocol guard as emit.
+func (h *Handle) emitCoarse(ev agent.Event) {
 	h.eventsMu.RLock()
 	defer h.eventsMu.RUnlock()
 	if h.eventsClosed.Load() {

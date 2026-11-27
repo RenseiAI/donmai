@@ -102,6 +102,33 @@ const (
 	// still matters.
 	interactiveNoticePullMaxPolls = 450
 
+	// interactiveNoticeIdlePolls bounds how long ONE notice may sit on a PULL
+	// channel with NO sign of session life before it is reported as needing
+	// an operator.
+	//
+	// A poll that follows real session activity (a turn ending, transcript
+	// events reaching the supervisor) is a session doing work: the notice
+	// waits for the next turn end under the long pull cap above. A poll with
+	// no activity behind it is a session likely idle at an empty prompt — a
+	// state the Stop hook has already fired for and will never fire out of
+	// on its own, so the message waits until a human interacts. Reporting
+	// needs-operator at 60 × interactiveNoticeRetry (≈2 minutes) hands the
+	// producer a typed receipt while the fact still matters, instead of
+	// holding the slot for the full 15-minute cap and then reporting a
+	// generic unconsumed wait. The threshold sits past the refusal cap (30)
+	// so a busy session's ordinary minute of work never reads as idle.
+	interactiveNoticeIdlePolls = 60
+
+	// interactiveNoticeClaimGracePolls bounds the wait AFTER the harness
+	// has claimed an offer (Retract reported false: pending.json is gone)
+	// for the acceptance record to appear on the recipient's own transcript.
+	// The claim and the record land asynchronously — the hook renames a file,
+	// the CLI appends the conversation entry later — so a cutoff poll that
+	// fires between the two must not report the delivery dead. 30 ×
+	// interactiveNoticeRetry (≈1 minute) is ample for a transcript append;
+	// a claim still silent past it reads as discarded output, not delivery.
+	interactiveNoticeClaimGracePolls = 30
+
 	// interactiveNoticeTruncated marks a notice clipped to the canonical-mode
 	// input bound. The full text remains wherever it was durably queued.
 	interactiveNoticeTruncated = " …[truncated]"
@@ -161,6 +188,17 @@ const (
 	// discarded, the session was parked on a modal so no turn ever ended, or
 	// the session went idle at an empty prompt where Stop has already fired.
 	noticeDeadNotConsumed = "not-consumed"
+
+	// noticeDeadNeedsOperator — the notice was offered on a pull channel and
+	// sat with no sign of session life for interactiveNoticeIdlePolls. The
+	// session is likely idle at an empty prompt, where the hook that would
+	// collect the message has already fired and will not fire again until a
+	// human interacts. The receipt tells the producer an operator nudge —
+	// not another silent wait — is what will move the message. It reports
+	// which happened by construction: this reason means idle-needs-operator,
+	// while noticeDeadNotConsumed means the session stayed busy past the
+	// long cap without ever collecting the offer.
+	noticeDeadNeedsOperator = "needs-operator"
 )
 
 // noticeChannelDrivenByRunner reports whether THIS build can actually push a
@@ -382,9 +420,31 @@ type interactiveNoticeQueue struct {
 	// yet been collected from. Deliberately not the same counter as attempts —
 	// see interactiveNoticePullMaxPolls.
 	polls int
+	// idlePolls counts consecutive polls with no sign of session life (no
+	// handle event reached the supervisor since the last reset, and no tool
+	// started-but-unfinished). It is the idle detector: noteActivity resets
+	// it, and a tool still running holds it at zero (see hasActiveTools), so
+	// a working session never trips the idle bound no matter how long its
+	// turn runs quiet, while an idle session trips it after
+	// interactiveNoticeIdlePolls of silence.
+	idlePolls int
 	// offered records that the pull channel has custody, so the offer is not
 	// rewritten on every poll.
 	offered bool
+	// pendingTools holds the ToolUseIDs the supervisor has seen start without
+	// their matching result: a foreground build runs silent for minutes after
+	// its tool-start event, and that silence is work, not idleness.
+	// pendingUnkeyed counts starts that carried no id (same meaning).
+	pendingTools   map[string]struct{}
+	pendingUnkeyed int
+	// claimed records that the harness took the offer (Retract returned false
+	// at a cutoff) while the acceptance record had not yet appeared. While
+	// set, cutoffs are suspended and only the Consumed poll plus the claim
+	// grace below decide. claimPolls counts those grace polls; claimReason is
+	// the cutoff's reason, reused if the grace expires still unacknowledged.
+	claimed     bool
+	claimPolls  int
+	claimReason string
 
 	warned bool // hard write error surfaced on the Result once
 }
@@ -403,16 +463,76 @@ func (q *interactiveNoticeQueue) undelivered(buffered int) int {
 	return buffered
 }
 
-// hold parks a payload in the slot.
+// hold parks a payload in the slot. Outstanding-tool state survives across
+// hold: a tool that started before the notice arrived is still running, and
+// clearing it here would read a mid-build inject as idle silence.
 func (q *interactiveNoticeQueue) hold(text, deliveryID string) {
 	q.text, q.deliveryID = text, deliveryID
-	q.attempts, q.polls, q.offered = 0, 0, false
+	q.attempts, q.polls, q.idlePolls, q.offered = 0, 0, 0, false
+	q.claimed, q.claimPolls, q.claimReason = false, 0, ""
 }
 
-// clear frees the slot.
+// clear frees the slot. Outstanding-tool state survives across delivery:
+// a tool that started while the acked notice waited is still running, and
+// clearing it here would read the NEXT notice's quiet work as idle silence.
+// Tool results arriving later delete the entries (see noteActivity), and the
+// long pull cap still bounds a leaked start, so preserving never holds the
+// slot past the cap.
 func (q *interactiveNoticeQueue) clear() {
 	q.text, q.deliveryID = "", ""
-	q.attempts, q.polls, q.offered = 0, 0, false
+	q.attempts, q.polls, q.idlePolls, q.offered = 0, 0, 0, false
+	q.claimed, q.claimPolls, q.claimReason = false, 0, ""
+}
+
+// noteActivity records one sign of session life while a notice is held: a
+// handle event reached the supervisor, so the session is working, not idle.
+// It resets the idle clock without touching the long pull cap, which keeps
+// bounding the total wait. Calls with nothing held are no-ops except for
+// tool start/result tracking, so the supervisor can invoke it
+// unconditionally on every event.
+//
+// Tool starts and results are tracked even while idle as well as counted:
+// a tool that started before the notice was held is still running, and a
+// foreground build emits its tool-start event and then nothing until it
+// finishes minutes later. A start without a matching result holds the idle
+// clock at zero across silent polls (see hasActiveTools).
+func (q *interactiveNoticeQueue) noteActivity(event agent.Event) {
+	switch e := event.(type) {
+	case agent.ToolUseEvent:
+		if e.ToolUseID != "" {
+			if q.pendingTools == nil {
+				q.pendingTools = map[string]struct{}{}
+			}
+			q.pendingTools[e.ToolUseID] = struct{}{}
+		} else {
+			q.pendingUnkeyed++
+		}
+		if q.idle() {
+			return
+		}
+	case agent.ToolResultEvent:
+		if e.ToolUseID != "" {
+			delete(q.pendingTools, e.ToolUseID)
+		} else if q.pendingUnkeyed > 0 {
+			q.pendingUnkeyed--
+		}
+		if q.idle() {
+			return
+		}
+	default:
+		if q.idle() {
+			return
+		}
+	}
+	q.idlePolls = 0
+}
+
+// hasActiveTools reports whether a tool started-but-unfinished is holding the
+// idle clock at zero. It suppresses only the idle shortcut, never the long
+// pull cap, so a leaked start delays needs-operator but cannot hold the slot
+// past the cap.
+func (q *interactiveNoticeQueue) hasActiveTools() bool {
+	return len(q.pendingTools) > 0 || q.pendingUnkeyed > 0
 }
 
 // readiness reads the truthful per-session semantic input readiness for the
@@ -547,16 +667,81 @@ func (q *interactiveNoticeQueue) attemptPull(
 	}
 
 	q.polls++
+	// A claimed offer is out of the runner's hands: the hook took it and the
+	// acceptance record lands on the transcript asynchronously, so a cutoff
+	// that fires between the claim and the record must not report the
+	// delivery dead. Keep asking the recipient's own record under the claim
+	// grace; a claim still silent past it reads as discarded output.
+	// A negative claim bound waits without expiring the grace (operator
+	// opt-out), but the single notice slot is still head-of-line blocking:
+	// even a claimed offer is bounded by the long pull cap so a claim whose
+	// record never arrives cannot starve later notices indefinitely.
+	if q.claimed {
+		q.claimPolls++
+		if claimGrace := r.claimGracePolls(); claimGrace < 0 {
+			if q.polls < interactiveNoticePullMaxPolls {
+				return noticeHeld
+			}
+		} else if q.claimPolls < claimGrace {
+			return noticeHeld
+		}
+		return q.deadLetter(r, qw, res, q.claimReason,
+			fmt.Sprintf("hook claimed the offer but no acceptance record appeared within %d polls over ~%s; "+
+				"treating the claim as discarded output", q.claimPolls,
+				time.Duration(q.claimPolls)*interactiveNoticeRetry))
+	}
+	// A tool still running is session life even when it emits nothing: a
+	// foreground build runs quiet for minutes after its tool-start event, and
+	// counting that silence as idle retracts the notice mid-turn. Hold the
+	// idle clock at zero while a start awaits its result; the long cap below
+	// keeps bounding regardless.
+	if q.hasActiveTools() {
+		q.idlePolls = 0
+	} else {
+		q.idlePolls++
+	}
+	if idleBound := r.idleNoticePolls(); idleBound >= 0 && q.idlePolls >= idleBound {
+		// No sign of session life for the idle bound: no turn ended, no
+		// transcript event reached the supervisor, no tool outstanding. The
+		// session is likely idle at an empty prompt, where the Stop hook has
+		// already fired and will not fire again until a human interacts — so
+		// holding to the long cap only delays the typed receipt the producer
+		// needs to nudge an operator. Withdraw first (same reason as the cap:
+		// a message reported dead must not stay collectable) — unless the
+		// hook claimed the offer first (retracted == false with no error),
+		// which enters the claim grace above instead of dying here.
+		retracted, rerr := nch.Retract()
+		if rerr == nil && !retracted {
+			q.claimed, q.claimPolls, q.claimReason = true, 0, noticeDeadNeedsOperator
+			r.logger.Info("[interactive] notice claimed at the idle cutoff — awaiting the acceptance record",
+				"sessionId", qw.SessionID, "deliveryId", q.deliveryID)
+			return noticeHeld
+		}
+		detail := fmt.Sprintf("offered but with no session activity for %d polls over ~%s; "+
+			"the session is likely idle at an empty prompt where the hook has already fired — "+
+			"needs operator (retracted=%v)",
+			q.idlePolls, time.Duration(q.idlePolls)*interactiveNoticeRetry, retracted)
+		if rerr != nil {
+			detail += fmt.Sprintf("; retract failed: %v", rerr)
+		}
+		return q.deadLetter(r, qw, res, noticeDeadNeedsOperator, detail)
+	}
 	if q.polls < interactiveNoticePullMaxPolls {
 		return noticeHeld
 	}
 
 	// The wait is spent. Withdraw the offer first so a late collection cannot
-	// deliver a message we are about to report as dead — and note that a
-	// failed withdrawal is not a reason to keep waiting: retracted == false
-	// means the harness already claimed it and produced no record of it
-	// landing, which is exactly the discarded-output case.
+	// deliver a message we are about to report as dead — unless the harness
+	// already claimed it (retracted == false with no error): the acceptance
+	// record may still be in flight, so enter the claim grace above instead of
+	// clearing a delivery that is about to acknowledge.
 	retracted, rerr := nch.Retract()
+	if rerr == nil && !retracted {
+		q.claimed, q.claimPolls, q.claimReason = true, 0, noticeDeadNotConsumed
+		r.logger.Info("[interactive] notice claimed at the pull cap — awaiting the acceptance record",
+			"sessionId", qw.SessionID, "deliveryId", q.deliveryID)
+		return noticeHeld
+	}
 	detail := fmt.Sprintf("offered but not consumed after %d polls over ~%s (retracted=%v)",
 		q.polls, time.Duration(interactiveNoticePullMaxPolls)*interactiveNoticeRetry, retracted)
 	if rerr != nil {
@@ -639,6 +824,27 @@ func declaredOrUndeclared(nd agent.NoticeDelivery) string {
 		return "<undeclared>"
 	}
 	return string(nd)
+}
+
+// idleNoticePolls resolves the idle shortcut bound for pull-channel
+// notices: the const default when unset, the operator's explicit poll count
+// when positive, and negative (disabled) when the operator opts to leave the
+// offer in place until the long pull cap.
+func (r *Runner) idleNoticePolls() int {
+	if r == nil || r.interactiveNoticeIdlePolls == 0 {
+		return interactiveNoticeIdlePolls
+	}
+	return r.interactiveNoticeIdlePolls
+}
+
+// claimGracePolls resolves the claim-grace bound the same way: default,
+// explicit count, or negative for wait-without-expiring (the long pull cap
+// still bounds the slot even while claimed).
+func (r *Runner) claimGracePolls() int {
+	if r == nil || r.interactiveNoticeClaimGracePolls == 0 {
+		return interactiveNoticeClaimGracePolls
+	}
+	return r.interactiveNoticeClaimGracePolls
 }
 
 // noticeRetryClock returns the clock the interactive supervisor arms its
