@@ -9,6 +9,10 @@ import (
 	"runtime"
 	"strings"
 	"unicode"
+	"unicode/utf8"
+
+	"golang.org/x/text/cases"
+	"golang.org/x/text/unicode/norm"
 
 	"github.com/RenseiAI/donmai/internal/toolpolicy"
 )
@@ -25,16 +29,16 @@ const maxSymlinkHops = 40
 // file-access approval does not say whether it reads or writes, so either
 // kind of deny applies.
 //
-// It fails closed against every other spelling of a denied path: the rules
-// are compiled once per spelling of their anchors (the root and home as
-// given and as resolved, and each pattern's literal directory resolved), an
-// approval path is matched both as written and as resolved on disk, and on a
-// case-insensitive platform both sides are case-folded. A path that cannot be
-// resolved, holds a control character, or is relative with no root to resolve
-// it against, is denied; so is every path while a deny's own directory cannot
-// be resolved.
+// It fails closed against every other spelling of a denied path. Each deny is
+// anchored here as an absolute glob for every spelling of its anchor (the
+// root and home as given and as resolved, and the deny's literal directory
+// resolved). An approval path is matched both as written and as resolved on
+// disk. On a case-insensitive platform both sides are case-folded and
+// normalized. A path that cannot be resolved, holds or resolves to a control
+// character, or is relative with no root to resolve it against, is denied;
+// so is every path while a deny's own directory cannot be resolved.
 type pathDenies struct {
-	rules      []toolpolicy.Paths
+	rules      toolpolicy.Paths
 	root       string
 	fold       bool
 	unresolved []string
@@ -59,6 +63,9 @@ func compilePathDenies(patterns []string, root, home string, fold bool) (pathDen
 
 	var expanded []string
 	var errs []error
+	add := func(name, glob string) {
+		expanded = append(expanded, name+"("+asciiSafeGlob(foldCase(glob, fold))+")")
+	}
 	for _, raw := range patterns {
 		name, arg, scoped := toolpolicy.ParseToolPattern(strings.TrimSpace(raw))
 		if !isPathToolName(name) {
@@ -72,8 +79,15 @@ func compilePathDenies(patterns []string, root, home string, fold bool) (pathDen
 			// A deny on the filesystem root covers every absolute path.
 			arg = "/**"
 		}
-		expanded = append(expanded, name+"("+arg+")")
-		for _, abs := range anchoredGlobs(arg, roots, homes) {
+		globs, ok := anchoredGlobs(arg, roots, homes)
+		if !ok {
+			// No root or home to anchor it at: toolpolicy rejects the
+			// pattern, which denies every path.
+			expanded = append(expanded, name+"("+arg+")")
+			continue
+		}
+		for _, abs := range globs {
+			add(name, abs)
 			canonical, ok := canonicalGlob(abs)
 			switch {
 			case !ok:
@@ -82,43 +96,21 @@ func compilePathDenies(patterns []string, root, home string, fold bool) (pathDen
 				d.unresolved = append(d.unresolved, raw)
 				errs = append(errs, fmt.Errorf("%q: directory cannot be resolved", raw))
 			case canonical != abs:
-				expanded = append(expanded, name+"("+canonical+")")
+				add(name, canonical)
 			}
 		}
 	}
 	if len(expanded) == 0 {
 		return d, nil
 	}
-
-	if len(roots) == 0 {
-		roots = []string{""}
-	}
-	if len(homes) == 0 {
-		homes = []string{""}
-	}
-	for i, r := range roots {
-		for j, h := range homes {
-			compiled, compileErrs := toolpolicy.CompilePaths(foldAll(expanded, fold), isPathToolName, toolpolicy.Deny, foldCase(r, fold), foldCase(h, fold))
-			if i == 0 && j == 0 {
-				errs = append(errs, compileErrs...)
-			}
-			d.rules = append(d.rules, compiled)
-		}
-	}
-	return d, errs
+	var compileErrs []error
+	d.rules, compileErrs = toolpolicy.CompilePaths(expanded, isPathToolName, toolpolicy.Deny, "", "")
+	return d, append(errs, compileErrs...)
 }
 
 // active reports whether any path deny is configured.
 func (d pathDenies) active() bool {
-	if len(d.unresolved) > 0 {
-		return true
-	}
-	for _, r := range d.rules {
-		if r.Len() > 0 {
-			return true
-		}
-	}
-	return false
+	return d.rules.Len() > 0
 }
 
 // denies reports whether a file access to path is denied, with the reason.
@@ -128,10 +120,6 @@ func (d pathDenies) denies(path string) (bool, string) {
 	}
 	if len(d.unresolved) > 0 {
 		return true, "a path deny's directory cannot be resolved, so every file access is denied: " + strings.Join(d.unresolved, ", ")
-	}
-	if strings.ContainsFunc(path, unicode.IsControl) {
-		// A newline would end a deny's match early; no deny can vouch for it.
-		return true, "path holds a control character"
 	}
 	if !filepath.IsAbs(path) {
 		if d.root == "" {
@@ -143,12 +131,15 @@ func (d pathDenies) denies(path string) (bool, string) {
 	if err != nil {
 		return true, "path cannot be resolved to check it against path denies"
 	}
+	if strings.ContainsFunc(path, unicode.IsControl) || strings.ContainsFunc(physical, unicode.IsControl) {
+		// A newline would end a deny's match early, so no deny can vouch for
+		// a name holding one, whether written in the path or reached
+		// through a symlink.
+		return true, "path holds or resolves to a control character"
+	}
 	for _, form := range []string{filepath.Clean(path), physical} {
-		form = foldCase(form, d.fold)
-		for _, r := range d.rules {
-			if r.Match(form, "") {
-				return true, "path matches a disallow pattern"
-			}
+		if d.rules.Match(foldCase(form, d.fold), "") {
+			return true, "path matches a disallow pattern"
 		}
 	}
 	return false, ""
@@ -167,30 +158,76 @@ func spellings(dir string) []string {
 	return out
 }
 
-// anchoredGlobs returns the absolute globs a path-deny argument names, for
-// each spelling of the root and home it is anchored at. A relative argument
-// without a "/" matches at any depth, so its literal directory is the root
-// itself and the root spellings already cover it.
-func anchoredGlobs(arg string, roots, homes []string) []string {
+// anchoredGlobs returns the absolute globs a path-deny argument names, one
+// for each spelling of the root or home it is anchored at, mirroring
+// toolpolicy's anchoring: a relative deny without a "/" matches at any depth
+// under the root. It reports false when there is no root or home to anchor
+// the argument at, or the argument names another user's home.
+func anchoredGlobs(arg string, roots, homes []string) ([]string, bool) {
+	var bases []string
+	var tail string
 	switch {
 	case arg == "~" || strings.HasPrefix(arg, "~/"):
-		out := make([]string, 0, len(homes))
-		for _, h := range homes {
-			out = append(out, escapeGlob(h)+arg[1:])
-		}
-		return out
+		bases, tail = homes, arg[1:]
 	case strings.HasPrefix(arg, "//"):
-		return []string{arg[1:]}
+		return []string{arg[1:]}, true
 	case strings.HasPrefix(arg, "/"):
-		return []string{arg}
-	case strings.HasPrefix(arg, "~") || !strings.Contains(arg, "/"):
-		return nil
+		return []string{arg}, true
+	case strings.HasPrefix(arg, "~"):
+		return nil, false
+	case !strings.Contains(arg, "/"):
+		bases, tail = roots, "/**/"+arg
+	default:
+		bases, tail = roots, "/"+arg
 	}
-	out := make([]string, 0, len(roots))
-	for _, r := range roots {
-		out = append(out, escapeGlob(r)+"/"+arg)
+	out := make([]string, 0, len(bases))
+	for _, b := range bases {
+		out = append(out, escapeGlob(b)+tail)
 	}
-	return out
+	return out, len(out) > 0
+}
+
+// asciiSafeGlob replaces every non-ASCII letter of an absolute glob with a
+// single-character wildcard, and any character class holding one with a
+// within-segment wildcard. toolpolicy
+// builds its expressions byte by byte and never matches a non-ASCII literal,
+// so this keeps such a deny matching, at the cost of also covering names that
+// differ only in that letter.
+func asciiSafeGlob(glob string) string {
+	var b strings.Builder
+	for i := 0; i < len(glob); {
+		r, size := utf8.DecodeRuneInString(glob[i:])
+		switch {
+		case r == '\\' && i+size < len(glob):
+			next, nsize := utf8.DecodeRuneInString(glob[i+size:])
+			if next >= utf8.RuneSelf {
+				b.WriteByte('?')
+			} else {
+				b.WriteString(glob[i : i+size+nsize])
+			}
+			i += size + nsize
+			continue
+		case r == '[':
+			if end := strings.IndexByte(glob[i+1:], ']'); end >= 0 {
+				class := glob[i : i+end+2]
+				if strings.IndexFunc(class, func(c rune) bool { return c >= utf8.RuneSelf }) >= 0 {
+					// A decomposed member can span several characters.
+					b.WriteByte('*')
+				} else {
+					b.WriteString(class)
+				}
+				i += len(class)
+				continue
+			}
+		case r >= utf8.RuneSelf:
+			b.WriteByte('?')
+			i += size
+			continue
+		}
+		b.WriteString(glob[i : i+size])
+		i += size
+	}
+	return b.String()
 }
 
 // canonicalGlob resolves the literal directory an absolute glob starts with,
@@ -267,28 +304,13 @@ func escapeGlob(dir string) string {
 	return b.String()
 }
 
-// foldCase folds s through upper case first, so letters such as the long s
-// (U+017F), which a case-insensitive volume matches as "s" but ToLower keeps,
-// fold to the same letter as their plain form.
+// foldCase applies full Unicode case folding between decompositions, the
+// way a case- and normalization-insensitive volume compares names: "ß" and
+// "ẞ" fold to "ss", "ﬂ" to "fl", the long s to "s", and composed and
+// decomposed accents meet.
 func foldCase(s string, fold bool) string {
 	if fold {
-		return strings.ToLower(strings.ToUpper(s))
+		return norm.NFD.String(cases.Fold().String(norm.NFD.String(s)))
 	}
 	return s
-}
-
-// foldAll folds the arguments of patterns, leaving the tool names alone.
-func foldAll(patterns []string, fold bool) []string {
-	if !fold {
-		return patterns
-	}
-	out := make([]string, len(patterns))
-	for i, p := range patterns {
-		name, arg, scoped := toolpolicy.ParseToolPattern(p)
-		if scoped {
-			p = name + "(" + foldCase(arg, true) + ")"
-		}
-		out[i] = p
-	}
-	return out
 }

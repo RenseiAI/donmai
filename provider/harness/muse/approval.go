@@ -238,16 +238,20 @@ func (b *ApprovalBridge) evaluateCommand(cmd string) ApprovalDecision {
 	return ApprovalDecision{Action: ActionDecline, Reason: "default decision is not allow"}
 }
 
-func (b *ApprovalBridge) evaluateFileAccess(path string) ApprovalDecision {
-	path = strings.TrimSpace(path)
+func (b *ApprovalBridge) evaluateFileAccess(raw string) ApprovalDecision {
+	path := strings.TrimSpace(raw)
 	if path == "" {
 		return ApprovalDecision{Action: ActionDecline, Reason: "empty file approval is never auto-approved"}
 	}
 	if b.denyAllFiles {
 		return ApprovalDecision{Action: ActionDecline, Reason: "file changes are denied"}
 	}
-	if denied, reason := b.denyPaths.denies(path); denied {
-		return ApprovalDecision{Action: ActionDecline, Reason: reason}
+	// The file Muse opens may carry the surrounding whitespace, and the
+	// trimmed form keeps a padded absolute path absolute: check both.
+	for _, form := range []string{raw, path} {
+		if denied, reason := b.denyPaths.denies(form); denied {
+			return ApprovalDecision{Action: ActionDecline, Reason: reason}
+		}
 	}
 	if b.denyFiles {
 		for _, re := range b.denyRegexes {

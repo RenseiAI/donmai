@@ -30,6 +30,13 @@ func mkdirs(t *testing.T, dirs ...string) {
 	}
 }
 
+func writeFile(t *testing.T, path string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+		t.Skipf("file name unsupported: %v", err)
+	}
+}
+
 func symlink(t *testing.T, target, link string) {
 	t.Helper()
 	if err := os.Symlink(target, link); err != nil {
@@ -84,11 +91,22 @@ func TestApprovalBridge_PathDeniesFailClosed(t *testing.T) {
 	symlink(t, filepath.Join(root, "docs"), filepath.Join(root, "alias"))
 	symlink(t, filepath.Join(root, "loop"), filepath.Join(root, "loop"))
 	symlink(t, filepath.Join(root, "docs", "new.md"), filepath.Join(root, "dangling"))
+	workflows := filepath.Join(root, ".github", "workflows")
+	mkdirs(t, workflows)
+	writeFile(t, filepath.Join(workflows, "b\n.yml"))
+	writeFile(t, filepath.Join(root, "docs", "a.md"))
+	symlink(t, filepath.Join(workflows, "b\n.yml"), filepath.Join(root, "src", "nl-existing"))
+	symlink(t, filepath.Join(workflows, "c\n.yml"), filepath.Join(root, "src", "nl-dangling"))
+	symlink(t, filepath.Join(root, "docs", "a.md"), filepath.Join(root, "src", "sp "))
+	symlink(t, filepath.Join(root, "docs", "a.md"), filepath.Join(root, "src", "nl\n"))
+	symlink(t, filepath.Join(root, "src", "a.go"), filepath.Join(root, "docs", "n\nl"))
 
 	secret := filepath.Join(canonicalTempDir(t), "secret")
 	mkdirs(t, secret)
 	secretLink := filepath.Join(canonicalTempDir(t), "secret-link")
 	symlink(t, secret, secretLink)
+	metaLink := filepath.Join(canonicalTempDir(t), "link[1]")
+	symlink(t, secret, metaLink)
 
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -112,12 +130,29 @@ func TestApprovalBridge_PathDeniesFailClosed(t *testing.T) {
 		{"symlinked absolute deny, canonical path", []string{"Read(" + secretLink + "/**)"}, root, file(filepath.Join(secret, "k")), ActionDecline},
 		{"symlinked root anchor, canonical path", edit, secretLink, file(filepath.Join(secret, "docs", "a.md")), ActionDecline},
 		{"symlinked root anchor, any-depth deny", []string{"Read(*.key)"}, secretLink, file(filepath.Join(secret, "a.key")), ActionDecline},
+		{"symlinked root with a glob character in its name", []string{"Read(*.key)"}, metaLink, file(filepath.Join(secret, "a.key")), ActionDecline},
 		{"dangling symlink a write would create in a denied tree", edit, root, file(filepath.Join(root, "dangling")), ActionDecline},
 		{"dot-dot into a denied tree", edit, root, file(root + "/src/../docs/a.md"), ActionDecline},
 		{"relative dot-dot into a denied tree", edit, root, file("src/../docs/a.md"), ActionDecline},
 		{"letter case on macOS", edit, root, file(filepath.Join(root, "DOCS", "a.md")), caseInsensitive},
 		{"long s folds to s on macOS", edit, root, file(filepath.Join(root, "doc\u017f", "a.md")), caseInsensitive},
 		{"long s home secret on macOS", []string{"Read(~/.ssh/**)"}, root, file(filepath.Join(home, ".\u017f\u017fh", "id_rsa")), caseInsensitive},
+		{"sharp s folds to ss on macOS", []string{"Read(~/.ssh/**)"}, root, file(filepath.Join(home, ".\u00dfh", "id_rsa")), caseInsensitive},
+		{"capital sharp s folds to ss on macOS", []string{"Read(~/.ssh/**)"}, root, file(filepath.Join(home, ".\u1e9eh", "id_rsa")), caseInsensitive},
+		{"fl ligature folds to fl on macOS", []string{"Edit(.github/workflows/**)"}, root, file(filepath.Join(workflows, "..", "work\ufb02ows", "a.yml")), caseInsensitive},
+		{"non-ASCII deny matches its fold on macOS", []string{"Edit(stra\u00dfe/**)"}, root, file(filepath.Join(root, "STRASSE", "x")), caseInsensitive},
+		{"non-ASCII deny leaves other names", []string{"Edit(stra\u00dfe/**)"}, root, file(filepath.Join(root, "stra\u00dfe.go")), ActionAllow},
+		{"composed deny matches decomposed path on macOS", []string{"Edit(caf\u00e9/**)"}, root, file(filepath.Join(root, "cafe\u0301", "a")), caseInsensitive},
+		{"non-ASCII deny, same spelling", []string{"Edit(caf\u00e9/**)"}, root, file(filepath.Join(root, "caf\u00e9", "a")), ActionDecline},
+		{"non-ASCII letter in a deny class", []string{"Edit([\u00e9a]bc/**)"}, root, file(filepath.Join(root, "\u00e9bc", "x")), ActionDecline},
+		{"non-ASCII workspace root", edit, filepath.Join(root, "jos\u00e9"), file(filepath.Join(root, "jos\u00e9", "docs", "a.md")), ActionDecline},
+		{"non-ASCII workspace root leaves other paths", edit, filepath.Join(root, "jos\u00e9"), file(filepath.Join(root, "jos\u00e9", "src", "a.go")), ActionAllow},
+		{"symlink to a newline target", []string{"Edit(.github/workflows/**)"}, root, file(filepath.Join(root, "src", "nl-existing")), ActionDecline},
+		{"dangling symlink to a newline target", []string{"Edit(.github/workflows/**)"}, root, file(filepath.Join(root, "src", "nl-dangling")), ActionDecline},
+		{"trailing-space symlink into a denied tree", edit, root, file(filepath.Join(root, "src", "sp ")), ActionDecline},
+		{"trailing-newline symlink into a denied tree", edit, root, file(filepath.Join(root, "src", "nl\n")), ActionDecline},
+		{"newline-named symlink in a denied tree to an allowed file", edit, root, file(filepath.Join(root, "docs", "n\nl")), ActionDecline},
+		{"leading space on an absolute path", edit, root, file(" " + filepath.Join(root, "docs", "a.md")), ActionDecline},
 		{"newline in an absolute path", []string{"Edit(.github/workflows/**)"}, root, file(filepath.Join(root, ".github", "workflows", "a\n.yml")), ActionDecline},
 		{"newline in a relative path", []string{"Edit(.github/workflows/**)"}, root, file(".github/workflows/a\n.yml"), ActionDecline},
 		{"filesystem root deny", []string{"Read(/)"}, root, file("/etc/passwd"), ActionDecline},
@@ -150,5 +185,27 @@ func TestApprovalBridge_UnresolvableDenyDirectory(t *testing.T) {
 	got := bridge.Evaluate(ApprovalRequest{Kind: ApprovalKindFileAccess, Path: filepath.Join(root, "src", "a.go")})
 	if got.Action != ActionDecline || !strings.Contains(got.Reason, "cannot be resolved") {
 		t.Errorf("file access with an unresolvable deny directory = %s (%s), want decline naming the unresolvable deny", got.Action, got.Reason)
+	}
+}
+
+// TestPathDenies_NonASCIIHome pins that a home directory with a non-ASCII
+// letter still anchors "~/" denies.
+func TestPathDenies_NonASCIIHome(t *testing.T) {
+	t.Parallel()
+	home := "/Users/jos\u00e9"
+	d, errs := compilePathDenies([]string{"Read(~/.ssh/**)"}, "/w", home, false)
+	if len(errs) > 0 {
+		t.Fatalf("compile errors: %v", errs)
+	}
+	for _, tc := range []struct {
+		path string
+		want bool
+	}{
+		{home + "/.ssh/id_rsa", true},
+		{home + "/src/a.go", false},
+	} {
+		if got, reason := d.denies(tc.path); got != tc.want {
+			t.Errorf("denies(%q) = %v (%s), want %v", tc.path, got, reason, tc.want)
+		}
 	}
 }
