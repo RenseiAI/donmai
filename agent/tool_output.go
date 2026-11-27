@@ -154,7 +154,7 @@ func toolOutputLimitFromConfig(providerConfig map[string]any) (int, bool) {
 			return int(n), true
 		}
 	case uint:
-		if n > 0 {
+		if n > 0 && n <= ^uint(0)>>1 {
 			return int(n), true
 		}
 	case uint32:
