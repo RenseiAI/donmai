@@ -114,6 +114,9 @@ type ToolCall struct {
 	Command string // bash text
 	Path    string // resolved path for file ops
 	Cwd     string // worktree root, for containment
+	// PathError is set when the input path cannot be read the way pi reads
+	// it; the call is then denied.
+	PathError string
 }
 
 // Decision is the adjudicator verdict for one tool call. Reason is filled on
@@ -233,6 +236,7 @@ func NewPolicyEngine(spec agent.Spec) *PolicyEngine {
 		allows = append(allows, cfg.AllowPatterns...)
 		e.hasAllowlist = e.hasAllowlist || len(cfg.AllowPatterns) > 0
 	}
+	denies = withExactBashPrefixes(denies)
 	e.denyCommands = toolpolicy.CompileCommands(denies, toolpolicy.Deny)
 	e.allowCommands = toolpolicy.CompileCommands(allows, toolpolicy.Allow)
 	home, _ := os.UserHomeDir()
@@ -295,6 +299,11 @@ func (e *PolicyEngine) Evaluate(call ToolCall) Decision {
 		if reason := stateDirDeletionReasonForRoots(call.Command, e.containmentRoot(call), e.stateRoot); reason != "" {
 			return Decision{Allow: false, Reason: reason}
 		}
+	}
+
+	// 1c. A file path whose reading by pi this engine cannot reproduce.
+	if call.PathError != "" && (isMutatingKind(call.Kind) || isReadKind(call.Kind)) {
+		return Decision{Allow: false, Reason: call.PathError}
 	}
 
 	// 2. Path containment for file ops.
@@ -413,12 +422,12 @@ func (e *PolicyEngine) pathDenied(call ToolCall) (bool, string) {
 		if call.Path == "" {
 			return false, ""
 		}
-		return e.denyWrites.denies(call.Path, false, false)
+		return e.denyWrites.denies(call.Path, noWalk, false)
 	case isReadKind(call.Kind):
-		walk := call.Kind != ToolRead
+		walk := map[ToolKind]walkKind{ToolLs: listWalk, ToolGrep: treeWalk, ToolFind: treeWalk}[call.Kind]
 		paths := []string{call.Path}
 		if call.Path == "" {
-			if !walk {
+			if walk == noWalk {
 				return false, ""
 			}
 			paths = nil
@@ -489,6 +498,22 @@ func scoped(patterns []string) []string {
 var claudeToolNames = map[string]string{
 	"bash": "Bash", "read": "Read", "grep": "Grep", "glob": "Glob", "find": "Find", "ls": "LS",
 	"write": "Write", "edit": "Edit", "multiedit": "MultiEdit", "notebookedit": "NotebookEdit",
+}
+
+// withExactBashPrefixes adds, for each exact Bash deny ("Bash(env)"), its word
+// prefix ("Bash(env:*)"). The deny then also covers the command run with
+// arguments ("env -0", "git push --force-with-lease"), as the whole-line
+// prefix match before the Claude grammar did, while a longer word
+// ("envsubst") stays allowed. Allows stay exact.
+func withExactBashPrefixes(denies []string) []string {
+	out := slices.Clone(denies)
+	for _, p := range denies {
+		name, arg, ok := toolpolicy.ParseToolPattern(strings.TrimSpace(p))
+		if ok && strings.EqualFold(strings.TrimSpace(name), "bash") && arg != "" && !strings.HasSuffix(arg, "*") {
+			out = append(out, "Bash("+arg+":*)")
+		}
+	}
+	return out
 }
 
 // A constraint that is empty after the trailing ":*" or "*" is trimmed

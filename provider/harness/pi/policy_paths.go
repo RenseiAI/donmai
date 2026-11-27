@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+	"syscall"
 	"unicode"
 
 	"golang.org/x/text/cases"
@@ -28,6 +29,19 @@ const maxSymlinkHops = 40
 // for the walk check; a deny with more reaches every walk.
 const maxBraceExpansions = 256
 
+// maxWalkScanEntries bounds how many entries the walk check reads beneath a
+// walked directory; a walk that would need more is denied.
+const maxWalkScanEntries = 100_000
+
+// walkKind says how far a tool walks the directory it is given.
+type walkKind int
+
+const (
+	noWalk   walkKind = iota // read, write, edit: the path itself
+	listWalk                 // ls: the directory's own entries
+	treeWalk                 // grep, find: the whole tree, symlinks not followed
+)
+
 // pathDenies enforces the scoped path denies of one tool family (every read
 // tool, or every write tool).
 //
@@ -42,13 +56,19 @@ const maxBraceExpansions = 256
 // resolved.
 //
 // grep, find and ls walk a directory, so for them a deny also applies when
-// the walk could reach a path it names: the directory is the deny's literal
-// directory, an ancestor of it, or a directory beneath a "**", a wildcard or
-// a brace set of the deny's glob.
+// the walk could reach a path it names (per brace alternative of its glob):
+//   - the directory is the deny's literal directory or one of its ancestors,
+//     or lies inside a denied tree: denied outright;
+//   - the directory lies beneath a "**" or a wildcard segment of the glob:
+//     denied when an entry the glob matches exists beneath it. The check
+//     reads the tree as fd and rg walk it (hidden names included, symlinks
+//     not followed; one level for ls) and denies when it cannot finish within
+//     scanLimit entries or a directory cannot be read.
 type pathDenies struct {
 	levels     []foldedDenies
 	root       string
 	unresolved []string
+	scanLimit  int
 }
 
 // foldedDenies are the denies compiled with every glob folded one way; a
@@ -87,7 +107,7 @@ func compilePathDenies(patterns []string, family func(string) bool, root, home s
 	if root != "" {
 		root = filepath.Clean(root)
 	}
-	d := pathDenies{root: root}
+	d := pathDenies{root: root, scanLimit: maxWalkScanEntries}
 
 	// A rule is a tool name with an absolute glob to fold, or, when anchored
 	// is false, a pattern passed to toolpolicy as written.
@@ -164,9 +184,9 @@ func (d pathDenies) active() bool {
 }
 
 // denies reports whether access to path is denied, with the reason. walk
-// marks a tool that walks path; variants adds the alternate names pi's read
-// tool falls back to (piReadVariants).
-func (d pathDenies) denies(path string, walk, variants bool) (bool, string) {
+// says how far the tool walks path; variants adds the alternate names pi's
+// read tool falls back to (piReadVariants).
+func (d pathDenies) denies(path string, walk walkKind, variants bool) (bool, string) {
 	if !d.active() {
 		return false, ""
 	}
@@ -194,15 +214,26 @@ func (d pathDenies) denies(path string, walk, variants bool) (bool, string) {
 			// through a symlink.
 			return true, "path holds or resolves to a control character"
 		}
+		var open []scanState
 		for _, form := range []string{p, physical} {
-			for _, l := range d.levels {
+			for li, l := range d.levels {
 				folded := l.fold(form)
 				if l.rules.Match(folded, "") {
 					return true, "path matches a disallow pattern"
 				}
-				if walk && reachesAny(l.walks, folded) {
+				if walk == noWalk {
+					continue
+				}
+				states, definite := l.walkStates(li, folded)
+				if definite {
 					return true, "walking this directory reaches a path a disallow pattern names"
 				}
+				open = append(open, states...)
+			}
+		}
+		if len(open) > 0 {
+			if denied, reason := d.scan(p, open, walk); denied {
+				return true, reason
 			}
 		}
 	}
@@ -238,9 +269,15 @@ type walkGlob struct {
 
 // walkSegment is one segment of a glob: a whole "**", or a pattern for one
 // path segment (nil when it cannot be compiled, which matches every name).
+// literal marks a segment without glob characters.
 type walkSegment struct {
 	globstar bool
+	literal  bool
 	rules    *toolpolicy.Paths
+}
+
+func (s walkSegment) matches(name string) bool {
+	return s.rules == nil || s.rules.Match("/"+name+"/x", "")
 }
 
 func compileWalkGlob(glob string) walkGlob {
@@ -263,58 +300,158 @@ func compileWalkGlob(glob string) walkGlob {
 				segs = append(segs, walkSegment{})
 				continue
 			}
-			segs = append(segs, walkSegment{rules: &rules})
+			segs = append(segs, walkSegment{literal: firstUnescapedMeta(s) < 0, rules: &rules})
 		}
 		w.alts = append(w.alts, segs)
 	}
 	return w
 }
 
-// reachesAny reports whether walking dir can reach a path any glob matches:
-// dir and a match lie on one branch of the tree, so the match is dir, beneath
-// it, or one of its ancestors (a deny also covers the tree beneath it).
-func reachesAny(walks []walkGlob, dir string) bool {
+// scanState is a position in one alternative of one deny glob, at one fold
+// level, that an entry beneath a walked directory could continue from.
+type scanState struct {
+	level, glob, alt, seg int
+}
+
+// walkStates consumes a walked directory's names against every glob of the
+// level. It reports definite when the directory is a glob's literal directory
+// or an ancestor of it (every name matched a literal segment), or lies inside
+// a denied tree; otherwise it returns the positions a matching entry beneath
+// the directory would continue from.
+func (l foldedDenies) walkStates(level int, dir string) ([]scanState, bool) {
 	var names []string
 	for _, n := range strings.Split(filepath.Clean(dir), string(filepath.Separator)) {
 		if n != "" {
 			names = append(names, n)
 		}
 	}
-	for _, w := range walks {
+	var out []scanState
+	for gi, w := range l.walks {
 		if w.all {
-			return true
+			return nil, true
 		}
-		for _, segs := range w.alts {
-			if segmentsReach(segs, names) {
-				return true
+		for ai, segs := range w.alts {
+			open, definite := consumeNames(segs, names)
+			if definite {
+				return nil, true
+			}
+			for _, si := range open {
+				out = append(out, scanState{level, gi, ai, si})
 			}
 		}
 	}
-	return false
+	return out, false
 }
 
-func segmentsReach(segs []walkSegment, names []string) bool {
-	memo := map[[2]int]bool{}
-	var reach func(si, ni int) bool
-	reach = func(si, ni int) bool {
-		if si == len(segs) || ni == len(names) {
-			return true
+// consumeNames runs a directory's names through a glob's segments, tracking
+// for each position whether only literal segments led there.
+func consumeNames(segs []walkSegment, names []string) (open []int, definite bool) {
+	cur := globstarClosure(segs, map[int]bool{0: true})
+	for _, n := range names {
+		if _, ok := cur[len(segs)]; ok {
+			// An ancestor of the directory matches: it is inside a denied
+			// tree.
+			return nil, true
 		}
-		key := [2]int{si, ni}
-		if v, ok := memo[key]; ok {
-			return v
+		next := map[int]bool{}
+		for si, lit := range cur {
+			switch s := segs[si]; {
+			case s.globstar:
+				next[si] = next[si] || false
+			case s.matches(n):
+				next[si+1] = next[si+1] || (lit && s.literal)
+			}
 		}
-		var r bool
-		switch s := segs[si]; {
-		case s.globstar:
-			r = reach(si+1, ni) || reach(si, ni+1)
-		case s.rules == nil || s.rules.Match("/"+names[ni]+"/x", ""):
-			r = reach(si+1, ni+1)
+		if cur = globstarClosure(segs, next); len(cur) == 0 {
+			return nil, false
 		}
-		memo[key] = r
-		return r
 	}
-	return reach(0, 0)
+	for si, lit := range cur {
+		if lit || si == len(segs) {
+			return nil, true
+		}
+		open = append(open, si)
+	}
+	return open, false
+}
+
+// globstarClosure adds, for each position at a "**", the position after it
+// (the "**" matching no segment).
+func globstarClosure(segs []walkSegment, positions map[int]bool) map[int]bool {
+	for changed := true; changed; {
+		changed = false
+		for si, lit := range positions {
+			if si < len(segs) && segs[si].globstar {
+				if old, ok := positions[si+1]; !ok || (lit && !old) {
+					positions[si+1] = lit || old
+					changed = true
+				}
+			}
+		}
+	}
+	return positions
+}
+
+// scan reads the entries beneath dir and reports whether one continues a
+// state to the end of its glob, which a deny then matches.
+func (d pathDenies) scan(dir string, states []scanState, walk walkKind) (bool, string) {
+	type pending struct {
+		path   string
+		states []scanState
+	}
+	queue := []pending{{dir, states}}
+	read := 0
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+		entries, err := os.ReadDir(cur.path)
+		if err != nil {
+			if cur.path == dir && (errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR)) {
+				// Nothing to walk: the path is missing or a file, which
+				// the deny was already matched against.
+				return false, ""
+			}
+			return true, "a directory the walk reaches cannot be read to check it against path denies"
+		}
+		for _, e := range entries {
+			if read++; read > d.scanLimit {
+				return true, "the walk reaches too many entries to check them against path denies"
+			}
+			folded := map[int]string{}
+			next := map[scanState]bool{}
+			for _, st := range cur.states {
+				name, ok := folded[st.level]
+				if !ok {
+					name = d.levels[st.level].fold(e.Name())
+					folded[st.level] = name
+				}
+				segs := d.levels[st.level].walks[st.glob].alts[st.alt]
+				var to map[int]bool
+				switch s := segs[st.seg]; {
+				case s.globstar:
+					to = map[int]bool{st.seg: false}
+				case s.matches(name):
+					to = map[int]bool{st.seg + 1: false}
+				default:
+					continue
+				}
+				for si := range globstarClosure(segs, to) {
+					if si == len(segs) {
+						return true, "walking this directory reaches a path a disallow pattern names: " + filepath.Join(cur.path, e.Name())
+					}
+					next[scanState{st.level, st.glob, st.alt, si}] = true
+				}
+			}
+			if walk == treeWalk && e.IsDir() && len(next) > 0 {
+				sub := make([]scanState, 0, len(next))
+				for st := range next {
+					sub = append(sub, st)
+				}
+				queue = append(queue, pending{filepath.Join(cur.path, e.Name()), sub})
+			}
+		}
+	}
+	return false, ""
 }
 
 // expandBraces expands a glob's brace sets the way toolpolicy reads them

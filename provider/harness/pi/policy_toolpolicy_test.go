@@ -33,6 +33,13 @@ func TestPolicyEngine_ClaudePermissionForms(t *testing.T) {
 		// Exact versus prefix.
 		{"exact deny is exact", []string{"Bash(env)"}, nil, bash("envsubst < a"), true},
 		{"exact deny matches", []string{"Bash(env)"}, nil, bash("env"), false},
+		{"exact deny covers env -0", []string{"Bash(env)"}, nil, bash("env -0"), false},
+		{"exact deny covers env --null", []string{"Bash(env)"}, nil, bash("env --null"), false},
+		{"exact deny covers env -u X", []string{"Bash(env)"}, nil, bash("env -u X"), false},
+		{"exact deny covers its arguments", []string{"Bash(git push)"}, nil, bash("git push --force-with-lease origin main"), false},
+		{"exact deny covers a chained use", []string{"Bash(git push)"}, nil, bash("cd x && git push -f"), false},
+		{"exact deny leaves another word", []string{"Bash(git push)"}, nil, bash("git pushx"), true},
+		{"exact allow stays exact", nil, []string{"Bash(git status)"}, bash("git status --porcelain"), false},
 		{"word prefix deny covers the bare word", []string{"Bash(pnpm *)"}, nil, bash("pnpm"), false},
 		// Path globs over every read and write kind.
 		{"home glob read deny", []string{"Read(~/.ssh/**)"}, nil, file(ToolRead, home+"/.ssh/id_rsa"), false},
