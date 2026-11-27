@@ -136,6 +136,19 @@ func TestNotificationStreamPlanUpdatedIsWholePlan(t *testing.T) {
 	if !ok || plan.Summary() != "Plan 1/3 · edit" || plan.Explanation != "why" {
 		t.Fatalf("plan = %#v", got[0])
 	}
+	wantSteps := []agent.PlanStep{
+		{Text: "read", Status: agent.PlanStepCompleted},
+		{Text: "edit", Status: agent.PlanStepInProgress},
+		{Text: "test", Status: agent.PlanStepPending},
+	}
+	if len(plan.Steps) != len(wantSteps) {
+		t.Fatalf("steps = %+v", plan.Steps)
+	}
+	for i, want := range wantSteps {
+		if plan.Steps[i] != want {
+			t.Fatalf("step %d = %+v, want %+v", i, plan.Steps[i], want)
+		}
+	}
 	if got := dispatch(t, notificationHandle(), "turn/plan/updated", `{"plan":[]}`); len(got) != 0 {
 		t.Fatalf("empty plan mapped to %+v", got)
 	}
@@ -208,6 +221,23 @@ func TestNotificationStreamReasoning(t *testing.T) {
 	got = dispatch(t, h, "turn/completed", `{"turn":{"id":"t","status":"completed"}}`)
 	if len(got) != 3 || reasoningOf(t, got[0]) != "final thought" {
 		t.Fatalf("turn reasoning flush = %+v", got)
+	}
+	if flushed, ok := got[0].(agent.ReasoningEvent); !ok || flushed.ItemID != "r" {
+		t.Fatalf("flushed reasoning item id = %q, want r", flushed.ItemID)
+	}
+}
+
+// A completed reasoning item that carries both a native summary and the
+// full reasoning content keeps both on the typed event.
+func TestNotificationStreamReasoningCompletedKeepsSummaryAndText(t *testing.T) {
+	t.Parallel()
+	got := dispatch(t, notificationHandle(), "item/completed", `{"item":{"id":"r","type":"reasoning","summary":["short"],"content":["full","reasoning"]}}`)
+	if len(got) != 1 {
+		t.Fatalf("reasoning = %+v", got)
+	}
+	r, ok := got[0].(agent.ReasoningEvent)
+	if !ok || r.ItemID != "r" || r.Summary != "short" || r.Text != "full\nreasoning" {
+		t.Fatalf("reasoning = %#v", got[0])
 	}
 }
 

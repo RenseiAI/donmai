@@ -551,6 +551,34 @@ func TestMapItem_CommandExecutionStartedAndCompleted(t *testing.T) {
 	}
 }
 
+// TestMapItem_CommandExecutionCompletedRealSchema pins the completed
+// commandExecution payload as the Codex app-server sends it: the output
+// lives in aggregatedOutput (there is no "text" field), with ANSI colour
+// codes intact. Since output deltas became text-less progress ticks, this
+// completion is the only place command output reaches the activity stream.
+func TestMapItem_CommandExecutionCompletedRealSchema(t *testing.T) {
+	t.Parallel()
+	params := json.RawMessage(`{"threadId":"thr","turnId":"turn","item":{` +
+		`"type":"commandExecution","id":"call_1","command":"/bin/zsh -lc 'go test ./pkg'",` +
+		`"cwd":"/work","processId":"4242","status":"completed",` +
+		`"commandActions":[{"type":"unknown","command":"go test ./pkg"}],` +
+		`"aggregatedOutput":"\u001b[32mok\u001b[0m  \tpkg\t1.2s\n","exitCode":0,"durationMs":1200}}`)
+	got := mapNotification("item/completed", params, &mapperState{}, nil)
+	if len(got) != 1 {
+		t.Fatalf("events = %+v", got)
+	}
+	tr, ok := got[0].(agent.ToolResultEvent)
+	if !ok {
+		t.Fatalf("expected ToolResultEvent, got %T", got[0])
+	}
+	if tr.ToolName != "shell" || tr.ToolUseID != "call_1" || tr.IsError {
+		t.Fatalf("result = %+v", tr)
+	}
+	if tr.Content != "ok  \tpkg\t1.2s\n" {
+		t.Fatalf("content = %q, want ANSI-stripped aggregatedOutput", tr.Content)
+	}
+}
+
 func TestMapItem_CommandExecutionFailed(t *testing.T) {
 	t.Parallel()
 	exit := 1

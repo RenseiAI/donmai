@@ -413,18 +413,22 @@ func mapRateLimitsUpdated(params json.RawMessage, state *mapperState, raw any) [
 func mapItem(method string, params json.RawMessage, raw any, states ...*mapperState) []agent.Event {
 	var p struct {
 		Item struct {
-			ID       string          `json:"id"`
-			Type     string          `json:"type"`
-			Text     string          `json:"text"`
-			Summary  json.RawMessage `json:"summary"`
-			Content  json.RawMessage `json:"content"`
-			Command  string          `json:"command"`
-			Status   string          `json:"status"`
-			ExitCode *int            `json:"exitCode"`
-			Server   string          `json:"server"`
-			Tool     string          `json:"tool"`
-			Args     json.RawMessage `json:"arguments"`
-			Result   struct {
+			ID      string          `json:"id"`
+			Type    string          `json:"type"`
+			Text    string          `json:"text"`
+			Summary json.RawMessage `json:"summary"`
+			Content json.RawMessage `json:"content"`
+			Command string          `json:"command"`
+			// AggregatedOutput is the commandExecution item's captured
+			// stdout+stderr (nullable in the app-server schema). Command
+			// items carry no "text" field; Text is only a legacy fallback.
+			AggregatedOutput string          `json:"aggregatedOutput"`
+			Status           string          `json:"status"`
+			ExitCode         *int            `json:"exitCode"`
+			Server           string          `json:"server"`
+			Tool             string          `json:"tool"`
+			Args             json.RawMessage `json:"arguments"`
+			Result           struct {
 				Content json.RawMessage `json:"content"`
 			} `json:"result"`
 			Error struct {
@@ -484,7 +488,7 @@ func mapItem(method string, params json.RawMessage, raw any, states ...*mapperSt
 			return []agent.Event{agent.ToolResultEvent{
 				ToolName:  "shell",
 				ToolUseID: p.Item.ID,
-				Content:   stripANSI(p.Item.Text),
+				Content:   stripANSI(commandOutput(p.Item.AggregatedOutput, p.Item.Text)),
 				IsError:   isError,
 				Raw:       raw,
 			}}
@@ -570,6 +574,16 @@ func mapItem(method string, params json.RawMessage, raw any, states ...*mapperSt
 // normalizeMcpToolName matches the format used by the Claude provider
 // for in-process MCP tools: `mcp__{server}__{tool}`. Mirrors
 // normalizeMcpToolName in the legacy TS.
+// commandOutput returns a completed commandExecution item's output.
+// Codex sends it as aggregatedOutput; text is kept as a fallback for
+// older or synthetic payloads.
+func commandOutput(aggregated, text string) string {
+	if aggregated != "" {
+		return aggregated
+	}
+	return text
+}
+
 func normalizeMcpToolName(server, tool string) string {
 	if server != "" && tool != "" {
 		return "mcp__" + server + "__" + tool
