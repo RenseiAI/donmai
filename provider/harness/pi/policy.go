@@ -444,14 +444,31 @@ func isWriteToolName(name string) bool {
 }
 
 // scoped keeps the Name(arg) patterns; unconstrained keeps the bare ones.
+// A Claude tool name is rewritten to the spelling internal/toolpolicy
+// compiles, because the flat tool lists match tool names case-insensitively
+// (as parseToolPatterns does): "bash(git push*)" is a Bash deny, not a raw
+// command regex that matches nothing.
 func scoped(patterns []string) []string {
 	var out []string
 	for _, p := range patterns {
-		if _, _, ok := toolpolicy.ParseToolPattern(strings.TrimSpace(p)); ok {
-			out = append(out, p)
+		p = strings.TrimSpace(p)
+		name, arg, ok := toolpolicy.ParseToolPattern(p)
+		if !ok {
+			continue
 		}
+		if canonical, known := claudeToolNames[strings.ToLower(strings.TrimSpace(name))]; known {
+			p = canonical + "(" + arg + ")"
+		}
+		out = append(out, p)
 	}
 	return out
+}
+
+// claudeToolNames maps a lower-cased Claude tool name to its canonical
+// spelling.
+var claudeToolNames = map[string]string{
+	"bash": "Bash", "read": "Read", "grep": "Grep", "glob": "Glob", "find": "Find", "ls": "LS",
+	"write": "Write", "edit": "Edit", "multiedit": "MultiEdit", "notebookedit": "NotebookEdit",
 }
 
 // A constraint that is empty after the trailing ":*" or "*" is trimmed

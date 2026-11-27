@@ -56,6 +56,15 @@ func TestPolicyEngine_ClaudePermissionForms(t *testing.T) {
 		{"path allow not another path", nil, []string{"Read(/w/docs/**)"}, file(ToolRead, "/w/src/a.go"), false},
 		{"path allow not another kind", nil, []string{"Read(/w/docs/**)"}, file(ToolGrep, "/w/docs/a.md"), false},
 		{"bare Read allow keeps its meaning", nil, []string{"Read"}, file(ToolRead, "/w/src/a.go"), true},
+		// Tool names match case-insensitively, as the bare-name patterns do.
+		{"lower-case prefix deny", []string{"bash(git push*)"}, nil, bash("git push origin"), false},
+		{"lower-case word deny chained", []string{"bash(rm:*)"}, nil, bash("ls; rm -rf src"), false},
+		{"upper-case exact deny", []string{"BASH(env)"}, nil, bash("env"), false},
+		{"lower-case deny leaves others", []string{"bash(git push*)"}, nil, bash("git status"), true},
+		{"lower-case prefix allow", nil, []string{"bash(git:*)"}, bash("git status"), true},
+		{"lower-case allow not a chained command", nil, []string{"bash(git:*)"}, bash("git status && rm -rf src"), false},
+		{"lower-case path deny", []string{"read(/w/secret/**)"}, nil, file(ToolGrep, "/w/secret/k"), false},
+		{"lower-case path allow authorizes no command", nil, []string{"read(/w/docs)"}, bash("cat read/w/docs"), false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -64,6 +73,20 @@ func TestPolicyEngine_ClaudePermissionForms(t *testing.T) {
 				t.Errorf("%+v: allowed = %v (%s), want %v", tc.call, got.Allow, got.Reason, tc.wantAllowed)
 			}
 		})
+	}
+}
+
+// TestPolicyEngine_RawRegexAllowNeedsEveryCommand: a raw PermissionConfig
+// allow regex does not approve a bash line on its own; the whole line and
+// every chained command must be covered.
+func TestPolicyEngine_RawRegexAllowNeedsEveryCommand(t *testing.T) {
+	t.Parallel()
+	engine := NewPolicyEngine(agent.Spec{Cwd: "/w", PermissionConfig: &agent.PermissionConfig{AllowPatterns: []string{"^git"}}})
+	if got := engine.Evaluate(ToolCall{Kind: ToolBash, Command: "git status && rm -rf x"}); got.Allow {
+		t.Errorf("chained command allowed by a raw regex allow, want deny")
+	}
+	if got := engine.Evaluate(ToolCall{Kind: ToolBash, Command: "git status"}); !got.Allow {
+		t.Errorf("covered command denied (%s), want allow", got.Reason)
 	}
 }
 
