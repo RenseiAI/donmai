@@ -449,6 +449,13 @@ func TestQuotaPoller_ClaudeSlotsPairAccountsAndPreserveHeartbeat(t *testing.T) {
 	if len(d1.QuotaSnapshot()) != 1 || len(d2.QuotaSnapshot()) != 1 {
 		t.Fatalf("snapshots = %v %v, want one default entry", d1.QuotaSnapshot(), d2.QuotaSnapshot())
 	}
+	// Each home must answer with its own identity: a status read routed to
+	// the default would reuse one account id across every slot.
+	sa, _ := d1.quota.claudeSlotAttempt(normalizeClaudeProbeHome(a))
+	sb, _ := d1.quota.claudeSlotAttempt(normalizeClaudeProbeHome(b))
+	if sa.accountID == sb.accountID || sa.accountID == d1.QuotaSnapshot()[0].ID || sb.accountID == d1.QuotaSnapshot()[0].ID {
+		t.Fatalf("claude slot identities not distinct: a=%q b=%q default=%q", sa.accountID, sb.accountID, d1.QuotaSnapshot()[0].ID)
+	}
 	dex := driveClaudeScan(t, bin, def, []string{exh})
 	snapEx := dex.QuotaSnapshot()
 	dDef := driveClaudeScan(t, bin, def, nil)
