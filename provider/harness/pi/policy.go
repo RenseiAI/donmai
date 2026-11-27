@@ -3,13 +3,17 @@ package pi
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
+	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/internal/codeintelcontract"
+	"github.com/RenseiAI/donmai/internal/toolpolicy"
 )
 
 // ToolKind classifies an intercepted built-in tool call. pi ships read /
@@ -110,6 +114,9 @@ type ToolCall struct {
 	Command string // bash text
 	Path    string // resolved path for file ops
 	Cwd     string // worktree root, for containment
+	// PathError is set when the input path cannot be read the way pi reads
+	// it; the call is then denied.
+	PathError string
 }
 
 // Decision is the adjudicator verdict for one tool call. Reason is filled on
@@ -183,8 +190,21 @@ type PolicyEngine struct {
 	allowRegexes []*regexp.Regexp
 	denyRegexes  []*regexp.Regexp
 
+	// allowedTools / disallowedTools are the unconstrained tool-kind
+	// patterns ("Read", "Bash", "*"). Constrained Bash and path patterns are
+	// compiled by internal/toolpolicy: denyCommands / allowCommands (with the
+	// PermissionConfig rules), denyReads / denyWrites (a scoped path deny of
+	// any read or write tool covers every read or write kind; see
+	// policy_paths.go for how they fail closed) and allowPaths (a scoped path
+	// allow covers only its own tool kind).
 	allowedTools    []toolPattern
 	disallowedTools []toolPattern
+	denyCommands    toolpolicy.Commands
+	allowCommands   toolpolicy.Commands
+	denyReads       pathDenies
+	denyWrites      pathDenies
+	allowPaths      map[ToolKind]toolpolicy.Paths
+	hasAllowlist    bool
 
 	// defaultAllow is the fallback when no explicit rule matches. Derived
 	// from PermissionConfig.DefaultDecision: "allow"/"" ⇒ true;
@@ -205,9 +225,32 @@ func NewPolicyEngine(spec agent.Spec) *PolicyEngine {
 		cwd:             spec.Cwd,
 		stateRoot:       sessionStateRoot(spec),
 		allowGated:      spec.ToolApprovalAllowGated(),
-		allowedTools:    parseToolPatterns(spec.AllowedTools),
-		disallowedTools: parseToolPatterns(spec.DisallowedTools),
+		allowedTools:    unconstrained(parseToolPatterns(spec.AllowedTools)),
+		disallowedTools: unconstrained(parseToolPatterns(spec.DisallowedTools)),
 		defaultAllow:    true,
+	}
+	denies, allows := scoped(spec.DisallowedTools), scoped(spec.AllowedTools)
+	e.hasAllowlist = len(spec.AllowedTools) > 0
+	if cfg := spec.PermissionConfig; cfg != nil {
+		denies = append(denies, cfg.DisallowPatterns...)
+		allows = append(allows, cfg.AllowPatterns...)
+		e.hasAllowlist = e.hasAllowlist || len(cfg.AllowPatterns) > 0
+	}
+	denies = withExactBashPrefixes(denies)
+	e.denyCommands = toolpolicy.CompileCommands(denies, toolpolicy.Deny)
+	e.allowCommands = toolpolicy.CompileCommands(allows, toolpolicy.Allow)
+	home, _ := os.UserHomeDir()
+	var errs, more []error
+	e.denyReads, errs = compilePathDenies(denies, isReadToolName, spec.Cwd, home, foldPathCase)
+	e.denyWrites, more = compilePathDenies(denies, isWriteToolName, spec.Cwd, home, foldPathCase)
+	e.allowPaths = map[ToolKind]toolpolicy.Paths{}
+	for kind, names := range pathAllowNames {
+		e.allowPaths[kind], _ = toolpolicy.CompilePaths(allows, func(name string) bool {
+			return slices.ContainsFunc(names, func(n string) bool { return strings.EqualFold(n, name) })
+		}, toolpolicy.Allow, spec.Cwd, home)
+	}
+	if errs = append(errs, more...); len(errs) > 0 {
+		slog.Warn("pi: path denies that cannot be compiled deny every path of their tool family", "errors", errs)
 	}
 	if cfg := spec.PermissionConfig; cfg != nil {
 		e.allowRegexes = compilePatterns(cfg.AllowPatterns)
@@ -258,6 +301,11 @@ func (e *PolicyEngine) Evaluate(call ToolCall) Decision {
 		}
 	}
 
+	// 1c. A file path whose reading by pi this engine cannot reproduce.
+	if call.PathError != "" && (isMutatingKind(call.Kind) || isReadKind(call.Kind)) {
+		return Decision{Allow: false, Reason: call.PathError}
+	}
+
 	// 2. Path containment for file ops.
 	if call.Path != "" && (isMutatingKind(call.Kind) || isReadKind(call.Kind)) {
 		if reason, contained := e.checkContainment(call); !contained {
@@ -276,16 +324,25 @@ func (e *PolicyEngine) Evaluate(call ToolCall) Decision {
 		}
 	}
 
-	// 4. PermissionConfig DisallowPatterns.
+	// 4. Command and path denies, and PermissionConfig regexes on a file
+	// path (a bash command is matched by denyCommands).
+	if call.Kind == ToolBash && e.denyCommands.Match(call.Command) {
+		return Decision{Allow: false, Reason: "command matches a disallow pattern"}
+	}
+	if denied, reason := e.pathDenied(call); denied {
+		return Decision{Allow: false, Reason: reason + ": " + call.Path}
+	}
 	for _, re := range e.denyRegexes {
-		if re.MatchString(subject) {
+		if call.Kind != ToolBash && re.MatchString(subject) {
 			return Decision{Allow: false, Reason: "matches disallow pattern: " + re.String()}
 		}
 	}
 
-	// 5. Allow-gate: when any allow rule exists, it becomes mandatory.
-	if len(e.allowedTools) > 0 || len(e.allowRegexes) > 0 {
-		if e.matchesAllowTool(call) || e.matchesAllowRegex(subject) {
+	// 5. Allow-gate: when any allow rule exists, it becomes mandatory. A
+	// command must be covered whole and command by command; a file path by a
+	// path allow of its own tool kind.
+	if e.hasAllowlist {
+		if e.matchesAllowTool(call) || e.allowedByRules(call) || (call.Kind != ToolBash && e.matchesAllowRegex(subject)) {
 			return Decision{Allow: true}
 		}
 		return Decision{Allow: false, Reason: "no allow pattern matched and an allow-list is configured"}
@@ -356,6 +413,121 @@ func (e *PolicyEngine) checkContainment(call ToolCall) (reason string, contained
 	}
 }
 
+// pathDenied applies the path denies, with the reason. grep, find and ls
+// walk their path, or without one the working directory: both the session's
+// and the call's are checked, and with neither the walk is denied.
+func (e *PolicyEngine) pathDenied(call ToolCall) (bool, string) {
+	switch {
+	case isMutatingKind(call.Kind):
+		if call.Path == "" {
+			return false, ""
+		}
+		return e.denyWrites.denies(call.Path, noWalk, false)
+	case isReadKind(call.Kind):
+		walk := map[ToolKind]walkKind{ToolLs: listWalk, ToolGrep: treeWalk, ToolFind: treeWalk}[call.Kind]
+		paths := []string{call.Path}
+		if call.Path == "" {
+			if walk == noWalk {
+				return false, ""
+			}
+			paths = nil
+			for _, dir := range []string{e.cwd, call.Cwd} {
+				if dir != "" {
+					paths = append(paths, dir)
+				}
+			}
+			if len(paths) == 0 && e.denyReads.active() {
+				return true, "walk without a directory cannot be checked against path denies"
+			}
+		}
+		for _, p := range paths {
+			if denied, reason := e.denyReads.denies(p, walk, call.Kind == ToolRead); denied {
+				return true, reason
+			}
+		}
+	}
+	return false, ""
+}
+
+func (e *PolicyEngine) allowedByRules(call ToolCall) bool {
+	if call.Kind == ToolBash {
+		return e.allowCommands.Match(call.Command)
+	}
+	rules, ok := e.allowPaths[call.Kind]
+	return ok && call.Path != "" && rules.Match(call.Path, e.containmentRoot(call))
+}
+
+// pathAllowNames maps each file tool kind to the Claude tool names whose
+// scoped path allow covers it.
+var pathAllowNames = map[ToolKind][]string{
+	ToolRead: {"Read"}, ToolGrep: {"Grep"}, ToolFind: {"Glob", "Find"}, ToolLs: {"LS"},
+	ToolWrite: {"Write"}, ToolEdit: {"Edit", "MultiEdit"},
+}
+
+func isReadToolName(name string) bool {
+	return slices.ContainsFunc([]string{"Read", "Grep", "Glob", "Find", "LS"}, func(n string) bool { return strings.EqualFold(n, name) })
+}
+
+func isWriteToolName(name string) bool {
+	return slices.ContainsFunc([]string{"Write", "Edit", "MultiEdit", "NotebookEdit"}, func(n string) bool { return strings.EqualFold(n, name) })
+}
+
+// scoped keeps the Name(arg) patterns; unconstrained keeps the bare ones.
+// A Claude tool name is rewritten to the spelling internal/toolpolicy
+// compiles, because the flat tool lists match tool names case-insensitively
+// (as parseToolPatterns does): "bash(git push*)" is a Bash deny, not a raw
+// command regex that matches nothing.
+func scoped(patterns []string) []string {
+	var out []string
+	for _, p := range patterns {
+		p = strings.TrimSpace(p)
+		name, arg, ok := toolpolicy.ParseToolPattern(p)
+		if !ok {
+			continue
+		}
+		if canonical, known := claudeToolNames[strings.ToLower(strings.TrimSpace(name))]; known {
+			p = canonical + "(" + arg + ")"
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+// claudeToolNames maps a lower-cased Claude tool name to its canonical
+// spelling.
+var claudeToolNames = map[string]string{
+	"bash": "Bash", "read": "Read", "grep": "Grep", "glob": "Glob", "find": "Find", "ls": "LS",
+	"write": "Write", "edit": "Edit", "multiedit": "MultiEdit", "notebookedit": "NotebookEdit",
+}
+
+// withExactBashPrefixes adds, for each exact Bash deny ("Bash(env)"), its word
+// prefix ("Bash(env:*)"). The deny then also covers the command run with
+// arguments ("env -0", "git push --force-with-lease"), as the whole-line
+// prefix match before the Claude grammar did, while a longer word
+// ("envsubst") stays allowed. Allows stay exact.
+func withExactBashPrefixes(denies []string) []string {
+	out := slices.Clone(denies)
+	for _, p := range denies {
+		name, arg, ok := toolpolicy.ParseToolPattern(strings.TrimSpace(p))
+		if ok && strings.EqualFold(strings.TrimSpace(name), "bash") && arg != "" && !strings.HasSuffix(arg, "*") {
+			out = append(out, "Bash("+arg+":*)")
+		}
+	}
+	return out
+}
+
+// A constraint that is empty after the trailing ":*" or "*" is trimmed
+// ("Bash(*)", "Bash(:*)") keeps its legacy whole-kind meaning.
+func unconstrained(patterns []toolPattern) []toolPattern {
+	var out []toolPattern
+	for _, p := range patterns {
+		if !p.hasConstr || p.constraint == "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 func (e *PolicyEngine) matchesAllowRegex(subject string) bool {
 	for _, re := range e.allowRegexes {
 		if re.MatchString(subject) {
@@ -414,6 +586,9 @@ func parseToolPatterns(patterns []string) []toolPattern {
 
 		normalizedName := strings.ToLower(strings.TrimSpace(name))
 		kind, known := builtInToolNames[normalizedName]
+		if alias, ok := claudeToolAliases[normalizedName]; ok {
+			kind, known = alias, true
+		}
 		switch {
 		case normalizedName == "*":
 			pattern.anyKind = true
@@ -426,6 +601,9 @@ func parseToolPatterns(patterns []string) []toolPattern {
 	}
 	return out
 }
+
+// claudeToolAliases maps Claude tool names to the pi built-in they gate.
+var claudeToolAliases = map[string]ToolKind{"glob": ToolFind, "multiedit": ToolEdit}
 
 // matches reports whether the pattern applies to the given call.
 func (tp toolPattern) matches(call ToolCall) bool {

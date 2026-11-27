@@ -4,14 +4,18 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode"
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/runtime/confinement"
@@ -1265,26 +1269,81 @@ func parseAdjudicateCall(payload map[string]any, specCwd string) ToolCall {
 	}
 	input := mapField(payload, "input")
 	command := stringField(input, "command")
-	path := resolveInputPath(cwd, input)
+	path, pathErr := resolveInputPath(cwd, input)
 	return ToolCall{
-		Kind:    kind,
-		Command: command,
-		Path:    path,
-		Cwd:     cwd,
+		Kind:      kind,
+		Command:   command,
+		Path:      path,
+		Cwd:       cwd,
+		PathError: pathErr,
 	}
 }
 
 // resolveInputPath resolves a tool input's file path (path/file/filename)
-// against cwd so containment checks operate on absolute paths.
-func resolveInputPath(cwd string, input map[string]any) string {
+// the way pi's tools do, against cwd, so containment checks and path denies
+// judge the file pi opens. It returns a reason instead when it cannot tell
+// which file that is.
+func resolveInputPath(cwd string, input map[string]any) (string, string) {
 	p := stringField(input, "path", "file", "filename")
 	if p == "" {
-		return ""
+		return "", ""
+	}
+	p, reason := normalizePiPath(p)
+	if reason != "" {
+		return "", reason
 	}
 	if !filepath.IsAbs(p) && cwd != "" {
 		p = filepath.Join(cwd, p)
 	}
-	return filepath.Clean(p)
+	return filepath.Clean(p), ""
+}
+
+// piUnicodeSpaces are the space characters pi's tools read as a plain space.
+var piUnicodeSpaces = regexp.MustCompile("[\u00a0\u2000-\u200a\u202f\u205f\u3000]")
+
+// normalizePiPath mirrors the normalization pi's file tools apply to a path
+// before resolving it: Unicode spaces become plain spaces, one leading "@" is
+// dropped, "~" and "~/" are the home directory and a file:// URL is its path.
+// Judged as written, each of these would be a name under cwd. pi does not
+// trim the path, so neither does this.
+func normalizePiPath(p string) (string, string) {
+	p = piUnicodeSpaces.ReplaceAllString(p, " ")
+	p = strings.TrimPrefix(p, "@")
+	if home, err := os.UserHomeDir(); err == nil && (p == "~" || strings.HasPrefix(p, "~/")) {
+		return home + p[1:], ""
+	}
+	if strings.HasPrefix(p, "file://") {
+		return fileURLPath(p)
+	}
+	return p, ""
+}
+
+// fileURLPath is the path of a file:// URL as pi reads it (WHATWG URL parsing,
+// then fileURLToPath), or a reason when this cannot reproduce that reading
+// exactly. The WHATWG parser rewrites a "\" to "/", trims and drops white
+// space and control characters, and cuts a query or fragment; fileURLToPath
+// rejects an encoded "/", a bad escape and any host but this machine. Rather
+// than mirror each rule, such a URL is refused.
+func fileURLPath(p string) (string, string) {
+	rest := strings.TrimPrefix(p, "file://")
+	if strings.ContainsAny(rest, `\#?`) || strings.ContainsFunc(rest, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) {
+		return "", "file URL holds a character pi's URL parser rewrites"
+	}
+	host, path := rest, "/"
+	if i := strings.IndexByte(rest, '/'); i >= 0 {
+		host, path = rest[:i], rest[i:]
+	}
+	if h, err := url.PathUnescape(host); err != nil || (h != "" && !strings.EqualFold(h, "localhost")) {
+		return "", "file URL names a host other than this machine"
+	}
+	if strings.Contains(strings.ToLower(path), "%2f") {
+		return "", "file URL path encodes a /"
+	}
+	decoded, err := url.PathUnescape(path)
+	if err != nil {
+		return "", "file URL path holds a bad escape"
+	}
+	return decoded, ""
 }
 
 func permissionMessage(call ToolCall, d Decision) string {
