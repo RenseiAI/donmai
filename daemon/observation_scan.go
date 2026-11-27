@@ -167,7 +167,10 @@ func (s *observationScanner) interval() time.Duration {
 }
 
 // ScanObservations runs a full scan of kinds (all kinds when empty) now:
-// it probes every quota harness, then reports what the probes found.
+// it probes the default home of every quota harness, then reports what
+// the probes found. Extras are never published, so the on-demand scan
+// stays default-only; waiting for them would downgrade a verified default
+// to unknown when the combined scan overruns its timeout.
 func (d *Daemon) ScanObservations(ctx context.Context, kinds []string) (*ObservationScanResult, error) {
 	if err := checkObservationKinds(kinds); err != nil {
 		return nil, err
@@ -188,7 +191,7 @@ func (d *Daemon) ScanObservations(ctx context.Context, kinds []string) (*Observa
 	probes, timeout := s.probes, s.timeout
 	s.mu.Unlock()
 	if probes == nil {
-		probes = d.quotaProbes()
+		probes = d.defaultQuotaProbes()
 	}
 	if timeout == 0 {
 		timeout = observationScanKindTimeout

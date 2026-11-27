@@ -49,6 +49,27 @@ func (d *Daemon) quotaProbes() map[string]quotaProbeFunc {
 	return probes
 }
 
+// defaultQuotaProbes builds the on-demand observation probes: the default
+// home of each configured harness only. Extras are never published, so the
+// observation scan must not wait for them; a slow extra would otherwise
+// downgrade an already-verified default to unknown on timeout.
+func (d *Daemon) defaultQuotaProbes() map[string]quotaProbeFunc {
+	probes := map[string]quotaProbeFunc{}
+	if d == nil {
+		return probes
+	}
+	if bin := d.opts.QuotaProbeBinaries[agent.UsageHarnessCodex]; bin != "" {
+		probes[agent.UsageHarnessCodex] = codexQuotaProbe(bin, true, nil)
+	}
+	if bin := d.opts.QuotaProbeBinaries[agent.UsageHarnessClaude]; bin != "" {
+		probes[agent.UsageHarnessClaude] = claudeQuotaProbe(bin, nil)
+	}
+	if bin := d.opts.QuotaProbeBinaries[agent.UsageHarnessMuse]; bin != "" {
+		probes[agent.UsageHarnessMuse] = museQuotaProbe(bin)
+	}
+	return probes
+}
+
 // quotaProbeTimeout bounds one quota probe attempt: the codex read and
 // the claude usage read each run under it. It stays above the slowest
 // per-read ceiling (the claude usage session) and below the 5-minute
@@ -180,33 +201,100 @@ type codexScanSlot struct {
 	isDefault bool
 }
 
+// probeParentDir returns the parent of an absolute path without cleaning
+// it first: filepath.Dir cleans, which collapses a ".." through a symlink
+// and resolves to an undeclared sibling. Trimming only trailing slashes
+// preserves the symlink component for EvalSymlinks to resolve as the OS
+// would open it.
+func probeParentDir(p string) string {
+	q := strings.TrimRight(p, "/")
+	if q == "" {
+		return "/"
+	}
+	if idx := strings.LastIndex(q, "/"); idx >= 0 {
+		if idx == 0 {
+			return "/"
+		}
+		return q[:idx]
+	}
+	return "."
+}
+
+// probeBase returns the final element without cleaning the path first,
+// so a name ending in a space keeps it.
+func probeBase(p string) string {
+	q := strings.TrimRight(p, "/")
+	if idx := strings.LastIndex(q, "/"); idx >= 0 {
+		return q[idx+1:]
+	}
+	return q
+}
+
+func sameProbeFile(a, b os.FileInfo) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	return os.SameFile(a, b)
+}
+
 func normalizeCodexProbeHome(dir string) string {
-	cleaned := filepath.Clean(dir)
-	if resolved, err := filepath.EvalSymlinks(cleaned); err == nil && resolved != "" {
+	// Resolve the declared path as the OS opens it: symlinks first, clean
+	// only the resolved result. Cleaning before resolving would collapse
+	// a ".." through a symlink and probe an undeclared home.
+	if resolved, err := filepath.EvalSymlinks(dir); err == nil && resolved != "" {
 		return filepath.Clean(resolved)
 	}
-	if parent, err := filepath.EvalSymlinks(filepath.Dir(cleaned)); err == nil && parent != "" {
-		return filepath.Join(filepath.Clean(parent), filepath.Base(cleaned))
+	parent, base := probeParentDir(dir), probeBase(dir)
+	if parent != "" && base != "" && base != "." && base != ".." {
+		if resolvedParent, err := filepath.EvalSymlinks(parent); err == nil && resolvedParent != "" {
+			return filepath.Join(filepath.Clean(resolvedParent), base)
+		}
 	}
-	return cleaned
+	return filepath.Clean(dir)
 }
 
 func buildCodexScanPlan(extraHomes []string) []codexScanSlot {
 	defDir := providercodex.DefaultCodexHome()
 	defKey := ""
+	var defInfo os.FileInfo
 	if defDir != "" {
 		defKey = normalizeCodexProbeHome(defDir)
+		defInfo, _ = os.Stat(defDir)
 	}
 	seen := map[string]struct{}{defKey: {}}
+	var seenInfos []os.FileInfo
+	if defInfo != nil {
+		seenInfos = append(seenInfos, defInfo)
+	}
 	var extras []string
 	for _, raw := range extraHomes {
 		if strings.TrimSpace(raw) == "" || !filepath.IsAbs(raw) {
 			continue
 		}
-		key := normalizeCodexProbeHome(filepath.Clean(raw))
+		key := normalizeCodexProbeHome(raw)
 		if _, dup := seen[key]; dup {
 			continue
 		}
+		if info, err := os.Stat(raw); err == nil {
+			dup := false
+			for _, s := range seenInfos {
+				if sameProbeFile(s, info) {
+					dup = true
+					break
+				}
+			}
+			// A different spelling that opens the same directory
+			// (case alias, symlink) probes once under the first key.
+			if dup {
+				continue
+			}
+			seen[key] = struct{}{}
+			seenInfos = append(seenInfos, info)
+			extras = append(extras, key)
+			continue
+		}
+		// Unstatable paths dedup by string only; the probe records an
+		// unanswered attempt for the missing home.
 		seen[key] = struct{}{}
 		extras = append(extras, key)
 	}
@@ -226,30 +314,54 @@ type claudeScanSlot struct {
 }
 
 func normalizeClaudeProbeHome(dir string) string {
-	cleaned := filepath.Clean(dir)
-	if resolved, err := filepath.EvalSymlinks(cleaned); err == nil && resolved != "" {
+	if resolved, err := filepath.EvalSymlinks(dir); err == nil && resolved != "" {
 		return filepath.Clean(resolved)
 	}
-	if parent, err := filepath.EvalSymlinks(filepath.Dir(cleaned)); err == nil && parent != "" {
-		return filepath.Join(filepath.Clean(parent), filepath.Base(cleaned))
+	parent, base := probeParentDir(dir), probeBase(dir)
+	if parent != "" && base != "" && base != "." && base != ".." {
+		if resolvedParent, err := filepath.EvalSymlinks(parent); err == nil && resolvedParent != "" {
+			return filepath.Join(filepath.Clean(resolvedParent), base)
+		}
 	}
-	return cleaned
+	return filepath.Clean(dir)
 }
 
 func buildClaudeScanPlan(extraHomes []string) []claudeScanSlot {
 	defDir := providerclaude.DefaultProbeConfigDir()
 	defKey := ""
+	var defInfo os.FileInfo
 	if defDir != "" {
 		defKey = normalizeClaudeProbeHome(defDir)
+		defInfo, _ = os.Stat(defDir)
 	}
 	seen := map[string]struct{}{defKey: {}}
+	var seenInfos []os.FileInfo
+	if defInfo != nil {
+		seenInfos = append(seenInfos, defInfo)
+	}
 	var extras []string
 	for _, raw := range extraHomes {
 		if strings.TrimSpace(raw) == "" || !filepath.IsAbs(raw) {
 			continue
 		}
-		key := normalizeClaudeProbeHome(filepath.Clean(raw))
+		key := normalizeClaudeProbeHome(raw)
 		if _, dup := seen[key]; dup {
+			continue
+		}
+		if info, err := os.Stat(raw); err == nil {
+			dup := false
+			for _, s := range seenInfos {
+				if sameProbeFile(s, info) {
+					dup = true
+					break
+				}
+			}
+			if dup {
+				continue
+			}
+			seen[key] = struct{}{}
+			seenInfos = append(seenInfos, info)
+			extras = append(extras, key)
 			continue
 		}
 		seen[key] = struct{}{}

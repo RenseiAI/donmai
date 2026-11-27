@@ -735,6 +735,9 @@ func LoadConfig(path string) (*Config, error) {
 	if err := yaml.Unmarshal(data, &authored); err != nil {
 		return nil, fmt.Errorf("parse daemon capacity %q: %w", path, err)
 	}
+	if err := checkQuotaProbeHomesPresence(data); err != nil {
+		return nil, fmt.Errorf("invalid daemon config %q: %w", path, err)
+	}
 
 	// Apply env-var substitution on authToken.
 	if cfg.Orchestrator.AuthToken != "" {
@@ -1293,6 +1296,67 @@ func validateConfig(c *Config) error {
 		for i, home := range homes {
 			if strings.TrimSpace(home) == "" || !filepath.IsAbs(home) {
 				return fmt.Errorf("quotaProbeHomes.%s[%d] must be an absolute path", harness, i)
+			}
+		}
+	}
+	return nil
+}
+
+// checkQuotaProbeHomesPresence rejects authored empty elements the typed
+// decoder silently drops: a bare dash or an explicit null decodes to no
+// element in []string, so validation would never see the missing slot.
+// An omitted list (or an explicit null list) stays valid; only an authored
+// element that carries no path is refused. Errors name the slot index only,
+// never the path, so a rejected value cannot leak through logs.
+func checkQuotaProbeHomesPresence(data []byte) error {
+	var doc yaml.Node
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		return nil
+	}
+	root := &doc
+	if root.Kind == yaml.DocumentNode && len(root.Content) > 0 {
+		root = root.Content[0]
+	}
+	if root.Kind != yaml.MappingNode {
+		return nil
+	}
+	for i := 0; i+1 < len(root.Content); i += 2 {
+		if root.Content[i].Kind != yaml.ScalarNode || root.Content[i].Value != "quotaProbeHomes" {
+			continue
+		}
+		val := root.Content[i+1]
+		if val.Kind == yaml.AliasNode && val.Alias != nil {
+			val = val.Alias
+		}
+		if val.Tag == "!!null" {
+			return nil
+		}
+		if val.Kind != yaml.MappingNode {
+			return nil
+		}
+		for j := 0; j+1 < len(val.Content); j += 2 {
+			harness := ""
+			if val.Content[j].Kind == yaml.ScalarNode {
+				harness = val.Content[j].Value
+			}
+			list := val.Content[j+1]
+			if list.Kind == yaml.AliasNode && list.Alias != nil {
+				list = list.Alias
+			}
+			if list.Tag == "!!null" {
+				continue
+			}
+			if list.Kind != yaml.SequenceNode {
+				continue
+			}
+			for k, elem := range list.Content {
+				e := elem
+				if e.Kind == yaml.AliasNode && e.Alias != nil {
+					e = e.Alias
+				}
+				if e.Tag == "!!null" || e.Kind != yaml.ScalarNode || strings.TrimSpace(e.Value) == "" {
+					return fmt.Errorf("quotaProbeHomes.%s[%d] must be an absolute path", harness, k)
+				}
 			}
 		}
 	}

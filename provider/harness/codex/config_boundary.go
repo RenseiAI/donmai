@@ -182,16 +182,22 @@ func resolveHostSessionAuthFile() (string, error) {
 // absolute. Only the path is resolved; credential contents never enter
 // Donmai memory or logs.
 func resolveHostSessionAuthFileFor(home string) (string, error) {
-	codexHome := strings.TrimSpace(home)
-	if codexHome == "" {
-		codexHome = strings.TrimSpace(os.Getenv("CODEX_HOME"))
-		if codexHome == "" {
-			userHome, err := os.UserHomeDir()
-			if err != nil {
-				return "", fmt.Errorf("resolve host Codex home: %w", err)
-			}
-			codexHome = filepath.Join(userHome, ".codex")
+	if strings.TrimSpace(home) != "" {
+		// Explicit home: use it exactly as declared. Trimming would
+		// collapse a name ending in a space onto its sibling and
+		// project the wrong login under the declared key.
+		if !filepath.IsAbs(home) {
+			return "", errors.New("host CODEX_HOME must be absolute")
 		}
+		return filepath.Join(home, codexAuthFileName), nil
+	}
+	codexHome := strings.TrimSpace(os.Getenv("CODEX_HOME"))
+	if codexHome == "" {
+		userHome, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("resolve host Codex home: %w", err)
+		}
+		codexHome = filepath.Join(userHome, ".codex")
 	}
 	if !filepath.IsAbs(codexHome) {
 		return "", errors.New("host CODEX_HOME must be absolute")

@@ -6,6 +6,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -51,6 +53,31 @@ func DefaultProbeConfigDir() string {
 	return interactiveUsageConfigDir(nil)
 }
 
+// claudeConfigDirReadable reports whether a declared config directory can
+// still be read. A home whose permissions were revoked still stats but
+// answers no CLI read; it must stay an unanswered local attempt, never an
+// answered refusal. Permission bits are checked explicitly so a revoked
+// home reads as unreadable even to a privileged reader.
+func claudeConfigDirReadable(dir string) bool {
+	info, err := os.Stat(dir)
+	if err != nil || !info.IsDir() {
+		return false
+	}
+	if info.Mode().Perm()&0o555 == 0 {
+		return false
+	}
+	// nolint:gosec // dir is the operator-declared config home already validated absolute.
+	f, err := os.Open(dir)
+	if err != nil {
+		return false
+	}
+	defer func() { _ = f.Close() }()
+	if _, err := f.Readdirnames(1); err != nil && !errors.Is(err, io.EOF) {
+		return false
+	}
+	return true
+}
+
 // ProbeUsageWithConfigDir runs one usage read against an explicit config home.
 // An empty configDir reads the default login; a non-empty value must name an
 // absolute config directory and is carried to the usage and status children.
@@ -69,6 +96,9 @@ func ProbeUsageWithConfigDir(ctx context.Context, binary, configDir string) (acc
 			return failed()
 		}
 		if info, err := os.Stat(configDir); err != nil || !info.IsDir() {
+			return failed()
+		}
+		if !claudeConfigDirReadable(configDir) {
 			return failed()
 		}
 	}
@@ -258,6 +288,11 @@ func loginRefusedFor(ctx context.Context, binary, override string) bool {
 	// login timeout proving it, and never mistake the expiry for a
 	// refusal.
 	if ctx.Err() != nil {
+		return false
+	}
+	// A revoked home answers no read; its status error is the missing
+	// directory, not a login refusal.
+	if override != "" && !claudeConfigDirReadable(override) {
 		return false
 	}
 	checkCtx, cancel := context.WithTimeout(ctx, hostLoginTimeout)
