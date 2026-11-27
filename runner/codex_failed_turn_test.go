@@ -46,7 +46,7 @@ func newCodexFailedTurnHandle(progress string, terminalErrors []string, subtype 
 	// to this line.
 	ch <- agent.AssistantTextEvent{Text: progress}
 	// Mapped form of turn/moderationMetadata.
-	ch <- agent.SystemEvent{Subtype: "codex_moderation", Message: "Codex turn moderation: {\"review\":true}"}
+	ch <- agent.SystemEvent{Subtype: "codex_moderation", Message: "Codex moderation blocked: prompt/cyber_security"}
 	// Mapped form of the error notification.
 	ch <- agent.SystemEvent{Subtype: "codex_error", Message: "Codex error"}
 	ch <- agent.ResultEvent{Success: false, Errors: terminalErrors, ErrorSubtype: subtype}

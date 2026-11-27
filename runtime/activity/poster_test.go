@@ -1554,27 +1554,28 @@ func TestAppliedReasoningEffortStopDrains(t *testing.T) {
 	}
 }
 
-// TestAnonymousToolResultTakesItsCallName pins the result naming: a harness
-// that reports a result by id alone (Claude stream-json) posts the result
-// under its call's tool name, and an MCP content-part array posts as text.
-func TestAnonymousToolResultTakesItsCallName(t *testing.T) {
-	t.Parallel()
-	type wire struct {
-		Activity struct {
-			Content    string `json:"content"`
-			ToolName   string `json:"toolName"`
-			ToolOutput string `json:"toolOutput"`
-		} `json:"activity"`
-	}
+// toolResultWire is the slice of an activity post the tool-result tests read.
+type toolResultWire struct {
+	Content    string `json:"content"`
+	ToolName   string `json:"toolName"`
+	ToolOutput string `json:"toolOutput"`
+}
+
+// postToolCall sends one call and its result through a started poster and
+// returns the posted result activity.
+func postToolCall(t *testing.T, use agent.ToolUseEvent, result agent.ToolResultEvent) toolResultWire {
+	t.Helper()
 	var mu sync.Mutex
-	var bodies []wire
+	var bodies []toolResultWire
 	srv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/activity") {
 			raw, _ := io.ReadAll(r.Body)
-			var b wire
+			var b struct {
+				Activity toolResultWire `json:"activity"`
+			}
 			_ = json.Unmarshal(raw, &b)
 			mu.Lock()
-			bodies = append(bodies, b)
+			bodies = append(bodies, b.Activity)
 			mu.Unlock()
 		}
 		w.WriteHeader(http.StatusOK)
@@ -1587,8 +1588,8 @@ func TestAnonymousToolResultTakesItsCallName(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = p.Stop() })
-	p.Send(context.Background(), agent.ToolUseEvent{ToolName: "mcp__docs__search", ToolUseID: "tu_1", Input: map[string]any{"query": "q"}})
-	p.Send(context.Background(), agent.ToolResultEvent{ToolUseID: "tu_1", Content: `[{"type":"text","text":"hit one"}]`})
+	p.Send(context.Background(), use)
+	p.Send(context.Background(), result)
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		mu.Lock()
@@ -1604,8 +1605,49 @@ func TestAnonymousToolResultTakesItsCallName(t *testing.T) {
 	if len(bodies) != 2 {
 		t.Fatalf("expected 2 activity posts; got %d", len(bodies))
 	}
-	res := bodies[1].Activity
-	if res.ToolName != "mcp__docs__search" || res.Content != "mcp__docs__search result" || res.ToolOutput != "hit one" {
-		t.Fatalf("result activity = %+v; want the call's name and decoded text output", res)
+	return bodies[1]
+}
+
+// TestToolResultNamingAndOutput pins the result naming (a harness that
+// reports a result by id alone, as Claude stream-json does, posts it under
+// its call's tool name; an explicit result name wins) and that the poster
+// forwards tool output verbatim. Plain stdout that happens to look like a
+// content-part array must not be rewritten: decoding structured content is
+// the harness parser's job, where the wire shape is known.
+func TestToolResultNamingAndOutput(t *testing.T) {
+	t.Parallel()
+	const partsShapedStdout = `[{"type":"modified","path":"main.go"}]`
+	for _, tc := range []struct {
+		name              string
+		use               agent.ToolUseEvent
+		result            agent.ToolResultEvent
+		wantName, wantOut string
+	}{
+		{
+			name:     "claude bash stdout shaped like content parts",
+			use:      agent.ToolUseEvent{ToolName: "Bash", ToolUseID: "tu_1", Input: map[string]any{"command": "cat changes.json"}},
+			result:   agent.ToolResultEvent{ToolUseID: "tu_1", Content: partsShapedStdout},
+			wantName: "Bash", wantOut: partsShapedStdout,
+		},
+		{
+			name:     "codex shell stdout shaped like content parts",
+			use:      agent.ToolUseEvent{ToolName: "shell", ToolUseID: "exec-1", Input: map[string]any{"command": "cat changes.json"}},
+			result:   agent.ToolResultEvent{ToolName: "shell", ToolUseID: "exec-1", Content: partsShapedStdout + "\n"},
+			wantName: "shell", wantOut: partsShapedStdout + "\n",
+		},
+		{
+			name:     "explicit result name wins over the call name",
+			use:      agent.ToolUseEvent{ToolName: "mcp__docs__search", ToolUseID: "tu_2"},
+			result:   agent.ToolResultEvent{ToolName: "docs_search", ToolUseID: "tu_2", Content: "hit one"},
+			wantName: "docs_search", wantOut: "hit one",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			res := postToolCall(t, tc.use, tc.result)
+			if res.ToolName != tc.wantName || res.Content != tc.wantName+" result" || res.ToolOutput != tc.wantOut {
+				t.Fatalf("result activity = %+v; want name %q and output %q", res, tc.wantName, tc.wantOut)
+			}
+		})
 	}
 }

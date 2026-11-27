@@ -755,7 +755,7 @@ func mapEvent(ev agent.Event, ts time.Time, providerName string, durationMs int6
 		out.ToolUseID = e.ToolUseID
 		out.IsError = e.IsError
 		out.DurationMs = durationMs
-		out.ToolOutput = truncateMiddle(present.OutputText(e.Content), toolOutputCap)
+		out.ToolOutput = truncateMiddle(e.Content, toolOutputCap)
 		return out, true
 
 	case agent.ResultEvent:

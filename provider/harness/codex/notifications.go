@@ -202,11 +202,14 @@ func mapWarning(method string, params json.RawMessage, state *mapperState, raw a
 		// Routine metadata (nothing blocked) arrives every turn and carries
 		// no reader-facing signal; only a block is worth a notice, and never
 		// as the raw classifier JSON.
-		blocked := moderationBlocks(p.Metadata)
-		if len(blocked) == 0 {
+		names, blocked := moderationBlocks(p.Metadata)
+		if !blocked {
 			return nil
 		}
-		subtype, message = "codex_moderation", "Codex moderation blocked: "+strings.Join(blocked, ", ")
+		subtype, message = "codex_moderation", "Codex moderation blocked"
+		if len(names) > 0 {
+			message += ": " + strings.Join(names, ", ")
+		}
 	default:
 		return nil
 	}

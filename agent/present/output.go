@@ -8,7 +8,9 @@ import (
 // OutputText decodes tool output for display: a JSON array of content parts
 // (`[{"type":"text","text":"…"}]`, as MCP and Claude results send) becomes
 // its texts joined by newlines, non-text parts become "[type]"; anything else
-// is returned unchanged.
+// is returned unchanged. Apply it only where the wire field is known to be a
+// content-part array (a harness parser), never to plain tool stdout, which
+// may itself be a JSON array of objects with a "type" key.
 func OutputText(content string) string {
 	trimmed := strings.TrimSpace(content)
 	if !strings.HasPrefix(trimmed, "[") || !strings.HasSuffix(trimmed, "]") {

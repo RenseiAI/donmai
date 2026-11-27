@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/agent/present"
 )
 
 // rawJSONLEnvelope is the discriminator-only decode used to dispatch
@@ -942,19 +943,23 @@ func decodeInput(raw json.RawMessage) map[string]any {
 	return m
 }
 
-// decodeToolResultContent normalizes the legacy SDK's flexible
-// content shape (string | object) to a string. Mirrors the
-// `typeof block.content === 'string' ? block.content : JSON.stringify`
-// branch of the legacy mapUserMessage.
+// decodeToolResultContent normalizes the flexible tool_result content shape
+// (string | content-block array | object) to a string. A string is the
+// tool's own output and passes through verbatim, even when it happens to be
+// JSON; only a structured content-block array (MCP and image results) is
+// decoded to its text. Anything else is stringified, mirroring the legacy
+// `typeof block.content === 'string' ? block.content : JSON.stringify`.
 func decodeToolResultContent(raw json.RawMessage) string {
 	if len(raw) == 0 {
 		return ""
 	}
-	// Try string first.
 	var s string
 	if err := json.Unmarshal(raw, &s); err == nil {
 		return s
 	}
-	// Otherwise stringify the raw JSON body.
-	return string(raw)
+	body := string(raw)
+	if strings.HasPrefix(strings.TrimSpace(body), "[") {
+		return present.OutputText(body)
+	}
+	return body
 }
