@@ -245,7 +245,7 @@ func checkpointHistoryDenied(ctx context.Context, target rescueTarget, to string
 			if path == "" {
 				continue
 			}
-			if shouldExcludeFromWIPCheckpoint(path) {
+			if target.excludesFromWIPCheckpoint(path) {
 				deny(path)
 				continue
 			}

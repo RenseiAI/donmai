@@ -171,6 +171,15 @@ type HeartbeatOptions struct {
 	// Optional — leave nil to ignore. Phase 2e.
 	OnHostStatus func(detail HostStatusDetail)
 
+	// OnUpdateDefaults consumes the heartbeat reply's update-defaults
+	// member. The argument is the raw member: nil when the server omitted
+	// it (older server), JSON null for an explicit whole-snapshot clear,
+	// or an object for per-field updates. Malformed members preserve the
+	// last-known-good snapshot with a typed diagnostic and never fail
+	// the beat. Optional — leave nil to ignore platform-provided
+	// defaults and keep serving from local configuration only.
+	OnUpdateDefaults func(raw json.RawMessage)
+
 	// OnManagedUpdateTrust is invoked when the heartbeat response carries
 	// a managedUpdateTrust projection. Nil (absent) projections never
 	// reach this callback: unconfigured leaves local policy unchanged.
@@ -953,13 +962,20 @@ func (h *HostStatusDetail) SuspendsClaiming() bool {
 // and pendingMutations. Both are optional — a daemon talking to a
 // pre-Phase-2 platform unmarshals the missing fields to zero values.
 type heartbeatResponseBody struct {
-	Acknowledged       bool                            `json:"acknowledged"`
-	ServerTime         string                          `json:"serverTime"`
-	PendingWorkCount   int                             `json:"pendingWorkCount"`
-	HostStatus         *HostStatusDetail               `json:"hostStatus,omitempty"`
-	PendingMutations   []PendingMutation               `json:"pendingMutations,omitempty"`
-	SessionShim        *SessionShimHeartbeatProjection `json:"sessionShim,omitempty"`
-	ManagedUpdateTrust *ManagedUpdateTrustProjection   `json:"managedUpdateTrust,omitempty"`
+	Acknowledged     bool                            `json:"acknowledged"`
+	ServerTime       string                          `json:"serverTime"`
+	PendingWorkCount int                             `json:"pendingWorkCount"`
+	HostStatus       *HostStatusDetail               `json:"hostStatus,omitempty"`
+	PendingMutations []PendingMutation               `json:"pendingMutations,omitempty"`
+	SessionShim      *SessionShimHeartbeatProjection `json:"sessionShim,omitempty"`
+	// UpdateDefaults carries the platform-provided system snapshot for
+	// update configuration. Raw so absence (nil, older server) stays
+	// distinct from an explicit null (clear) and from malformed data.
+	// Additive: older servers omit it and newer daemons ignore unknown
+	// members inside it.
+	UpdateDefaults json.RawMessage `json:"updateDefaults,omitempty"`
+	// ManagedUpdateTrust carries the managed update-trust projection.
+	ManagedUpdateTrust *ManagedUpdateTrustProjection `json:"managedUpdateTrust,omitempty"`
 }
 
 func (h *HeartbeatService) callEndpoint(
@@ -1122,6 +1138,14 @@ func (h *HeartbeatService) dropConfirmedAcks(applied []string, failures []Heartb
 func (h *HeartbeatService) handleHeartbeatResponse(ctx context.Context, resp *heartbeatResponseBody) {
 	if resp == nil {
 		return
+	}
+	// The production consumer for platform-provided update defaults.
+	// Runs on every successful beat, including beats from older servers
+	// whose reply omits the member (raw == nil, a no-op preserve) and
+	// beats that carry an explicit clear or malformed data (preserve
+	// last-good with a typed diagnostic, never fail the beat).
+	if h.opts.OnUpdateDefaults != nil && resp.UpdateDefaults != nil {
+		h.opts.OnUpdateDefaults(resp.UpdateDefaults)
 	}
 	if resp.HostStatus != nil && h.opts.OnHostStatus != nil {
 		h.opts.OnHostStatus(*resp.HostStatus)

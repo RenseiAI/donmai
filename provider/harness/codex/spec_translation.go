@@ -104,7 +104,7 @@ func resolveApprovalPolicy(spec agent.Spec) string {
 // baseInstructions is the explicit replacement surface. Appended harness,
 // policy, and role instructions use developerInstructions so Codex's built-in
 // base prompt remains intact (verified in the 0.146.0 app-server schema).
-func threadStartParams(spec agent.Spec) map[string]any {
+func threadStartParams(spec agent.Spec, deny denyPlan) map[string]any {
 	params := map[string]any{
 		"cwd":            spec.Cwd,
 		"approvalPolicy": resolveApprovalPolicy(spec),
@@ -117,8 +117,21 @@ func threadStartParams(spec agent.Spec) map[string]any {
 	if spec.SystemPromptAppend != "" {
 		params["developerInstructions"] = spec.SystemPromptAppend
 	}
+	if config := deny.threadConfig(); config != nil {
+		params["config"] = config
+	}
 	if mode := resolveSandboxMode(spec); mode != "" {
 		params["sandbox"] = mode
+	}
+	return params
+}
+
+// threadResumeParams builds the JSON-RPC params for `thread/resume`. A resumed
+// thread does not inherit the thread/start config, so it is sent again.
+func threadResumeParams(threadID string, deny denyPlan) map[string]any {
+	params := map[string]any{"threadId": threadID, "personality": "pragmatic"}
+	if config := deny.threadConfig(); config != nil {
+		params["config"] = config
 	}
 	return params
 }
@@ -298,6 +311,20 @@ type SpawnPlan struct {
 	// when a fresh turn must be started on an existing thread.
 	PromptInput []map[string]any
 
+	// ThreadResume is the params for `thread/resume`, minus threadId.
+	ThreadResume map[string]any
+
+	// DenyReport says how each PermissionConfig deny reached Codex, and
+	// DenyErr is set when one cannot reach it (Spawn refuses first).
+	DenyReport []DenyTranslation
+	DenyErr    error
+
+	// ExecPolicyRules is the rule file staged into CODEX_HOME/rules before
+	// the app-server starts; empty when the session has no command deny.
+	ExecPolicyRules string
+
+	denyNotice *agent.SystemEvent
+
 	// IgnoredFields lists the agent.Spec fields the codex provider
 	// does NOT translate — surfaced for tests + observability so we
 	// know which fields are silently dropped vs. silently lost.
@@ -317,12 +344,16 @@ type SpecFieldNote struct {
 // ensure every relevant Spec field is either translated or
 // explicitly noted.
 func NewSpawnPlan(spec agent.Spec) SpawnPlan {
-	threadStart := threadStartParams(spec)
-
+	deny, denyErr := translateDenies(spec)
 	plan := SpawnPlan{
-		MCPConfig:   mcpServersConfig(spec.MCPServers),
-		ThreadStart: threadStart,
-		PromptInput: promptInput(spec),
+		MCPConfig:       mcpServersConfig(spec.MCPServers),
+		ThreadStart:     threadStartParams(spec, deny),
+		ThreadResume:    threadResumeParams("", deny),
+		PromptInput:     promptInput(spec),
+		DenyReport:      deny.report,
+		DenyErr:         denyErr,
+		ExecPolicyRules: deny.execPolicyRules(),
+		denyNotice:      deny.notice(),
 	}
 	plan.TurnStart = turnStartParams("", spec, plan.PromptInput)
 
@@ -396,7 +427,7 @@ func ignoredSpecFields(spec agent.Spec) []SpecFieldNote {
 	if spec.PermissionConfig != nil {
 		notes = append(notes, SpecFieldNote{
 			Field:  "PermissionConfig",
-			Reason: "consumed by the approval bridge (approval.go), not via thread/start params",
+			Reason: "consumed by the approval bridge (approval.go) and translated into Codex exec-policy rules and thread config (deny_translation.go)",
 		})
 	}
 
@@ -438,9 +469,4 @@ func ignoredSpecFields(spec agent.Spec) []SpecFieldNote {
 	// session with the shared pid so cost/heartbeat hooks still fire.
 	// This is documented as honored, not ignored.
 	return notes
-}
-
-// threadResumeParams builds the JSON-RPC params for `thread/resume`.
-func threadResumeParams(threadID string) map[string]any {
-	return map[string]any{"threadId": threadID, "personality": "pragmatic"}
 }

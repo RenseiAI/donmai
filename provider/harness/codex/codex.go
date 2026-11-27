@@ -11,6 +11,7 @@ import (
 	"maps"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -27,6 +28,17 @@ import (
 // even though the same request completed immediately afterward. Five seconds
 // remains bounded beneath the ordinary RPC timeout while covering that drain.
 const mcpConfigCleanupTimeout = 5 * time.Second
+
+// mcpClearMaxAttempts bounds the final-release clear retries: the first
+// attempt plus two short-backoff retries. A loaded host can fail one clear
+// RPC while the next succeeds; anything still failing after these attempts
+// is reported through the existing poison + retention/sweep path.
+const mcpClearMaxAttempts = 3
+
+// mcpClearRetryBaseDelay is the linear backoff unit between clear attempts
+// (50ms, then 100ms). Short and bounded so the release stays well under the
+// per-attempt RPC timeout while covering transient load spikes.
+const mcpClearRetryBaseDelay = 50 * time.Millisecond
 
 // Provider is the agent.Provider implementation backed by a long-lived
 // `codex app-server` subprocess. One Provider instance owns one
@@ -70,6 +82,12 @@ type Provider struct {
 	// child actually received — see checkSessionEnvLocked.
 	pinnedSessionEnv map[string]string
 	sessionEnvPinned bool
+
+	// pinnedExecRules is the exec-policy rule file staged before the
+	// app-server started (deny_translation.go). Codex keeps the rules it
+	// loaded, so a later session asking for different rules is refused.
+	pinnedExecRules string
+	execRulesPinned bool
 
 	// pinnedGatewayBaseURL/pinnedGatewayRouted freeze the gateway route the
 	// running app-server child was started with, and gatewayRoutePinned
@@ -142,12 +160,6 @@ type Options struct {
 	// and MCP servers remain private.
 	HostSessionAuth bool
 
-	// HostHome names an explicit Codex config directory whose auth.json
-	// the host-session projection reads. Empty means the default login;
-	// a non-empty value must be absolute and is carried only to the auth
-	// file resolution, never to the child environment.
-	HostHome string
-
 	// HandshakeTimeout caps the JSON-RPC initialize handshake.
 	// Defaults to 30s.
 	HandshakeTimeout time.Duration
@@ -207,6 +219,22 @@ type Options struct {
 // credential is projected before Codex caches an unauthenticated startup
 // state. See startLocked / ensureHeadlessReady.
 func New(opts Options) (*Provider, error) {
+	hostAuthFile := ""
+	if opts.HostSessionAuth {
+		var err error
+		hostAuthFile, err = resolveHostSessionAuthFile()
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", agent.ErrProviderUnavailable, err)
+		}
+	}
+	return newProviderWithHostAuth(opts, hostAuthFile, opts.HostSessionAuth)
+}
+
+// newProviderWithHostAuth constructs a Provider against an already-resolved
+// host auth file, bypassing default resolution entirely. The quota probe uses
+// it with an explicit source home so a valid explicit login is never gated on
+// the default; New resolves the default first and then delegates here.
+func newProviderWithHostAuth(opts Options, hostAuthFile string, fileAuth bool) (*Provider, error) {
 	if opts.HandshakeTimeout == 0 {
 		opts.HandshakeTimeout = 30 * time.Second
 	}
@@ -215,15 +243,6 @@ func New(opts Options) (*Provider, error) {
 	}
 	if len(opts.Args) == 0 {
 		opts.Args = []string{"app-server"}
-	}
-
-	hostAuthFile := ""
-	if opts.HostSessionAuth {
-		var err error
-		hostAuthFile, err = resolveHostSessionAuthFileFor(opts.HostHome)
-		if err != nil {
-			return nil, fmt.Errorf("%w: %v", agent.ErrProviderUnavailable, err)
-		}
 	}
 	codexBin := ""
 	if !opts.skipProcess {
@@ -240,7 +259,7 @@ func New(opts Options) (*Provider, error) {
 		handles:      make(map[*Handle]struct{}),
 		hostAuthFile: hostAuthFile,
 	}
-	boundary, err := newCodexConfigBoundary(opts.configTempDir, opts.HostSessionAuth)
+	boundary, err := newCodexConfigBoundary(opts.configTempDir, fileAuth)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", agent.ErrProviderUnavailable, err)
 	}
@@ -265,7 +284,7 @@ func New(opts Options) (*Provider, error) {
 func (p *Provider) ensureStarted() error {
 	p.startMu.Lock()
 	defer p.startMu.Unlock()
-	return p.startLocked(nil)
+	return p.startLocked(context.Background(), nil)
 }
 
 // ensureProbeStarted starts the app-server for a quota read. A
@@ -274,7 +293,10 @@ func (p *Provider) ensureStarted() error {
 // started without it has no login and refuses every read, which would
 // report a signed-in host as logged out. A host with no login file
 // fails here, before any read, so the probe records no verdict.
-func (p *Provider) ensureProbeStarted() error {
+func (p *Provider) ensureProbeStarted(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	p.startMu.Lock()
 	defer p.startMu.Unlock()
 	select {
@@ -287,7 +309,7 @@ func (p *Provider) ensureProbeStarted() error {
 			return fmt.Errorf("%w: codex host-session auth: %w", agent.ErrProviderUnavailable, err)
 		}
 	}
-	return p.startLocked(nil)
+	return p.startLocked(ctx, nil)
 }
 
 // startLocked starts and initializes the app-server. startMu must be held.
@@ -304,7 +326,10 @@ func (p *Provider) ensureProbeStarted() error {
 // layer it applied, and ensureHeadlessReady refuses a later Spawn/Resume whose
 // layer materially differs rather than silently serving it the first session's
 // DONMAI_SESSION_ID and DONMAI_API_URL. See checkSessionEnvLocked.
-func (p *Provider) startLocked(sessionEnv map[string]string) error {
+func (p *Provider) startLocked(ctx context.Context, sessionEnv map[string]string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if p.startErr != nil {
 		return p.startErr
 	}
@@ -330,24 +355,24 @@ func (p *Provider) startLocked(sessionEnv map[string]string) error {
 		cmd.Env = mergeEnv(p.opts.Env, sessionEnv, p.config.home)
 		stdin, err := cmd.StdinPipe()
 		if err != nil {
-			return p.failStartLocked(fmt.Errorf("%w: codex stdin pipe: %v", agent.ErrProviderUnavailable, err))
+			return p.failStartLocked(ctx, fmt.Errorf("%w: codex stdin pipe: %v", agent.ErrProviderUnavailable, err))
 		}
 		stdout, err := cmd.StdoutPipe()
 		if err != nil {
 			_ = stdin.Close()
-			return p.failStartLocked(fmt.Errorf("%w: codex stdout pipe: %v", agent.ErrProviderUnavailable, err))
+			return p.failStartLocked(ctx, fmt.Errorf("%w: codex stdout pipe: %v", agent.ErrProviderUnavailable, err))
 		}
 		stderr, err := cmd.StderrPipe()
 		if err != nil {
 			_ = stdin.Close()
 			_ = stdout.Close()
-			return p.failStartLocked(fmt.Errorf("%w: codex stderr pipe: %v", agent.ErrProviderUnavailable, err))
+			return p.failStartLocked(ctx, fmt.Errorf("%w: codex stderr pipe: %v", agent.ErrProviderUnavailable, err))
 		}
 		if err := cmd.Start(); err != nil {
 			_ = stdin.Close()
 			_ = stdout.Close()
 			_ = stderr.Close()
-			return p.failStartLocked(fmt.Errorf("%w: codex spawn: %v", agent.ErrProviderUnavailable, err))
+			return p.failStartLocked(ctx, fmt.Errorf("%w: codex spawn: %v", agent.ErrProviderUnavailable, err))
 		}
 		p.cmd = cmd
 		p.stdin = stdin
@@ -366,7 +391,8 @@ func (p *Provider) startLocked(sessionEnv map[string]string) error {
 		// actually surface it.
 		p.processDone = make(chan error, 1)
 		p.ownedProcess = newOwnedProcess(cmd)
-		p.config.stopWriter = func() error { return p.stopProcess(context.Background()) }
+		stopCtx := ctx
+		p.config.stopWriter = func() error { return p.stopProcess(stopCtx) }
 		p.appServerStderr = captureAppServerStderr(stderr)
 	}
 
@@ -376,7 +402,7 @@ func (p *Provider) startLocked(sessionEnv map[string]string) error {
 		go p.watchExit()
 	}
 
-	hctx, cancel := context.WithTimeout(context.Background(), p.opts.HandshakeTimeout)
+	hctx, cancel := context.WithTimeout(ctx, p.opts.HandshakeTimeout)
 	defer cancel()
 	initRaw, err := p.client.Request(hctx, "initialize", map[string]any{
 		"clientInfo": map[string]any{
@@ -389,18 +415,18 @@ func (p *Provider) startLocked(sessionEnv map[string]string) error {
 		},
 	}, p.opts.HandshakeTimeout)
 	if err != nil {
-		return p.failStartLocked(fmt.Errorf("%w: codex initialize handshake: %v", agent.ErrProviderUnavailable, err))
+		return p.failStartLocked(ctx, fmt.Errorf("%w: codex initialize handshake: %v", agent.ErrProviderUnavailable, err))
 	}
 	if !p.opts.skipProcess {
 		var initResp struct {
 			CodexHome string `json:"codexHome"`
 		}
 		if err := json.Unmarshal(initRaw, &initResp); err != nil || initResp.CodexHome == "" || !sameResolvedPath(initResp.CodexHome, p.config.home) {
-			return p.failStartLocked(fmt.Errorf("%w: codex app-server did not confirm its isolated config home", agent.ErrProviderUnavailable))
+			return p.failStartLocked(ctx, fmt.Errorf("%w: codex app-server did not confirm its isolated config home", agent.ErrProviderUnavailable))
 		}
 	}
 	if err := p.client.Notify("initialized", map[string]any{}); err != nil {
-		return p.failStartLocked(fmt.Errorf("%w: codex initialized notification: %v", agent.ErrProviderUnavailable, err))
+		return p.failStartLocked(ctx, fmt.Errorf("%w: codex initialized notification: %v", agent.ErrProviderUnavailable, err))
 	}
 	p.forwardRateLimitUpdates()
 	p.started = true
@@ -413,11 +439,14 @@ func (p *Provider) startLocked(sessionEnv map[string]string) error {
 	return nil
 }
 
-func (p *Provider) failStartLocked(err error) error {
+func (p *Provider) failStartLocked(ctx context.Context, err error) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if excerpt := p.appServerStderr.Excerpt(); excerpt != "" {
 		err = fmt.Errorf("%w (app-server stderr: %s)", err, excerpt)
 	}
-	p.startErr = errors.Join(err, p.terminateLocked(context.Background()))
+	p.startErr = errors.Join(err, p.terminateLocked(ctx))
 	return p.startErr
 }
 
@@ -613,6 +642,11 @@ func (p *Provider) ensureHeadlessReady(spec agent.Spec) (agent.Spec, stagedSkill
 		return spec, stagedSkills{}, fmt.Errorf("%w: %w: codex provider already shut down", agent.ErrSpawnFailed, agent.ErrProviderUnavailable)
 	default:
 	}
+	// A deny list Codex cannot enforce is refused here, before any side effect.
+	deny, err := translateDenies(spec)
+	if err != nil {
+		return spec, stagedSkills{}, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
+	}
 	// Resolve the gateway route first: gatewayBinding is pure (no side
 	// effects) and the projected layer is what the running child actually
 	// carries, so the session-env check below must compare against it. A
@@ -677,7 +711,10 @@ func (p *Provider) ensureHeadlessReady(spec agent.Spec) (agent.Spec, stagedSkill
 	if err != nil {
 		return spec, stagedSkills{}, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
 	}
-	if err := p.startLocked(spec.Env); err != nil {
+	if err := p.stageExecPolicyRulesLocked(deny.execPolicyRules()); err != nil {
+		return spec, stagedSkills{}, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
+	}
+	if err := p.startLocked(context.Background(), spec.Env); err != nil {
 		return spec, stagedSkills{}, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
 	}
 	// Freeze the route the child was started with. baseURL is empty when the
@@ -687,6 +724,34 @@ func (p *Provider) ensureHeadlessReady(spec agent.Spec) (agent.Spec, stagedSkill
 	p.pinnedGatewayRouted = gatewayRouted
 	p.gatewayRoutePinned = true
 	return spec, skills, nil
+}
+
+// stageExecPolicyRulesLocked writes the session's exec-policy rules into the
+// private CODEX_HOME/rules before the app-server starts and pins them. An
+// app-server already started without staged rules (a quota probe) is pinned
+// to none. startMu must be held.
+func (p *Provider) stageExecPolicyRulesLocked(rules string) error {
+	if !p.execRulesPinned {
+		p.execRulesPinned = true
+		if p.started {
+			p.pinnedExecRules = ""
+		} else {
+			if rules != "" {
+				dir := filepath.Join(p.config.home, "rules")
+				if err := os.MkdirAll(dir, 0o700); err != nil {
+					return fmt.Errorf("codex exec-policy rules: %w", err)
+				}
+				if err := os.WriteFile(filepath.Join(dir, codexDenyRulesFile), []byte(rules), 0o600); err != nil {
+					return fmt.Errorf("codex exec-policy rules: %w", err)
+				}
+			}
+			p.pinnedExecRules = rules
+		}
+	}
+	if rules != p.pinnedExecRules {
+		return fmt.Errorf("%w: the exec-policy rules of a started app-server cannot change", ErrDenyUntranslatable)
+	}
+	return nil
 }
 
 func (p *Provider) prepareHeadlessProtectedMCPAuthorityLocked(servers []agent.MCPServerConfig) error {
@@ -773,8 +838,27 @@ func (p *Provider) acquireMCPConfig(ctx context.Context, mcpConfig map[string]an
 					}
 					return
 				}
+				// One shared budget for every clear attempt, not a fresh
+				// window per attempt: the turn's terminal event is already
+				// known and the runner is waiting on its run deadline, so
+				// holding the result past that deadline turns a completed
+				// turn into a timeout. A hung clear consumes the budget
+				// on the first attempt and no further attempt is sent; a
+				// fast failure still leaves budget for the retry.
 				cleanupCtx, cancel := context.WithTimeout(context.Background(), min(p.opts.RPCTimeout, mcpConfigCleanupTimeout))
-				err := p.applyMCPConfig(cleanupCtx, map[string]any{}, cwd, true)
+				var err error
+				for attempt := 1; attempt <= mcpClearMaxAttempts; attempt++ {
+					if attempt > 1 && cleanupCtx.Err() != nil {
+						break
+					}
+					err = p.applyMCPConfig(cleanupCtx, map[string]any{}, cwd, true)
+					if err == nil {
+						break
+					}
+					if attempt < mcpClearMaxAttempts {
+						time.Sleep(mcpClearRetryBaseDelay * time.Duration(attempt))
+					}
+				}
 				cancel()
 				if err != nil {
 					p.mcpConfigKnown = false
@@ -963,10 +1047,10 @@ func (e *mcpBoundaryError) reason() string {
 // session's server credentials). Owner removal follows the normal retention
 // rule: a home holding resumable session state is kept (only cache/ is
 // removed), so its config.toml stays on disk exactly as it would after any
-// other session end; contained never claims that file was scrubbed. A
-// contained failure after a completed turn is reported as a warning next to
-// the turn's result; an uncontained one keeps replacing the result with the
-// terminal mcp_cleanup_failed error.
+// other session end; contained never claims that file was scrubbed. A cleanup
+// failure after a successful turn is reported as a warning next to the turn's
+// result (contained or not); only a turn that did not finish successfully
+// keeps failing closed with the terminal mcp_cleanup_failed error.
 type mcpCleanupError struct {
 	err       error
 	contained bool
@@ -1180,19 +1264,45 @@ func (p *Provider) terminateLocked(ctx context.Context) error {
 // its once-only cleanup. The lifecycle owner stops writers before reaping
 // the leader, then publishes completion before invoking client callbacks.
 func (p *Provider) stopProcess(ctx context.Context) error {
-	p.stopOnce.Do(func() {
-		if p.cmd == nil || p.cmd.Process == nil {
-			return
-		}
-		grace := 5 * time.Second
-		if dl, ok := ctx.Deadline(); ok {
-			if remaining := time.Until(dl); remaining < grace && remaining > 0 {
+	if p.cmd == nil || p.cmd.Process == nil || p.ownedProcess == nil {
+		return nil
+	}
+	grace := 5 * time.Second
+	if ctx != nil {
+		if ctx.Err() != nil {
+			grace = 0
+		} else if dl, ok := ctx.Deadline(); ok {
+			if remaining := time.Until(dl); remaining <= 0 {
+				grace = 0
+			} else if remaining < grace {
 				grace = remaining
 			}
 		}
-		p.stopErr = p.ownedProcess.stop(grace)
-	})
-	return p.stopErr
+	}
+	// Offer every request to the single signal/wait owner: it keeps the
+	// shortest grace so a cancellation arriving during grace shortens the
+	// wait instead of queuing behind the first stop. When the caller's
+	// context cancels mid-wait, offer zero grace at that moment so an
+	// in-progress drain does not hold the original grace: the waiter
+	// reaps on the shortest request.
+	release := func() bool { return false }
+	if ctx != nil {
+		if done := ctx.Done(); done != nil {
+			select {
+			case <-done:
+			// Already cancelled: grace is already zero above.
+			default:
+				release = context.AfterFunc(ctx, func() { _ = p.ownedProcess.stop(0) })
+			}
+		}
+	}
+	err := p.ownedProcess.stop(grace)
+	release()
+	p.stopOnce.Do(func() { p.stopErr = err })
+	if p.stopErr != nil {
+		return p.stopErr
+	}
+	return err
 }
 
 // checkAlive returns ErrProviderUnavailable if the app-server has

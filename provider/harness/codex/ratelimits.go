@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"errors"
 	"math"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -499,13 +500,27 @@ func (p *Provider) ProbeQuota(ctx context.Context) (accountID, plan string, prob
 	if p == nil {
 		return "", "", agent.MakeUnavailableUsageLimits(agent.ISOTime(time.Now()), agent.UsageUnavailableProbeFailed, "Codex did not answer the usage request.")
 	}
-	if err := p.ensureProbeStarted(); err != nil {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	// The shared app-server outlives one probe attempt, so its startup
+	// runs under a detached context: a slow but healthy initialize that
+	// outlasts this attempt's deadline must not poison the shared
+	// Provider with a permanent shutdown. The read below stays bound to
+	// the caller, and a cancelled attempt still yields unknown before or
+	// after the read without touching shared startup state. The
+	// probe-owned ProbeQuotaForLogin below keeps the caller's deadline
+	// for startup because it owns its process from construction onward.
+	if err := p.ensureProbeStarted(context.Background()); err != nil {
 		return "", "", agent.MakeUnavailableUsageLimits(agent.ISOTime(time.Now()), agent.UsageUnavailableProbeFailed, RateLimitsFailureMessage(err))
 	}
 	p.startMu.Lock()
 	client := p.client
 	p.startMu.Unlock()
 	if client == nil {
+		return "", "", agent.MakeUnavailableUsageLimits(agent.ISOTime(time.Now()), agent.UsageUnavailableProbeFailed, "Codex did not answer the usage request.")
+	}
+	if ctx.Err() != nil {
 		return "", "", agent.MakeUnavailableUsageLimits(agent.ISOTime(time.Now()), agent.UsageUnavailableProbeFailed, "Codex did not answer the usage request.")
 	}
 	checkedAt := agent.ISOTime(time.Now())
@@ -521,7 +536,125 @@ func (p *Provider) ProbeQuota(ctx context.Context) (accountID, plan string, prob
 	if err := json.Unmarshal(raw, &resp); err != nil {
 		return "", "", agent.MakeUnavailableUsageLimits(checkedAt, agent.UsageUnavailableProbeFailed, "Codex did not answer the usage request.")
 	}
+	if ctx.Err() != nil {
+		return "", "", agent.MakeUnavailableUsageLimits(agent.ISOTime(time.Now()), agent.UsageUnavailableProbeFailed, "Codex did not answer the usage request.")
+	}
 	return decodeRateLimitsRead(resp, checkedAt)
+}
+
+// ProbeQuotaForLogin reads quota for exactly one login through a probe-owned
+// app-server, bound by the caller's deadline from construction through
+// shutdown. sourceHome selects the login: empty preserves the default host
+// resolution, while any non-empty value is an explicit selector that must be
+// an absolute path whose auth.json is projected through the checked private
+// hard link. A blank or otherwise invalid explicit selector never falls back
+// to the default: it yields unknown. The child always starts with the private
+// CODEX_HOME and must confirm it; the source home is never passed to the
+// child and its files are never written. One quota read serves identity,
+// plan and windows together, so a login that answers once is published even
+// when a second read would fail. Cancellation at any point — including
+// during shutdown grace — yields an unknown snapshot with empty identity
+// and plan, superseding even a live login refusal; only an uncancelled
+// refusal stays answered. The private home is
+// joined before removal and retained when writer quiescence cannot be proved.
+func ProbeQuotaForLogin(ctx context.Context, opts Options, sourceHome string) (accountID, plan string, probed agent.UsageLimits) {
+	fail := func() (string, string, agent.UsageLimits) {
+		return "", "", agent.MakeUnavailableUsageLimits(agent.ISOTime(time.Now()), agent.UsageUnavailableProbeFailed, "Codex did not answer the usage request.")
+	}
+	if ctx == nil || ctx.Err() != nil {
+		return fail()
+	}
+	// Any non-empty selector is explicit: a blank selector is an invalid
+	// explicit login, not an omitted one, so it must not resolve the default.
+	explicit := sourceHome != ""
+	var hostAuthFile string
+	fileAuth := opts.HostSessionAuth
+	if explicit {
+		if !opts.HostSessionAuth {
+			return fail()
+		}
+		if strings.TrimSpace(sourceHome) == "" {
+			return fail()
+		}
+		// Resolve before constructing the private home and never consult
+		// the default: a valid explicit login must not depend on it.
+		resolved, err := explicitHostSessionAuthFile(sourceHome)
+		if err != nil {
+			return fail()
+		}
+		if _, err := os.Lstat(resolved); err != nil {
+			return fail()
+		}
+		hostAuthFile = resolved
+		fileAuth = true
+	} else if opts.HostSessionAuth {
+		resolved, err := resolveHostSessionAuthFile()
+		if err != nil {
+			return fail()
+		}
+		hostAuthFile = resolved
+	}
+	provider, err := newProviderWithHostAuth(opts, hostAuthFile, fileAuth)
+	if err != nil {
+		return fail()
+	}
+	// Own shutdown from construction onward under the attempt budget: the
+	// deferred Shutdown joins the owned group before the private home is
+	// removed, caps grace at the time remaining, and requests zero grace
+	// once the attempt is cancelled or expired. A cancellation that lands
+	// at any point — including during shutdown after a successful read or
+	// a live login refusal — supersedes every outcome with unknown: the
+	// daemon must not record a fresh login verdict for an attempt it
+	// cancelled. Only an uncancelled refusal stays answered.
+	defer func() {
+		_ = provider.Shutdown(ctx)
+		if ctx.Err() != nil {
+			accountID, plan, probed = fail()
+		}
+	}()
+	if err := provider.ensureProbeStarted(ctx); err != nil {
+		accountID, plan, probed = fail()
+		return accountID, plan, probed
+	}
+	provider.startMu.Lock()
+	client := provider.client
+	provider.startMu.Unlock()
+	if client == nil {
+		accountID, plan, probed = fail()
+		return accountID, plan, probed
+	}
+	if ctx.Err() != nil {
+		accountID, plan, probed = fail()
+		return accountID, plan, probed
+	}
+	// A single read serves identity, plan and windows from the same reply:
+	// discarding it for a second read would publish nothing on a cold cache
+	// when the backend fails between the two calls.
+	checkedAt := agent.ISOTime(time.Now())
+	reqCtx, cancel := context.WithTimeout(ctx, RateLimitsProbeTimeout)
+	defer cancel()
+	raw, err := client.Request(reqCtx, "account/rateLimits/read", nil, RateLimitsProbeTimeout)
+	if err != nil {
+		out := agent.MakeUnavailableUsageLimits(checkedAt, agent.UsageUnavailableProbeFailed, RateLimitsFailureMessage(err))
+		out.Unavailable.Answered = answeredByAppServer(client, err)
+		accountID, plan, probed = "", "", out
+		return accountID, plan, probed
+	}
+	var resp rateLimitsReadResponse
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		accountID, plan, probed = fail()
+		return accountID, plan, probed
+	}
+	if ctx.Err() != nil {
+		accountID, plan, probed = fail()
+		return accountID, plan, probed
+	}
+	accountID, plan, probed = decodeRateLimitsRead(resp, checkedAt)
+	if ctx.Err() != nil {
+		accountID, plan, probed = fail()
+		return accountID, plan, probed
+	}
+	return accountID, plan, probed
 }
 
 // rateLimitsRefusalCode is the JSON-RPC code the app-server answers a

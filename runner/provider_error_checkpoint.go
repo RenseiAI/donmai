@@ -132,9 +132,9 @@ func createWIPCheckpoint(ctx context.Context, qw QueuedWork, target rescueTarget
 	if err != nil {
 		return nil, warnings, fmt.Errorf("git status: %w", err)
 	}
-	changed := meaningfulPaths(porcelainPaths(status))
+	changed := target.meaningfulPaths(porcelainPaths(status))
 	if len(changed) > 0 {
-		commitSHA, dropped, skipped, commitErr := checkpointDirtyWorktree(ctx, target.path, head, qw)
+		commitSHA, dropped, skipped, commitErr := checkpointDirtyWorktree(ctx, target, head, qw)
 		warnings = append(warnings, dropped...)
 		if commitErr != nil {
 			return nil, warnings, commitErr
@@ -197,7 +197,8 @@ func sessionCommitted(ctx context.Context, target rescueTarget, head string) (bo
 	return len(unpushed) > 0, nil
 }
 
-func checkpointDirtyWorktree(ctx context.Context, worktreePath, head string, qw QueuedWork) (string, []string, bool, error) {
+func checkpointDirtyWorktree(ctx context.Context, target rescueTarget, head string, qw QueuedWork) (string, []string, bool, error) {
+	worktreePath := target.path
 	indexDir, err := tempown.MkdirTemp("", tempown.PrefixCheckpointIndex)
 	if err != nil {
 		return "", nil, false, fmt.Errorf("create scratch index dir: %w", err)
@@ -234,7 +235,7 @@ func checkpointDirtyWorktree(ctx context.Context, worktreePath, head string, qw 
 		if strings.HasPrefix(status, "D") {
 			continue
 		}
-		if shouldExcludeFromWIPCheckpoint(path) {
+		if target.excludesFromWIPCheckpoint(path) {
 			excluded = append(excluded, path)
 		} else {
 			survivors = append(survivors, path)

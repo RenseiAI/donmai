@@ -139,6 +139,10 @@ var validReviewVerdicts = map[string]struct{}{
 // tags — lets a malformed agent-written file be rejected with a precise error
 // rather than silently coerced (e.g. a string "1" schemaVersion, an unknown
 // verdict, a missing required field).
+//
+// "findings" is deliberately absent: it is optional review detail, decoded
+// tolerantly by [agent.TurnManifestFindings], and a value of the wrong shape
+// must never cost the manifest its summary and verdicts.
 const manifestSchema = `{
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
@@ -232,6 +236,7 @@ func ParseManifest(worktreePath string) (*TurnManifest, error) {
 	if err := validateManifestRepositories(manifestRepositoryEntries(&m)); err != nil {
 		return nil, err
 	}
+	m.Findings = NormalizeManifestFindings(m.Findings)
 	return &m, nil
 }
 
@@ -299,6 +304,7 @@ func ParseInlineManifest(finalMessage string) (*TurnManifest, error) {
 	if err := validateManifestRepositories(manifestRepositoryEntries(&m)); err != nil {
 		return nil, ErrNoInlineManifest
 	}
+	m.Findings = NormalizeManifestFindings(m.Findings)
 	return &m, nil
 }
 

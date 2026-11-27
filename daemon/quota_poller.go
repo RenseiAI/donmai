@@ -120,12 +120,13 @@ func (q *quotaState) quotaProbeDueAt(harness string, now time.Time) time.Time {
 type quotaProbeFunc func(ctx context.Context, q *quotaState)
 
 // codexQuotaProbe returns the probe that reads the host's codex login
-// through a short-lived app-server: construct, read, shut down. The
-// read runs under the shared probe mapper, so its rows carry the same
-// window ids the streamed updates merge onto. codexBin is the resolved
-// codex binary; hostAuth selects whether the host's existing CLI
-// login is projected into the probe's isolated home. An empty binary
-// (codex not installed) disables the probe: the attempt records
+// through a short-lived probe-owned app-server: one owned operation
+// constructs, starts, reads and shuts down under the attempt deadline.
+// The read runs under the shared probe mapper, so its rows carry the
+// same window ids the streamed updates merge onto. codexBin is the
+// resolved codex binary; hostAuth selects whether the host's existing
+// CLI login is projected into the probe's isolated home. An empty
+// binary (codex not installed) disables the probe: the attempt records
 // nothing and the heartbeat keeps omitting the codex entry.
 func codexQuotaProbe(codexBin string, hostAuth bool, extraHomes []string) quotaProbeFunc {
 	homes := append([]string(nil), extraHomes...)
@@ -159,40 +160,19 @@ func codexQuotaProbe(codexBin string, hostAuth bool, extraHomes []string) quotaP
 	}
 }
 
-// probeCodexSlot runs one codex quota read against an explicit config home.
-// An empty homeDir reads the default login; a non-empty value must name an
-// absolute config directory whose auth.json is projected into the probe's
-// isolated home. Unreadable homes yield unanswered failures, never verdicts.
+// probeCodexSlot runs one codex quota read through the probe-owned
+// app-server, bound by ctx from construction through shutdown. An empty
+// homeDir omits the login selector and reads the default login; a
+// non-empty value is an explicit absolute config directory whose auth.json
+// is projected into the probe's isolated home. A missing or unreadable
+// home yields an unanswered failure, never a verdict.
 func probeCodexSlot(ctx context.Context, codexBin string, hostAuth bool, homeDir string) (string, string, agent.UsageLimits) {
-	at := time.Now()
-	failed := func() (string, string, agent.UsageLimits) {
-		return "", "", agent.MakeUnavailableUsageLimits(agent.ISOTime(at), agent.UsageUnavailableProbeFailed, "Codex did not answer the usage request.")
-	}
-	if homeDir != "" {
-		if !filepath.IsAbs(homeDir) {
-			return failed()
-		}
-		if info, err := os.Stat(homeDir); err != nil || !info.IsDir() {
-			return failed()
-		}
-	}
-	provider, err := providercodex.New(providercodex.Options{
+	return providercodex.ProbeQuotaForLogin(ctx, providercodex.Options{
 		CodexBin:         codexBin,
 		HostSessionAuth:  hostAuth,
-		HostHome:         homeDir,
 		HandshakeTimeout: quotaProbeTimeout / 2,
 		RPCTimeout:       providercodex.RateLimitsProbeTimeout,
-	})
-	if err != nil {
-		return failed()
-	}
-	accountID, plan, probed := provider.ProbeQuota(ctx)
-	defer func() {
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = provider.Shutdown(shutdownCtx)
-	}()
-	return accountID, plan, probed
+	}, homeDir)
 }
 
 type codexScanSlot struct {
@@ -398,7 +378,7 @@ func claudeQuotaProbe(binary string, extraHomes []string) quotaProbeFunc {
 			}
 			slotCtx, cancel := context.WithTimeout(ctx, quotaProbeTimeout)
 			at := time.Now()
-			accountID, probed, _ := providerclaude.ProbeUsageWithConfigDir(slotCtx, binary, slot.dir)
+			accountID, probed, _ := probeClaudeSlot(slotCtx, binary, slot.dir)
 			cancel()
 			q.recordClaudeSlotAttempt(slot.key, accountID, probed, at, slot.isDefault)
 			if ctx.Err() != nil {
@@ -406,6 +386,16 @@ func claudeQuotaProbe(binary string, extraHomes []string) quotaProbeFunc {
 			}
 		}
 	}
+}
+
+// probeClaudeSlot runs one claude usage read. An empty dir reads the
+// default login; a non-empty dir is an explicit absolute config home whose
+// usage and status children carry exactly that CLAUDE_CONFIG_DIR.
+func probeClaudeSlot(ctx context.Context, binary, dir string) (string, agent.UsageLimits, providerclaude.ScopedLimitNames) {
+	if dir == "" {
+		return providerclaude.ProbeUsage(ctx, binary)
+	}
+	return providerclaude.ProbeUsageForConfigDir(ctx, binary, dir)
 }
 
 // museHostSessionAccountID is the opaque account identity the muse
