@@ -160,8 +160,10 @@ const (
 	// model. 256 KiB keeps legitimate outputs (test logs, diffs) intact
 	// while bounding the pathological ones; the runner never fails a
 	// turn for oversize output alone. The daemon's maxToolOutputBytes
-	// setting and `agent run --max-tool-output-bytes` override it.
-	DefaultMaxToolOutputBytes = 256 * 1024
+	// setting and `agent run --max-tool-output-bytes` override it. It
+	// shares its value with agent.DefaultMaxToolOutputBytes, the helper's
+	// own default.
+	DefaultMaxToolOutputBytes = agent.DefaultMaxToolOutputBytes
 
 	// DefaultStatusBeaconInterval bounds the runner's current-step beacon
 	// posts to the session progress endpoint: at most one POST per

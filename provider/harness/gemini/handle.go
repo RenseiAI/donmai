@@ -58,6 +58,10 @@ type sessionParams struct {
 	// (agentic turns) allowed before the driver terminates with an
 	// error_max_turns result. 0 means uncapped.
 	maxTurns int
+	// maxToolOutputBytes bounds one tool result's payload folded back into
+	// the model's conversation (see boundToolResponse). Zero means the
+	// shared default.
+	maxToolOutputBytes int
 }
 
 // injectMsg carries an injected steering message into the driver loop.
@@ -102,6 +106,12 @@ type Handle struct {
 	// deliberate cap from a model-side truncation.
 	maxTurns int
 
+	// maxToolOutputBytes bounds one tool result's payload folded back into
+	// the model's conversation (see boundToolResponse). Zero means the
+	// shared default. The ToolResultEvent handed to the runner carries the
+	// full result; the runner bounds its own copy with its own limit.
+	maxToolOutputBytes int
+
 	events chan agent.Event
 	cancel context.CancelFunc
 
@@ -140,21 +150,22 @@ func startSession(ctx context.Context, p sessionParams) (*Handle, error) {
 	}
 
 	h := &Handle{
-		sessionID: p.sessionID,
-		apiKey:    p.apiKey,
-		turnURL:   p.turnURL,
-		model:     p.model,
-		plan:      p.plan,
-		client:    client,
-		executor:  newToolExecutor(p.cwd, p.env, p.mcp),
-		mcp:       p.mcp,
-		maxTurns:  p.maxTurns,
-		events:    make(chan agent.Event, eventBufferSize),
-		cancel:    cancel,
-		inject:    make(chan injectMsg, 4),
-		contents:  append([]requestContent(nil), p.plan.initialContents...),
-		shutdown:  make(chan struct{}),
-		state:     &turnState{model: p.model, providerConfig: p.providerConfig},
+		sessionID:          p.sessionID,
+		apiKey:             p.apiKey,
+		turnURL:            p.turnURL,
+		model:              p.model,
+		plan:               p.plan,
+		client:             client,
+		executor:           newToolExecutor(p.cwd, p.env, p.mcp),
+		mcp:                p.mcp,
+		maxTurns:           p.maxTurns,
+		maxToolOutputBytes: p.maxToolOutputBytes,
+		events:             make(chan agent.Event, eventBufferSize),
+		cancel:             cancel,
+		inject:             make(chan injectMsg, 4),
+		contents:           append([]requestContent(nil), p.plan.initialContents...),
+		shutdown:           make(chan struct{}),
+		state:              &turnState{model: p.model, providerConfig: p.providerConfig},
 	}
 	h.executor.policy = p.policy
 
@@ -316,6 +327,30 @@ func (h *Handle) drive(ctx context.Context) {
 	}
 }
 
+// boundToolResponse truncates string values in a functionResponse payload
+// (output/error/content) to the session's tool-output limit, so the model
+// receives a bounded copy around the shared marker. Each string value is
+// bounded on its own.
+func boundToolResponse(response map[string]any, limit int) map[string]any {
+	if len(response) == 0 {
+		return response
+	}
+	if limit <= 0 {
+		limit = agent.DefaultMaxToolOutputBytes
+	}
+	out := make(map[string]any, len(response))
+	for k, v := range response {
+		if str, ok := v.(string); ok {
+			if truncated, changed := agent.TruncateToolOutput(str, limit); changed {
+				out[k] = truncated
+				continue
+			}
+		}
+		out[k] = v
+	}
+	return out
+}
+
 // executeToolCalls runs every pending functionCall via the session-local
 // executor, surfaces a ToolResultEvent per call, and folds the matching
 // functionResponse parts back into the conversation history as a single
@@ -344,6 +379,12 @@ func (h *Handle) executeToolCalls(ctx context.Context, calls []candidateFuncCall
 		}
 
 		res := h.executor.execute(ctx, c)
+		// Bound oversized tool output before it reaches the model: this
+		// harness runs the tool loop itself, so the functionResponse folded
+		// back into the conversation is the model's copy. The event keeps
+		// the full result: the runner bounds its own copy with its own
+		// (operator-configurable) limit and records the oversize warning.
+		boundedResponse := boundToolResponse(res.response, h.toolOutputLimit())
 		if !h.sendEvent(agent.ToolResultEvent{
 			ToolName:  c.Name,
 			ToolUseID: c.ID,
@@ -356,7 +397,7 @@ func (h *Handle) executeToolCalls(ctx context.Context, calls []candidateFuncCall
 			FunctionResponse: &functionResponse{
 				ID:       c.ID,
 				Name:     c.Name,
-				Response: res.response,
+				Response: boundedResponse,
 			},
 		})
 	}
@@ -461,6 +502,14 @@ func (h *Handle) appendToolResultTurn(parts []requestPart) {
 	h.contentsMu.Lock()
 	h.contents = append(h.contents, requestContent{Role: "user", Parts: parts})
 	h.contentsMu.Unlock()
+}
+
+// toolOutputLimit returns the per-tool-result byte bound for this session.
+func (h *Handle) toolOutputLimit() int {
+	if h == nil || h.maxToolOutputBytes <= 0 {
+		return agent.DefaultMaxToolOutputBytes
+	}
+	return h.maxToolOutputBytes
 }
 
 // sendEvent forwards one event onto the events channel. Returns false

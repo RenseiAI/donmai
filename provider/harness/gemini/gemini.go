@@ -272,13 +272,14 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 	}
 
 	return startSession(ctx, sessionParams{
-		apiKey:         apiKey,
-		turnURL:        turnURL,
-		model:          model,
-		providerConfig: spec.ProviderConfig,
-		plan:           plan,
-		client:         p.httpClient,
-		sessionID:      p.sessionIDFn(),
+		apiKey:             apiKey,
+		turnURL:            turnURL,
+		model:              model,
+		providerConfig:     spec.ProviderConfig,
+		maxToolOutputBytes: agent.ResolveToolOutputLimit(spec.ProviderConfig),
+		plan:               plan,
+		client:             p.httpClient,
+		sessionID:          p.sessionIDFn(),
 		// cwd / env drive the session-local tool executor: native
 		// functionCalls (Bash/Read/Edit/Write) run in the session's
 		// working directory with the session env; mcp routes mcp__*
