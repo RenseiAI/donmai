@@ -25,7 +25,7 @@ var diagnosticRedactions = []diagnosticRedaction{
 		"${1}[REDACTED]",
 	},
 	{
-		regexp.MustCompile(`(?i)((?:api[_-]?keys?|access[_-]?tokens?|refresh[_-]?tokens?|auth[_-]?tokens?|client[_-]?secrets?|private[_-]?keys?|secrets?|tokens?|passwords?|passwds?|credentials?|cookies?|sessions?)["']?\s*[:=]\s*)` + diagnosticValuePattern),
+		regexp.MustCompile(`(?i)((?:api[_-]?keys?|access[_-]?tokens?|refresh[_-]?tokens?|auth[_-]?tokens?|\bauth\b|client[_-]?secrets?|private[_-]?keys?|secrets?|tokens?|passwords?|passwds?|credentials?|cookies?|sessions?)["']?\s*[:=]\s*)` + diagnosticValuePattern),
 		"${1}[REDACTED]",
 	},
 	{

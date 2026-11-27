@@ -23,7 +23,13 @@ import (
 // auto-update is opt-in and only runs when the operator configures a CDN base
 // (via UpdaterOptions.CDNBase). When unset, auto-update is disabled rather than
 // pointing at any vendor's infrastructure.
-const UpdateCDNBase = ""
+//
+// It is a var (not a const) so a downstream build can set a default origin at
+// link time without forking the source, e.g.:
+// go build -ldflags "-X github.com/RenseiAI/donmai/daemon.UpdateCDNBase=<origin>"
+// The OSS binary leaves it empty; an explicitly configured autoUpdate.cdnBase
+// always takes precedence (see effectiveUpdateCDNBase).
+var UpdateCDNBase = ""
 
 // effectiveUpdateCDNBase resolves the update source the production updater
 // checks: the operator-configured autoUpdate.cdnBase when set, otherwise the

@@ -115,6 +115,9 @@ func TestCodexRequestParamDrift(t *testing.T) {
 		ResponseSchema: json.RawMessage(`{"type":"object"}`),
 	}
 	plan := NewSpawnPlan(spec)
+	denied := spec
+	denied.PermissionConfig = &agent.PermissionConfig{DisallowPatterns: []string{"Bash"}}
+	deniedPlan := NewSpawnPlan(denied)
 	for _, request := range []struct {
 		method string
 		params map[string]any
@@ -122,6 +125,8 @@ func TestCodexRequestParamDrift(t *testing.T) {
 	}{
 		{method: "thread/start", params: plan.ThreadStart, must: []string{"baseInstructions", "developerInstructions", "sandbox"}},
 		{method: "turn/start", params: turnStartParams("thread-1", spec, plan.PromptInput), must: []string{"effort", "sandboxPolicy", "outputSchema"}},
+		{method: "thread/start", params: deniedPlan.ThreadStart, must: []string{"config"}},
+		{method: "thread/resume", params: deniedPlan.ThreadResume, must: []string{"threadId", "config"}},
 	} {
 		known := inventory.RequestParams[request.method]
 		if len(known) == 0 {

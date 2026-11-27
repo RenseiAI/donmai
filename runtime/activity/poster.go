@@ -17,6 +17,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/agent/present"
 )
 
 // Default values for [Config]. Exposed so callers can tune individual
@@ -776,7 +777,7 @@ func mapEvent(ev agent.Event, ts time.Time, providerName string, durationMs int6
 			out.Type = "error"
 			out.Content = e.Message
 			return out, true
-		case "codex_warning", "codex_model_rerouted", "codex_moderation", "codex_safety_buffering":
+		case "codex_warning", "codex_model_rerouted", "codex_moderation", "codex_safety_buffering", "codex_safety_buffering_started", "codex_safety_buffering_ended":
 			out.Type = "warning"
 			out.Content = e.Message
 			return out, true
@@ -1249,49 +1250,12 @@ func ContextUsageContextValue(e agent.ContextUsageEvent) string {
 }
 
 // summarizeToolUse produces a short one-line summary of a tool call,
-// capped at MaxToolSummaryChars. Heuristics for the common Claude Code
-// tools (Bash, Read, Edit, Write, Grep) preserve the most salient
-// argument; unknown tools fall back to the bare tool name.
+// capped at MaxToolSummaryChars. The shared presentation rules pick the
+// salient argument per tool family across harnesses (command with its
+// shell wrapper removed, path, pattern, URL, description); a call with no
+// such argument falls back to the bare tool name.
 func summarizeToolUse(e agent.ToolUseEvent) string {
-	name := e.ToolName
-	if name == "" {
-		name = "tool"
-	}
-	var arg string
-	switch {
-	case strings.EqualFold(name, "Bash"):
-		arg = stringArg(e.Input, "command")
-	case strings.EqualFold(name, "Read"), strings.EqualFold(name, "Edit"),
-		strings.EqualFold(name, "Write"), strings.EqualFold(name, "NotebookEdit"):
-		arg = stringArg(e.Input, "file_path")
-	case strings.EqualFold(name, "Grep"), strings.EqualFold(name, "Glob"):
-		arg = stringArg(e.Input, "pattern")
-	case strings.EqualFold(name, "Agent"), strings.EqualFold(name, "Task"):
-		// Sub-agent dispatch — surface the description so /topology can
-		// render a human-readable sub-agent label.
-		arg = stringArg(e.Input, "description")
-		if arg == "" {
-			arg = stringArg(e.Input, "prompt")
-		}
-	}
-	if arg == "" {
-		return truncate(name, MaxToolSummaryChars)
-	}
-	return truncate(name+": "+collapseWhitespace(arg), MaxToolSummaryChars)
-}
-
-// stringArg returns the trimmed string value of input[key], or "" when
-// missing or non-string.
-func stringArg(input map[string]any, key string) string {
-	v, ok := input[key]
-	if !ok {
-		return ""
-	}
-	s, ok := v.(string)
-	if !ok {
-		return ""
-	}
-	return strings.TrimSpace(s)
+	return truncate(present.DescribeTool(e.ToolName, e.Input).Summary(), MaxToolSummaryChars)
 }
 
 // truncate clips s to at most n bytes, appending an ellipsis when
@@ -1338,26 +1302,4 @@ func truncateMiddle(s string, n int) string {
 		tailStart++
 	}
 	return s[:head] + sep + s[tailStart:]
-}
-
-// collapseWhitespace replaces runs of whitespace with a single space.
-// Used by summarizeToolUse to keep the one-line summary readable when
-// the tool input contains newlines (e.g. multi-line bash commands).
-func collapseWhitespace(s string) string {
-	var b strings.Builder
-	b.Grow(len(s))
-	prevSpace := false
-	for _, r := range s {
-		if r == ' ' || r == '\t' || r == '\n' || r == '\r' {
-			if !prevSpace && b.Len() > 0 {
-				b.WriteByte(' ')
-			}
-			prevSpace = true
-			continue
-		}
-		b.WriteRune(r)
-		prevSpace = false
-	}
-	out := b.String()
-	return strings.TrimRight(out, " ")
 }

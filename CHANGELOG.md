@@ -8,6 +8,59 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+No unreleased changes.
+
+## v0.73.17 — 2026-11-25
+
+### Chores
+
+- Add atomic managed update policy storage and validation
+- Scope usage and status reads to one selected config home
+- Bind the isolated quota probe to its selected login and deadline
+- Wake idle hook-delivered interactive sessions; bound the MCP HTTP transport
+- Verify long role delivery at the runner and harness boundary
+
+## v0.73.16 — 2026-11-25
+
+### Chores
+
+- Report per-session chat readiness on the session status wire
+
+## v0.73.15 — 2026-11-24
+
+### Chores
+
+- Preserve successful turn result when isolated config cleanup fails
+- Pi handshake: retry one slow start, classify broken extensions
+
+## v0.73.14 — 2026-11-24
+
+### Features
+
+- Expose a Go reader for replaying the current run’s local session journal and following live events.
+
+## v0.73.13 — 2026-11-24
+
+### Features
+
+- Honour a profile-declared cyber access program per turn
+- Shared tool presentation rules for every harness
+- Normalized instructions, translation report, effective settings
+
+### Fixes
+
+- Keep a completed turn's result when MCP cleanup is contained
+
+### Chores
+
+- Preserve provider metering evidence for probed logins
+- Auto-recovered session work
+- Expose per-session chat readiness and prove hook delivery
+- Harden transcript-tail redaction for failed sessions
+- Report a failed turn's provider error instead of the last progress note
+
+## v0.73.12 — 2026-11-23
+
 ### Chores
 
 - The fast lane's `local-verify` status read-back now retries for about 35 seconds instead of reading the eventually consistent combined status once.
