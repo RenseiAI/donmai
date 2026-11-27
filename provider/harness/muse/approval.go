@@ -1,6 +1,8 @@
 package muse
 
 import (
+	"log/slog"
+	"os"
 	"regexp"
 	"strings"
 
@@ -129,6 +131,10 @@ type ApprovalBridge struct {
 	denyAllFiles    bool
 	allowAllFiles   bool
 
+	// denyPaths are the scoped path denies of every read and write tool
+	// ("Read(~/.ssh/**)", "Edit(docs/**)"); see pathDenies.
+	denyPaths pathDenies
+
 	// autoApprove is the default when no pattern matches. True unless
 	// the Spec sets DefaultDecision deny/prompt (autonomous fleets
 	// cannot answer prompts, so prompt reads as decline-by-default).
@@ -139,8 +145,22 @@ type ApprovalBridge struct {
 // ready-to-use bridge. A nil config produces a bridge that runs the
 // built-in safety deny rules and otherwise auto-approves.
 func NewApprovalBridge(cfg *agent.PermissionConfig) *ApprovalBridge {
+	return newApprovalBridgeAt(cfg, "")
+}
+
+// newApprovalBridgeAt is NewApprovalBridge with relative path denies anchored
+// at root, the absolute workspace root the session reports file approvals
+// under. Without an absolute root, a relative path deny denies every file
+// access.
+func newApprovalBridgeAt(cfg *agent.PermissionConfig, root string) *ApprovalBridge {
 	br := &ApprovalBridge{config: cfg, autoApprove: true}
 	if cfg != nil {
+		home, _ := os.UserHomeDir()
+		var errs []error
+		br.denyPaths, errs = compilePathDenies(cfg.DisallowPatterns, root, home, foldPathCase)
+		if len(errs) > 0 {
+			slog.Warn("muse: path denies that cannot be compiled or resolved deny every file access", "errors", errs)
+		}
 		br.hasAllowlist = len(cfg.AllowPatterns) > 0
 		br.allowRegexes, br.allowFiles = compilePatterns(cfg.AllowPatterns)
 		br.denyRegexes, br.denyFiles = compilePatterns(cfg.DisallowPatterns)
@@ -218,13 +238,20 @@ func (b *ApprovalBridge) evaluateCommand(cmd string) ApprovalDecision {
 	return ApprovalDecision{Action: ActionDecline, Reason: "default decision is not allow"}
 }
 
-func (b *ApprovalBridge) evaluateFileAccess(path string) ApprovalDecision {
-	path = strings.TrimSpace(path)
+func (b *ApprovalBridge) evaluateFileAccess(raw string) ApprovalDecision {
+	path := strings.TrimSpace(raw)
 	if path == "" {
 		return ApprovalDecision{Action: ActionDecline, Reason: "empty file approval is never auto-approved"}
 	}
 	if b.denyAllFiles {
 		return ApprovalDecision{Action: ActionDecline, Reason: "file changes are denied"}
+	}
+	// The file Muse opens may carry the surrounding whitespace, and the
+	// trimmed form keeps a padded absolute path absolute: check both.
+	for _, form := range []string{raw, path} {
+		if denied, reason := b.denyPaths.denies(form); denied {
+			return ApprovalDecision{Action: ActionDecline, Reason: reason}
+		}
 	}
 	if b.denyFiles {
 		for _, re := range b.denyRegexes {
@@ -321,6 +348,17 @@ func isFileChangeTool(pattern string) bool {
 	lower := strings.ToLower(pattern)
 	return strings.HasPrefix(lower, "edit(") || strings.HasPrefix(lower, "write(") ||
 		strings.HasPrefix(lower, "patch(") || strings.HasPrefix(lower, "file(")
+}
+
+// isPathToolName reports a read or write tool whose scoped pattern names a
+// path, in the Claude grammar or this bridge's own Patch/File names.
+func isPathToolName(name string) bool {
+	for _, n := range []string{"Read", "Grep", "Glob", "LS", "Write", "Edit", "MultiEdit", "NotebookEdit", "Patch", "File"} {
+		if strings.EqualFold(n, name) {
+			return true
+		}
+	}
+	return false
 }
 
 // isBareFileTool reports a bare file-change tool name, which covers every
