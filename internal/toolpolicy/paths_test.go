@@ -1,6 +1,7 @@
 package toolpolicy
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -32,6 +33,21 @@ func TestPathForms(t *testing.T) {
 		{"Read(/srv/docs)", Allow, []string{"/srv/docs"}, []string{"/srv/docs/x", "/srv/docsx"}},
 		{"Read(*.md)", Allow, []string{"/w/a.md"}, []string{"/w/x/a.md"}},
 		{"Read(docs/**)", Allow, []string{"/w/docs/a/b.md", "/w/docs"}, []string{"/w/docsx"}},
+		// A newline in a name does not stop "**" or the deny subtree.
+		{"Read(~/.ssh/**)", Deny, []string{"/home/u/.ssh/a\nb"}, nil},
+		{"Read(/srv/secret)", Deny, []string{"/srv/secret/a\nb"}, nil},
+		{"Read(/srv/**/.env*)", Deny, []string{"/srv/a\nb/.env"}, nil},
+		// A class and a non-segment "**" stay within one directory.
+		{"Read(/w/x[!a]y)", Allow, []string{"/w/xby"}, []string{"/w/x/y", "/w/xay"}},
+		{"Read(/w/x[^a]y)", Allow, []string{"/w/xby"}, []string{"/w/x/y", "/w/xay"}},
+		{"Read(/w/docs**)", Allow, []string{"/w/docsx"}, []string{"/w/docsx/secret"}},
+		{"Read(/w/a**/b)", Allow, []string{"/w/ax/b"}, []string{"/w/a/x/b"}},
+		// A negated class starting with "-" excludes "-", not a range from "/".
+		{"Read(/w/x[!-a]y)", Deny, []string{"/w/xBy", "/w/x0y"}, []string{"/w/x-y", "/w/xay"}},
+		{"Read(/w/x[!-a]y)", Allow, []string{"/w/xBy"}, []string{"/w/x-y", "/w/xay", "/w/x/y"}},
+		// Each brace alternative starts where its "{" does.
+		{"Read(/s/{**/x,y})", Deny, []string{"/s/a/b/x", "/s/x", "/s/y"}, []string{"/s/z"}},
+		{"Read(/s/a{**/x,y})", Allow, []string{"/s/aq/x", "/s/ay"}, []string{"/s/a/q/x"}},
 	} {
 		rules, errs := CompilePaths([]string{tc.pattern}, readFamily, tc.side, root, home)
 		if len(errs) != 0 {
@@ -67,6 +83,67 @@ func TestPathRootIsLiteral(t *testing.T) {
 	}
 }
 
+// TestPathRootDeny: a deny that names the filesystem root covers every path.
+func TestPathRootDeny(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct{ pattern, root, home string }{
+		{"Read(/)", "/w", "/h"},
+		{"Read(//)", "/w", "/h"},
+		{"Read(/..)", "/w", "/h"},
+		{"Read(..)", "/", "/h"},
+		{"Read(~)", "/w", "/"},
+		{"Read(~/)", "/w", "/"},
+	} {
+		rules, errs := CompilePaths([]string{tc.pattern}, readFamily, Deny, tc.root, tc.home)
+		if len(errs) != 0 {
+			t.Errorf("%s: unexpected errors %v", tc.pattern, errs)
+		}
+		for _, path := range []string{"/", "/etc/passwd", "/w/main.go", "/a\nb/c"} {
+			if !rules.Match(path, tc.root) {
+				t.Errorf("%s (root %q, home %q): %q not denied", tc.pattern, tc.root, tc.home, path)
+			}
+		}
+	}
+	allow, _ := CompilePaths([]string{"Read(/)"}, readFamily, Allow, "/w", "/h")
+	if !allow.Match("/", "/w") || allow.Match("/etc/passwd", "/w") {
+		t.Errorf("allow Read(/) must match only /")
+	}
+}
+
+// TestPathMultibyte: non-ASCII characters in a pattern, root or home are
+// literal whole characters, so a deny written with them still denies.
+func TestPathMultibyte(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		pattern, root, home string
+		side                Side
+		matched, unmatched  []string
+	}{
+		{"Read(~/.ssh/**)", "/w", "/home/josé", Deny, []string{"/home/josé/.ssh/id_rsa"}, []string{"/home/jose/.ssh/id_rsa", "/home/josè/.ssh/id_rsa"}},
+		{"Read(/srv/données/**)", "/w", "/h", Deny, []string{"/srv/données/k", "/srv/données"}, []string{"/srv/donnees/k", "/srv/donnéesx/k"}},
+		{"Read(secret)", "/wörk", "/h", Deny, []string{"/wörk/secret", "/wörk/a/secret/k"}, []string{"/work/secret"}},
+		{"Read(/s/日本/*.key)", "/w", "/h", Allow, []string{"/s/日本/a.key"}, []string{"/s/日本/a/b.key", "/s/日/a.key"}},
+		{"Read(/s/?.key)", "/w", "/h", Deny, []string{"/s/é.key"}, []string{"/s/éé.key"}},
+		{"Read(/s/[éa].key)", "/w", "/h", Deny, []string{"/s/é.key", "/s/a.key"}, []string{"/s/e.key"}},
+		{"Read(/s/\\é.key)", "/w", "/h", Deny, []string{"/s/é.key"}, []string{"/s/e.key"}},
+	} {
+		rules, errs := CompilePaths([]string{tc.pattern}, readFamily, tc.side, tc.root, tc.home)
+		if len(errs) != 0 {
+			t.Errorf("%s: unexpected errors %v", tc.pattern, errs)
+		}
+		for _, path := range tc.matched {
+			if !rules.Match(path, tc.root) {
+				t.Errorf("%s (root %q, home %q): %q not matched", tc.pattern, tc.root, tc.home, path)
+			}
+		}
+		for _, path := range tc.unmatched {
+			if rules.Match(path, tc.root) {
+				t.Errorf("%s (root %q, home %q): %q matched", tc.pattern, tc.root, tc.home, path)
+			}
+		}
+	}
+}
+
 // TestPathFailsClosed: a pattern that cannot be compiled denies every path as a
 // deny and allows none as an allow, and is reported.
 func TestPathFailsClosed(t *testing.T) {
@@ -79,9 +156,20 @@ func TestPathFailsClosed(t *testing.T) {
 		{"Read(~/.ssh/**)", "/w", ""},
 		{"Read(docs/**)", "", "/h"},
 		{"Read()", "/w", "/h"},
+		{"Read(/s/a\nb)", "/w", "/h"},
+		{"Read(/s/[!].key)", "/w", "/h"},
+		{"Read(/s/\xffa)", "/w", "/h"},
+		{"Read(secret)", "/w\xff", "/h"},
+		// A class never matches "/", and forms it cannot translate exactly fail.
+		{"Read(/w/x[+-0]y)", "/w", "/h"},
+		{"Read(/w/x[/]y)", "/w", "/h"},
+		{"Read(/w/[\\]]x)", "/w", "/h"},
+		{"Read(/w/[]*]x)", "/w", "/h"},
+		{"Read(/w/[[:alpha:]]x)", "/w", "/h"},
+		{"Read(/w/[z-a]x)", "/w", "/h"},
 	} {
 		deny, errs := CompilePaths([]string{tc.pattern}, readFamily, Deny, tc.root, tc.home)
-		if len(errs) != 1 || !strings.Contains(errs[0].Error(), tc.pattern) {
+		if len(errs) != 1 || !strings.Contains(errs[0].Error(), strconv.Quote(tc.pattern)) {
 			t.Errorf("%s: errors = %v, want one naming the pattern", tc.pattern, errs)
 		}
 		if !deny.Match("/unrelated/file", tc.root) {
