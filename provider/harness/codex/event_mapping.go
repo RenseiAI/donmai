@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/agent/present"
 )
 
 // mapperState carries the running totals across notifications so
@@ -434,10 +435,7 @@ func mapItem(method string, params json.RawMessage, raw any, states ...*mapperSt
 			Error struct {
 				Message string `json:"message"`
 			} `json:"error"`
-			Changes []struct {
-				Path string `json:"path"`
-				Kind string `json:"kind"`
-			} `json:"changes"`
+			Changes []fileUpdateChange `json:"changes"`
 		} `json:"item"`
 	}
 	_ = json.Unmarshal(params, &p)
@@ -497,17 +495,10 @@ func mapItem(method string, params json.RawMessage, raw any, states ...*mapperSt
 
 	case "fileChange":
 		if isCompleted {
-			content := ""
-			for i, ch := range p.Item.Changes {
-				if i > 0 {
-					content += "\n"
-				}
-				content += ch.Kind + ": " + ch.Path
-			}
 			return []agent.Event{agent.ToolResultEvent{
 				ToolName:  "file_change",
 				ToolUseID: p.Item.ID,
-				Content:   content,
+				Content:   fileChangeContent(p.Item.Changes),
 				IsError:   p.Item.Status == "failed",
 				Raw:       raw,
 			}}
@@ -533,7 +524,9 @@ func mapItem(method string, params json.RawMessage, raw any, states ...*mapperSt
 			isError := p.Item.Status == "failed" || p.Item.Error.Message != ""
 			content := p.Item.Error.Message
 			if content == "" && len(p.Item.Result.Content) > 0 {
-				content = string(p.Item.Result.Content)
+				// result.content is the MCP content-block array; decode
+				// it to text here, where the shape is known.
+				content = present.OutputText(string(p.Item.Result.Content))
 			}
 			return []agent.Event{agent.ToolResultEvent{
 				ToolName:  toolName,

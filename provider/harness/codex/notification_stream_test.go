@@ -86,7 +86,7 @@ func TestNotificationStreamWarningsAndProgress(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct{ method, params, subtype, content string }{
 		{"model/rerouted", `{"fromModel":"first","toModel":"second","reason":"safety"}`, "codex_model_rerouted", "second"},
-		{"turn/moderationMetadata", `{"metadata":{"review":true}}`, "codex_moderation", "review"},
+		{"turn/moderationMetadata", `{"metadata":{"prompt":{"cyber_security":{"outputs":[{"is_blocked":true}]}}}}`, "codex_moderation", "Codex moderation blocked: prompt/cyber_security"},
 		{"model/safetyBuffering/updated", `{"model":"first","reasons":["review"]}`, "codex_safety_buffering_started", "review"},
 	} {
 		t.Run(tc.method, func(t *testing.T) {
@@ -592,14 +592,14 @@ func TestNotificationStreamSafetyBufferingLeavesModerationAlone(t *testing.T) {
 	if got := dispatch(t, h, "model/safetyBuffering/updated", `{`); len(got) != 0 {
 		t.Fatalf("malformed buffering emitted %+v", got)
 	}
-	// Moderation results still emit per notification, untouched by the collapse.
+	// Moderation blocks still emit per notification, untouched by the collapse.
 	for range 2 {
-		got := dispatch(t, h, "turn/moderationMetadata", `{"metadata":{"review":true}}`)
+		got := dispatch(t, h, "turn/moderationMetadata", `{"metadata":{"prompt":{"cyber_security":{"is_blocked":true}}}}`)
 		if len(got) != 1 {
 			t.Fatalf("moderation = %+v", got)
 		}
 		event, ok := got[0].(agent.SystemEvent)
-		if !ok || event.Subtype != "codex_moderation" || !strings.Contains(event.Message, "review") {
+		if !ok || event.Subtype != "codex_moderation" || !strings.Contains(event.Message, "prompt/cyber_security") {
 			t.Fatalf("moderation = %+v", got[0])
 		}
 	}

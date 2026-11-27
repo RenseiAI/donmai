@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"testing"
 
 	"github.com/RenseiAI/donmai/agent"
@@ -617,6 +618,29 @@ func TestMapLine_UserMessage_NoToolResults(t *testing.T) {
 	}
 	if sys.Subtype != "user_message" {
 		t.Errorf("Subtype = %q, want user_message", sys.Subtype)
+	}
+}
+
+// TestMapLine_ToolResult_ContentShape pins where content parts decode: a
+// string is the tool's own stdout and passes through verbatim even when it is
+// a JSON array of typed objects (cat of a JSON file), while a structured
+// content-block array (MCP, image results) decodes to its text.
+func TestMapLine_ToolResult_ContentShape(t *testing.T) {
+	t.Parallel()
+	const stdout = `[{"type":"modified","path":"main.go"}]`
+	for _, tc := range []struct{ name, content, want string }{
+		{"string stdout shaped like content parts", strconv.Quote(stdout), stdout},
+		{"content-block array", `[{"type":"text","text":"hit one"},{"type":"image","source":{"type":"base64","data":"AA=="}}]`, "hit one\n[image]"},
+	} {
+		line := []byte(`{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_bash","content":` + tc.content + `,"is_error":false}]}}`)
+		events := mapLine(line)
+		if len(events) != 1 {
+			t.Fatalf("%s: got %d events, want 1", tc.name, len(events))
+		}
+		tr, ok := events[0].(agent.ToolResultEvent)
+		if !ok || tr.Content != tc.want {
+			t.Fatalf("%s: event = %+v; want content %q", tc.name, events[0], tc.want)
+		}
 	}
 }
 

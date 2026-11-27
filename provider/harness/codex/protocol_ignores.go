@@ -61,6 +61,7 @@ var ignoredNotifications = map[string]string{
 	"thread/realtime/transcript/delta":          "not consumed by the autonomous harness",
 	"thread/realtime/transcript/done":           "not consumed by the autonomous harness",
 	"thread/reverted":                           "not consumed by the autonomous harness",
+	"thread/search/partial":                     "app UI thread search; not consumed by the autonomous harness",
 	"thread/section/changed":                    "app UI thread sections; not consumed by the autonomous harness",
 	"thread/unarchived":                         "not consumed by the autonomous harness",
 	"windows/worldWritableWarning":              "not consumed by the autonomous harness",

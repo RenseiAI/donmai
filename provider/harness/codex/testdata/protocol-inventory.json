@@ -1,5 +1,5 @@
 {
-  "generator": "codex-cli 0.170.0",
+  "generator": "codex-cli 0.171.0",
   "notifications": [
     "account/gatewayOAuth/changed",
     "account/login/completed",
@@ -73,6 +73,7 @@
     "thread/realtime/transcript/delta",
     "thread/realtime/transcript/done",
     "thread/reverted",
+    "thread/search/partial",
     "thread/section/changed",
     "thread/settings/updated",
     "thread/started",
