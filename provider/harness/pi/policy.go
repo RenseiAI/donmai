@@ -191,14 +191,15 @@ type PolicyEngine struct {
 	// patterns ("Read", "Bash", "*"). Constrained Bash and path patterns are
 	// compiled by internal/toolpolicy: denyCommands / allowCommands (with the
 	// PermissionConfig rules), denyReads / denyWrites (a scoped path deny of
-	// any read or write tool covers every read or write kind) and allowPaths
-	// (a scoped path allow covers only its own tool kind).
+	// any read or write tool covers every read or write kind; see
+	// policy_paths.go for how they fail closed) and allowPaths (a scoped path
+	// allow covers only its own tool kind).
 	allowedTools    []toolPattern
 	disallowedTools []toolPattern
 	denyCommands    toolpolicy.Commands
 	allowCommands   toolpolicy.Commands
-	denyReads       toolpolicy.Paths
-	denyWrites      toolpolicy.Paths
+	denyReads       pathDenies
+	denyWrites      pathDenies
 	allowPaths      map[ToolKind]toolpolicy.Paths
 	hasAllowlist    bool
 
@@ -236,8 +237,8 @@ func NewPolicyEngine(spec agent.Spec) *PolicyEngine {
 	e.allowCommands = toolpolicy.CompileCommands(allows, toolpolicy.Allow)
 	home, _ := os.UserHomeDir()
 	var errs, more []error
-	e.denyReads, errs = toolpolicy.CompilePaths(denies, isReadToolName, toolpolicy.Deny, spec.Cwd, home)
-	e.denyWrites, more = toolpolicy.CompilePaths(denies, isWriteToolName, toolpolicy.Deny, spec.Cwd, home)
+	e.denyReads, errs = compilePathDenies(denies, isReadToolName, spec.Cwd, home, foldPathCase)
+	e.denyWrites, more = compilePathDenies(denies, isWriteToolName, spec.Cwd, home, foldPathCase)
 	e.allowPaths = map[ToolKind]toolpolicy.Paths{}
 	for kind, names := range pathAllowNames {
 		e.allowPaths[kind], _ = toolpolicy.CompilePaths(allows, func(name string) bool {
@@ -319,8 +320,8 @@ func (e *PolicyEngine) Evaluate(call ToolCall) Decision {
 	if call.Kind == ToolBash && e.denyCommands.Match(call.Command) {
 		return Decision{Allow: false, Reason: "command matches a disallow pattern"}
 	}
-	if e.pathDenied(call) {
-		return Decision{Allow: false, Reason: "path matches a disallow pattern: " + call.Path}
+	if denied, reason := e.pathDenied(call); denied {
+		return Decision{Allow: false, Reason: reason + ": " + call.Path}
 	}
 	for _, re := range e.denyRegexes {
 		if call.Kind != ToolBash && re.MatchString(subject) {
@@ -403,21 +404,40 @@ func (e *PolicyEngine) checkContainment(call ToolCall) (reason string, contained
 	}
 }
 
-// pathDenied applies the path denies. grep, find and ls without a path walk
-// the working directory, and walking an ancestor of a denied tree is denied.
-func (e *PolicyEngine) pathDenied(call ToolCall) bool {
-	root := e.containmentRoot(call)
+// pathDenied applies the path denies, with the reason. grep, find and ls
+// walk their path, or without one the working directory: both the session's
+// and the call's are checked, and with neither the walk is denied.
+func (e *PolicyEngine) pathDenied(call ToolCall) (bool, string) {
 	switch {
 	case isMutatingKind(call.Kind):
-		return call.Path != "" && e.denyWrites.Match(call.Path, root)
-	case isReadKind(call.Kind):
-		path := call.Path
-		if path == "" {
-			path = root
+		if call.Path == "" {
+			return false, ""
 		}
-		return path != "" && (e.denyReads.Match(path, root) || (call.Kind != ToolRead && e.denyReads.Under(path, root)))
+		return e.denyWrites.denies(call.Path, false, false)
+	case isReadKind(call.Kind):
+		walk := call.Kind != ToolRead
+		paths := []string{call.Path}
+		if call.Path == "" {
+			if !walk {
+				return false, ""
+			}
+			paths = nil
+			for _, dir := range []string{e.cwd, call.Cwd} {
+				if dir != "" {
+					paths = append(paths, dir)
+				}
+			}
+			if len(paths) == 0 && e.denyReads.active() {
+				return true, "walk without a directory cannot be checked against path denies"
+			}
+		}
+		for _, p := range paths {
+			if denied, reason := e.denyReads.denies(p, walk, call.Kind == ToolRead); denied {
+				return true, reason
+			}
+		}
 	}
-	return false
+	return false, ""
 }
 
 func (e *PolicyEngine) allowedByRules(call ToolCall) bool {

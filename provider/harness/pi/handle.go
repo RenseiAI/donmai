@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1276,21 +1278,41 @@ func parseAdjudicateCall(payload map[string]any, specCwd string) ToolCall {
 }
 
 // resolveInputPath resolves a tool input's file path (path/file/filename)
-// against cwd so containment checks operate on absolute paths.
+// the way pi's tools do, against cwd, so containment checks and path denies
+// judge the file pi opens.
 func resolveInputPath(cwd string, input map[string]any) string {
 	p := stringField(input, "path", "file", "filename")
 	if p == "" {
 		return ""
 	}
-	// A "~/" path is the home directory, never a "~" directory under cwd:
-	// judging it as the latter would put a home read inside the worktree.
-	if home, err := os.UserHomeDir(); err == nil && (p == "~" || strings.HasPrefix(p, "~/")) {
-		p = home + p[1:]
-	}
+	p = normalizePiPath(p)
 	if !filepath.IsAbs(p) && cwd != "" {
 		p = filepath.Join(cwd, p)
 	}
 	return filepath.Clean(p)
+}
+
+// piUnicodeSpaces are the space characters pi's tools read as a plain space.
+var piUnicodeSpaces = regexp.MustCompile("[\u00a0\u2000-\u200a\u202f\u205f\u3000]")
+
+// normalizePiPath mirrors the normalization pi's file tools apply to a path
+// before resolving it: Unicode spaces become plain spaces, one leading "@" is
+// dropped, "~" and "~/" are the home directory and a file:// URL is its path.
+// Judged as written, each of these would be a name under cwd. pi does not
+// trim the path, so neither does this.
+func normalizePiPath(p string) string {
+	p = piUnicodeSpaces.ReplaceAllString(p, " ")
+	p = strings.TrimPrefix(p, "@")
+	if home, err := os.UserHomeDir(); err == nil && (p == "~" || strings.HasPrefix(p, "~/")) {
+		return home + p[1:]
+	}
+	if strings.HasPrefix(p, "file://") {
+		if u, err := url.Parse(p); err == nil && (u.Host == "" || u.Host == "localhost") &&
+			!strings.Contains(strings.ToLower(u.EscapedPath()), "%2f") {
+			return u.Path
+		}
+	}
+	return p
 }
 
 func permissionMessage(call ToolCall, d Decision) string {
