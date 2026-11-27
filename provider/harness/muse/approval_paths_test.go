@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/RenseiAI/donmai/agent"
@@ -89,6 +90,10 @@ func TestApprovalBridge_PathDeniesFailClosed(t *testing.T) {
 	secretLink := filepath.Join(canonicalTempDir(t), "secret-link")
 	symlink(t, secret, secretLink)
 
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Skip("no home directory")
+	}
 	caseInsensitive := ActionAllow
 	if runtime.GOOS == "darwin" {
 		caseInsensitive = ActionDecline
@@ -111,6 +116,10 @@ func TestApprovalBridge_PathDeniesFailClosed(t *testing.T) {
 		{"dot-dot into a denied tree", edit, root, file(root + "/src/../docs/a.md"), ActionDecline},
 		{"relative dot-dot into a denied tree", edit, root, file("src/../docs/a.md"), ActionDecline},
 		{"letter case on macOS", edit, root, file(filepath.Join(root, "DOCS", "a.md")), caseInsensitive},
+		{"long s folds to s on macOS", edit, root, file(filepath.Join(root, "doc\u017f", "a.md")), caseInsensitive},
+		{"long s home secret on macOS", []string{"Read(~/.ssh/**)"}, root, file(filepath.Join(home, ".\u017f\u017fh", "id_rsa")), caseInsensitive},
+		{"newline in an absolute path", []string{"Edit(.github/workflows/**)"}, root, file(filepath.Join(root, ".github", "workflows", "a\n.yml")), ActionDecline},
+		{"newline in a relative path", []string{"Edit(.github/workflows/**)"}, root, file(".github/workflows/a\n.yml"), ActionDecline},
 		{"filesystem root deny", []string{"Read(/)"}, root, file("/etc/passwd"), ActionDecline},
 		{"unresolvable symlink loop", edit, root, file(filepath.Join(root, "loop", "a.md")), ActionDecline},
 		{"relative path without a root", []string{"Read(/srv/**)"}, "", file("a.txt"), ActionDecline},
@@ -125,5 +134,21 @@ func TestApprovalBridge_PathDeniesFailClosed(t *testing.T) {
 				t.Errorf("file %q = %s (%s), want %s", tc.req.Path, got.Action, got.Reason, tc.want)
 			}
 		})
+	}
+}
+
+// TestApprovalBridge_UnresolvableDenyDirectory pins that a deny whose own
+// directory cannot be resolved still denies every file access, and says why.
+func TestApprovalBridge_UnresolvableDenyDirectory(t *testing.T) {
+	t.Parallel()
+	root := canonicalTempDir(t)
+	mkdirs(t, filepath.Join(root, "src"))
+	loop := filepath.Join(canonicalTempDir(t), "loop")
+	symlink(t, loop, loop)
+
+	bridge := newApprovalBridgeAt(&agent.PermissionConfig{DisallowPatterns: []string{"Read(" + loop + "/inner/**)"}}, root)
+	got := bridge.Evaluate(ApprovalRequest{Kind: ApprovalKindFileAccess, Path: filepath.Join(root, "src", "a.go")})
+	if got.Action != ActionDecline || !strings.Contains(got.Reason, "cannot be resolved") {
+		t.Errorf("file access with an unresolvable deny directory = %s (%s), want decline naming the unresolvable deny", got.Action, got.Reason)
 	}
 }

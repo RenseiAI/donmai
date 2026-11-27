@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"unicode"
 
 	"github.com/RenseiAI/donmai/internal/toolpolicy"
 )
@@ -29,11 +30,14 @@ const maxSymlinkHops = 40
 // given and as resolved, and each pattern's literal directory resolved), an
 // approval path is matched both as written and as resolved on disk, and on a
 // case-insensitive platform both sides are case-folded. A path that cannot be
-// resolved, or a relative path with no root to resolve it against, is denied.
+// resolved, holds a control character, or is relative with no root to resolve
+// it against, is denied; so is every path while a deny's own directory cannot
+// be resolved.
 type pathDenies struct {
-	rules []toolpolicy.Paths
-	root  string
-	fold  bool
+	rules      []toolpolicy.Paths
+	root       string
+	fold       bool
+	unresolved []string
 }
 
 // compilePathDenies compiles the path denies among patterns with relative
@@ -54,6 +58,7 @@ func compilePathDenies(patterns []string, root, home string, fold bool) (pathDen
 	homes := spellings(home)
 
 	var expanded []string
+	var errs []error
 	for _, raw := range patterns {
 		name, arg, scoped := toolpolicy.ParseToolPattern(strings.TrimSpace(raw))
 		if !isPathToolName(name) {
@@ -72,8 +77,10 @@ func compilePathDenies(patterns []string, root, home string, fold bool) (pathDen
 			canonical, ok := canonicalGlob(abs)
 			switch {
 			case !ok:
-				// The deny's own directory cannot be resolved: deny every path.
-				expanded = append(expanded, name)
+				// The deny's own directory cannot be resolved, so nothing can
+				// be shown to lie outside it: deny every path.
+				d.unresolved = append(d.unresolved, raw)
+				errs = append(errs, fmt.Errorf("%q: directory cannot be resolved", raw))
 			case canonical != abs:
 				expanded = append(expanded, name+"("+canonical+")")
 			}
@@ -83,7 +90,6 @@ func compilePathDenies(patterns []string, root, home string, fold bool) (pathDen
 		return d, nil
 	}
 
-	var errs []error
 	if len(roots) == 0 {
 		roots = []string{""}
 	}
@@ -94,7 +100,7 @@ func compilePathDenies(patterns []string, root, home string, fold bool) (pathDen
 		for j, h := range homes {
 			compiled, compileErrs := toolpolicy.CompilePaths(foldAll(expanded, fold), isPathToolName, toolpolicy.Deny, foldCase(r, fold), foldCase(h, fold))
 			if i == 0 && j == 0 {
-				errs = compileErrs
+				errs = append(errs, compileErrs...)
 			}
 			d.rules = append(d.rules, compiled)
 		}
@@ -104,6 +110,9 @@ func compilePathDenies(patterns []string, root, home string, fold bool) (pathDen
 
 // active reports whether any path deny is configured.
 func (d pathDenies) active() bool {
+	if len(d.unresolved) > 0 {
+		return true
+	}
 	for _, r := range d.rules {
 		if r.Len() > 0 {
 			return true
@@ -116,6 +125,13 @@ func (d pathDenies) active() bool {
 func (d pathDenies) denies(path string) (bool, string) {
 	if !d.active() {
 		return false, ""
+	}
+	if len(d.unresolved) > 0 {
+		return true, "a path deny's directory cannot be resolved, so every file access is denied: " + strings.Join(d.unresolved, ", ")
+	}
+	if strings.ContainsFunc(path, unicode.IsControl) {
+		// A newline would end a deny's match early; no deny can vouch for it.
+		return true, "path holds a control character"
 	}
 	if !filepath.IsAbs(path) {
 		if d.root == "" {
@@ -251,9 +267,12 @@ func escapeGlob(dir string) string {
 	return b.String()
 }
 
+// foldCase folds s through upper case first, so letters such as the long s
+// (U+017F), which a case-insensitive volume matches as "s" but ToLower keeps,
+// fold to the same letter as their plain form.
 func foldCase(s string, fold bool) string {
 	if fold {
-		return strings.ToLower(s)
+		return strings.ToLower(strings.ToUpper(s))
 	}
 	return s
 }
@@ -267,7 +286,7 @@ func foldAll(patterns []string, fold bool) []string {
 	for i, p := range patterns {
 		name, arg, scoped := toolpolicy.ParseToolPattern(p)
 		if scoped {
-			p = name + "(" + strings.ToLower(arg) + ")"
+			p = name + "(" + foldCase(arg, true) + ")"
 		}
 		out[i] = p
 	}

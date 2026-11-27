@@ -159,7 +159,7 @@ func newApprovalBridgeAt(cfg *agent.PermissionConfig, root string) *ApprovalBrid
 		var errs []error
 		br.denyPaths, errs = compilePathDenies(cfg.DisallowPatterns, root, home, foldPathCase)
 		if len(errs) > 0 {
-			slog.Warn("muse: path denies that cannot be compiled deny every file access", "errors", errs)
+			slog.Warn("muse: path denies that cannot be compiled or resolved deny every file access", "errors", errs)
 		}
 		br.hasAllowlist = len(cfg.AllowPatterns) > 0
 		br.allowRegexes, br.allowFiles = compilePatterns(cfg.AllowPatterns)
