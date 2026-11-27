@@ -207,11 +207,20 @@ func TestConcurrentRebindsDriveExactlyOneReadoption(t *testing.T) {
 	errs := make([]error, 2)
 	var wg sync.WaitGroup
 	wg.Add(1)
+	first := make(chan struct{})
 	go func() {
 		defer wg.Done()
+		defer close(first)
 		results[0], errs[0] = f.daemon.RebindAdoptedSessionShim(context.Background(), f.id.OrgID, f.id.SessionID)
 	}()
-	<-entered
+	// The first rebind can end before it ever reaches durable adoption (a
+	// dial that fails on a loaded host, say). Waiting on entered alone would
+	// then hang the package instead of reporting what the first caller got.
+	select {
+	case <-entered:
+	case <-first:
+		t.Fatalf("the first rebind returned %s, %v before reaching durable adoption", results[0], errs[0])
+	}
 	results[1], errs[1] = f.daemon.RebindAdoptedSessionShim(context.Background(), f.id.OrgID, f.id.SessionID)
 	close(release)
 	wg.Wait()

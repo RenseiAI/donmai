@@ -1,0 +1,11 @@
+{
+  "generator": "codex-cli 0.170.0",
+  "command": "codex app-server generate-json-schema --experimental",
+  "source": "https://github.com/openai/codex",
+  "license": "Apache-2.0",
+  "schemas": [
+    "v2/ThreadStartParams.json",
+    "v2/ThreadResumeParams.json",
+    "v2/TurnStartParams.json"
+  ]
+}

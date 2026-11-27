@@ -32,6 +32,7 @@ type OperationalPayload struct {
 	CacheSeedID           string                            `json:"cacheSeedId,omitempty"`
 	PullRequest           *workarea.PullRequestV1           `json:"pullRequest,omitempty"`
 	ContinuePullRequest   *prompt.ContinuePullRequest       `json:"continuePullRequest,omitempty"`
+	ContextPack           json.RawMessage                   `json:"contextPack,omitempty"`
 	Env                   map[string]string                 `json:"env,omitempty"`
 	ResolvedProfile       ResolvedProfile                   `json:"resolvedProfile,omitempty"`
 	Branch                string                            `json:"branch,omitempty"`
@@ -39,6 +40,7 @@ type OperationalPayload struct {
 	TerminalWorkareaLease *workarea.TerminalLeaseRequest    `json:"terminalWorkareaLease,omitempty"`
 	PermissionProfile     PermissionProfile                 `json:"permissionProfile,omitempty"`
 	ExecutionSecurity     *agent.ExecutionSecurity          `json:"executionSecurity,omitempty"`
+	StartPermissionMode   StartPermissionMode               `json:"startPermissionMode,omitempty"`
 }
 
 // ProjectOperationalPayload returns the exact admission-time payload shared by
@@ -54,6 +56,7 @@ func ProjectOperationalPayload(qw QueuedWork) OperationalPayload {
 		CacheSeedID:           qw.CacheSeedID,
 		PullRequest:           qw.PullRequest,
 		ContinuePullRequest:   qw.ContinuePullRequest,
+		ContextPack:           qw.ContextPack,
 		Env:                   maps.Clone(qw.Env),
 		ResolvedProfile:       qw.ResolvedProfile,
 		Branch:                qw.Branch,
@@ -61,6 +64,7 @@ func ProjectOperationalPayload(qw QueuedWork) OperationalPayload {
 		TerminalWorkareaLease: qw.TerminalWorkareaLease,
 		PermissionProfile:     qw.PermissionProfile,
 		ExecutionSecurity:     qw.ExecutionSecurity.Clone(),
+		StartPermissionMode:   qw.StartPermissionMode,
 	}
 	// The embedded QueuedWork copy aliases the dispatch-declared
 	// delivery policy pointer: clone it so mutating the projection

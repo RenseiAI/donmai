@@ -208,6 +208,12 @@ type Handle struct {
 	// err = failed/mismatch. Buffered so the pump never blocks on it.
 	handshakeResult chan error
 	handshakeOnce   sync.Once
+	// handshakeSettled reports whether the verdict above has been
+	// delivered. handleExtensionRequest reads it to tell a malformed
+	// first marker frame (the extension spoke, but not a handshake —
+	// fail closed as broken) from a stray post-handshake frame (the
+	// boundary already verified — cancel it and carry on).
+	handshakeSettled atomic.Bool
 
 	// adjudications records, per pi tool call id, the outcome the trust
 	// boundary reached for that call — an allow, or a refusal from either
@@ -482,7 +488,9 @@ func (h *Handle) run() {
 	defer func() {
 		// If the pump exits before the handshake resolved, that is itself a
 		// failure (child died / stream closed pre-handshake) — unblock Spawn.
-		h.resolveHandshake(fmt.Errorf("pi: event stream closed before handshake"))
+		// The extension is gone, not slow: classify it broken so the
+		// launch loop does not retry a process that no longer exists.
+		h.resolveHandshake(fmt.Errorf("%w: pi: event stream closed before handshake: %w", agent.ErrSpawnFailed, agent.ErrPolicyExtensionBroken))
 		h.signalClosed()
 		h.closeEvents()
 		h.releaseConfinement()
@@ -999,7 +1007,7 @@ func (h *Handle) handleExtensionRequest(ev rawEvent) {
 				Code:    "policy_extension_failed",
 				Raw:     raw(ev),
 			})
-			h.resolveHandshake(fmt.Errorf("%w: pi policy extension handshake token/SHA mismatch", agent.ErrSpawnFailed))
+			h.resolveHandshake(fmt.Errorf("%w: pi policy extension handshake token/SHA mismatch: %w", agent.ErrSpawnFailed, agent.ErrPolicyExtensionBroken))
 			h.signalClosed()
 			return
 		}
@@ -1057,6 +1065,23 @@ func (h *Handle) handleExtensionRequest(ev rawEvent) {
 		})
 
 	default:
+		if !h.handshakeSettled.Load() {
+			// The extension spoke on the trust-boundary channel before
+			// any handshake verified, and it was not a handshake at
+			// all: malformed protocol data. Fail closed as a broken
+			// extension — never retry, never run unguarded. A stray
+			// frame after a verified handshake takes the cancel path
+			// below instead.
+			_ = h.replyExtensionValue(reqID, "reject")
+			h.emit(agent.ErrorEvent{
+				Message: "pi policy extension handshake malformed — refusing to run unguarded",
+				Code:    "policy_extension_failed",
+				Raw:     raw(ev),
+			})
+			h.resolveHandshake(fmt.Errorf("%w: pi policy extension handshake malformed: %w", agent.ErrSpawnFailed, agent.ErrPolicyExtensionBroken))
+			h.signalClosed()
+			return
+		}
 		_ = h.replyExtensionCancelled(reqID)
 		h.emit(agent.SystemEvent{Subtype: "unhandled_extension_request", Message: stringField(payload, "donmai"), Raw: raw(ev)})
 	}
@@ -1112,7 +1137,10 @@ func mustDecisionJSON(d Decision) string {
 
 // resolveHandshake delivers the handshake verdict to Spawn exactly once.
 func (h *Handle) resolveHandshake(err error) {
-	h.handshakeOnce.Do(func() { h.handshakeResult <- err })
+	h.handshakeOnce.Do(func() {
+		h.handshakeSettled.Store(true)
+		h.handshakeResult <- err
+	})
 }
 
 // recordAdjudication registers the outcome for one call id. Two rules bind

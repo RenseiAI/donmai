@@ -135,7 +135,7 @@ func TestOperationalEnvironmentIsDigestBoundAndDefensivelyProjected(t *testing.T
 
 func TestOperationalPayloadProjectionClassifiesEveryQueuedWorkField(t *testing.T) {
 	classifications := map[string]string{
-		"QueuedWork": "projected", "RepositoryDeclaration": "projected", "ResolvedProfile": "projected", "Branch": "projected", "TerminalWorkareaLease": "projected",
+		"QueuedWork": "projected", "RepositoryDeclaration": "projected", "ResolvedProfile": "projected", "Branch": "projected", "TerminalWorkareaLease": "projected", "ContextPack": "projected",
 		"WorkareaMode": "projected", "ParentWorkareaID": "projected", "RepositoryFilter": "projected", "CacheSeedID": "projected",
 		// The dispatched pull request decides which commits the workarea
 		// materializes, so it is admission-bound like every other workarea
@@ -151,7 +151,11 @@ func TestOperationalPayloadProjectionClassifiesEveryQueuedWorkField(t *testing.T
 		// The stamped execution-security levels decide how much the session
 		// may do; they are admission-bound like every other intent.
 		"ExecutionSecurity": "projected",
-		"AdmissionReceipt":  "execution-sidecar", "ClaimReceipt": "execution-sidecar", "EffectiveCell": "execution-sidecar",
+		// A request to start a human-controlled session in bypass changes
+		// the permission mode the harness starts in, so it is admission-bound
+		// like the levels it depends on.
+		"StartPermissionMode": "projected",
+		"AdmissionReceipt":    "execution-sidecar", "ClaimReceipt": "execution-sidecar", "EffectiveCell": "execution-sidecar",
 		"ExecutionRuntimeBinding": "execution-sidecar", "OperationalPayload": "execution-sidecar", "HostAdaptationReceipt": "execution-sidecar",
 		"toolLifecycleProfileID": "execution-sidecar",
 		// Trusted registry policy; local admission binds it in producer evidence,
@@ -506,5 +510,127 @@ func TestOperationalPayloadDeliveryPolicyIsDigestBound(t *testing.T) {
 	}
 	if ProjectOperationalPayload(base).Delivery != nil {
 		t.Fatal("absent delivery policy projected non-nil; want nil (legacy shape preserved)")
+	}
+}
+
+// TestOperationalPayloadStartPermissionModeIsDigestBound pins that the
+// start-mode request is part of the admission projection when present, is
+// absent from it (keeping the pre-field digest) when not, and that a
+// producer hashing the JSON it sends and a verifier hashing the typed
+// projection it decoded agree with and without the field.
+func TestOperationalPayloadStartPermissionModeIsDigestBound(t *testing.T) {
+	t.Parallel()
+
+	absent := fullOperationalFixture()
+	absentCanonical, err := CanonicalOperationalPayload(absent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(absentCanonical), "startPermissionMode") {
+		t.Fatalf("absent request changed the legacy operational shape: %s", absentCanonical)
+	}
+	requested := absent
+	requested.StartPermissionMode = StartPermissionModeBypass
+	requestedCanonical, err := CanonicalOperationalPayload(requested)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(requestedCanonical), `"startPermissionMode":"bypass"`) {
+		t.Fatalf("requested start mode missing from the operational projection: %s", requestedCanonical)
+	}
+	if string(requestedCanonical) == string(absentCanonical) {
+		t.Fatal("start-mode request did not change the admission digest")
+	}
+
+	for _, tc := range []struct {
+		name string
+		mode StartPermissionMode
+	}{
+		{name: "without field"},
+		{name: "with bypass", mode: StartPermissionModeBypass},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			typed := QueuedWork{QueuedWork: prompt.QueuedWork{SessionID: "session-parity", Mode: "interactive", Title: "parity"}, StartPermissionMode: tc.mode}
+			typedDigest, err := DigestOperationalPayload(typed)
+			if err != nil {
+				t.Fatal(err)
+			}
+			sent, err := json.Marshal(ProjectOperationalPayload(typed))
+			if err != nil {
+				t.Fatal(err)
+			}
+			producerDigest, err := DigestOperationalPayload(QueuedWork{OperationalPayload: sent})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if producerDigest != typedDigest {
+				t.Fatalf("producer digest %s != verifier digest %s for %s", producerDigest, typedDigest, sent)
+			}
+			var decoded QueuedWork
+			if err := json.Unmarshal(sent, &decoded); err != nil {
+				t.Fatalf("decode sent payload: %v", err)
+			}
+			if decoded.StartPermissionMode != tc.mode {
+				t.Fatalf("decoded startPermissionMode = %q, want %q", decoded.StartPermissionMode, tc.mode)
+			}
+			decodedDigest, err := DigestOperationalPayload(decoded)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if decodedDigest != typedDigest {
+				t.Fatalf("decoded projection digest %s != sent digest %s", decodedDigest, typedDigest)
+			}
+		})
+	}
+}
+
+// TestQueuedWorkStartPermissionModeClosedDecoder pins the wire contract of
+// startPermissionMode: "bypass" is the only value, absence and JSON null
+// read as no request, and every other present value fails the work item's
+// decode the way a malformed executionSecurity section does.
+func TestQueuedWorkStartPermissionModeClosedDecoder(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name    string
+		payload string
+		want    StartPermissionMode
+		wantErr bool
+	}{
+		{name: "bypass", payload: `{"sessionId":"s","startPermissionMode":"bypass"}`, want: StartPermissionModeBypass},
+		{name: "absent (older control plane)", payload: `{"sessionId":"s"}`},
+		{name: "null", payload: `{"sessionId":"s","startPermissionMode":null}`},
+		{name: "empty string", payload: `{"sessionId":"s","startPermissionMode":""}`, wantErr: true},
+		{name: "unknown mode", payload: `{"sessionId":"s","startPermissionMode":"acceptEdits"}`, wantErr: true},
+		{name: "wrong case", payload: `{"sessionId":"s","startPermissionMode":"Bypass"}`, wantErr: true},
+		{name: "not a string", payload: `{"sessionId":"s","startPermissionMode":true}`, wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var qw QueuedWork
+			err := json.Unmarshal([]byte(tc.payload), &qw)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("decode accepted %s as %q; want refusal", tc.payload, qw.StartPermissionMode)
+				}
+				if !strings.Contains(err.Error(), "startPermissionMode") {
+					t.Fatalf("refusal does not name the field: %v", err)
+				}
+				if agent.ExecutionSecurityErrorCode(err) != agent.ExecutionSecurityUnresolvable {
+					t.Fatalf("refusal = %v, want the typed execution_security_unresolvable refusal", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("decode %s: %v", tc.payload, err)
+			}
+			if qw.StartPermissionMode != tc.want {
+				t.Fatalf("startPermissionMode = %q, want %q", qw.StartPermissionMode, tc.want)
+			}
+			if qw.SessionID != "s" {
+				t.Fatalf("sessionId = %q, want s (the embedded payload must still decode)", qw.SessionID)
+			}
+		})
 	}
 }

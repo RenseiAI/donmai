@@ -290,6 +290,12 @@ func SpawnBinary(
 //
 // An empty ownedSessionID keeps the historical behavior exactly: the
 // session id stays empty until the first InitEvent arrives.
+//
+// unsetEnv names variables the child must not see from ANY layer: they are
+// removed after the parent and spec layers merge, so neither an inherited
+// copy (including one a supervisor declared injected) nor a spec copy
+// survives. The composed env is reused verbatim for every Inject --resume,
+// so the removal holds across turns. Names only; no values.
 func SpawnBinaryWithOwnedSessionID(
 	ctx context.Context,
 	binary string,
@@ -301,8 +307,9 @@ func SpawnBinaryWithOwnedSessionID(
 	env map[string]string,
 	onProcessSpawned func(pid int),
 	ownedSessionID string,
+	unsetEnv ...string,
 ) (*Handle, error) {
-	return spawnRaw(ctx, binary, argv, stdinPrompt, mcpConfigPath, resumeExtraArgs, cwd, env, onProcessSpawned, ownedSessionID)
+	return spawnRaw(ctx, binary, argv, stdinPrompt, mcpConfigPath, resumeExtraArgs, cwd, env, onProcessSpawned, ownedSessionID, unsetEnv...)
 }
 
 // spawnRaw is the low-level subprocess spawn shared by the claude
@@ -324,6 +331,7 @@ func spawnRaw(
 	env map[string]string,
 	onProcessSpawned func(pid int),
 	ownedSessionID string,
+	unsetEnv ...string,
 ) (*Handle, error) {
 	// Resolve the per-session tool-output bound and export it to the child
 	// so the child-side enforcement applies the same limit the Go-side
@@ -339,7 +347,7 @@ func spawnRaw(
 	if cwd != "" {
 		cmd.Dir = cwd
 	}
-	childEnv := composeEnv(os.Environ(), env)
+	childEnv := composeEnv(os.Environ(), env, unsetEnv...)
 	cmd.Env = childEnv
 	// Place the child in its own process group so we can signal the
 	// whole group atomically (the binary may fork shell helpers;
@@ -1042,6 +1050,27 @@ func (h *Handle) runCleanups() {
 // (typically os.Environ()) with specEnv. The runner applies its general agent
 // blocklist before spawning; this driver independently removes runner-only
 // attach controls from both layers so direct provider use cannot leak them.
-func composeEnv(parentEnv []string, specEnv map[string]string) []string {
-	return runtimeenv.ComposeChildEnv(parentEnv, specEnv)
+// Every name in unset is then removed from the merged result, whichever
+// layer supplied it.
+func composeEnv(parentEnv []string, specEnv map[string]string, unset ...string) []string {
+	merged := runtimeenv.ComposeChildEnv(parentEnv, specEnv)
+	if len(unset) == 0 {
+		return merged
+	}
+	drop := make(map[string]struct{}, len(unset))
+	for _, name := range unset {
+		drop[name] = struct{}{}
+	}
+	out := merged[:0]
+	for _, entry := range merged {
+		key := entry
+		if i := strings.IndexByte(entry, '='); i >= 0 {
+			key = entry[:i]
+		}
+		if _, ok := drop[key]; ok {
+			continue
+		}
+		out = append(out, entry)
+	}
+	return out
 }

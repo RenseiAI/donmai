@@ -340,7 +340,7 @@ func TestBuildInteractiveLaunch_Model(t *testing.T) {
 // TestBuildInteractiveLaunch_ReasoningEffort pins the interactive TUI's
 // reasoning effort to the headless lane's: a configured effort (max included)
 // rides a process-local model_reasoning_effort override carrying the same
-// value turn/start sends as reasoningEffort, and none emits no override.
+// value turn/start sends as effort, and none emits no override.
 func TestBuildInteractiveLaunch_ReasoningEffort(t *testing.T) {
 	t.Parallel()
 	workspace := t.TempDir()
@@ -368,9 +368,9 @@ func TestBuildInteractiveLaunch_ReasoningEffort(t *testing.T) {
 		if !ok || got != tc.want {
 			t.Errorf("effort %q: model_reasoning_effort override = %q (present=%t), want %q: %q", tc.effort, got, ok, tc.want, launch.argv)
 		}
-		headless := turnStartParams("t", agent.Spec{Effort: tc.effort}, nil)["reasoningEffort"]
+		headless := turnStartParams("t", agent.Spec{Effort: tc.effort}, nil)["effort"]
 		if headless != tc.want {
-			t.Errorf("effort %q: headless reasoningEffort = %v, interactive override = %q", tc.effort, headless, got)
+			t.Errorf("effort %q: headless turn/start effort = %v, interactive override = %q", tc.effort, headless, got)
 		}
 	}
 }

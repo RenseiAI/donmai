@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -146,8 +147,13 @@ func TestHeldPastWindowWithdrawsTheMomentTheComposingLayerLetsGo(t *testing.T) {
 		t.Fatalf("adopted set = %+v after the hold ended, want the lineage withdrawn", adopted)
 	}
 	projected := f.daemon.QuarantinedSessions()
-	if len(projected) != 1 || projected[0].Detail != sessionShimReadoptionWindowExhaustedDetail {
+	if len(projected) != 1 || !strings.HasPrefix(projected[0].Detail, sessionShimReadoptionWindowExhaustedDetail) {
 		t.Fatalf("quarantine projection = %+v, want the lineage withdrawn under the exhausted-window detail", projected)
+	}
+	// The terminal record names the harness liveness at release: the hold
+	// ended with the shim still observable, so the harness was alive.
+	if !strings.Contains(projected[0].Detail, "harness alive at release: true") {
+		t.Fatalf("quarantine detail = %q, want it to name the live harness at release", projected[0].Detail)
 	}
 }
 

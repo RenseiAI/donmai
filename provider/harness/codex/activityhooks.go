@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
@@ -297,6 +298,13 @@ func wrapActivityHandle(h *interactiveConversationHandle, relay *activityrelay.R
 		events:                        make(chan agent.Event, activityCoarseEventSlots+activityRelayEventSlots),
 		activityFlushed:               make(chan struct{}),
 	}
+	// The handle owns relay (non-nil on every call site): the relay
+	// directory is removed only after the final flush has read it,
+	// before ActivityFlushed closes. ptycli runs the session cleanup
+	// right after Done, concurrently with that final flush, so removing
+	// the events file in the cleanup would drop a hook fire the child
+	// wrote after the last per-tick sweep. The terminal ResultEvent
+	// still follows the removal.
 	tailer := activityrelay.NewTailer(relay.EventsPath())
 	emit := func(ev agent.Event) {
 		emitActivityEvent(w.events, ev)
@@ -308,9 +316,16 @@ func wrapActivityHandle(h *interactiveConversationHandle, relay *activityrelay.R
 		var flushed sync.Once
 		flush := func() {
 			flushed.Do(func() {
+				if d := finalActivitySweepDelay.Load(); d > 0 {
+					time.Sleep(time.Duration(d))
+				}
 				for _, ev := range tailer.Sweep(activityrelay.MaxLinesPerSweep, activityrelay.MaxEventsPerSweep) {
 					emit(ev)
 				}
+				// Best effort like the relay itself: the final flush
+				// already read every line, so a failed removal loses no
+				// telemetry.
+				_ = relay.Close()
 				close(w.activityFlushed)
 			})
 		}
@@ -348,6 +363,13 @@ func wrapActivityHandle(h *interactiveConversationHandle, relay *activityrelay.R
 	}()
 	return w
 }
+
+// finalActivitySweepDelay holds the final relay sweep back, in
+// nanoseconds; zero outside tests. Tests widen it to prove the relay file
+// outlives the session's PTY cleanup, which ptycli runs concurrently with
+// this flush. Atomic because tailers of earlier sessions may still be
+// flushing while a test sets it.
+var finalActivitySweepDelay atomic.Int64
 
 // Events overrides the embedded handle's channel with the coarse
 // contract plus relayed harness-lifecycle events.

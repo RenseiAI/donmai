@@ -26,6 +26,7 @@ package daemon
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -314,9 +315,12 @@ func TestTheBudgetedAmbiguityCycleWithdrawsOnlyWhenReadoptionFails(t *testing.T)
 		t.Fatalf("quarantine after %d consecutive cycles = %+v, want one durable_ack_timeout lineage",
 			maxConsecutiveDurableAckAmbiguityCycles, projected)
 	}
-	if projected[0].Detail != sessionShimDurableAckCyclesSpentDetail {
-		t.Fatalf("detail = %q, want the spent-cycles detail — an operator cannot otherwise tell this from one slow bound",
+	if !strings.HasPrefix(projected[0].Detail, sessionShimDurableAckCyclesSpentDetail) {
+		t.Fatalf("detail = %q, want prefix the spent-cycles detail — an operator cannot otherwise tell this from one slow bound",
 			projected[0].Detail)
+	}
+	if !strings.Contains(projected[0].Detail, "harness alive at release:") {
+		t.Fatalf("detail = %q, want it to name the harness liveness at release", projected[0].Detail)
 	}
 	if got := d.durableAckAmbiguityCycles(f.id); got != 0 {
 		t.Fatalf("the streak survived the withdrawal (%d); a later lineage on this identity would inherit a spent budget", got)
@@ -366,8 +370,11 @@ func TestPlatformCarrierLossesAreBoundedBeforeQuarantine(t *testing.T) {
 	if len(projected) != 1 || projected[0].Reason != sessionshim.QuarantineDurableAckTimeout {
 		t.Fatalf("platform-loss streak quarantine = %+v, want one durable-ack timeout", projected)
 	}
-	if projected[0].Detail != sessionShimDurableAckCyclesSpentDetail {
-		t.Fatalf("platform-loss streak detail = %q, want %q", projected[0].Detail, sessionShimDurableAckCyclesSpentDetail)
+	if !strings.HasPrefix(projected[0].Detail, sessionShimDurableAckCyclesSpentDetail) {
+		t.Fatalf("platform-loss streak detail = %q, want prefix %q", projected[0].Detail, sessionShimDurableAckCyclesSpentDetail)
+	}
+	if !strings.Contains(projected[0].Detail, "harness alive at release:") {
+		t.Fatalf("platform-loss streak detail = %q, want it to name the harness liveness at release", projected[0].Detail)
 	}
 }
 

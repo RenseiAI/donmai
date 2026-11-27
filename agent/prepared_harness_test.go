@@ -437,3 +437,67 @@ func TestApplyPreparedHarnessNamesToolLifecycleOnlyDriftingFields(t *testing.T) 
 		t.Fatalf("Error() = %q must name the drifting field", err.Error())
 	}
 }
+
+// TestPreparedHarnessAuthorityBindsStartInBypass pins that StartInBypass is
+// part of the prepared-harness authority: a spec without it compiles to the
+// exact pre-field authority digest, a spec with it compiles to a different
+// digest carrying its own field digest, and flipping it between compile and
+// apply is reported as drift on that field.
+func TestPreparedHarnessAuthorityBindsStartInBypass(t *testing.T) {
+	t.Parallel()
+	manifest := (&codex.Provider{}).Manifest()
+	source := func(startInBypass bool) agent.Spec {
+		return agent.Spec{
+			PromptMode:     agent.PromptModeHumanControlled,
+			SandboxEnabled: true,
+			SandboxLevel:   agent.SandboxWorkspaceWrite,
+			Model:          "gpt-test",
+			PromptPlan: &agent.PromptPlan{
+				ContractVersion:  agent.PromptContractVersion,
+				BaseInstructions: agent.BaseInstructionPlan{Strategy: agent.BaseInstructionsPreserve},
+				UserPrompt:       agent.PromptContent{ID: "actual-user-task", Text: "inspect the actual input", Required: true},
+			},
+			Interactive:   &agent.InteractiveSpec{},
+			StartInBypass: startInBypass,
+		}
+	}
+	const operationalDigest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	var materializations []agent.HarnessMaterialization
+	for _, channel := range []string{"worktree", "environment", "credentials", "config", "endpoint_delivery", "services", "child_process", "runtime", "cleanup"} {
+		materializations = append(materializations, agent.HarnessMaterialization{Channel: channel, SourceDigest: operationalDigest, Required: true})
+	}
+	compile := func(t *testing.T, spec agent.Spec) *agent.PreparedHarness {
+		t.Helper()
+		plan, err := agent.CompilePreparedHarness(spec, manifest, operationalDigest, nil, materializations)
+		if err != nil {
+			t.Fatalf("compile: %v", err)
+		}
+		return plan
+	}
+
+	// The authority digest of this spec before StartInBypass existed.
+	const preFieldAuthorityDigest = "7597ddeecfee6b51257fa65842f3ce8c475b3d034a82224ac58267f9ce2ea40c"
+	absent := compile(t, source(false))
+	if absent.AuthorityDigest != preFieldAuthorityDigest {
+		t.Fatalf("absent StartInBypass authority digest = %s, want the pre-field %s", absent.AuthorityDigest, preFieldAuthorityDigest)
+	}
+	if _, ok := absent.AuthorityFieldDigests["startInBypass"]; ok {
+		t.Fatal("absent StartInBypass added a field digest")
+	}
+
+	present := compile(t, source(true))
+	if present.AuthorityDigest == absent.AuthorityDigest {
+		t.Fatal("StartInBypass is not bound into the authority digest")
+	}
+	if present.AuthorityFieldDigests["startInBypass"] == "" {
+		t.Fatal("present StartInBypass has no field digest")
+	}
+
+	flipped := source(false)
+	flipped.PreparedHarness = present
+	_, err := agent.ApplyPreparedHarness(flipped, manifest)
+	var drift *agent.AuthorityDriftError
+	if !errors.As(err, &drift) || !reflect.DeepEqual(drift.Fields, []string{"startInBypass"}) {
+		t.Fatalf("apply with StartInBypass flipped = %v, want drift on startInBypass", err)
+	}
+}

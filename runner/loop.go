@@ -611,8 +611,35 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 			res.PostSessionWarnings = append(res.PostSessionWarnings, warning)
 		}
 	}
-	runnerStatePath := wpath
+	// Negotiated documents land before the first executor turn: the versioned
+	// carrier is validated, decoded and published under the session-owned
+	// context directory. Any refusal fails before spawn so rejected documents
+	// are never claimed as included.
 	selectedRepositoryReadOnly := repositoryDeclaration != nil && repositoryDeclaration.Selected.Authority == workarea.RepositoryReadOnly
+	if err := r.materializeContextPack(qw, res.WorkareaRoot, res, provider, r.logger); err != nil {
+		// A refusal still owns the provisioned checkouts: record their
+		// bases (reseeding re-entered generations) so teardown can
+		// preserve unrelated repository work instead of deleting the
+		// workarea without archiving it. The refusal itself is unchanged.
+		switch {
+		case repositoryFree:
+		case repositoryDeclaration != nil:
+			targets := make([]rescueTarget, 0, len(repositoryDeclaration.Repositories))
+			for _, repository := range repositoryDeclaration.Repositories {
+				if repository.Authority == workarea.RepositoryMutable {
+					if path := declaredRepositoryPaths[repository.Name]; path != "" {
+						targets = append(targets, rescueTarget{name: repository.Name, path: path})
+					}
+				}
+			}
+			recordRescueTargets(ctx, res, targets)
+			reseedRescueBasesFromDeclaration(ctx, res, res.WorkareaRoot, r.wt, qw.SessionID, r.logger)
+		case !selectedRepositoryReadOnly:
+			recordRescueTargets(ctx, res, []rescueTarget{{path: wpath}})
+		}
+		return res, err
+	}
+	runnerStatePath := wpath
 	if selectedRepositoryReadOnly {
 		runnerStatePath = filepath.Join(res.WorkareaRoot, workarea.DeclarationDirName, "runner")
 		root, err := os.OpenRoot(res.WorkareaRoot)
@@ -1802,6 +1829,10 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// lastTurn is the latest turn's own observation; tail recovery reads how
 	// it ended.
 	lastTurn := streamRes
+	// lastTurnFollowUp is set once lastTurn is a follow-up turn's own
+	// observation (a memory inject, the pull request nudge, a
+	// continuation or a retry) rather than the first turn's.
+	lastTurnFollowUp := false
 	if runtimeInjectEnabled && !streamRes.blocked && budgetStop == nil {
 		injRes := r.drainMemoryInjects(ctx, handle, runnerStatePath, qw, res, enforcer, sink, traceProcessor, injectCh, beacons)
 		injRes.applyTo(res, provider.Name())
@@ -1810,6 +1841,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		}
 		if injRes.terminalEvent != nil {
 			lastTurn = injRes
+			lastTurnFollowUp = true
 		}
 		budgetStop = r.stopAtBudget(qw, handle, enforcer, nil)
 	}
@@ -1928,6 +1960,7 @@ tailRecovery:
 			tailRes.applyTo(res, provider.Name())
 			applyFollowUp(tailRes)
 			lastTurn = tailRes
+			lastTurnFollowUp = true
 			if budgetStop = r.stopAtBudget(qw, handle, enforcer, tailErr); budgetStop != nil {
 				break tailRecovery
 			}
@@ -2028,6 +2061,7 @@ tailRecovery:
 		tail.applyTo(res, provider.Name())
 		applyFollowUp(tail)
 		lastTurn = tail
+		lastTurnFollowUp = true
 		if budget != nil {
 			budgetStop = budget
 			break tailRecovery
@@ -2150,8 +2184,31 @@ tailRecovery:
 	// recorded, so a runner-authored refusal (divergence, provision)
 	// keeps its own typed reason.
 	if qw.ContinuePullRequest != nil && !repositoryFree && qw.requiresPR() && res.FailureMode == "" && budgetStop == nil {
-		startHead := strings.TrimSpace(qw.ContinuePullRequest.HeadSha)
-		if res.PullRequestURL != "" || continuePullRequestURL(verifyCtx, qw, repositoryDeclaration, wpath) != "" {
+		// A latest turn that ended abnormally — the harness exited or
+		// reported failure, or a provider or harness error ended it,
+		// possibly after a tool result went over the size limit —
+		// records that cause as the terminal reason: the "still a
+		// draft" message is only for a turn that completed normally and
+		// delivered no code. A first turn with no successful terminal
+		// result (a silent exit or a failed terminal) fails here, before
+		// the delivery check, because step 12 fails it anyway. Every
+		// other abnormal ending goes through the delivery check first:
+		// a continuation turn's death, and a first turn whose successful
+		// terminal still carries a provider or harness error, which step
+		// 12 would complete. When the continued pull request already
+		// carries the session's delivered code the run completes with
+		// the cause as a warning, otherwise the cause replaces the
+		// check's message (settleAbnormalContinuationTurn). Either way
+		// a WORK_RESULT marker alone never counts as passed for an
+		// abnormal turn.
+		abnormalMode, abnormalMessage, abnormal := abnormalContinueTurnEndCause(res, streamRes, lastTurn, qw.ContinuePullRequest.Number, r.toolOutputLimit())
+		switch {
+		case abnormal && !lastTurnFollowUp && !lastTurn.terminalSuccess:
+			res.Status = "failed"
+			res.FailureMode = abnormalMode
+			res.Error = abnormalMessage
+		case res.PullRequestURL != "" || continuePullRequestURL(verifyCtx, qw, repositoryDeclaration, wpath) != "":
+			startHead := strings.TrimSpace(qw.ContinuePullRequest.HeadSha)
 			gateCtx, gateCancel := context.WithTimeout(context.Background(), 30*time.Second)
 			func() {
 				defer gateCancel()
@@ -2187,8 +2244,8 @@ tailRecovery:
 				// A passed turn counts only when the turn itself
 				// ended successfully: a WORK_RESULT marker alone
 				// must not promote a turn that then ended on a
-				// provider error to completed.
-				passed := res.WorkResult == "passed" && res.Status != "failed" && lastTurn.providerError == ""
+				// provider error, or died, to completed.
+				passed := res.WorkResult == "passed" && res.Status != "failed" && lastTurn.providerError == "" && !abnormal
 				// completeContinueNoOp ends the run completed with the
 				// no-op continuation outcome, keeping the old failure
 				// message as a post-session warning so it stays
@@ -2267,6 +2324,13 @@ tailRecovery:
 					res.Error = fmt.Sprintf("continued pull request #%d has no code change since dispatch (only merges or scratch files)", qw.ContinuePullRequest.Number)
 				}
 			}()
+			if abnormal {
+				settleAbnormalContinuationTurn(res, abnormalMode, abnormalMessage)
+			}
+		case abnormal:
+			res.Status = "failed"
+			res.FailureMode = abnormalMode
+			res.Error = abnormalMessage
 		}
 	}
 
@@ -2341,7 +2405,21 @@ tailRecovery:
 		} else {
 			res.Status = "failed"
 			if res.FailureMode == "" {
-				res.FailureMode = FailureSilentExit
+				// A failed terminal ResultEvent can carry the provider's
+				// own failure text in Errors (codex turn/completed
+				// status failed). Surface it as the failure reason with
+				// a provider-error mode so the terminal reason names the
+				// provider refusal instead of falling back to the last
+				// progress note. A failed terminal with no error text
+				// keeps silent-exit.
+				if msg := terminalProviderErrorMessage(streamRes.terminalEvent); msg != "" {
+					res.FailureMode = FailureProviderError
+					if res.Error == "" {
+						res.Error = msg
+					}
+				} else {
+					res.FailureMode = FailureSilentExit
+				}
 			}
 		}
 	}
@@ -3004,6 +3082,16 @@ type streamObservation struct {
 	// has a last assistant message with no tool call: lastAssistantText is
 	// set and no ToolUseEvent came after it. Updated in observeEvent.
 	toolAfterLastAssistant bool
+	// toolOutputTruncated reports that a tool result of this stream
+	// exceeded the runner's tool-output limit and was truncated around
+	// a marker before the runner retained or forwarded it (see
+	// truncateToolOutput; the harness bounds the model's copy
+	// separately). Protective, never a failure: the turn keeps going.
+	// toolOutputBytes is the largest original byte size truncated on
+	// this stream; toolOutputLimit is the limit applied.
+	toolOutputTruncated bool
+	toolOutputBytes     int
+	toolOutputLimit     int
 	// finalProvider names the provider the stream's model calls last
 	// identified from native response evidence
 	// (LlmCallEvent.ResponseModelProvider): the provider the wire response
@@ -3046,15 +3134,6 @@ type streamObservation struct {
 	// disabled, Resume was refused, or the backoff was cut short). With
 	// noProgress it is what classifyStreamStop reads as FailureProviderError.
 	stallFailed bool
-	// toolOutputTruncated reports that a tool result of this stream
-	// exceeded the runner's tool-output limit and was truncated around
-	// a marker before the runner retained it (see truncateToolOutput).
-	// Protective, never a failure: the turn keeps going on the bounded
-	// copy. toolOutputBytes is the largest original byte size truncated
-	// on this stream; toolOutputLimit is the limit applied.
-	toolOutputTruncated bool
-	toolOutputBytes     int
-	toolOutputLimit     int
 }
 
 // splitProviderErrorRetryable separates the harness-reported retryability
@@ -3164,7 +3243,7 @@ func (o streamObservation) applyTo(res *Result, providerName agent.ProviderName)
 	}
 	// An oversized tool result the runner truncated rides as a
 	// post-session warning — observability, never a failure — so the
-	// bound copy the seat kept going on stays visible wherever
+	// truncation of the runner's retained copy stays visible wherever
 	// warnings surface.
 	noteToolOutputTruncation(res, o)
 }
@@ -3504,16 +3583,19 @@ func (r *Runner) consumeEventsWithin(
 			if !ok {
 				return obs, nil
 			}
-			// Bound oversized tool output at ingress: a result larger than
-			// the runner's tool-output limit is truncated around a marker
-			// before anything downstream — the audit log, the activity
-			// sink, the pull-request scan — retains it, so one
-			// escape-laden CI log cannot wedge the turn. Protective,
-			// never a failure: the turn keeps going on the bounded copy,
-			// and the observation records that it happened so the
-			// terminal reason can name it when the turn still dies.
-			// Middle-elision keeps the tail, so a pull request URL at
-			// the end of the output still scans.
+			// Bound oversized tool output at the runner's ingress: a
+			// result larger than the runner's tool-output limit is
+			// truncated around a marker before the runner retains or
+			// forwards it — the audit log, the activity sink, the
+			// pull-request scan — so one escape-laden CI log cannot
+			// balloon the runner's own buffers. This is the runner's
+			// copy; each harness separately bounds the copy it hands the
+			// model with the same shared helper and default (see
+			// agent.TruncateToolOutput). Protective, never a failure: the
+			// turn keeps going, and the observation records the
+			// truncation so the terminal reason can name it when the
+			// turn still dies. Middle-elision keeps the tail, so a pull
+			// request URL at the end of the output still scans.
 			if toolRes, ok := ev.(agent.ToolResultEvent); ok {
 				if truncated, changed := truncateToolOutput(toolRes.Content, r.toolOutputLimit()); changed {
 					original := len(toolRes.Content)
@@ -4009,6 +4091,54 @@ func classifyWorktreeErr(err error) string {
 	default:
 		return FailureWorktreeProvision
 	}
+}
+
+// terminalProviderErrorMessage reports the provider's failure text from a
+// failed terminal ResultEvent. It joins the non-empty Errors entries, but
+// ignores the harness-synthesized fallbacks ("Turn failed",
+// "Turn was interrupted") the mappers emit when the provider reported no
+// error text, the finish-reason stops (ErrorSubtype "finish_*") a
+// mapper reports when the model hit a cap or policy finish reason instead
+// of a provider failure (for example Gemini "MAX_TOKENS"), the
+// interruption stops (ErrorSubtype "interrupted") a host reports when
+// the turn was cancelled before a tool ran, and the turn-cap stops
+// (ErrorSubtype "error_max_turns") a harness reports when the model hit
+// its configured turn ceiling: none of those carry a provider diagnostic,
+// so a failed terminal with only that text keeps silent-exit instead of
+// provider-error. The OutputTail fallback still preserves the diagnostic
+// tail.
+func terminalProviderErrorMessage(ev *agent.ResultEvent) string {
+	if ev == nil || ev.Success || len(ev.Errors) == 0 {
+		return ""
+	}
+	// A finish-reason stop is a cap or policy truncation, not a provider
+	// failure: the retry-bearing provider-error mode (resumable, deferred
+	// failure transition, provider-error retries) must not apply to it.
+	if strings.HasPrefix(ev.ErrorSubtype, "finish_") {
+		return ""
+	}
+	// An interrupted turn (user or operator cancel) and a turn-cap stop
+	// are not provider failures either: they must stay silent-exit so the
+	// run is not resumable and still takes its declared failure
+	// transition. Only a genuine provider refusal or endpoint failure
+	// (for example Codex turn_failed with the provider's error text)
+	// promotes to provider-error.
+	switch ev.ErrorSubtype {
+	case "interrupted", "error_max_turns":
+		return ""
+	}
+	var kept []string
+	for _, e := range ev.Errors {
+		trimmed := strings.TrimSpace(e)
+		if trimmed == "" || trimmed == "Turn failed" || trimmed == "Turn was interrupted" {
+			continue
+		}
+		kept = append(kept, trimmed)
+	}
+	if len(kept) == 0 {
+		return ""
+	}
+	return strings.Join(kept, "\n")
 }
 
 // boundedFailureTail redacts secret-shaped values then applies the

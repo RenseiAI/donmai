@@ -4,6 +4,7 @@ package runner
 
 import (
 	"context"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/internal/testexec"
 )
 
 // guardTestTools skips the test unless the guard's fixed tool search path
@@ -65,8 +67,24 @@ func guardTestEnv(layout signalGuardLayout, worktree string, extra map[string]st
 	return out
 }
 
+// writeTestExecFile installs one executable test stub through the shared
+// fork-guarded writer: holding the fork lock across the write guarantees
+// no concurrent fork can inherit the still-open descriptor, so a later
+// exec never observes ETXTBSY (text file busy) under load.
+func writeTestExecFile(t *testing.T, path string, data []byte) {
+	t.Helper()
+	if err := testexec.WriteFile(path, data, 0o755); err != nil { //nolint:gosec // G306: test stub must carry the exec bit.
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
 // startGuardSleeper starts `sleep 300` with argv[0] set to name and cwd
-// dir, and waits until the guard's own pgrep form sees it. exec -a gives
+// dir, and waits for the child's readiness signal on a pipe: the shell
+// writes one word to the inherited fd before execing sleep, so when the
+// parent reads it the sleeper exists and the exec follows immediately.
+// The parent then closes the pipe and probes the pid before returning,
+// by which time the exec has normally completed and the guard's own
+// pgrep form can match the final distinctive command line. exec -a gives
 // the process a distinctive command line on every platform; the process
 // NAME used for name matching is calibrated per platform with
 // guardSleeperComm. On Linux the comm stays the executed basename
@@ -76,6 +94,13 @@ func guardTestEnv(layout signalGuardLayout, worktree string, extra map[string]st
 // unique per sleeper. trapIgnoreTERM makes the sleeper ignore SIGTERM,
 // so a test can tell TERM apart from KILL by survival.
 func startGuardSleeper(t *testing.T, dir, name string, trapIgnoreTERM bool) *exec.Cmd {
+	t.Helper()
+	return startGuardSleeperWithAttr(t, dir, name, trapIgnoreTERM, nil)
+}
+
+// startGuardSleeperWithAttr is startGuardSleeper with an explicit
+// SysProcAttr (for the process-group leg, which leads its own group).
+func startGuardSleeperWithAttr(t *testing.T, dir, name string, trapIgnoreTERM bool, attr *syscall.SysProcAttr) *exec.Cmd {
 	t.Helper()
 	sleepBin := "/bin/sleep"
 	if _, err := os.Stat(sleepBin); err != nil {
@@ -87,36 +112,60 @@ func startGuardSleeper(t *testing.T, dir, name string, trapIgnoreTERM bool) *exe
 			t.Fatalf("read %s: %v", sleepBin, err)
 		}
 		uniqueBin := filepath.Join(t.TempDir(), "sleep-"+name)
-		if err := os.WriteFile(uniqueBin, src, 0o755); err != nil { //nolint:gosec // G306: test stub must carry the exec bit.
-			t.Fatalf("write unique sleep binary: %v", err)
-		}
+		writeTestExecFile(t, uniqueBin, src)
 		sleepBin = uniqueBin
 	}
-	argv := "exec -a " + name + " " + sleepBin + " 300"
-	if trapIgnoreTERM {
-		argv = "trap '' TERM; " + argv
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("sleeper %q pipe: %v", name, err)
 	}
-	cmd := exec.Command("bash", "-c", argv) //nolint:gosec // G204: test fixture, argv is a hard-coded sleeper with a generated marker name.
+	script := "printf 'ready' >&3; exec 3>&-; exec -a \"$0\" \"$1\" 300"
+	if trapIgnoreTERM {
+		script = "trap '' TERM; " + script
+	}
+	cmd := exec.Command("bash", "-c", script, name, sleepBin) //nolint:gosec // G204: test fixture, the marker travels as $0 and the sleep path as $1.
 	cmd.Dir = dir
+	cmd.SysProcAttr = attr
+	cmd.ExtraFiles = []*os.File{pw}
 	if err := cmd.Start(); err != nil {
+		_ = pw.Close()
+		_ = pr.Close()
 		t.Fatalf("start sleeper %q in %s: %v", name, dir, err)
 	}
+	_ = pw.Close()
 	t.Cleanup(func() {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
 	})
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		pg, err := exec.Command("pgrep", "-f", "--", name).CombinedOutput() //nolint:gosec // G204: test fixture, the marker comes from our own started process.
-		if err == nil && len(strings.Fields(string(pg))) > 0 {
-			return cmd
-		}
-		if time.Now().After(deadline) {
-			_ = cmd.Process.Kill()
-			t.Fatalf("sleeper %q (pid %d) never visible to pgrep -f", name, cmd.Process.Pid)
-		}
-		time.Sleep(50 * time.Millisecond)
+	type readRes struct {
+		n   int
+		err error
 	}
+	ch := make(chan readRes, 1)
+	go func() {
+		buf := make([]byte, 5)
+		n, err := io.ReadFull(pr, buf)
+		if err == nil && string(buf[:n]) != "ready" {
+			err = io.ErrUnexpectedEOF
+		}
+		ch <- readRes{n: n, err: err}
+	}()
+	select {
+	case res := <-ch:
+		_ = pr.Close()
+		if res.err != nil {
+			_ = cmd.Process.Kill()
+			t.Fatalf("sleeper %q readiness failed: %v", name, res.err)
+		}
+	case <-time.After(10 * time.Second):
+		_ = pr.Close()
+		_ = cmd.Process.Kill()
+		t.Fatalf("sleeper %q never signaled readiness", name)
+	}
+	if err := cmd.Process.Signal(syscall.Signal(0)); err != nil {
+		t.Fatalf("sleeper %q died before the guard could see it: %v", name, err)
+	}
+	return cmd
 }
 
 // guardSleeperComm reads the process NAME the platform reports for cmd:
@@ -213,9 +262,7 @@ func TestSignalGuardScopesPatternKillToSession(t *testing.T) {
 	}
 	parentPath := filepath.Join(parentDir, "parent.sh")
 	parentBody := "#!/bin/sh\n\"" + layout.pkill + "\" -f \"" + marker + "\"\n"
-	if err := os.WriteFile(parentPath, []byte(parentBody), 0o755); err != nil { //nolint:gosec // G306: a stub executable must carry the exec bit.
-		t.Fatal(err)
-	}
+	writeTestExecFile(t, parentPath, []byte(parentBody))
 	parent := exec.Command("sh", parentPath) //nolint:gosec // G204: test fixture, path comes from t.TempDir.
 	parent.Dir = worktree
 	parent.Env = env
@@ -627,9 +674,7 @@ func TestSignalGuardFailingPgrepRefusesClosed(t *testing.T) {
 			layout := installTestGuard(t)
 			stubDir := t.TempDir()
 			stub := "#!/bin/sh\nexit 2\n"
-			if err := os.WriteFile(stubDir+"/pgrep", []byte(stub), 0o755); err != nil { //nolint:gosec // G306: test stub must carry the exec bit.
-				t.Fatal(err)
-			}
+			writeTestExecFile(t, stubDir+"/pgrep", []byte(stub))
 			extra := map[string]string{"DONMAI_SIGNAL_GUARD_TOOL_DIRS": stubDir + " /usr/bin /bin /usr/sbin /sbin"}
 			bin := layout.pkill
 			args := []string{"-f", name}
@@ -688,13 +733,9 @@ func TestSignalGuardLsofFailureRefusesClosed(t *testing.T) {
 			// Deterministic scan order: the session pid is examined
 			// first, so without the reset the outsider inherits its cwd.
 			pgrepStub := "#!/bin/sh\nprintf '%s\\n%s\\n' \"" + strconv.Itoa(own.Process.Pid) + "\" \"" + strconv.Itoa(outsider.Process.Pid) + "\"\n"
-			if err := os.WriteFile(stubDir+"/pgrep", []byte(pgrepStub), 0o755); err != nil { //nolint:gosec // G306: test stub must carry the exec bit.
-				t.Fatal(err)
-			}
+			writeTestExecFile(t, stubDir+"/pgrep", []byte(pgrepStub))
 			stub := "#!/bin/sh\nfor a in \"$@\"; do\n  if [ \"$a\" = \"" + strconv.Itoa(outsider.Process.Pid) + "\" ]; then\n    exit 1\n  fi\ndone\nexec \"" + realLsof + "\" \"$@\"\n"
-			if err := os.WriteFile(stubDir+"/lsof", []byte(stub), 0o755); err != nil { //nolint:gosec // G306: test stub must carry the exec bit.
-				t.Fatal(err)
-			}
+			writeTestExecFile(t, stubDir+"/lsof", []byte(stub))
 			layout := installTestGuard(t)
 			extra := map[string]string{"DONMAI_SIGNAL_GUARD_TOOL_DIRS": stubDir + " /usr/bin /bin /usr/sbin /sbin"}
 			bin := layout.pkill
@@ -747,13 +788,9 @@ func TestSignalGuardPerPidKillToleratesExitedPid(t *testing.T) {
 	}
 	stubDir := t.TempDir()
 	pgrepStub := "#!/bin/sh\nprintf '%s\\n%s\\n999999\\n' \"" + strconv.Itoa(own.Process.Pid) + "\" \"" + strconv.Itoa(own.Process.Pid) + "\"\n"
-	if err := os.WriteFile(stubDir+"/pgrep", []byte(pgrepStub), 0o755); err != nil { //nolint:gosec // G306: test stub must carry the exec bit.
-		t.Fatal(err)
-	}
+	writeTestExecFile(t, stubDir+"/pgrep", []byte(pgrepStub))
 	lsofStub := "#!/bin/sh\nfor a in \"$@\"; do\n  if [ \"$a\" = \"999999\" ]; then\n    printf 'p999999\\nn%s\\n' \"" + worktree + "\"\n    exit 0\n  fi\ndone\nexec \"" + realLsof + "\" \"$@\"\n"
-	if err := os.WriteFile(stubDir+"/lsof", []byte(lsofStub), 0o755); err != nil { //nolint:gosec // G306: test stub must carry the exec bit.
-		t.Fatal(err)
-	}
+	writeTestExecFile(t, stubDir+"/lsof", []byte(lsofStub))
 	layout := installTestGuard(t)
 	extra := map[string]string{"DONMAI_SIGNAL_GUARD_TOOL_DIRS": stubDir + " /usr/bin /bin /usr/sbin /sbin"}
 	kill := exec.Command(layout.pkill, "-f", name) //nolint:gosec // G204: test fixture, the marker comes from our own started process.
@@ -810,17 +847,9 @@ func TestSignalGuardProcessGroupLeg(t *testing.T) {
 	name := "gGrpLeg1"
 
 	// The own process leads its own group (like a spawned harness with
-	// Setpgid); the outsider shares the test's group.
-	own := exec.Command("bash", "-c", "exec -a "+name+" /bin/sleep 300") //nolint:gosec // G204: test fixture, the marker is a hard-coded literal.
-	own.Dir = nowhere
-	own.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	if err := own.Start(); err != nil {
-		t.Fatalf("start grouped sleeper: %v", err)
-	}
-	t.Cleanup(func() {
-		_ = own.Process.Kill()
-		_ = own.Wait()
-	})
+	// Setpgid); the outsider shares the test's group. Readiness comes
+	// from the child's pipe signal, not a pgrep poll.
+	own := startGuardSleeperWithAttr(t, nowhere, name, false, &syscall.SysProcAttr{Setpgid: true})
 	outsider := startGuardSleeper(t, nowhere, name, false)
 
 	layout := installTestGuard(t)

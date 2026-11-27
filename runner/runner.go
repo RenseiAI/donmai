@@ -151,9 +151,19 @@ const (
 	// the runner, applied when [Options.MaxToolOutputBytes] is zero or
 	// negative. It aliases agent.DefaultMaxToolOutputBytes so the runner
 	// and every harness share one documented, configurable limit with a
-	// visible default. A larger result is truncated around a marker that
-	// names the truncation (see agent.TruncateToolOutput) before the
-	// runner retains it, so an oversized result cannot wedge the turn.
+	// visible default. A tool result larger than this is truncated around
+	// a marker that names the truncation (see truncateToolOutput) before
+	// the runner retains or forwards it, so an oversized result — a
+	// multi-megabyte CI log, escape-laden output that balloons
+	// downstream buffers — cannot balloon the runner's audit log,
+	// activity stream or pull request scan, and a turn that still dies
+	// after one names it in its terminal reason. Each harness applies the
+	// same bound to the copy it hands the model (see
+	// agent.ResolveToolOutputLimit). 256 KiB keeps legitimate outputs
+	// (test logs, diffs) intact while bounding the pathological ones; the
+	// runner never fails a turn for oversize output alone. The daemon's
+	// maxToolOutputBytes setting and `agent run --max-tool-output-bytes`
+	// override it for the runner.
 	DefaultMaxToolOutputBytes = agent.DefaultMaxToolOutputBytes
 
 	// DefaultStatusBeaconInterval bounds the runner's current-step beacon
@@ -301,15 +311,35 @@ type Options struct {
 	// cut-off it replaces).
 	ProviderStallRetries int
 
+	// InteractiveNoticeIdlePolls bounds how long one pull-channel notice
+	// may sit with no session life before it is reported as needs-operator
+	// (see interactiveNoticeIdlePolls). Zero uses the default; a NEGATIVE
+	// value disables the idle shortcut entirely so the offer waits for the
+	// next turn end under the long pull cap — the opt-out for an operator
+	// who returns just after the idle threshold and starts the turn that
+	// would still collect the offer.
+	InteractiveNoticeIdlePolls int
+
+	// InteractiveNoticeClaimGracePolls bounds the wait after the harness
+	// claims an offer for the acceptance record to appear (see
+	// interactiveNoticeClaimGracePolls). Zero uses the default; a NEGATIVE
+	// value waits without expiring the grace, but the long pull cap still
+	// bounds the slot even while claimed so a record that never arrives
+	// cannot hold the single notice slot indefinitely and starve later
+	// notices.
+	InteractiveNoticeClaimGracePolls int
+
 	// MaxToolOutputBytes bounds one tool result's content (in bytes) the
 	// runner retains per ToolResultEvent. A larger result is truncated
-	// around a marker naming the truncation (see agent.TruncateToolOutput)
-	// before the runner stores or forwards it, so an oversized result
-	// cannot wedge the turn and the seat keeps going on the bounded
-	// copy. Zero or negative uses DefaultMaxToolOutputBytes; there is
-	// no unbounded setting — the cap is protective, never advisory.
-	// It is the same documented limit every harness applies before
-	// handing tool output to the model.
+	// around a marker naming the truncation (see truncateToolOutput)
+	// before the runner stores or forwards it (audit log, activity
+	// stream, pull request scan), and the seat keeps going. This bounds
+	// the runner's copy; each harness separately bounds the copy it hands
+	// the model with the same documented default. Zero or negative uses DefaultMaxToolOutputBytes; there is
+	// no unbounded setting — the cap is protective, never advisory. The
+	// daemon states it per worker from its maxToolOutputBytes setting
+	// (DONMAI_MAX_TOOL_OUTPUT_BYTES, read by `agent run
+	// --max-tool-output-bytes`).
 	MaxToolOutputBytes int
 
 	// PreserveWorktreeOnFailure keeps the worktree on disk after a
@@ -633,7 +663,7 @@ type Runner struct {
 	narrationNudgeLimit int
 	// maxToolOutputBytes is Options.MaxToolOutputBytes, resolved to
 	// DefaultMaxToolOutputBytes when unset. It bounds one tool result's
-	// retained content (see agent.TruncateToolOutput).
+	// retained content (see truncateToolOutput).
 	maxToolOutputBytes int
 	// providerRetryBackoff spaces provider-error retries; nil uses
 	// defaultProviderRetryBackoff. Tests substitute a zero wait.
@@ -649,6 +679,16 @@ type Runner struct {
 	// the session pull request verifier. Nil uses captureHeadSHA; tests
 	// replace it.
 	pullRequestHeadLookup pullRequestHeadLookup
+
+	// interactiveNoticeIdlePolls is Options.InteractiveNoticeIdlePolls,
+	// resolved to interactiveNoticeIdlePolls when unset. Negative disables
+	// the idle shortcut (the offer waits under the long pull cap).
+	interactiveNoticeIdlePolls int
+	// interactiveNoticeClaimGracePolls is
+	// Options.InteractiveNoticeClaimGracePolls, resolved to
+	// interactiveNoticeClaimGracePolls when unset. Negative waits without
+	// expiring the claim grace.
+	interactiveNoticeClaimGracePolls int
 
 	// interactiveNoticeClock overrides the interactive supervisor's
 	// notice-retry clock. Nil in production (real time); tests substitute a
@@ -811,6 +851,16 @@ func New(opts Options) (*Runner, error) {
 	}
 	if r.maxToolOutputBytes <= 0 {
 		r.maxToolOutputBytes = DefaultMaxToolOutputBytes
+	}
+	if opts.InteractiveNoticeIdlePolls == 0 {
+		r.interactiveNoticeIdlePolls = interactiveNoticeIdlePolls
+	} else {
+		r.interactiveNoticeIdlePolls = opts.InteractiveNoticeIdlePolls
+	}
+	if opts.InteractiveNoticeClaimGracePolls == 0 {
+		r.interactiveNoticeClaimGracePolls = interactiveNoticeClaimGracePolls
+	} else {
+		r.interactiveNoticeClaimGracePolls = opts.InteractiveNoticeClaimGracePolls
 	}
 	return r, nil
 }
@@ -997,7 +1047,7 @@ func (r *Runner) run(ctx context.Context, qw QueuedWork, admission *HarnessAdmis
 					inspectionCtx, inspectionCancel := context.WithTimeout(context.Background(), 30*time.Second)
 					var assessment worktree.PublicationAssessment
 					lease, assessment, acquireErr = r.wt.AcquireInteractiveTerminalLease(
-						inspectionCtx, interactivePublicationSpec(qw), acquireSpec, leaseRequested,
+						inspectionCtx, interactivePublicationSpec(qw, sessionDocumentPrefix(res, res.WorktreePath)), acquireSpec, leaseRequested,
 					)
 					inspectionCancel()
 					r.logger.Info("interactive workarea publication disposition",
@@ -1025,7 +1075,7 @@ func (r *Runner) run(ctx context.Context, qw QueuedWork, admission *HarnessAdmis
 						archiveReference = lease.ArchiveReference
 						res.TerminalArchiveReference = archiveReference
 					}
-					body, bodyErr := r.poster.PrepareTerminalStatusBodyWithOptions(context.Background(), qw.SessionID, res.Result, result.PostOptions{TerminalWorkareaLease: leaseProjection, TerminalArchiveReference: archiveReference})
+					body, bodyErr := r.poster.PrepareTerminalStatusBodyWithOptions(context.Background(), qw.SessionID, res.Result, result.PostOptions{TerminalWorkareaLease: leaseProjection, TerminalArchiveReference: archiveReference, ContextPack: res.ContextPack})
 					if bodyErr != nil {
 						leaseErr := fmt.Errorf("runner: encode immutable terminal status body: %w", bodyErr)
 						markTerminalLeaseFailure(res, leaseErr)
@@ -1113,7 +1163,7 @@ func (r *Runner) run(ctx context.Context, qw QueuedWork, admission *HarnessAdmis
 	// loop would send the same terminal twice if the runner died before
 	// the first send.
 	if r.shimSeat != nil && res.Status != "" && !leasePrepared {
-		standaloneBody, bodyErr := r.poster.PrepareTerminalStatusBody(context.Background(), qw.SessionID, res.Result, leaseProjection)
+		standaloneBody, bodyErr := r.poster.PrepareTerminalStatusBodyWithOptions(context.Background(), qw.SessionID, res.Result, result.PostOptions{TerminalWorkareaLease: leaseProjection, ContextPack: res.ContextPack})
 		if bodyErr != nil {
 			r.logger.Warn("standalone terminal status body not persisted; sending without replay",
 				"sessionId", qw.SessionID, "err", bodyErr)
@@ -1157,7 +1207,7 @@ func (r *Runner) run(ctx context.Context, qw QueuedWork, admission *HarnessAdmis
 	if leasePrepared || standalonePrepared {
 		postOutcome = r.poster.PostPreparedOutcome(postCtx, qw.SessionID, res.Result, preparedStatusBody)
 	} else {
-		postOutcome = r.poster.PostWithOptionsOutcome(postCtx, qw.SessionID, res.Result, result.PostOptions{})
+		postOutcome = r.poster.PostWithOptionsOutcome(postCtx, qw.SessionID, res.Result, result.PostOptions{ContextPack: res.ContextPack})
 	}
 	postCancel()
 	if standalonePrepared && postOutcome.StatusObserved() {

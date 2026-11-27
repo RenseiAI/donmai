@@ -459,6 +459,9 @@ func serveEnvMap(env []string) map[string]string {
 //	                   allowAll for a policy-free autonomous session; a
 //	                   non-autonomous session keeps the CLI default
 //	                   on-request so the attached human approves)
+//	StartInBypass      → --approval-mode never for a non-autonomous session
+//	                   whose stamped toolApproval level is "bypass" (see
+//	                   startsInBypass); otherwise ignored
 //	SandboxLevel       → --disable-shell --disable-write on the read-only
 //	                   lane (byte-identical to serveArgs: the read-only lane
 //	                   is never widened); provider DisableSandbox →
@@ -507,6 +510,15 @@ func museSeedMessage(seed string) string {
 	return seed
 }
 
+// startsInBypass reports whether a human-controlled session asked to start
+// in the never-ask approval mode and its stamped toolApproval level already
+// grants bypass. The stamp is re-checked here so the request can never
+// widen what the execution-security levels allow.
+func startsInBypass(spec agent.Spec) bool {
+	return !spec.Autonomous && spec.StartInBypass && spec.ExecutionSecurity != nil &&
+		spec.ExecutionSecurity.Levels.ToolApproval == agent.ToolApprovalBypass
+}
+
 func (p *Provider) interactiveArgs(spec agent.Spec) []string {
 	var argv []string
 	trustWorkspace := p != nil && p.opts.TrustWorkspace
@@ -521,7 +533,7 @@ func (p *Provider) interactiveArgs(spec agent.Spec) []string {
 	} else if disableSandbox {
 		argv = append(argv, "--disable-sandbox")
 	}
-	if spec.Autonomous {
+	if spec.Autonomous || startsInBypass(spec) {
 		argv = append(argv, "--approval-mode", "never")
 	}
 	if model := strings.TrimSpace(spec.Model); model != "" && model != "default" {

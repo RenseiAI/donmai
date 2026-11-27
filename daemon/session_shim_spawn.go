@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -3650,6 +3651,24 @@ func (d *Daemon) quarantineLostSessionShim(
 		return
 	}
 	now := d.shimNow()
+	// Read the harness liveness of the LOST incarnation before taking the write
+	// lock: the terminal record must say whether that harness was still alive
+	// at the moment of release. The lost controller's Hello is never the
+	// answer — it is the phase at adoption, not at release, and it says
+	// "running" or "orphaned" for a shim that has since died. The read is best
+	// effort: an unreadable registry reports "unknown" rather than refusing the
+	// withdrawal.
+	hello := entry.controller.Hello()
+	liveness := sessionShimLivenessAtRelease(d.openedShimRegistry(), id, entry.shimID, hello.ProcessEpoch)
+	// The published record names the lost incarnation (its ShimID and
+	// ProcessEpoch), so its Phase may come only from that incarnation's own
+	// record. Anything else keeps the adoption-time phase it always carried.
+	releasePhase := cmp.Or(liveness.phase, hello.Phase)
+	if detail != "" {
+		detail = fmt.Sprintf("%s; harness alive at release: %s (%s)", detail, liveness.alive, liveness.evidence)
+	} else {
+		detail = fmt.Sprintf("harness alive at release: %s (%s)", liveness.alive, liveness.evidence)
+	}
 	d.shims.mu.Lock()
 	current, ok := d.shims.adopted[id]
 	if ok && current.controller != entry.controller {
@@ -3661,7 +3680,6 @@ func (d *Daemon) quarantineLostSessionShim(
 		// Withdrawn: there is nothing left to count, and a later lineage on
 		// this identity must start from a clean streak.
 		delete(d.shims.ambiguityCycles, id)
-		hello := entry.controller.Hello()
 		q := sessionshim.NewQuarantinedSession(sessionshim.Record{
 			OrgID:             id.OrgID,
 			SessionID:         id.SessionID,
@@ -3669,7 +3687,7 @@ func (d *Daemon) quarantineLostSessionShim(
 			ProcessEpoch:      hello.ProcessEpoch,
 			ProtocolMin:       hello.Min,
 			ProtocolMax:       hello.Max,
-			Phase:             hello.Phase,
+			Phase:             releasePhase,
 			CreatedAtUnixNano: now.UnixNano(),
 		}, reason, detail, now)
 		q.ControllerGeneration = uint64(entry.controller.Generation())
@@ -3679,6 +3697,66 @@ func (d *Daemon) quarantineLostSessionShim(
 	d.lifecycleMu.Unlock()
 	if ok {
 		d.publishQuarantineAfterConsumingTerminalProof(id.OrgID)
+	}
+}
+
+// sessionShimReleaseLiveness is what the registry says, at release, about the
+// harness of one exact shim incarnation.
+type sessionShimReleaseLiveness struct {
+	// alive is "true", "false" or "unknown".
+	alive string
+	// evidence names what alive was decided from, for the quarantine detail.
+	evidence string
+	// phase is the incarnation's own published phase. It is empty unless it
+	// was read from a discovery record whose ShimID and ProcessEpoch match.
+	phase shimwire.Phase
+}
+
+// sessionShimLivenessAtRelease resolves harness liveness for the incarnation
+// (id, shimID, processEpoch), never for whatever record the identity names now.
+//
+// A discovery record is keyed by identity alone, so a record present under id
+// may belong to a newer incarnation; its phase says nothing about the lost one.
+// The answers:
+//
+//   - an exact tombstone for the incarnation: false — the shim recorded its
+//     harness's end;
+//   - no record, or a record of another incarnation: false — the incarnation no
+//     longer publishes a live record;
+//   - the incarnation's own record with a known phase: that phase's
+//     HarnessLive;
+//   - an unreadable registry, record or tombstone set, or an unknown phase:
+//     unknown.
+func sessionShimLivenessAtRelease(registry *sessionshim.Registry, id sessionshim.Identity, shimID string, processEpoch uint64) sessionShimReleaseLiveness {
+	unknown := func(evidence string) sessionShimReleaseLiveness {
+		return sessionShimReleaseLiveness{alive: "unknown", evidence: evidence}
+	}
+	gone := func(evidence string) sessionShimReleaseLiveness {
+		return sessionShimReleaseLiveness{alive: "false", evidence: evidence}
+	}
+	if registry == nil {
+		return unknown("registry unavailable")
+	}
+	if _, err := registry.GetTombstoneIncarnation(id, shimID, processEpoch); err == nil {
+		return gone("tombstoned")
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return unknown("tombstones unreadable")
+	}
+	rec, err := registry.Get(id)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return gone("record gone")
+	case err != nil:
+		return unknown("record unreadable")
+	case rec.ShimID != shimID || rec.ProcessEpoch != processEpoch:
+		return gone("record superseded")
+	case !rec.Phase.Known():
+		return unknown("phase unknown")
+	}
+	return sessionShimReleaseLiveness{
+		alive:    strconv.FormatBool(rec.Phase.HarnessLive()),
+		evidence: "phase=" + string(rec.Phase),
+		phase:    rec.Phase,
 	}
 }
 
