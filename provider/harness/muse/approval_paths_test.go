@@ -107,6 +107,8 @@ func TestApprovalBridge_PathDeniesFailClosed(t *testing.T) {
 	symlink(t, secret, secretLink)
 	metaLink := filepath.Join(canonicalTempDir(t), "link[1]")
 	symlink(t, secret, metaLink)
+	mkdirs(t, filepath.Join(root, "real-secrets"), filepath.Join(root, "a"))
+	symlink(t, filepath.Join(root, "real-secrets"), filepath.Join(root, "a", "secrets"))
 	metaRoots := map[string]string{}
 	for _, name := range []string{"a[1]", "b{x}", "s*q"} {
 		r := filepath.Join(canonicalTempDir(t), name)
@@ -142,6 +144,7 @@ func TestApprovalBridge_PathDeniesFailClosed(t *testing.T) {
 		{"symlinked deny under a root with {", []string{"Edit(protected/**)"}, metaRoots["b{x}"], file(filepath.Join(metaRoots["b{x}"], "real", "x")), ActionDecline},
 		{"symlinked deny under a root with *", []string{"Edit(protected/**)"}, metaRoots["s*q"], file(filepath.Join(metaRoots["s*q"], "real", "x")), ActionDecline},
 		{"escaped glob character in an absolute symlinked deny", []string{`Read(` + filepath.Dir(metaLink) + `/link\[1\]/**)`}, root, file(filepath.Join(secret, "k")), ActionDecline},
+		{"symlink after a glob character, as written", []string{"Edit(*/secrets/**)"}, root, file(filepath.Join(root, "a", "secrets", "k")), ActionDecline},
 		{"any-depth deny reaches nested files", []string{"Read(*.key)"}, root, file(filepath.Join(root, "src", "deep", "a.key")), ActionDecline},
 		{"escaped non-ASCII letter in a deny", []string{"Edit(*/caf\\\u00e9/**)"}, root, file(filepath.Join(root, "src", "caf\u00e9", "a")), ActionDecline},
 		{"escaped non-ASCII letter in a deny leaves other paths", []string{"Edit(*/caf\\\u00e9/**)"}, root, file(filepath.Join(root, "src", "a.go")), ActionAllow},
@@ -223,6 +226,20 @@ func TestPathDenies_SymlinkedDenyUnderMetacharHome(t *testing.T) {
 	}
 	if got, reason := d.denies(filepath.Join(target, "id_rsa")); !got {
 		t.Errorf("denies(<symlink target>/id_rsa) = false (%s), want true", reason)
+	}
+}
+
+// TestPathDenies_ReportsCompileErrorsAtEveryFoldLevel pins that a deny one
+// fold level cannot compile (folding inverts the range "[Z-a]") is logged,
+// not silently turned into a deny of every path.
+func TestPathDenies_ReportsCompileErrorsAtEveryFoldLevel(t *testing.T) {
+	t.Parallel()
+	d, errs := compilePathDenies([]string{"Edit([Z-a]x/**)"}, "/w", "", true)
+	if len(errs) == 0 {
+		t.Errorf("compile errors = none, want the folded range reported")
+	}
+	if got, _ := d.denies("/w/src/a.go"); !got {
+		t.Errorf("denies(/w/src/a.go) = false, want true: an uncompilable deny fails closed")
 	}
 }
 

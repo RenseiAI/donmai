@@ -125,7 +125,8 @@ func compilePathDenies(patterns []string, root, home string, fold bool) (pathDen
 	if len(rules) == 0 {
 		return d, nil
 	}
-	for i, f := range foldLevels(fold) {
+	reported := map[string]bool{}
+	for _, f := range foldLevels(fold) {
 		expanded := make([]string, 0, len(rules))
 		for _, r := range rules {
 			if r.anchored {
@@ -135,8 +136,13 @@ func compilePathDenies(patterns []string, root, home string, fold bool) (pathDen
 			}
 		}
 		compiled, compileErrs := toolpolicy.CompilePaths(expanded, isPathToolName, toolpolicy.Deny, "", "")
-		if i == 0 {
-			errs = append(errs, compileErrs...)
+		// A deny that only one fold level cannot compile still denies
+		// every path; report each such failure once.
+		for _, err := range compileErrs {
+			if !reported[err.Error()] {
+				reported[err.Error()] = true
+				errs = append(errs, err)
+			}
 		}
 		d.levels = append(d.levels, foldedRules{fold: f, rules: compiled})
 	}
