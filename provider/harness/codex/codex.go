@@ -402,7 +402,19 @@ func (p *Provider) startLocked(ctx context.Context, sessionEnv map[string]string
 		go p.watchExit()
 	}
 
-	hctx, cancel := context.WithTimeout(ctx, p.opts.HandshakeTimeout)
+	// The handshake is bound by ctx and HandshakeTimeout; the smaller wins,
+	// so a caller-scoped scan (the catalog access-program probe) never holds
+	// the initialize call past its own deadline.
+	handshakeTimeout := p.opts.HandshakeTimeout
+	if handshakeTimeout <= 0 {
+		handshakeTimeout = 30 * time.Second
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		if remaining := time.Until(deadline); remaining < handshakeTimeout {
+			handshakeTimeout = remaining
+		}
+	}
+	hctx, cancel := context.WithTimeout(ctx, handshakeTimeout)
 	defer cancel()
 	initRaw, err := p.client.Request(hctx, "initialize", map[string]any{
 		"clientInfo": map[string]any{
@@ -413,7 +425,7 @@ func (p *Provider) startLocked(ctx context.Context, sessionEnv map[string]string
 		"capabilities": map[string]any{
 			"experimentalApi": true,
 		},
-	}, p.opts.HandshakeTimeout)
+	}, handshakeTimeout)
 	if err != nil {
 		return p.failStartLocked(ctx, fmt.Errorf("%w: codex initialize handshake: %v", agent.ErrProviderUnavailable, err))
 	}

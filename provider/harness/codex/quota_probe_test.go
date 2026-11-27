@@ -7,6 +7,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -18,17 +19,25 @@ import (
 // `account/rateLimits/read` call with a canned fixture-shaped result,
 // so ProbeQuota runs end to end without a real app-server.
 type quotaProbeFakeServer struct {
-	stdin  *io.PipeReader
-	stdout *io.PipeWriter
-	read   map[string]any
-	reads  atomic.Int64
+	stdin      *io.PipeReader
+	stdout     *io.PipeWriter
+	read       map[string]any
+	reads      atomic.Int64
+	initDelay  time.Duration
+	modelSteps []quotaProbeModelStep
+	modelIndex atomic.Int64
+	modelMu    sync.Mutex
+	modelReqs  []map[string]any
 }
 
-func startQuotaProbeFake(t *testing.T, read map[string]any, refuse bool) (*Provider, *atomic.Int64, func()) {
+type quotaProbeModelStep struct {
+	result map[string]any
+	rpcErr map[string]any
+	delay  time.Duration
+}
+
+func serveQuotaProbeFake(t *testing.T, fs *quotaProbeFakeServer, refuse bool) {
 	t.Helper()
-	stdinReader, stdinWriter := io.Pipe()
-	stdoutReader, stdoutWriter := io.Pipe()
-	fs := &quotaProbeFakeServer{stdin: stdinReader, stdout: stdoutWriter, read: read}
 	go func() {
 		dec := json.NewDecoder(fs.stdin)
 		for {
@@ -43,14 +52,31 @@ func startQuotaProbeFake(t *testing.T, read map[string]any, refuse bool) (*Provi
 			}
 			switch method {
 			case "initialize":
+				time.Sleep(fs.initDelay)
 				writeQuotaProbeLine(t, fs.stdout, map[string]any{"jsonrpc": "2.0", "id": idRaw, "result": map[string]any{}})
+			case "model/list":
+				pm, _ := msg["params"].(map[string]any)
+				fs.modelMu.Lock()
+				fs.modelReqs = append(fs.modelReqs, pm)
+				fs.modelMu.Unlock()
+				idx := int(fs.modelIndex.Add(1) - 1)
+				var st quotaProbeModelStep
+				if idx < len(fs.modelSteps) {
+					st = fs.modelSteps[idx]
+				}
+				time.Sleep(st.delay)
+				switch {
+				case st.rpcErr != nil:
+					writeQuotaProbeLine(t, fs.stdout, map[string]any{"jsonrpc": "2.0", "id": idRaw, "error": st.rpcErr})
+				case st.result != nil:
+					writeQuotaProbeLine(t, fs.stdout, map[string]any{"jsonrpc": "2.0", "id": idRaw, "result": st.result})
+				default:
+					writeQuotaProbeLine(t, fs.stdout, map[string]any{"jsonrpc": "2.0", "id": idRaw, "result": map[string]any{"data": []any{}}})
+				}
 			case "account/rateLimits/read":
 				fs.reads.Add(1)
 				if refuse {
-					writeQuotaProbeLine(t, fs.stdout, map[string]any{
-						"jsonrpc": "2.0", "id": idRaw,
-						"error": map[string]any{"code": -32600, "message": "authentication required to read rate limits"},
-					})
+					writeQuotaProbeLine(t, fs.stdout, map[string]any{"jsonrpc": "2.0", "id": idRaw, "error": map[string]any{"code": -32600, "message": "authentication required to read rate limits"}})
 				} else {
 					writeQuotaProbeLine(t, fs.stdout, map[string]any{"jsonrpc": "2.0", "id": idRaw, "result": fs.read})
 				}
@@ -59,6 +85,14 @@ func startQuotaProbeFake(t *testing.T, read map[string]any, refuse bool) (*Provi
 			}
 		}
 	}()
+}
+
+func startQuotaProbeFake(t *testing.T, read map[string]any, refuse bool) (*Provider, *atomic.Int64, func()) {
+	t.Helper()
+	stdinReader, stdinWriter := io.Pipe()
+	stdoutReader, stdoutWriter := io.Pipe()
+	fs := &quotaProbeFakeServer{stdin: stdinReader, stdout: stdoutWriter, read: read}
+	serveQuotaProbeFake(t, fs, refuse)
 	p, err := New(Options{
 		skipProcess:    true,
 		stdinOverride:  stdinWriter,
