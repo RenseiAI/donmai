@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -32,6 +33,10 @@ type Handle struct {
 	client   *Client
 	bridge   *ApprovalBridge
 	spec     agent.Spec
+
+	// denyNotice reports the denies Codex does not enforce as asked; it is
+	// emitted once, right after the InitEvent the event contract keeps first.
+	denyNotice *agent.SystemEvent
 
 	// Per-call request timeout for thread/start, turn/start, etc.
 	rpcTimeout time.Duration
@@ -297,13 +302,19 @@ func (h *Handle) start(ctx context.Context, plan SpawnPlan, resumeThreadID strin
 	// Subscribe BEFORE thread/start to catch the immediate
 	// thread/started notification.
 	provisionalSub := func(n notification) { h.notifyCh <- n }
+	if plan.DenyErr != nil {
+		return plan.DenyErr
+	}
+	h.denyNotice = plan.denyNotice
 
 	if resumeThreadID != "" {
 		h.client.Subscribe(resumeThreadID, provisionalSub)
 		h.idMu.Lock()
 		h.threadID = resumeThreadID
 		h.idMu.Unlock()
-		params := threadResumeParams(resumeThreadID)
+		params := threadResumeParams(resumeThreadID, denyPlan{})
+		maps.Copy(params, plan.ThreadResume)
+		params["threadId"] = resumeThreadID
 		if _, err := h.client.RequestWithRetry(ctx, "thread/resume", params, h.rpcTimeout); err != nil {
 			h.client.Unsubscribe(resumeThreadID)
 			// A rejected resume is not a fresh spawn: when the backend
@@ -492,6 +503,10 @@ func (h *Handle) handleNotification(n notification) bool {
 			return true
 		}
 		h.emit(ev)
+		if ev.Kind() == agent.EventInit && h.denyNotice != nil {
+			h.emit(*h.denyNotice)
+			h.denyNotice = nil
+		}
 	}
 	return false
 }

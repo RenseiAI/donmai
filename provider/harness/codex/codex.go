@@ -11,6 +11,7 @@ import (
 	"maps"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -81,6 +82,12 @@ type Provider struct {
 	// child actually received — see checkSessionEnvLocked.
 	pinnedSessionEnv map[string]string
 	sessionEnvPinned bool
+
+	// pinnedExecRules is the exec-policy rule file staged before the
+	// app-server started (deny_translation.go). Codex keeps the rules it
+	// loaded, so a later session asking for different rules is refused.
+	pinnedExecRules string
+	execRulesPinned bool
 
 	// pinnedGatewayBaseURL/pinnedGatewayRouted freeze the gateway route the
 	// running app-server child was started with, and gatewayRoutePinned
@@ -635,6 +642,11 @@ func (p *Provider) ensureHeadlessReady(spec agent.Spec) (agent.Spec, stagedSkill
 		return spec, stagedSkills{}, fmt.Errorf("%w: %w: codex provider already shut down", agent.ErrSpawnFailed, agent.ErrProviderUnavailable)
 	default:
 	}
+	// A deny list Codex cannot enforce is refused here, before any side effect.
+	deny, err := translateDenies(spec)
+	if err != nil {
+		return spec, stagedSkills{}, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
+	}
 	// Resolve the gateway route first: gatewayBinding is pure (no side
 	// effects) and the projected layer is what the running child actually
 	// carries, so the session-env check below must compare against it. A
@@ -699,6 +711,9 @@ func (p *Provider) ensureHeadlessReady(spec agent.Spec) (agent.Spec, stagedSkill
 	if err != nil {
 		return spec, stagedSkills{}, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
 	}
+	if err := p.stageExecPolicyRulesLocked(deny.execPolicyRules()); err != nil {
+		return spec, stagedSkills{}, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
+	}
 	if err := p.startLocked(context.Background(), spec.Env); err != nil {
 		return spec, stagedSkills{}, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
 	}
@@ -709,6 +724,34 @@ func (p *Provider) ensureHeadlessReady(spec agent.Spec) (agent.Spec, stagedSkill
 	p.pinnedGatewayRouted = gatewayRouted
 	p.gatewayRoutePinned = true
 	return spec, skills, nil
+}
+
+// stageExecPolicyRulesLocked writes the session's exec-policy rules into the
+// private CODEX_HOME/rules before the app-server starts and pins them. An
+// app-server already started without staged rules (a quota probe) is pinned
+// to none. startMu must be held.
+func (p *Provider) stageExecPolicyRulesLocked(rules string) error {
+	if !p.execRulesPinned {
+		p.execRulesPinned = true
+		if p.started {
+			p.pinnedExecRules = ""
+		} else {
+			if rules != "" {
+				dir := filepath.Join(p.config.home, "rules")
+				if err := os.MkdirAll(dir, 0o700); err != nil {
+					return fmt.Errorf("codex exec-policy rules: %w", err)
+				}
+				if err := os.WriteFile(filepath.Join(dir, codexDenyRulesFile), []byte(rules), 0o600); err != nil {
+					return fmt.Errorf("codex exec-policy rules: %w", err)
+				}
+			}
+			p.pinnedExecRules = rules
+		}
+	}
+	if rules != p.pinnedExecRules {
+		return fmt.Errorf("%w: the exec-policy rules of a started app-server cannot change", ErrDenyUntranslatable)
+	}
+	return nil
 }
 
 func (p *Provider) prepareHeadlessProtectedMCPAuthorityLocked(servers []agent.MCPServerConfig) error {

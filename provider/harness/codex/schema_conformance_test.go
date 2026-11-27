@@ -77,7 +77,23 @@ func TestCodexRequestsSatisfyVendoredSchemas(t *testing.T) {
 			}
 		}
 	}
-	validateParams(t, threadResume, "thread/resume", threadResumeParams("thread-1"))
+	validateParams(t, threadResume, "thread/resume", threadResumeParams("thread-1", denyPlan{}))
+	// A deny list adds a thread config to thread/start and thread/resume;
+	// both must still satisfy the pinned schemas.
+	denied := agent.Spec{
+		Cwd: "/tmp/w", Model: "gpt-5.6-sol", Prompt: "go",
+		PermissionConfig: &agent.PermissionConfig{DisallowPatterns: []string{"Bash"}},
+	}
+	deniedPlan := NewSpawnPlan(denied)
+	deny, err := translateDenies(denied)
+	if err != nil || deniedPlan.DenyErr != nil {
+		t.Fatalf("deny plan: %v / %v", err, deniedPlan.DenyErr)
+	}
+	if _, ok := deniedPlan.ThreadStart["config"]; !ok {
+		t.Fatalf("denied thread/start carries no config: %v", deniedPlan.ThreadStart)
+	}
+	validateParams(t, threadStart, "thread/start denied", deniedPlan.ThreadStart)
+	validateParams(t, threadResume, "thread/resume denied", threadResumeParams("thread-1", deny))
 }
 
 // TestVendoredSchemasMatchInventory pins the vendored schemas and the
