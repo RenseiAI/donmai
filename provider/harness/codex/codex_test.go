@@ -836,12 +836,14 @@ func TestHandle_StopReportsMCPReadbackCleanupFailureAndPoisonsProvider(t *testin
 		t.Fatalf("Stop error leaked config readback: %v", err)
 	}
 	events := drainEvents(t, h.Events(), time.Second)
-	if len(events) != 1 {
-		t.Fatalf("Stop events = %v, want one cleanup failure", kindsOf(events))
+	// The InitEvent comes from the thread/start response; the cleanup
+	// failure is the only event Stop adds.
+	if len(events) != 2 || events[0].Kind() != agent.EventInit {
+		t.Fatalf("Stop events = %v, want init then one cleanup failure", kindsOf(events))
 	}
-	cleanup, ok := events[0].(agent.ErrorEvent)
+	cleanup, ok := events[1].(agent.ErrorEvent)
 	if !ok || cleanup.Code != "mcp_cleanup_failed" {
-		t.Fatalf("Stop event = %#v, want observable mcp_cleanup_failed", events[0])
+		t.Fatalf("Stop event = %#v, want observable mcp_cleanup_failed", events[1])
 	}
 	if _, statErr := os.Stat(ownedHome); !os.IsNotExist(statErr) {
 		t.Fatalf("owned home survives failed clear: stat err=%v", statErr)

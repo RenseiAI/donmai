@@ -38,17 +38,16 @@ type Handle struct {
 	// emitted once, right after the InitEvent the event contract keeps first.
 	denyNotice *agent.SystemEvent
 
+	// initEmitted keeps the InitEvent single: a fresh thread emits it from
+	// the thread/start response, and a thread/started that does reach the
+	// subscription afterwards is a duplicate.
+	initEmitted atomic.Bool
+
 	// Per-call request timeout for thread/start, turn/start, etc.
 	rpcTimeout time.Duration
 
 	idMu     sync.RWMutex
 	threadID string
-
-	// settingsMu orders the effective-settings echo after the InitEvent:
-	// thread/start's response and the thread/started notification race.
-	settingsMu      sync.Mutex
-	initEmitted     bool
-	pendingSettings *agent.EffectiveSettingsEvent
 
 	events   chan agent.Event
 	notifyCh chan notification
@@ -356,8 +355,16 @@ func (h *Handle) start(ctx context.Context, plan SpawnPlan, resumeThreadID strin
 		h.threadID = resp.Thread.ID
 		h.idMu.Unlock()
 		h.client.Subscribe(resp.Thread.ID, provisionalSub)
+		// The response carries the thread id, so the InitEvent is emitted
+		// here. The real thread/started notification keys the id under
+		// params.thread, not a top-level threadId, so the client routes it
+		// to the global handler rather than this subscription; it also
+		// races the Subscribe above. Neither can be what delivers Init.
+		var initRaw map[string]any
+		_ = json.Unmarshal(raw, &initRaw)
+		h.emitInit(agent.InitEvent{SessionID: resp.Thread.ID, Raw: initRaw})
 		if settings, ok := effectiveSettings(h.spec, raw); ok {
-			h.queueSettings(settings)
+			h.emit(settings)
 		}
 		if h.spec.SessionName != "" {
 			if _, err := h.client.RequestWithRetry(ctx, "thread/name/set", map[string]any{
@@ -511,14 +518,11 @@ func (h *Handle) handleNotification(n notification) bool {
 			}
 			return true
 		}
-		h.emit(ev)
 		if ev.Kind() == agent.EventInit {
-			if h.denyNotice != nil {
-				h.emit(*h.denyNotice)
-				h.denyNotice = nil
-			}
-			h.initDone()
+			h.emitInit(ev)
+			continue
 		}
+		h.emit(ev)
 	}
 	return false
 }
@@ -762,28 +766,16 @@ func emptyToUnknown(s string) string {
 	return s
 }
 
-// queueSettings emits the effective-settings echo now if the InitEvent is
-// out, else holds it until initDone.
-func (h *Handle) queueSettings(ev agent.EffectiveSettingsEvent) {
-	h.settingsMu.Lock()
-	ready := h.initEmitted
-	if !ready {
-		h.pendingSettings = &ev
+// emitInit publishes the session's single InitEvent and, right behind it,
+// the deny notice. A later InitEvent (a thread/started after the
+// thread/start response already emitted one) is dropped.
+func (h *Handle) emitInit(ev agent.Event) {
+	if !h.initEmitted.CompareAndSwap(false, true) {
+		return
 	}
-	h.settingsMu.Unlock()
-	if ready {
-		h.emit(ev)
-	}
-}
-
-// initDone marks the InitEvent emitted and releases a held echo.
-func (h *Handle) initDone() {
-	h.settingsMu.Lock()
-	h.initEmitted = true
-	pending := h.pendingSettings
-	h.pendingSettings = nil
-	h.settingsMu.Unlock()
-	if pending != nil {
-		h.emit(*pending)
+	h.emit(ev)
+	if h.denyNotice != nil {
+		h.emit(*h.denyNotice)
+		h.denyNotice = nil
 	}
 }

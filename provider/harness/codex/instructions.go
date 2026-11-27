@@ -23,10 +23,8 @@ func translateInstructions(spec agent.Spec) agent.TranslationReport {
 	}
 	if spec.Effort != "" {
 		line := agent.TranslationLine{Instruction: agent.InstructionEffort, Requested: string(spec.Effort), Outcome: agent.TranslationUnsupported}
-		for _, key := range []string{"effort", "reasoningEffort"} {
-			if _, ok := turn[key]; ok {
-				line.Outcome, line.Native = agent.TranslationApplied, "turn/start."+key
-			}
+		if _, ok := turn["effort"]; ok {
+			line.Outcome, line.Native = agent.TranslationApplied, "turn/start.effort"
 		}
 		add(line)
 	}
@@ -41,10 +39,21 @@ func translateInstructions(spec agent.Spec) agent.TranslationReport {
 		return report
 	}
 	if in.Approvals != "" {
-		add(agent.TranslationLine{
-			Instruction: agent.InstructionApprovals, Requested: string(in.Approvals), Outcome: agent.TranslationApplied,
-			Native: "thread/start.approvalPolicy=" + resolveApprovalPolicy(spec),
-		})
+		line := agent.TranslationLine{Instruction: agent.InstructionApprovals, Requested: string(in.Approvals)}
+		switch policy := codexApproval(in.Approvals); {
+		case policy == "":
+			// An unknown mode falls back to the base policy; it is not honoured.
+			line.Outcome = agent.TranslationUnsupported
+			line.Note = "no AskForApproval value; thread/start keeps approvalPolicy=" + resolveApprovalPolicy(spec)
+		case policy == "never" && spec.PermissionConfig != nil:
+			// With never, Codex issues no approval requests, so the bridge's
+			// permission patterns are never consulted.
+			line.Outcome, line.Native = agent.TranslationApplied, "thread/start.approvalPolicy=never"
+			line.Note = "Codex issues no approval requests, so the approval bridge's permission patterns are not consulted"
+		default:
+			line.Outcome, line.Native = agent.TranslationApplied, "thread/start.approvalPolicy="+policy
+		}
+		add(line)
 	}
 	if in.PlanMode != "" && in.PlanMode != agent.PlanOff {
 		add(agent.TranslationLine{
@@ -75,8 +84,15 @@ func codexApproval(mode agent.ApprovalMode) string {
 }
 
 // effectiveSettings echoes what thread/start applied (D3): the response's
-// own model, reasoning effort, sandbox and approval policy, against what the
-// translator requested.
+// own model, sandbox and approval policy, against what the translator
+// requested.
+//
+// Effort is the exception. thread/start carries no effort parameter; a
+// requested effort rides turn/start.effort, and no response or notification
+// echoes it. The response's reasoningEffort is the thread's configured
+// default, so it is a true echo only when no effort was requested (the turn
+// then runs at that default). Otherwise the row reports the value turn/start
+// sends, with translator evidence.
 func effectiveSettings(spec agent.Spec, response json.RawMessage) (agent.EffectiveSettingsEvent, bool) {
 	var resp struct {
 		Model           string          `json:"model"`
@@ -94,9 +110,13 @@ func effectiveSettings(spec agent.Spec, response json.RawMessage) (agent.Effecti
 	var approval string
 	_ = json.Unmarshal(resp.ApprovalPolicy, &approval)
 	echo := agent.EvidenceNativeEcho
+	effort := agent.NewEffectiveSetting(agent.InstructionEffort, "", resp.ReasoningEffort, echo)
+	if sent, _ := turnStartParams("", spec, nil)["effort"].(string); sent != "" {
+		effort = agent.NewEffectiveSetting(agent.InstructionEffort, string(spec.Effort), sent, agent.EvidenceTranslator)
+	}
 	return agent.EffectiveSettingsEvent{Settings: []agent.EffectiveSetting{
 		agent.NewEffectiveSetting(agent.InstructionModel, resolveModel(spec), resp.Model, echo),
-		agent.NewEffectiveSetting(agent.InstructionEffort, string(spec.Effort), resp.ReasoningEffort, echo),
+		effort,
 		agent.NewEffectiveSetting(agent.InstructionSandbox, resolveSandboxMode(spec), codexSandboxName(sandbox.Type), echo),
 		agent.NewEffectiveSetting(agent.InstructionApprovals, resolveApprovalPolicy(spec), approval, echo),
 	}, Raw: response}, true
