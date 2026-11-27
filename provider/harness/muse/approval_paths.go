@@ -30,18 +30,43 @@ const maxSymlinkHops = 40
 // kind of deny applies.
 //
 // It fails closed against every other spelling of a denied path. Each deny is
-// anchored here as an absolute glob for every spelling of its anchor (the
-// root and home as given and as resolved, and the deny's literal directory
-// resolved). An approval path is matched both as written and as resolved on
-// disk. On a case-insensitive platform both sides are case-folded and
-// normalized. A path that cannot be resolved, holds or resolves to a control
-// character, or is relative with no root to resolve it against, is denied;
-// so is every path while a deny's own directory cannot be resolved.
+// anchored here as an absolute glob, both as written and with its literal
+// directory (everything before its first glob character, root or home
+// included) resolved on disk. An approval path is matched both as written and
+// as resolved. On a case-insensitive platform it matches at several fold
+// levels and denies when any matches (see foldLevels). A path that cannot be
+// resolved, holds or resolves to a control character, or is relative with no
+// root to resolve it against, is denied; so is every path while a deny's own
+// directory cannot be resolved.
 type pathDenies struct {
-	rules      toolpolicy.Paths
+	levels     []foldedRules
 	root       string
-	fold       bool
 	unresolved []string
+}
+
+// foldedRules are the deny rules compiled with every glob folded one way;
+// an approval path is folded the same way before it is matched.
+type foldedRules struct {
+	fold  func(string) string
+	rules toolpolicy.Paths
+}
+
+// foldLevels are the foldings a deny is matched at. Full case folding between
+// decompositions meets every spelling a case-insensitive volume equates, but
+// it changes how many characters a letter spans, so a "?" or a one-character
+// class stops matching "é", "ß" or "ﬁ". Matching also unfolded, and with the
+// simple per-letter fold, keeps those denies. Without folding, only the
+// unfolded level applies.
+func foldLevels(fold bool) []func(string) string {
+	unfolded := func(s string) string { return s }
+	if !fold {
+		return []func(string) string{unfolded}
+	}
+	return []func(string) string{
+		unfolded,
+		func(s string) string { return strings.ToLower(strings.ToUpper(s)) },
+		func(s string) string { return norm.NFD.String(cases.Fold().String(norm.NFD.String(s))) },
+	}
 }
 
 // compilePathDenies compiles the path denies among patterns with relative
@@ -54,63 +79,73 @@ func compilePathDenies(patterns []string, root, home string, fold bool) (pathDen
 	if root != "" {
 		root = filepath.Clean(root)
 	}
-	d := pathDenies{fold: fold}
-	roots := spellings(root)
-	if len(roots) > 0 {
-		d.root = roots[len(roots)-1]
-	}
-	homes := spellings(home)
+	d := pathDenies{root: root}
 
-	var expanded []string
-	var errs []error
-	add := func(name, glob string) {
-		expanded = append(expanded, name+"("+asciiSafeGlob(foldCase(glob, fold))+")")
+	// A rule is a tool name with an absolute glob to fold, or, when anchored
+	// is false, a pattern passed to toolpolicy as written.
+	type rule struct {
+		name, glob string
+		anchored   bool
 	}
+	var rules []rule
+	var errs []error
+	add := func(name, glob string) { rules = append(rules, rule{name, glob, true}) }
 	for _, raw := range patterns {
 		name, arg, scoped := toolpolicy.ParseToolPattern(strings.TrimSpace(raw))
 		if !isPathToolName(name) {
 			continue
 		}
 		if !scoped {
-			expanded = append(expanded, name)
+			rules = append(rules, rule{name: name})
 			continue
 		}
 		if filepath.Clean(arg) == "/" {
 			// A deny on the filesystem root covers every absolute path.
 			arg = "/**"
 		}
-		globs, ok := anchoredGlobs(arg, roots, homes)
+		abs, ok := anchoredGlob(arg, root, home)
 		if !ok {
 			// No root or home to anchor it at: toolpolicy rejects the
 			// pattern, which denies every path.
-			expanded = append(expanded, name+"("+arg+")")
+			rules = append(rules, rule{name: name, glob: "(" + arg + ")"})
 			continue
 		}
-		for _, abs := range globs {
-			add(name, abs)
-			canonical, ok := canonicalGlob(abs)
-			switch {
-			case !ok:
-				// The deny's own directory cannot be resolved, so nothing can
-				// be shown to lie outside it: deny every path.
-				d.unresolved = append(d.unresolved, raw)
-				errs = append(errs, fmt.Errorf("%q: directory cannot be resolved", raw))
-			case canonical != abs:
-				add(name, canonical)
-			}
+		add(name, abs)
+		canonical, ok := canonicalGlob(abs)
+		switch {
+		case !ok:
+			// The deny's own directory cannot be resolved, so nothing can be
+			// shown to lie outside it: deny every path.
+			d.unresolved = append(d.unresolved, raw)
+			errs = append(errs, fmt.Errorf("%q: directory cannot be resolved", raw))
+		case canonical != abs:
+			add(name, canonical)
 		}
 	}
-	if len(expanded) == 0 {
+	if len(rules) == 0 {
 		return d, nil
 	}
-	var compileErrs []error
-	d.rules, compileErrs = toolpolicy.CompilePaths(expanded, isPathToolName, toolpolicy.Deny, "", "")
-	return d, append(errs, compileErrs...)
+	for i, f := range foldLevels(fold) {
+		expanded := make([]string, 0, len(rules))
+		for _, r := range rules {
+			if r.anchored {
+				expanded = append(expanded, r.name+"("+asciiSafeGlob(f(r.glob))+")")
+			} else {
+				expanded = append(expanded, r.name+r.glob)
+			}
+		}
+		compiled, compileErrs := toolpolicy.CompilePaths(expanded, isPathToolName, toolpolicy.Deny, "", "")
+		if i == 0 {
+			errs = append(errs, compileErrs...)
+		}
+		d.levels = append(d.levels, foldedRules{fold: f, rules: compiled})
+	}
+	return d, errs
 }
 
 // active reports whether any path deny is configured.
 func (d pathDenies) active() bool {
-	return d.rules.Len() > 0
+	return len(d.levels) > 0 && d.levels[0].rules.Len() > 0
 }
 
 // denies reports whether a file access to path is denied, with the reason.
@@ -138,53 +173,34 @@ func (d pathDenies) denies(path string) (bool, string) {
 		return true, "path holds or resolves to a control character"
 	}
 	for _, form := range []string{filepath.Clean(path), physical} {
-		if d.rules.Match(foldCase(form, d.fold), "") {
-			return true, "path matches a disallow pattern"
+		for _, l := range d.levels {
+			if l.rules.Match(l.fold(form), "") {
+				return true, "path matches a disallow pattern"
+			}
 		}
 	}
 	return false, ""
 }
 
-// spellings returns dir as given and, when it differs, as resolved on disk;
-// the resolved spelling is last. An empty dir has none.
-func spellings(dir string) []string {
-	if dir == "" {
-		return nil
-	}
-	out := []string{dir}
-	if resolved, err := resolvePhysical(dir, 0); err == nil && resolved != dir {
-		out = append(out, resolved)
-	}
-	return out
-}
-
-// anchoredGlobs returns the absolute globs a path-deny argument names, one
-// for each spelling of the root or home it is anchored at, mirroring
-// toolpolicy's anchoring: a relative deny without a "/" matches at any depth
-// under the root. It reports false when there is no root or home to anchor
-// the argument at, or the argument names another user's home.
-func anchoredGlobs(arg string, roots, homes []string) ([]string, bool) {
-	var bases []string
-	var tail string
+// anchoredGlob returns the absolute glob a path-deny argument names,
+// mirroring toolpolicy's anchoring: a relative deny without a "/" matches at
+// any depth under the root. It reports false when there is no root or home to
+// anchor the argument at, or the argument names another user's home.
+func anchoredGlob(arg, root, home string) (string, bool) {
 	switch {
 	case arg == "~" || strings.HasPrefix(arg, "~/"):
-		bases, tail = homes, arg[1:]
+		return escapeGlob(home) + arg[1:], home != ""
 	case strings.HasPrefix(arg, "//"):
-		return []string{arg[1:]}, true
+		return arg[1:], true
 	case strings.HasPrefix(arg, "/"):
-		return []string{arg}, true
+		return arg, true
 	case strings.HasPrefix(arg, "~"):
-		return nil, false
+		return "", false
 	case !strings.Contains(arg, "/"):
-		bases, tail = roots, "/**/"+arg
+		return escapeGlob(root) + "/**/" + arg, root != ""
 	default:
-		bases, tail = roots, "/"+arg
+		return escapeGlob(root) + "/" + arg, root != ""
 	}
-	out := make([]string, 0, len(bases))
-	for _, b := range bases {
-		out = append(out, escapeGlob(b)+tail)
-	}
-	return out, len(out) > 0
 }
 
 // asciiSafeGlob replaces every non-ASCII letter of an absolute glob with a
@@ -230,18 +246,20 @@ func asciiSafeGlob(glob string) string {
 	return b.String()
 }
 
-// canonicalGlob resolves the literal directory an absolute glob starts with,
-// so a deny naming a symlink also covers the directory it points to. It
+// canonicalGlob resolves the literal directory an absolute glob starts with
+// (everything before its first unescaped glob character), so a deny whose
+// literal directory passes through a symlink also covers the directory it
+// points to. A symlink after the first glob character is not resolved. It
 // reports false when that directory cannot be resolved.
 func canonicalGlob(glob string) (string, bool) {
 	literal := glob
-	if i := strings.IndexAny(glob, `*?[{\`); i >= 0 {
+	if i := firstUnescapedMeta(glob); i >= 0 {
 		literal = glob[:strings.LastIndexByte(glob[:i], '/')+1]
 	}
 	if literal == "" || literal == "/" {
 		return glob, true
 	}
-	resolved, err := resolvePhysical(literal, 0)
+	resolved, err := resolvePhysical(unescapeGlob(literal), 0)
 	if err != nil {
 		return "", false
 	}
@@ -250,6 +268,32 @@ func canonicalGlob(glob string) (string, bool) {
 		tail = "/" + tail
 	}
 	return escapeGlob(resolved) + tail, true
+}
+
+// firstUnescapedMeta returns the index of the first glob character a
+// backslash does not escape, or -1.
+func firstUnescapedMeta(glob string) int {
+	for i := 0; i < len(glob); i++ {
+		switch glob[i] {
+		case '\\':
+			i++
+		case '*', '?', '[', '{':
+			return i
+		}
+	}
+	return -1
+}
+
+// unescapeGlob drops the backslashes that make glob characters literal.
+func unescapeGlob(glob string) string {
+	var b strings.Builder
+	for i := 0; i < len(glob); i++ {
+		if glob[i] == '\\' && i+1 < len(glob) {
+			i++
+		}
+		b.WriteByte(glob[i])
+	}
+	return b.String()
 }
 
 // resolvePhysical resolves every symlink in path the way the kernel would,
@@ -302,15 +346,4 @@ func escapeGlob(dir string) string {
 		b.WriteRune(r)
 	}
 	return b.String()
-}
-
-// foldCase applies full Unicode case folding between decompositions, the
-// way a case- and normalization-insensitive volume compares names: "ß" and
-// "ẞ" fold to "ss", "ﬂ" to "fl", the long s to "s", and composed and
-// decomposed accents meet.
-func foldCase(s string, fold bool) string {
-	if fold {
-		return norm.NFD.String(cases.Fold().String(norm.NFD.String(s)))
-	}
-	return s
 }

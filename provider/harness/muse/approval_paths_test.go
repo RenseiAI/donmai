@@ -107,6 +107,13 @@ func TestApprovalBridge_PathDeniesFailClosed(t *testing.T) {
 	symlink(t, secret, secretLink)
 	metaLink := filepath.Join(canonicalTempDir(t), "link[1]")
 	symlink(t, secret, metaLink)
+	metaRoots := map[string]string{}
+	for _, name := range []string{"a[1]", "b{x}", "s*q"} {
+		r := filepath.Join(canonicalTempDir(t), name)
+		mkdirs(t, filepath.Join(r, "real"))
+		symlink(t, filepath.Join(r, "real"), filepath.Join(r, "protected"))
+		metaRoots[name] = r
+	}
 
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -131,6 +138,20 @@ func TestApprovalBridge_PathDeniesFailClosed(t *testing.T) {
 		{"symlinked root anchor, canonical path", edit, secretLink, file(filepath.Join(secret, "docs", "a.md")), ActionDecline},
 		{"symlinked root anchor, any-depth deny", []string{"Read(*.key)"}, secretLink, file(filepath.Join(secret, "a.key")), ActionDecline},
 		{"symlinked root with a glob character in its name", []string{"Read(*.key)"}, metaLink, file(filepath.Join(secret, "a.key")), ActionDecline},
+		{"symlinked deny under a root with [", []string{"Edit(protected/**)"}, metaRoots["a[1]"], file(filepath.Join(metaRoots["a[1]"], "real", "x")), ActionDecline},
+		{"symlinked deny under a root with {", []string{"Edit(protected/**)"}, metaRoots["b{x}"], file(filepath.Join(metaRoots["b{x}"], "real", "x")), ActionDecline},
+		{"symlinked deny under a root with *", []string{"Edit(protected/**)"}, metaRoots["s*q"], file(filepath.Join(metaRoots["s*q"], "real", "x")), ActionDecline},
+		{"escaped glob character in an absolute symlinked deny", []string{`Read(` + filepath.Dir(metaLink) + `/link\[1\]/**)`}, root, file(filepath.Join(secret, "k")), ActionDecline},
+		{"any-depth deny reaches nested files", []string{"Read(*.key)"}, root, file(filepath.Join(root, "src", "deep", "a.key")), ActionDecline},
+		{"escaped non-ASCII letter in a deny", []string{"Edit(*/caf\\\u00e9/**)"}, root, file(filepath.Join(root, "src", "caf\u00e9", "a")), ActionDecline},
+		{"escaped non-ASCII letter in a deny leaves other paths", []string{"Edit(*/caf\\\u00e9/**)"}, root, file(filepath.Join(root, "src", "a.go")), ActionAllow},
+		{"wildcard against a precomposed letter", []string{"Edit(caf?/**)"}, root, file(filepath.Join(root, "caf\u00e9", "a")), ActionDecline},
+		{"wildcard against sharp s", []string{"Edit(stra?e/**)"}, root, file(filepath.Join(root, "stra\u00dfe", "a")), ActionDecline},
+		{"wildcard against a ligature", []string{"Edit(?le/**)"}, root, file(filepath.Join(root, "\ufb01le", "a")), ActionDecline},
+		{"negated class against a precomposed letter", []string{"Edit([!a]bc/**)"}, root, file(filepath.Join(root, "\u00e9bc", "x")), ActionDecline},
+		{"wildcard against an upper-case precomposed letter on macOS", []string{"Edit(caf?/**)"}, root, file(filepath.Join(root, "CAF\u00c9", "a")), caseInsensitive},
+		{"class with an expanding letter on macOS", []string{"Edit([\u00dfa]x/**)"}, root, file(filepath.Join(root, "SSX", "a")), caseInsensitive},
+		{"negated class against an upper-case letter", []string{"Edit([!a]bc/**)"}, root, file(filepath.Join(root, "Abc", "x")), ActionDecline},
 		{"dangling symlink a write would create in a denied tree", edit, root, file(filepath.Join(root, "dangling")), ActionDecline},
 		{"dot-dot into a denied tree", edit, root, file(root + "/src/../docs/a.md"), ActionDecline},
 		{"relative dot-dot into a denied tree", edit, root, file("src/../docs/a.md"), ActionDecline},
@@ -185,6 +206,23 @@ func TestApprovalBridge_UnresolvableDenyDirectory(t *testing.T) {
 	got := bridge.Evaluate(ApprovalRequest{Kind: ApprovalKindFileAccess, Path: filepath.Join(root, "src", "a.go")})
 	if got.Action != ActionDecline || !strings.Contains(got.Reason, "cannot be resolved") {
 		t.Errorf("file access with an unresolvable deny directory = %s (%s), want decline naming the unresolvable deny", got.Action, got.Reason)
+	}
+}
+
+// TestPathDenies_SymlinkedDenyUnderMetacharHome pins that "~/" denies
+// resolve a symlink beneath a home whose name holds a glob character.
+func TestPathDenies_SymlinkedDenyUnderMetacharHome(t *testing.T) {
+	t.Parallel()
+	home := filepath.Join(canonicalTempDir(t), "h[1]")
+	target := filepath.Join(canonicalTempDir(t), "ssh-real")
+	mkdirs(t, home, target)
+	symlink(t, target, filepath.Join(home, ".ssh"))
+	d, errs := compilePathDenies([]string{"Read(~/.ssh/**)"}, "/w", home, foldPathCase)
+	if len(errs) > 0 {
+		t.Fatalf("compile errors: %v", errs)
+	}
+	if got, reason := d.denies(filepath.Join(target, "id_rsa")); !got {
+		t.Errorf("denies(<symlink target>/id_rsa) = false (%s), want true", reason)
 	}
 }
 
