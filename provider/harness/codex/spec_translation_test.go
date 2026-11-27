@@ -58,9 +58,6 @@ func TestSpecFieldCoverage(t *testing.T) {
 	// coverage check works regardless of input.
 	ignoredFields := []string{
 		"toolLifecycleProfileID", // process-only selection consumed before provider translation
-		// Instructions (the interaction contract's normalized intents) are
-		// not yet translated by this adapter; its translator lands next.
-		"Instructions",
 		// SessionName is consumed by the spawn lifecycle rather than encoded in
 		// thread/start: fresh headless sessions issue thread/name/set after the
 		// thread id exists and before turn/start; named interactive sessions use
