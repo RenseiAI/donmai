@@ -169,6 +169,35 @@ func resolveHostSessionAuthFile() (string, error) {
 	return filepath.Join(codexHome, codexAuthFileName), nil
 }
 
+// explicitHostSessionAuthFile resolves an explicit source home's auth.json
+// without consulting the default host home. The result must still be
+// projected through linkHostSessionAuth so mode, inode and symlink checks
+// apply. It carries no credential bytes and never names the default home.
+func explicitHostSessionAuthFile(sourceHome string) (string, error) {
+	if !filepath.IsAbs(sourceHome) {
+		return "", errors.New("explicit Codex source home must be absolute")
+	}
+	// Filesystem-resolve the source directory before joining auth.json.
+	// Cleaning first would drop a symlink component and ".." before
+	// the kernel resolves them (for example a "current" symlink inside
+	// "/profiles" pointing elsewhere), selecting a different home's
+	// credential when both homes hold valid auth files. EvalSymlinks
+	// follows the same resolution the kernel applies, so the probe
+	// projects exactly the selected login. Only the directory is
+	// resolved: the auth.json name itself stays lexical so a symlinked
+	// credential file still reaches linkHostSessionAuth as a symlink and
+	// is rejected there.
+	resolvedDir, err := filepath.EvalSymlinks(sourceHome)
+	if err != nil {
+		return "", fmt.Errorf("resolve explicit Codex source home: %w", err)
+	}
+	resolvedDir = filepath.Clean(resolvedDir)
+	if !filepath.IsAbs(resolvedDir) {
+		return "", errors.New("explicit Codex source home must be absolute")
+	}
+	return filepath.Join(resolvedDir, codexAuthFileName), nil
+}
+
 // linkHostSessionAuth projects exactly the host login into the private Codex
 // home. A hard link is deliberate: unlike a copy it keeps refresh-token writes
 // coherent, and unlike reusing the host CODEX_HOME it does not expose ambient

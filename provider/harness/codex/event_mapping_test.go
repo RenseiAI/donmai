@@ -325,8 +325,8 @@ func TestMapItem_ReasoningStarted_Dropped(t *testing.T) {
 	}
 }
 
-// Chain guard: a COMPLETED reasoning item must map to
-// SystemEvent{Subtype: "reasoning"}, and the shared activity poster must
+// Chain guard: a COMPLETED reasoning item must map to a typed
+// ReasoningEvent, and the shared activity poster must
 // forward exactly that event as a type=thought payload. Companion to
 // TestMapNotification_ReasoningDelta_StreamProgress above, which pins that
 // per-token deltas carry no content (the content-free stream-progress
@@ -345,15 +345,12 @@ func TestMapItem_ReasoningCompleted_PostsThoughtActivity(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("expected 1 event, got %d", len(got))
 	}
-	se, ok := got[0].(agent.SystemEvent)
+	se, ok := got[0].(agent.ReasoningEvent)
 	if !ok {
-		t.Fatalf("expected SystemEvent, got %T", got[0])
+		t.Fatalf("expected ReasoningEvent, got %T", got[0])
 	}
-	if se.Subtype != "reasoning" {
-		t.Fatalf("expected subtype=reasoning, got %q", se.Subtype)
-	}
-	if se.Message != "inspecting the failing test first" {
-		t.Fatalf("unexpected message: %q", se.Message)
+	if se.Summary != "inspecting the failing test first" || se.ItemID != "r-1" {
+		t.Fatalf("unexpected reasoning: %#v", se)
 	}
 
 	// Second hop: push the mapped event through a real activity poster and
@@ -551,6 +548,34 @@ func TestMapItem_CommandExecutionStartedAndCompleted(t *testing.T) {
 	}
 	if tr.Content != "clean\n" {
 		t.Fatalf("expected content=clean, got %q", tr.Content)
+	}
+}
+
+// TestMapItem_CommandExecutionCompletedRealSchema pins the completed
+// commandExecution payload as the Codex app-server sends it: the output
+// lives in aggregatedOutput (there is no "text" field), with ANSI colour
+// codes intact. Since output deltas became text-less progress ticks, this
+// completion is the only place command output reaches the activity stream.
+func TestMapItem_CommandExecutionCompletedRealSchema(t *testing.T) {
+	t.Parallel()
+	params := json.RawMessage(`{"threadId":"thr","turnId":"turn","item":{` +
+		`"type":"commandExecution","id":"call_1","command":"/bin/zsh -lc 'go test ./pkg'",` +
+		`"cwd":"/work","processId":"4242","status":"completed",` +
+		`"commandActions":[{"type":"unknown","command":"go test ./pkg"}],` +
+		`"aggregatedOutput":"\u001b[32mok\u001b[0m  \tpkg\t1.2s\n","exitCode":0,"durationMs":1200}}`)
+	got := mapNotification("item/completed", params, &mapperState{}, nil)
+	if len(got) != 1 {
+		t.Fatalf("events = %+v", got)
+	}
+	tr, ok := got[0].(agent.ToolResultEvent)
+	if !ok {
+		t.Fatalf("expected ToolResultEvent, got %T", got[0])
+	}
+	if tr.ToolName != "shell" || tr.ToolUseID != "call_1" || tr.IsError {
+		t.Fatalf("result = %+v", tr)
+	}
+	if tr.Content != "ok  \tpkg\t1.2s\n" {
+		t.Fatalf("content = %q, want ANSI-stripped aggregatedOutput", tr.Content)
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/RenseiAI/donmai/agent"
 )
@@ -95,6 +96,89 @@ func mapTokenUsageUpdated(params json.RawMessage, state *mapperState, raw any) [
 	return append(events, notice)
 }
 
+// safetyBufferingSummaryInterval caps how often a still-buffering turn
+// re-announces itself. Consecutive model/safetyBuffering/updated
+// notifications arrive per moderated chunk (dozens per second on
+// security-heavy content); without collapsing, each becomes its own
+// session-stream row. The first chunk emits a started event, chunks in
+// between stay silent unless buffering runs past this interval (then one
+// periodic summary), and the turn boundary emits the ended event with the
+// chunk count and buffering duration.
+const safetyBufferingSummaryInterval = 10 * time.Second
+
+// Subtypes for the collapsed safety-buffering pair. The periodic summary
+// reuses the historical codex_safety_buffering subtype so existing
+// consumers keep seeing the in-progress signal; started/ended are new.
+const (
+	subtypeSafetyBufferingStarted = "codex_safety_buffering_started"
+	subtypeSafetyBufferingEnded   = "codex_safety_buffering_ended"
+)
+
+// safetyBufferingEpisode collapses one turn's run of
+// model/safetyBuffering/updated notifications into a started/ended pair.
+type safetyBufferingEpisode struct {
+	chunks   int
+	start    time.Time
+	lastEmit time.Time
+	model    string
+	reasons  string
+}
+
+// clock reports the mapper's wall-clock time. Tests inject a fake clock;
+// production leaves now nil and reads time.Now.
+func (s *mapperState) clock() time.Time {
+	if s != nil && s.now != nil {
+		return s.now()
+	}
+	return time.Now()
+}
+
+// mapSafetyBuffering collapses consecutive model/safetyBuffering/updated
+// notifications for one turn into a started/ended pair. The first chunk
+// emits the started event; later chunks stay silent unless buffering runs
+// past safetyBufferingSummaryInterval (then one periodic summary, at most
+// one per interval); the turn boundary (flushSafetyBuffering) emits the
+// ended event carrying chunks=<n> and duration_ms. Moderation results and
+// refusals bypass this path untouched.
+func mapSafetyBuffering(params json.RawMessage, state *mapperState, raw any) []agent.Event {
+	var p struct {
+		Model   string   `json:"model"`
+		Reasons []string `json:"reasons"`
+	}
+	if json.Unmarshal(params, &p) != nil {
+		return nil
+	}
+	now := state.clock()
+	if state.safetyBuffering == nil {
+		reasons := strings.Join(p.Reasons, ", ")
+		state.safetyBuffering = &safetyBufferingEpisode{chunks: 1, start: now, lastEmit: now, model: p.Model, reasons: reasons}
+		return []agent.Event{agent.SystemEvent{Subtype: subtypeSafetyBufferingStarted, Message: "Codex safety buffering started for " + p.Model + ": " + reasons, Raw: raw}}
+	}
+	ep := state.safetyBuffering
+	ep.chunks++
+	if now.Sub(ep.lastEmit) >= safetyBufferingSummaryInterval {
+		ep.lastEmit = now
+		return []agent.Event{agent.SystemEvent{Subtype: "codex_safety_buffering", Message: fmt.Sprintf("Codex safety buffering for %s: %s (%d chunks so far)", ep.model, ep.reasons, ep.chunks), Raw: raw}}
+	}
+	return nil
+}
+
+// flushSafetyBuffering ends the turn's buffering episode, if any, with an
+// ended event carrying the chunk count and buffering duration. Called on
+// turn boundaries; a turn with no buffering emits nothing.
+func flushSafetyBuffering(state *mapperState, raw any) []agent.Event {
+	ep := state.safetyBuffering
+	if ep == nil {
+		return nil
+	}
+	state.safetyBuffering = nil
+	durationMs := state.clock().Sub(ep.start).Milliseconds()
+	if durationMs < 0 {
+		durationMs = 0
+	}
+	return []agent.Event{agent.SystemEvent{Subtype: subtypeSafetyBufferingEnded, Message: fmt.Sprintf("Codex safety buffering ended for %s: chunks=%d duration_ms=%d", ep.model, ep.chunks, durationMs), Raw: raw}}
+}
+
 func mapWarning(method string, params json.RawMessage, state *mapperState, raw any) []agent.Event {
 	var p struct {
 		From     string          `json:"fromModel"`
@@ -123,8 +207,8 @@ func mapWarning(method string, params json.RawMessage, state *mapperState, raw a
 			return nil
 		}
 		subtype, message = "codex_moderation", "Codex moderation blocked: "+strings.Join(blocked, ", ")
-	case "model/safetyBuffering/updated":
-		subtype, message = "codex_safety_buffering", "Codex safety buffering for "+p.Model+": "+strings.Join(p.Reasons, ", ")
+	default:
+		return nil
 	}
 	return []agent.Event{agent.SystemEvent{Subtype: subtype, Message: message, Raw: raw}}
 }
@@ -175,7 +259,7 @@ func finishReasoning(state *mapperState, id string, raw any) []agent.Event {
 	if strings.TrimSpace(text) == "" {
 		return nil
 	}
-	return []agent.Event{agent.SystemEvent{Subtype: "reasoning", Message: text, Raw: raw}}
+	return []agent.Event{agent.ReasoningEvent{ItemID: id, Summary: b.summary.String(), Text: b.text.String(), Raw: raw}}
 }
 
 func flushReasoning(state *mapperState, raw any) []agent.Event {

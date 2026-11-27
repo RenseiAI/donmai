@@ -343,19 +343,30 @@ func TestFailStatic_PlatformUnreachableWithinTTL_ClaimSucceedsFromCache(t *testi
 func TestFailStatic_TTLExpired_ClaimRefusesTyped(t *testing.T) {
 	t.Parallel()
 	pub, priv := mustGenerateTestKey(t)
-	compiledAt := time.Now().Add(-time.Hour) // already old at fetch time
-	srv := newSnapshotTestServer(t, func() []byte {
-		return buildSnapshotResponse(t, priv, snapshotFixture{
+	// Fixed wall instant, read through an injected clock: the snapshot is
+	// expired because now-compiledAt (one hour) exceeds RefuseAfter (one
+	// minute) by construction, never because a wall-clock sleep or fetch
+	// latency happened to land on one side of the bound.
+	compiledAt := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+	now := compiledAt.Add(time.Hour)
+	var hits atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(buildSnapshotResponse(t, priv, snapshotFixture{
 			poolID: "pool-expired", poolStatus: "active", grantedByProfile: true,
 			hostID: "worker-local", hostStatus: "ready", harnessID: "codex",
 			compiledAt: compiledAt,
-		})
-	})
+		}))
+	}))
+	t.Cleanup(srv.Close)
+	stateDir := t.TempDir()
 	client, err := rulesetsnapshot.NewClient(rulesetsnapshot.Config{
 		Endpoint: srv.URL, TrustedKeys: map[string]ed25519.PublicKey{"ksk_test": pub},
-		StatePath:     filepath.Join(t.TempDir(), "snap.json"),
+		StatePath:     filepath.Join(stateDir, "snap.json"),
 		DegradedAfter: 10 * time.Second,
-		RefuseAfter:   time.Minute, // compiledAt is already an hour old
+		RefuseAfter:   time.Minute, // now is already an hour past compiledAt
+		Now:           func() time.Time { return now },
 	})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
@@ -363,6 +374,7 @@ func TestFailStatic_TTLExpired_ClaimRefusesTyped(t *testing.T) {
 	if err := client.Refresh(context.Background()); err != nil {
 		t.Fatalf("Refresh: %v", err)
 	}
+	hits.Store(0)
 
 	d := startSnapshotClaimGateDaemon(t, &stubPreflightOnlyProvider{}, client)
 	admission, cell := snapshotBoundAdmission(t, "pool-expired")
@@ -376,6 +388,20 @@ func TestFailStatic_TTLExpired_ClaimRefusesTyped(t *testing.T) {
 	if !errors.As(err, &expired) {
 		t.Fatalf("error = %v, want an *rulesetsnapshot.ExpiredError in its chain", err)
 	}
+
+	// The refusal kicks one shared background refresh whose persist writes
+	// beside StatePath. Drain it before returning: otherwise the persist
+	// can land mid-way through t.TempDir cleanup and fail the test with
+	// "directory not empty" — the flake this test exhibited under parallel
+	// load, where the kicked goroutine was still in flight at cleanup time.
+	deadline := time.Now().Add(5 * time.Second)
+	for hits.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("expired refusal did not start a background fetch")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	drainSnapshotBackgroundIO(t, stateDir, &hits)
 }
 
 // TestFailStatic_TamperedSnapshotNeverAdopted proves the fourth acceptance

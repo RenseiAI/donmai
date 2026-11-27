@@ -493,6 +493,46 @@ func TestEventMappingTable(t *testing.T) {
 		hasOutput   bool
 	}{
 		{
+			name:        "Reasoning v2 -> thought from summary",
+			event:       agent.ReasoningEvent{ItemID: "r1", Summary: "checking the schema", Text: "long"},
+			wantSent:    true,
+			wantType:    "thought",
+			wantContent: "checking the schema",
+		},
+		{
+			name:        "Plan v2 -> context marker with summary",
+			event:       agent.PlanEvent{Steps: []agent.PlanStep{{Text: "read", Status: agent.PlanStepCompleted}, {Text: "edit", Status: agent.PlanStepInProgress}}},
+			wantSent:    true,
+			wantType:    "context",
+			wantContent: "Plan 1/2 · edit",
+			wantContext: "plan=Plan 1/2 · edit",
+		},
+		{
+			name:        "Notice v2 blocked -> warning",
+			event:       agent.NoticeEvent{Severity: agent.NoticeBlocked, Text: "moderation blocked: prompt/x"},
+			wantSent:    true,
+			wantType:    "warning",
+			wantContent: "moderation blocked",
+		},
+		{
+			name:        "Interactive request v2 -> context marker",
+			event:       agent.InteractiveRequestEvent{RequestID: "q1", RequestKind: agent.RequestApproval, Prompt: "Run rm?"},
+			wantSent:    true,
+			wantType:    "context",
+			wantContent: "Waiting for approval: Run rm?",
+			wantContext: "interactiveRequest=q1",
+		},
+		{
+			name:     "FileChange v2 -> no row (its tool result carries it)",
+			event:    agent.FileChangeEvent{Files: []agent.FileChange{{Path: "a.go", Change: agent.FileUpdated}}},
+			wantSent: false,
+		},
+		{
+			name:     "Turn v2 -> no row",
+			event:    agent.TurnEvent{Phase: agent.TurnStarted},
+			wantSent: false,
+		},
+		{
 			name:        "AssistantText -> thought",
 			event:       agent.AssistantTextEvent{Text: "thinking out loud"},
 			wantSent:    true,

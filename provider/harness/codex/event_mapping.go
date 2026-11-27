@@ -39,6 +39,14 @@ type mapperState struct {
 	usageTotal    *codexTokenUsage
 	usageThisTurn bool
 	reasoning     map[string]*reasoningBuffer
+	// safetyBuffering is the in-progress per-turn buffering episode.
+	// Consecutive model/safetyBuffering/updated notifications collapse
+	// into one started event plus one ended event (flushed on the turn
+	// boundary) instead of one session-stream row per moderated chunk.
+	safetyBuffering *safetyBufferingEpisode
+	// now overrides the wall clock for buffering durations; nil reads
+	// time.Now. Tests inject a fake clock.
+	now func() time.Time
 }
 
 // mapNotification translates one inbound JSON-RPC notification into
@@ -108,14 +116,18 @@ func mapNotification(method string, params json.RawMessage, state *mapperState, 
 		state.usageThisTurn = false
 		state.turnCount++
 		state.turnStarted = time.Now()
-		return []agent.Event{agent.SystemEvent{
+		// A previous turn's buffering episode never closed by its own
+		// turn/completed ends here so the next turn starts clean.
+		ended := flushSafetyBuffering(state, raw)
+		return append(ended, agent.Event(agent.SystemEvent{
 			Subtype: "turn_started",
 			Message: fmt.Sprintf("Turn %d started", state.turnCount),
 			Raw:     raw,
-		}}
+		}))
 
 	case "turn/completed":
 		events := flushReasoning(state, raw)
+		events = append(events, flushSafetyBuffering(state, raw)...)
 		return append(events, mapTurnCompleted(params, state, raw)...)
 
 	// The account rate-limit notification carries the same snapshot
@@ -173,20 +185,13 @@ func mapNotification(method string, params json.RawMessage, state *mapperState, 
 		return []agent.Event{agent.StreamProgressEvent()}
 
 	case "item/commandExecution/outputDelta":
+		// Output deltas are liveness for the running command, keyed by its
+		// item id; the final output arrives on item/completed.
 		var p struct {
-			Delta  string `json:"delta"`
-			Output string `json:"output"`
+			ItemID string `json:"itemId"`
 		}
 		_ = json.Unmarshal(params, &p)
-		text := p.Delta
-		if text == "" {
-			text = p.Output
-		}
-		return []agent.Event{agent.SystemEvent{
-			Subtype: "command_progress",
-			Message: stripANSI(text),
-			Raw:     raw,
-		}}
+		return []agent.Event{agent.ToolProgressEvent{ToolName: "shell", ItemID: p.ItemID, Raw: raw}}
 
 	// ─── Diff / plan ──────────────────────────────────────────────
 	case "turn/diff/updated":
@@ -197,39 +202,35 @@ func mapNotification(method string, params json.RawMessage, state *mapperState, 
 		return []agent.Event{agent.SystemEvent{Subtype: "diff_updated", Message: p.Diff, Raw: raw}}
 
 	case "turn/plan/updated":
-		var p struct {
-			Plan json.RawMessage `json:"plan"`
-		}
-		_ = json.Unmarshal(params, &p)
-		return []agent.Event{agent.SystemEvent{Subtype: "plan_updated", Message: string(p.Plan), Raw: raw}}
+		return mapPlanUpdated(params, raw)
 
 	case "error", "warning":
 		return mapDiagnostic(method, params)
 	case "thread/tokenUsage/updated":
 		return mapTokenUsageUpdated(params, state, raw)
-	case "model/rerouted", "turn/moderationMetadata", "model/safetyBuffering/updated":
+	case "model/rerouted", "turn/moderationMetadata":
 		return mapWarning(method, params, state, raw)
+	case "model/safetyBuffering/updated":
+		return mapSafetyBuffering(params, state, raw)
 	case "thread/compacted":
 		return []agent.Event{agent.ContextUsageEvent{Harness: "codex", Source: "app-server", NoticeKind: agent.ContextUsageCompaction, Raw: raw}}
 	case "item/reasoning/textDelta", "item/reasoning/summaryTextDelta", "item/reasoning/summaryPartAdded":
 		bufferReasoning(method, params, state)
 		return []agent.Event{agent.StreamProgressEvent()}
 	case "item/fileChange/outputDelta", "item/fileChange/patchUpdated", "item/plan/delta":
+		// Patch and plan deltas are progress on their item, never rows; the
+		// completed item carries the content.
 		var p struct {
-			Delta   string          `json:"delta"`
-			Changes json.RawMessage `json:"changes"`
+			ItemID string `json:"itemId"`
 		}
 		if json.Unmarshal(params, &p) != nil {
 			return nil
 		}
-		text := stripANSI(p.Delta)
-		if method == "item/fileChange/patchUpdated" {
-			text = string(p.Changes)
+		tool := "file_change"
+		if method == "item/plan/delta" {
+			tool = "plan"
 		}
-		if text == "" {
-			return nil
-		}
-		return []agent.Event{agent.SystemEvent{Subtype: "codex_progress", Message: text, Raw: raw}}
+		return []agent.Event{agent.ToolProgressEvent{ToolName: tool, ItemID: p.ItemID, Raw: raw}}
 	default:
 		countIgnored(state, method)
 		slog.Debug("Unrecognized Codex notification", "method", method)
@@ -412,18 +413,22 @@ func mapRateLimitsUpdated(params json.RawMessage, state *mapperState, raw any) [
 func mapItem(method string, params json.RawMessage, raw any, states ...*mapperState) []agent.Event {
 	var p struct {
 		Item struct {
-			ID       string          `json:"id"`
-			Type     string          `json:"type"`
-			Text     string          `json:"text"`
-			Summary  json.RawMessage `json:"summary"`
-			Content  json.RawMessage `json:"content"`
-			Command  string          `json:"command"`
-			Status   string          `json:"status"`
-			ExitCode *int            `json:"exitCode"`
-			Server   string          `json:"server"`
-			Tool     string          `json:"tool"`
-			Args     json.RawMessage `json:"arguments"`
-			Result   struct {
+			ID      string          `json:"id"`
+			Type    string          `json:"type"`
+			Text    string          `json:"text"`
+			Summary json.RawMessage `json:"summary"`
+			Content json.RawMessage `json:"content"`
+			Command string          `json:"command"`
+			// AggregatedOutput is the commandExecution item's captured
+			// stdout+stderr (nullable in the app-server schema). Command
+			// items carry no "text" field; Text is only a legacy fallback.
+			AggregatedOutput string          `json:"aggregatedOutput"`
+			Status           string          `json:"status"`
+			ExitCode         *int            `json:"exitCode"`
+			Server           string          `json:"server"`
+			Tool             string          `json:"tool"`
+			Args             json.RawMessage `json:"arguments"`
+			Result           struct {
 				Content json.RawMessage `json:"content"`
 			} `json:"result"`
 			Error struct {
@@ -461,10 +466,7 @@ func mapItem(method string, params json.RawMessage, raw any, states ...*mapperSt
 		// a partial summary) for every reasoning item.
 		if isCompleted {
 			if msg := reasoningText(p.Item.Summary); msg != "" || reasoningText(p.Item.Content) != "" {
-				if msg == "" {
-					msg = reasoningText(p.Item.Content)
-				}
-				return []agent.Event{agent.SystemEvent{Subtype: "reasoning", Message: msg, Raw: raw}}
+				return []agent.Event{agent.ReasoningEvent{ItemID: p.Item.ID, Summary: msg, Text: reasoningText(p.Item.Content), Raw: raw}}
 			}
 		}
 		return nil
@@ -483,7 +485,7 @@ func mapItem(method string, params json.RawMessage, raw any, states ...*mapperSt
 			return []agent.Event{agent.ToolResultEvent{
 				ToolName:  "shell",
 				ToolUseID: p.Item.ID,
-				Content:   stripANSI(p.Item.Text),
+				Content:   stripANSI(commandOutput(p.Item.AggregatedOutput, p.Item.Text)),
 				IsError:   isError,
 				Raw:       raw,
 			}}
@@ -533,10 +535,18 @@ func mapItem(method string, params json.RawMessage, raw any, states ...*mapperSt
 		}
 		return nil
 
+	// Plan and web-search items emit once, on completion; started carries
+	// nothing the completed item lacks.
 	case "plan":
+		if !isCompleted {
+			return nil
+		}
 		return []agent.Event{agent.SystemEvent{Subtype: "plan", Message: p.Item.Text, Raw: raw}}
 
 	case "webSearch":
+		if !isCompleted {
+			return nil
+		}
 		return []agent.Event{agent.SystemEvent{Subtype: "web_search", Message: "Web search: " + p.Item.Text, Raw: raw}}
 
 	case "contextCompaction":
@@ -554,6 +564,16 @@ func mapItem(method string, params json.RawMessage, raw any, states ...*mapperSt
 // normalizeMcpToolName matches the format used by the Claude provider
 // for in-process MCP tools: `mcp__{server}__{tool}`. Mirrors
 // normalizeMcpToolName in the legacy TS.
+// commandOutput returns a completed commandExecution item's output.
+// Codex sends it as aggregatedOutput; text is kept as a fallback for
+// older or synthetic payloads.
+func commandOutput(aggregated, text string) string {
+	if aggregated != "" {
+		return aggregated
+	}
+	return text
+}
+
 func normalizeMcpToolName(server, tool string) string {
 	if server != "" && tool != "" {
 		return "mcp__" + server + "__" + tool
@@ -640,4 +660,32 @@ func calculateCostUSD(freshInputTokens, cachedInputTokens, outputTokens int64, m
 	return (float64(freshInputTokens)/1_000_000)*pricing.input +
 		(float64(cachedInputTokens)/1_000_000)*pricing.cachedInput +
 		(float64(outputTokens)/1_000_000)*pricing.output
+}
+
+// mapPlanUpdated maps turn/plan/updated to the whole current plan. Codex
+// sends `plan: [{step, status}]` with status pending | inProgress | completed.
+func mapPlanUpdated(params json.RawMessage, raw any) []agent.Event {
+	var p struct {
+		TurnID      string `json:"turnId"`
+		Explanation string `json:"explanation"`
+		Plan        []struct {
+			Step   string `json:"step"`
+			Status string `json:"status"`
+		} `json:"plan"`
+	}
+	if json.Unmarshal(params, &p) != nil || len(p.Plan) == 0 {
+		return nil
+	}
+	steps := make([]agent.PlanStep, 0, len(p.Plan))
+	for _, s := range p.Plan {
+		status := agent.PlanStepPending
+		switch s.Status {
+		case "inProgress", "in_progress":
+			status = agent.PlanStepInProgress
+		case "completed":
+			status = agent.PlanStepCompleted
+		}
+		steps = append(steps, agent.PlanStep{Text: s.Step, Status: status})
+	}
+	return []agent.Event{agent.PlanEvent{ItemID: "plan", Explanation: p.Explanation, Steps: steps, Raw: raw}}
 }

@@ -790,7 +790,7 @@ func mapEvent(ev agent.Event, ts time.Time, providerName string, durationMs int6
 			out.Type = "error"
 			out.Content = e.Message
 			return out, true
-		case "codex_warning", "codex_model_rerouted", "codex_moderation", "codex_safety_buffering":
+		case "codex_warning", "codex_model_rerouted", "codex_moderation", "codex_safety_buffering", "codex_safety_buffering_started", "codex_safety_buffering_ended":
 			out.Type = "warning"
 			out.Content = e.Message
 			return out, true
@@ -885,6 +885,50 @@ func mapEvent(ev agent.Event, ts time.Time, providerName string, durationMs int6
 	case agent.InitEvent, agent.ToolProgressEvent:
 		return payload{}, false
 
+	// Event model v2 kinds (ADR-2026-11-20). Until the control plane accepts
+	// the normalized stream, each maps onto the existing activity shape.
+	case agent.ReasoningEvent:
+		text := strings.TrimSpace(e.Summary)
+		if text == "" {
+			text = strings.TrimSpace(e.Text)
+		}
+		if text == "" {
+			return payload{}, false
+		}
+		out.Type = "thought"
+		out.Content = text
+		return out, true
+	case agent.PlanEvent:
+		if len(e.Steps) == 0 {
+			return payload{}, false
+		}
+		out.Type = "context"
+		out.Content = e.Summary()
+		out.ContextKey = PlanContextKey
+		out.ContextValue = e.Summary()
+		return out, true
+	case agent.NoticeEvent:
+		text := strings.TrimSpace(e.Text)
+		if text == "" {
+			return payload{}, false
+		}
+		out.Type = "warning"
+		if e.Severity == agent.NoticeInfo {
+			out.Type = "context"
+		}
+		out.Content = text
+		return out, true
+	case agent.InteractiveRequestEvent:
+		out.Type = "context"
+		out.Content = "Waiting for " + string(e.RequestKind) + ": " + strings.TrimSpace(e.Prompt)
+		out.ContextKey = InteractiveRequestContextKey
+		out.ContextValue = e.RequestID
+		return out, true
+	case agent.FileChangeEvent, agent.TurnEvent:
+		// A file change pairs with the tool result that already carries its
+		// summary, and turn boundaries are runner-internal; neither is a row.
+		return payload{}, false
+
 	case agent.ContextUsageEvent:
 		// The typed harness notice for a compaction or a context-window
 		// threshold crossing. It maps to a context marker whose structured
@@ -899,6 +943,13 @@ func mapEvent(ev agent.Event, ts time.Time, providerName string, durationMs int6
 	}
 	return payload{}, false
 }
+
+// PlanContextKey and InteractiveRequestContextKey are the contextKeys a plan
+// update and a pending interactive request carry.
+const (
+	PlanContextKey               = "plan"
+	InteractiveRequestContextKey = "interactiveRequest"
+)
 
 // ReasoningEffortContextKey is the contextKey a reasoning-effort marker
 // carries, so a control plane can read the effort a session ran at without

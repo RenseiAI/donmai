@@ -190,6 +190,25 @@ func summarizeEvent(ev TailEvent) (kind, summary string) {
 		return "result", truncateRunes(collapseWS(msg), maxStreamSummary)
 	case agent.ErrorEvent:
 		return "error", truncateRunes(collapseWS(e.Message), maxStreamSummary)
+	case agent.ReasoningEvent:
+		txt := strings.TrimSpace(e.Summary)
+		if txt == "" {
+			txt = strings.TrimSpace(e.Text)
+		}
+		if txt == "" {
+			return "", ""
+		}
+		return "reasoning", truncateRunes(collapseWS(txt), maxStreamSummary)
+	case agent.PlanEvent:
+		return "plan", truncateRunes(collapseWS(e.Summary()), maxStreamSummary)
+	case agent.FileChangeEvent:
+		return "file_change", truncateRunes(collapseWS(e.Summary()), maxStreamSummary)
+	case agent.NoticeEvent:
+		return "notice", truncateRunes(collapseWS(e.Text), maxStreamSummary)
+	case agent.InteractiveRequestEvent:
+		return "ask", truncateRunes(collapseWS(string(e.RequestKind)+": "+e.Prompt), maxStreamSummary)
+	case agent.TurnEvent:
+		return "", "" // a boundary, not content
 	default:
 		return string(ev.Event.Kind()), ""
 	}

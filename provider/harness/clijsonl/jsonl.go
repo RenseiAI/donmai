@@ -385,6 +385,35 @@ func mapLine(line []byte) []agent.Event {
 	return mapLineWithNames(line, scopedUsageNames{})
 }
 
+// systemTreatment is how a stream-json system subtype maps.
+type systemTreatment int
+
+const (
+	systemUnclassified systemTreatment = iota
+	// systemLiveness frames carry no reader-facing content (request status,
+	// running thinking-token estimates); each maps to the content-free
+	// stream-progress signal, never to a row.
+	systemLiveness
+	// systemNotice frames pass through as a SystemEvent with their subtype.
+	systemNotice
+)
+
+// systemSubtypes classifies every system subtype the recorded conformance
+// corpus (testdata/recorded) contains, plus the documented init frame. The
+// corpus test fails on an unclassified subtype, so a Claude Code release that
+// adds one is reviewed here rather than rendered raw.
+var systemSubtypes = map[string]systemTreatment{
+	"init":              systemNotice, // mapped to InitEvent before classification
+	"status":            systemLiveness,
+	"thinking_tokens":   systemLiveness,
+	"task_started":      systemNotice,
+	"task_notification": systemNotice,
+	"compact_boundary":  systemNotice,
+	"hook_started":      systemNotice,
+	"hook_response":     systemNotice,
+	"informational":     systemNotice,
+}
+
 func mapSystem(line []byte) []agent.Event {
 	var s rawSystemEnvelope
 	if err := json.Unmarshal(line, &s); err != nil {
@@ -399,6 +428,9 @@ func mapSystem(line []byte) []agent.Event {
 			SessionID: s.SessionID,
 			Raw:       json.RawMessage(line),
 		}}
+	}
+	if systemSubtypes[s.Subtype] == systemLiveness {
+		return []agent.Event{agent.StreamProgressEvent()}
 	}
 	subtype := s.Subtype
 	if subtype == "" {
