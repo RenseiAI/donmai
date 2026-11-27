@@ -58,6 +58,9 @@ func TestSpecFieldCoverage(t *testing.T) {
 	// coverage check works regardless of input.
 	ignoredFields := []string{
 		"toolLifecycleProfileID", // process-only selection consumed before provider translation
+		// Instructions (the interaction contract's normalized intents) are
+		// not yet translated by this adapter; its translator lands next.
+		"Instructions",
 		// SessionName is consumed by the spawn lifecycle rather than encoded in
 		// thread/start: fresh headless sessions issue thread/name/set after the
 		// thread id exists and before turn/start; named interactive sessions use
@@ -102,6 +105,10 @@ func TestSpecFieldCoverage(t *testing.T) {
 		// is the zero value. Registered here (the static coverage mirror) so
 		// this guard rail stays green; NewSpawnPlan is unchanged.
 		"Endpoint",
+		// AuthMode selects which credential surface a harness child may see.
+		// The codex child's credential is decided by its own CODEX_HOME and
+		// env composition (codex.go), never a JSON-RPC param.
+		"AuthMode",
 		// Interactive (W4, interactive-attach-v1) is INTENTIONALLY IGNORED by
 		// NewSpawnPlan/this JSON-RPC translation layer: Provider.Spawn
 		// (codex.go) branches on Spec.Interactive != nil BEFORE NewSpawnPlan

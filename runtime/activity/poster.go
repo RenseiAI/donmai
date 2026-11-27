@@ -17,6 +17,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/agent/present"
 )
 
 // Default values for [Config]. Exposed so callers can tune individual
@@ -776,7 +777,7 @@ func mapEvent(ev agent.Event, ts time.Time, providerName string, durationMs int6
 			out.Type = "error"
 			out.Content = e.Message
 			return out, true
-		case "codex_warning", "codex_model_rerouted", "codex_moderation", "codex_safety_buffering":
+		case "codex_warning", "codex_model_rerouted", "codex_moderation", "codex_safety_buffering", "codex_safety_buffering_started", "codex_safety_buffering_ended":
 			out.Type = "warning"
 			out.Content = e.Message
 			return out, true
@@ -871,6 +872,50 @@ func mapEvent(ev agent.Event, ts time.Time, providerName string, durationMs int6
 	case agent.InitEvent, agent.ToolProgressEvent:
 		return payload{}, false
 
+	// Event model v2 kinds (ADR-2026-11-20). Until the control plane accepts
+	// the normalized stream, each maps onto the existing activity shape.
+	case agent.ReasoningEvent:
+		text := strings.TrimSpace(e.Summary)
+		if text == "" {
+			text = strings.TrimSpace(e.Text)
+		}
+		if text == "" {
+			return payload{}, false
+		}
+		out.Type = "thought"
+		out.Content = text
+		return out, true
+	case agent.PlanEvent:
+		if len(e.Steps) == 0 {
+			return payload{}, false
+		}
+		out.Type = "context"
+		out.Content = e.Summary()
+		out.ContextKey = PlanContextKey
+		out.ContextValue = e.Summary()
+		return out, true
+	case agent.NoticeEvent:
+		text := strings.TrimSpace(e.Text)
+		if text == "" {
+			return payload{}, false
+		}
+		out.Type = "warning"
+		if e.Severity == agent.NoticeInfo {
+			out.Type = "context"
+		}
+		out.Content = text
+		return out, true
+	case agent.InteractiveRequestEvent:
+		out.Type = "context"
+		out.Content = "Waiting for " + string(e.RequestKind) + ": " + strings.TrimSpace(e.Prompt)
+		out.ContextKey = InteractiveRequestContextKey
+		out.ContextValue = e.RequestID
+		return out, true
+	case agent.FileChangeEvent, agent.TurnEvent:
+		// A file change pairs with the tool result that already carries its
+		// summary, and turn boundaries are runner-internal; neither is a row.
+		return payload{}, false
+
 	case agent.ContextUsageEvent:
 		// The typed harness notice for a compaction or a context-window
 		// threshold crossing. It maps to a context marker whose structured
@@ -885,6 +930,13 @@ func mapEvent(ev agent.Event, ts time.Time, providerName string, durationMs int6
 	}
 	return payload{}, false
 }
+
+// PlanContextKey and InteractiveRequestContextKey are the contextKeys a plan
+// update and a pending interactive request carry.
+const (
+	PlanContextKey               = "plan"
+	InteractiveRequestContextKey = "interactiveRequest"
+)
 
 // ReasoningEffortContextKey is the contextKey a reasoning-effort marker
 // carries, so a control plane can read the effort a session ran at without
@@ -1198,49 +1250,12 @@ func ContextUsageContextValue(e agent.ContextUsageEvent) string {
 }
 
 // summarizeToolUse produces a short one-line summary of a tool call,
-// capped at MaxToolSummaryChars. Heuristics for the common Claude Code
-// tools (Bash, Read, Edit, Write, Grep) preserve the most salient
-// argument; unknown tools fall back to the bare tool name.
+// capped at MaxToolSummaryChars. The shared presentation rules pick the
+// salient argument per tool family across harnesses (command with its
+// shell wrapper removed, path, pattern, URL, description); a call with no
+// such argument falls back to the bare tool name.
 func summarizeToolUse(e agent.ToolUseEvent) string {
-	name := e.ToolName
-	if name == "" {
-		name = "tool"
-	}
-	var arg string
-	switch {
-	case strings.EqualFold(name, "Bash"):
-		arg = stringArg(e.Input, "command")
-	case strings.EqualFold(name, "Read"), strings.EqualFold(name, "Edit"),
-		strings.EqualFold(name, "Write"), strings.EqualFold(name, "NotebookEdit"):
-		arg = stringArg(e.Input, "file_path")
-	case strings.EqualFold(name, "Grep"), strings.EqualFold(name, "Glob"):
-		arg = stringArg(e.Input, "pattern")
-	case strings.EqualFold(name, "Agent"), strings.EqualFold(name, "Task"):
-		// Sub-agent dispatch — surface the description so /topology can
-		// render a human-readable sub-agent label.
-		arg = stringArg(e.Input, "description")
-		if arg == "" {
-			arg = stringArg(e.Input, "prompt")
-		}
-	}
-	if arg == "" {
-		return truncate(name, MaxToolSummaryChars)
-	}
-	return truncate(name+": "+collapseWhitespace(arg), MaxToolSummaryChars)
-}
-
-// stringArg returns the trimmed string value of input[key], or "" when
-// missing or non-string.
-func stringArg(input map[string]any, key string) string {
-	v, ok := input[key]
-	if !ok {
-		return ""
-	}
-	s, ok := v.(string)
-	if !ok {
-		return ""
-	}
-	return strings.TrimSpace(s)
+	return truncate(present.DescribeTool(e.ToolName, e.Input).Summary(), MaxToolSummaryChars)
 }
 
 // truncate clips s to at most n bytes, appending an ellipsis when
@@ -1287,26 +1302,4 @@ func truncateMiddle(s string, n int) string {
 		tailStart++
 	}
 	return s[:head] + sep + s[tailStart:]
-}
-
-// collapseWhitespace replaces runs of whitespace with a single space.
-// Used by summarizeToolUse to keep the one-line summary readable when
-// the tool input contains newlines (e.g. multi-line bash commands).
-func collapseWhitespace(s string) string {
-	var b strings.Builder
-	b.Grow(len(s))
-	prevSpace := false
-	for _, r := range s {
-		if r == ' ' || r == '\t' || r == '\n' || r == '\r' {
-			if !prevSpace && b.Len() > 0 {
-				b.WriteByte(' ')
-			}
-			prevSpace = true
-			continue
-		}
-		b.WriteRune(r)
-		prevSpace = false
-	}
-	out := b.String()
-	return strings.TrimRight(out, " ")
 }

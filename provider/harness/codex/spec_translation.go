@@ -109,7 +109,7 @@ func resolveApprovalPolicy(spec agent.Spec) string {
 // baseInstructions is the explicit replacement surface. Appended harness,
 // policy, and role instructions use developerInstructions so Codex's built-in
 // base prompt remains intact (verified in the 0.146.0 app-server schema).
-func threadStartParams(spec agent.Spec) map[string]any {
+func threadStartParams(spec agent.Spec, deny denyPlan) map[string]any {
 	params := map[string]any{
 		"cwd":            spec.Cwd,
 		"approvalPolicy": resolveApprovalPolicy(spec),
@@ -122,8 +122,21 @@ func threadStartParams(spec agent.Spec) map[string]any {
 	if spec.SystemPromptAppend != "" {
 		params["developerInstructions"] = spec.SystemPromptAppend
 	}
+	if config := deny.threadConfig(); config != nil {
+		params["config"] = config
+	}
 	if mode := resolveSandboxMode(spec); mode != "" {
 		params["sandbox"] = mode
+	}
+	return params
+}
+
+// threadResumeParams builds the JSON-RPC params for `thread/resume`. A resumed
+// thread does not inherit the thread/start config, so it is sent again.
+func threadResumeParams(threadID string, deny denyPlan) map[string]any {
+	params := map[string]any{"threadId": threadID, "personality": "pragmatic"}
+	if config := deny.threadConfig(); config != nil {
+		params["config"] = config
 	}
 	return params
 }
@@ -174,6 +187,13 @@ func turnStartParams(threadID string, spec agent.Spec, input []map[string]any) m
 	}
 	if len(spec.ResponseSchema) > 0 {
 		params["outputSchema"] = spec.ResponseSchema
+	}
+	// A declared cyber access program rides every turn of the session
+	// (turn/start scopes it to "this turn"). Spawn and Resume refuse an
+	// invalid declaration before any turn is built, so an error here can only
+	// mean an undeclared program, which emits nothing.
+	if program, err := resolveCyberAccessProgram(spec); err == nil && program != "" {
+		params["cyberAccessProgram"] = program
 	}
 	return params
 }
@@ -296,6 +316,20 @@ type SpawnPlan struct {
 	// when a fresh turn must be started on an existing thread.
 	PromptInput []map[string]any
 
+	// ThreadResume is the params for `thread/resume`, minus threadId.
+	ThreadResume map[string]any
+
+	// DenyReport says how each PermissionConfig deny reached Codex, and
+	// DenyErr is set when one cannot reach it (Spawn refuses first).
+	DenyReport []DenyTranslation
+	DenyErr    error
+
+	// ExecPolicyRules is the rule file staged into CODEX_HOME/rules before
+	// the app-server starts; empty when the session has no command deny.
+	ExecPolicyRules string
+
+	denyNotice *agent.SystemEvent
+
 	// IgnoredFields lists the agent.Spec fields the codex provider
 	// does NOT translate — surfaced for tests + observability so we
 	// know which fields are silently dropped vs. silently lost.
@@ -315,12 +349,16 @@ type SpecFieldNote struct {
 // ensure every relevant Spec field is either translated or
 // explicitly noted.
 func NewSpawnPlan(spec agent.Spec) SpawnPlan {
-	threadStart := threadStartParams(spec)
-
+	deny, denyErr := translateDenies(spec)
 	plan := SpawnPlan{
-		MCPConfig:   mcpServersConfig(spec.MCPServers),
-		ThreadStart: threadStart,
-		PromptInput: promptInput(spec),
+		MCPConfig:       mcpServersConfig(spec.MCPServers),
+		ThreadStart:     threadStartParams(spec, deny),
+		ThreadResume:    threadResumeParams("", deny),
+		PromptInput:     promptInput(spec),
+		DenyReport:      deny.report,
+		DenyErr:         denyErr,
+		ExecPolicyRules: deny.execPolicyRules(),
+		denyNotice:      deny.notice(),
 	}
 	plan.TurnStart = turnStartParams("", spec, plan.PromptInput)
 
@@ -394,7 +432,7 @@ func ignoredSpecFields(spec agent.Spec) []SpecFieldNote {
 	if spec.PermissionConfig != nil {
 		notes = append(notes, SpecFieldNote{
 			Field:  "PermissionConfig",
-			Reason: "consumed by the approval bridge (approval.go), not via thread/start params",
+			Reason: "consumed by the approval bridge (approval.go) and translated into Codex exec-policy rules and thread config (deny_translation.go)",
 		})
 	}
 
@@ -408,12 +446,17 @@ func ignoredSpecFields(spec agent.Spec) []SpecFieldNote {
 	}
 
 	// ProviderConfig: opaque per-provider extension bag. The codex
-	// provider has no defined keys today; the field is reserved.
-	if len(spec.ProviderConfig) > 0 {
+	// provider consumes only cyberAccessProgram (turn/start); any other key
+	// is recorded as ignored.
+	for key := range spec.ProviderConfig {
+		if key == providerConfigCyberAccessProgram {
+			continue
+		}
 		notes = append(notes, SpecFieldNote{
 			Field:  "ProviderConfig",
-			Reason: "codex defines no providerConfig keys today; field is reserved",
+			Reason: "codex consumes only providerConfig.cyberAccessProgram (turn/start); other keys are ignored",
 		})
+		break
 	}
 
 	// SubAgentProvider: only meaningful when the codex agent spawns

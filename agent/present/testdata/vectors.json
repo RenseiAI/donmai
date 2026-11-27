@@ -1,0 +1,30 @@
+{
+  "tools": [
+    {"case": "claude bash", "name": "Bash", "input": {"command": "go test ./...", "description": "Run tests"}, "family": "command", "title": "Bash", "detail": "go test ./...", "summary": "Bash: go test ./..."},
+    {"case": "claude read", "name": "Read", "input": {"file_path": "/work/main.go"}, "family": "read", "title": "Read", "detail": "/work/main.go", "summary": "Read: /work/main.go"},
+    {"case": "claude grep prefers pattern over path", "name": "Grep", "input": {"pattern": "TODO", "path": "src"}, "family": "search", "title": "Grep", "detail": "TODO", "summary": "Grep: TODO"},
+    {"case": "claude task", "name": "Task", "input": {"description": "Audit imports", "prompt": "long prompt"}, "family": "agent", "title": "Task", "detail": "Audit imports", "summary": "Task: Audit imports"},
+    {"case": "claude webfetch", "name": "WebFetch", "input": {"url": "https://example.com", "prompt": "summarize"}, "family": "web", "title": "WebFetch", "detail": "https://example.com", "summary": "WebFetch: https://example.com"},
+    {"case": "claude todowrite has no detail", "name": "TodoWrite", "input": {"todos": [{"content": "a"}]}, "family": "plan", "title": "TodoWrite", "detail": "", "summary": "TodoWrite"},
+    {"case": "codex shell zsh -c double quoted", "name": "shell", "input": {"command": "/bin/zsh -c \"sed -n '1,9p' main.go\""}, "family": "command", "title": "shell", "detail": "sed -n '1,9p' main.go", "summary": "shell: sed -n '1,9p' main.go"},
+    {"case": "codex shell bash -lc single quoted", "name": "shell", "input": {"command": "bash -lc 'git status'"}, "family": "command", "title": "shell", "detail": "git status", "summary": "shell: git status"},
+    {"case": "codex shell escaped inner quotes", "name": "shell", "input": {"command": "/bin/zsh -lc \"echo \\\"hi\\\"\""}, "family": "command", "title": "shell", "detail": "echo \"hi\"", "summary": "shell: echo \"hi\""},
+    {"case": "codex argv command", "name": "shell", "input": {"command": ["bash", "-lc", "ls -la"]}, "family": "command", "title": "shell", "detail": "ls -la", "summary": "shell: ls -la"},
+    {"case": "multi-line script collapses", "name": "shell", "input": {"command": "/bin/zsh -lc \"cd app\nmake test\""}, "family": "command", "title": "shell", "detail": "cd app make test", "summary": "shell: cd app make test"},
+    {"case": "unwrapped command unchanged", "name": "bash", "input": {"command": "zsh scripts/run.sh"}, "family": "command", "title": "bash", "detail": "zsh scripts/run.sh", "summary": "bash: zsh scripts/run.sh"},
+    {"case": "pi read uses path", "name": "read", "input": {"path": "/work/README.md"}, "family": "read", "title": "read", "detail": "/work/README.md", "summary": "read: /work/README.md"},
+    {"case": "opencode read uses filePath", "name": "read", "input": {"filePath": "/work/a.ts"}, "family": "read", "title": "read", "detail": "/work/a.ts", "summary": "read: /work/a.ts"},
+    {"case": "codex file_change", "name": "file_change", "input": {}, "family": "edit", "title": "file_change", "detail": "", "summary": "file_change"},
+    {"case": "mcp double underscore", "name": "mcp__tracker__get_issue", "input": {"id": "X-1"}, "family": "mcp", "title": "tracker › get_issue", "detail": "", "summary": "mcp__tracker__get_issue"},
+    {"case": "mcp colon form", "name": "mcp:docs/search", "input": {"query": "cursor"}, "family": "mcp", "title": "docs › search", "detail": "cursor", "summary": "mcp:docs/search: cursor"},
+    {"case": "unknown tool generic keys", "name": "custom_tool", "input": {"path": "/x"}, "family": "other", "title": "custom_tool", "detail": "/x", "summary": "custom_tool: /x"},
+    {"case": "empty name", "name": "", "input": null, "family": "other", "title": "tool", "detail": "", "summary": "tool"}
+  ],
+  "outputs": [
+    {"case": "mcp text parts join", "content": "[{\"type\":\"text\",\"text\":\"line one\"},{\"type\":\"text\",\"text\":\"line two\"}]", "text": "line one\nline two"},
+    {"case": "non-text part placeholder", "content": "[{\"type\":\"text\",\"text\":\"see\"},{\"type\":\"image\",\"data\":\"AAAA\"}]", "text": "see\n[image]"},
+    {"case": "plain text unchanged", "content": "ok\n", "text": "ok\n"},
+    {"case": "other json array unchanged", "content": "[1,2,3]", "text": "[1,2,3]"},
+    {"case": "object unchanged", "content": "{\"a\":1}", "text": "{\"a\":1}"}
+  ]
+}

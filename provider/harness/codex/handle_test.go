@@ -38,6 +38,20 @@ type fakeServer struct {
 	// before run starts.
 	onInitialize func()
 	skillsList   func(params map[string]any) (result any, code int)
+
+	// failNextBatchWrites makes the next N config/batchWrite requests fail
+	// with a JSON-RPC error of failBatchWriteCode. Tests set it after acquire
+	// so the release's first clear attempt fails and the retry succeeds. A
+	// non-transient code (for example -32602) keeps the client's own
+	// RequestWithRetry from masking the outer release retry.
+	failNextBatchWrites int
+	failBatchWriteCode  int
+
+	// hangBatchWrite, when true, records config/batchWrite requests but
+	// never answers them, so the client's per-attempt timeout fires. Tests
+	// set it after acquire to prove the final release fits one shared
+	// budget instead of holding the terminal past the run deadline.
+	hangBatchWrite bool
 }
 
 func newFakeServer() (*fakeServer, *io.PipeWriter, *io.PipeReader) {
@@ -138,6 +152,27 @@ func (fs *fakeServer) run(t *testing.T, threadID string) {
 			}
 			fs.write(t, map[string]any{"jsonrpc": "2.0", "id": idRaw, "result": result})
 		case method == "config/batchWrite" && hasID:
+			fs.mu.Lock()
+			hang := fs.hangBatchWrite
+			fs.mu.Unlock()
+			if hang {
+				continue
+			}
+			fs.mu.Lock()
+			failRemaining := fs.failNextBatchWrites
+			failCode := fs.failBatchWriteCode
+			if failRemaining > 0 {
+				fs.failNextBatchWrites = failRemaining - 1
+			}
+			fs.mu.Unlock()
+			if failRemaining > 0 {
+				code := failCode
+				if code == 0 {
+					code = -32602
+				}
+				fs.write(t, map[string]any{"jsonrpc": "2.0", "id": idRaw, "error": map[string]any{"code": code, "message": "injected batchWrite failure"}})
+				continue
+			}
 			params, _ := msg["params"].(map[string]any)
 			edits, _ := params["edits"].([]any)
 			if len(edits) == 1 {

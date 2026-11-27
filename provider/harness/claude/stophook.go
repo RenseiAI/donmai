@@ -508,7 +508,11 @@ func (c *stopHookChannel) Retract() (bool, error) {
 		c.text, c.deliveryID = "", ""
 		return true, nil
 	case errors.Is(err, os.ErrNotExist):
-		c.text, c.deliveryID = "", ""
+		// Already claimed: the hook renamed pending.json and the
+		// acceptance record lands on the transcript asynchronously.
+		// Preserve the match state so Consumed can still read it;
+		// clearing here is how a claim just before a cutoff died
+		// before its record could acknowledge it.
 		return false, nil
 	default:
 		return false, fmt.Errorf("stop-hook channel: retract offer: %w", err)

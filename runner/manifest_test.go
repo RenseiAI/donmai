@@ -371,7 +371,7 @@ func TestParseInlineManifest(t *testing.T) {
 			if err != nil {
 				t.Fatalf("ParseInlineManifest() unexpected error: %v", err)
 			}
-			if *got != *tt.want {
+			if !reflect.DeepEqual(*got, *tt.want) {
 				t.Fatalf("ParseInlineManifest() = %+v, want %+v", *got, *tt.want)
 			}
 		})
