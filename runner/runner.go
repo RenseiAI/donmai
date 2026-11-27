@@ -149,21 +149,20 @@ const (
 
 	// DefaultMaxToolOutputBytes bounds one tool result's content kept by
 	// the runner, applied when [Options.MaxToolOutputBytes] is zero or
-	// negative. It aliases agent.DefaultMaxToolOutputBytes so the runner
-	// and every harness share one documented, configurable limit with a
-	// visible default. A tool result larger than this is truncated around
-	// a marker that names the truncation (see truncateToolOutput) before
+	// negative. A tool result larger than this is truncated around a
+	// marker that names the truncation (see truncateToolOutput) before
 	// the runner retains or forwards it, so an oversized result — a
 	// multi-megabyte CI log, escape-laden output that balloons
 	// downstream buffers — cannot balloon the runner's audit log,
 	// activity stream or pull request scan, and a turn that still dies
-	// after one names it in its terminal reason. Each harness applies the
-	// same bound to the copy it hands the model (see
-	// agent.ResolveToolOutputLimit). 256 KiB keeps legitimate outputs
-	// (test logs, diffs) intact while bounding the pathological ones; the
-	// runner never fails a turn for oversize output alone. The daemon's
-	// maxToolOutputBytes setting and `agent run --max-tool-output-bytes`
-	// override it for the runner.
+	// after one names it in its terminal reason. It bounds the runner's
+	// copy only: the harness has already handed the full result to the
+	// model. 256 KiB keeps legitimate outputs (test logs, diffs) intact
+	// while bounding the pathological ones; the runner never fails a
+	// turn for oversize output alone. The daemon's maxToolOutputBytes
+	// setting and `agent run --max-tool-output-bytes` override it. It
+	// shares its value with agent.DefaultMaxToolOutputBytes, the helper's
+	// own default.
 	DefaultMaxToolOutputBytes = agent.DefaultMaxToolOutputBytes
 
 	// DefaultStatusBeaconInterval bounds the runner's current-step beacon
@@ -333,9 +332,10 @@ type Options struct {
 	// runner retains per ToolResultEvent. A larger result is truncated
 	// around a marker naming the truncation (see truncateToolOutput)
 	// before the runner stores or forwards it (audit log, activity
-	// stream, pull request scan), and the seat keeps going. This bounds
-	// the runner's copy; each harness separately bounds the copy it hands
-	// the model with the same documented default. Zero or negative uses DefaultMaxToolOutputBytes; there is
+	// stream, pull request scan), and the seat keeps going. The harness
+	// emitted the event after its own tool loop handed the full result
+	// to the model, so this bounds the runner's copy, not the model's
+	// context. Zero or negative uses DefaultMaxToolOutputBytes; there is
 	// no unbounded setting — the cap is protective, never advisory. The
 	// daemon states it per worker from its maxToolOutputBytes setting
 	// (DONMAI_MAX_TOOL_OUTPUT_BYTES, read by `agent run

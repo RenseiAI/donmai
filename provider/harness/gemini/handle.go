@@ -58,8 +58,9 @@ type sessionParams struct {
 	// (agentic turns) allowed before the driver terminates with an
 	// error_max_turns result. 0 means uncapped.
 	maxTurns int
-	// maxToolOutputBytes bounds one tool result's content handed to the
-	// model and to the runner. Zero means the shared default.
+	// maxToolOutputBytes bounds one tool result's payload folded back into
+	// the model's conversation (see boundToolResponse). Zero means the
+	// shared default.
 	maxToolOutputBytes int
 }
 
@@ -105,8 +106,10 @@ type Handle struct {
 	// deliberate cap from a model-side truncation.
 	maxTurns int
 
-	// maxToolOutputBytes bounds one tool result's content handed to the
-	// model and to the runner. Zero means the shared default.
+	// maxToolOutputBytes bounds one tool result's payload folded back into
+	// the model's conversation (see boundToolResponse). Zero means the
+	// shared default. The ToolResultEvent handed to the runner carries the
+	// full result; the runner bounds its own copy with its own limit.
 	maxToolOutputBytes int
 
 	events chan agent.Event
@@ -325,8 +328,9 @@ func (h *Handle) drive(ctx context.Context) {
 }
 
 // boundToolResponse truncates string values in a functionResponse payload
-// (output/error/content) to the shared tool-output limit so the model
-// receives the bounded copy.
+// (output/error/content) to the session's tool-output limit, so the model
+// receives a bounded copy around the shared marker. Each string value is
+// bounded on its own.
 func boundToolResponse(response map[string]any, limit int) map[string]any {
 	if len(response) == 0 {
 		return response
@@ -375,16 +379,16 @@ func (h *Handle) executeToolCalls(ctx context.Context, calls []candidateFuncCall
 		}
 
 		res := h.executor.execute(ctx, c)
-		// Bound oversized tool output before it reaches the model and the
-		// runner: the bounded text rides both the event and the
-		// functionResponse folded back into the conversation, so the model
-		// never sees the full output.
-		boundedText := h.boundToolResult(res.text)
+		// Bound oversized tool output before it reaches the model: this
+		// harness runs the tool loop itself, so the functionResponse folded
+		// back into the conversation is the model's copy. The event keeps
+		// the full result: the runner bounds its own copy with its own
+		// (operator-configurable) limit and records the oversize warning.
 		boundedResponse := boundToolResponse(res.response, h.toolOutputLimit())
 		if !h.sendEvent(agent.ToolResultEvent{
 			ToolName:  c.Name,
 			ToolUseID: c.ID,
-			Content:   boundedText,
+			Content:   res.text,
 			IsError:   res.isError,
 		}) {
 			return false
@@ -508,24 +512,9 @@ func (h *Handle) toolOutputLimit() int {
 	return h.maxToolOutputBytes
 }
 
-// boundToolResult truncates oversized tool output before it is handed to
-// the model and to the runner, using the shared documented limit.
-func (h *Handle) boundToolResult(content string) string {
-	if truncated, changed := agent.TruncateToolOutput(content, h.toolOutputLimit()); changed {
-		return truncated
-	}
-	return content
-}
-
 // sendEvent forwards one event onto the events channel. Returns false
 // when shutdown has been signalled so the driver exits promptly.
 func (h *Handle) sendEvent(ev agent.Event) bool {
-	if toolRes, ok := ev.(agent.ToolResultEvent); ok {
-		if truncated, changed := agent.TruncateToolOutput(toolRes.Content, h.toolOutputLimit()); changed {
-			toolRes.Content = truncated
-			ev = toolRes
-		}
-	}
 	if h.eventsClosed.Load() {
 		return false
 	}

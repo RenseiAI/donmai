@@ -496,12 +496,6 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
 	}
-	// The per-session tool-output bound is enforced Go-side by the Handle
-	// (newHandle resolves it from ProviderConfig and Spec.Env). It is NOT
-	// exported into Spec.Env here, unlike the per-process harnesses: the
-	// headless app-server is shared and pins the session env layer it was
-	// started with (checkSessionEnvLocked), so injecting a value would make
-	// every session diverge from a probe- or pre-started child.
 	// Interactive spawn mode (W4): independent of this Provider's shared
 	// headless app-server state — see interactive.go.
 	// Capability-gated on the live manifest so a future edit that flips

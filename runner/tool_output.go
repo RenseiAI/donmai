@@ -10,7 +10,8 @@ import (
 // toolOutputTruncatedInfix is the stable infix every truncated tool result
 // carries, so operators and tests can recognise a bounded payload without
 // scraping byte counts. It aliases agent.ToolOutputTruncatedInfix so the
-// runner and every harness mark a truncation identically.
+// runner and a harness that bounds its model copy mark a truncation
+// identically.
 const toolOutputTruncatedInfix = agent.ToolOutputTruncatedInfix
 
 // toolOutputTruncationWarningPrefix prefixes the post-session warning
@@ -21,24 +22,34 @@ const toolOutputTruncationWarningPrefix = "tool output exceeded"
 // truncateToolOutput bounds one tool result's content to limit bytes,
 // preserving the head and the tail around a marker that names the
 // truncation. It is a thin alias over the shared agent helper so the runner
-// and every harness apply byte-identical, rune-safe truncation around the
-// same marker (see agent.TruncateToolOutput). In the runner it bounds the
-// runner's own copy of a harness ToolResultEvent — what the runner retains
-// or forwards; each harness separately bounds the copy it hands the model.
+// and a harness that bounds its model copy (one whose tool loop runs in Go)
+// apply byte-identical, rune-safe truncation around the same marker (see
+// agent.TruncateToolOutput). It bounds the runner's own
+// copy of a harness ToolResultEvent — what the runner retains or forwards —
+// not the result the harness already handed the model.
 func truncateToolOutput(content string, limit int) (string, bool) {
 	return agent.TruncateToolOutput(content, limit)
 }
 
 // toolOutputLimit returns the per-tool-result byte bound this Runner
 // retains. Hand-built Runners that bypass New resolve to the default, so
-// the cap holds on every construction path. The default is the same
-// documented limit every harness applies before handing tool output to the
-// model (see agent.DefaultMaxToolOutputBytes).
+// the cap holds on every construction path.
 func (r *Runner) toolOutputLimit() int {
 	if r == nil || r.maxToolOutputBytes <= 0 {
 		return DefaultMaxToolOutputBytes
 	}
 	return r.maxToolOutputBytes
+}
+
+// noteToolOutputTruncated records one truncated tool result on the stream
+// observation: original is the result's original byte size, limit the bound
+// applied to it. The largest original wins, carrying its limit with it.
+func (o *streamObservation) noteToolOutputTruncated(original, limit int) {
+	o.toolOutputTruncated = true
+	if original > o.toolOutputBytes || o.toolOutputLimit == 0 {
+		o.toolOutputBytes = original
+		o.toolOutputLimit = limit
+	}
 }
 
 // noteToolOutputTruncation records an oversized tool result the runner

@@ -7,34 +7,27 @@ import (
 	"unicode/utf8"
 )
 
-// Tool-output bound shared by the runner and every harness.
+// Tool-output bound shared by the runner and the in-process tool loop.
 //
 // A seat's tool can print a very large output (for example a multi-megabyte
-// CI log). The harness passes that output to the model; the runner retains
-// its own copy. Both sides bound the copy they keep with the SAME limit so
-// one oversized result cannot wedge the turn on either leg.
+// CI log). The runner bounds the copy it retains or forwards (its audit log,
+// activity stream and pull request scan) with this helper. A harness whose
+// tool loop runs in Go (the harness itself executes the tool and folds the
+// result back into the model's context) can bound the copy it hands the
+// model with the same helper and marker. A harness whose child CLI runs the
+// tool hands the result to the model itself; nothing here bounds that copy.
 //
-// The limit is configurable per session and visible: ProviderConfig
-// "maxToolOutputBytes" (positive number) wins, then the
-// DONMAI_TOOL_OUTPUT_LIMIT environment value the spawner places in the
-// harness child environment, then DefaultMaxToolOutputBytes. There is no
-// unbounded setting — the cap is protective, never advisory.
+// There is no unbounded setting — the cap is protective, never advisory.
 const (
 	// DefaultMaxToolOutputBytes bounds one tool result's content (in bytes)
-	// when no per-session limit is configured. 256 KiB keeps legitimate
-	// outputs (test logs, diffs) intact while bounding pathological ones.
+	// when no limit is configured. 256 KiB keeps legitimate outputs (test
+	// logs, diffs) intact while bounding pathological ones.
 	DefaultMaxToolOutputBytes = 256 * 1024
 
-	// ToolOutputLimitEnvVar carries the per-session tool-output byte bound
-	// into the harness child environment at spawn time. The runner resolves
-	// the bound and every harness exports it so the child-side enforcement
-	// (gateway, wrapper, or harness subprocess) applies the same limit the
-	// Go-side truncation uses.
-	ToolOutputLimitEnvVar = "DONMAI_TOOL_OUTPUT_LIMIT"
-
 	// ToolOutputLimitConfigKey is the ProviderConfig key that overrides the
-	// tool-output byte bound for one session. A positive number wins over
-	// the environment value and the default.
+	// model-side tool-output byte bound for one session, for a harness that
+	// runs its tool loop in Go. A positive whole number wins over the
+	// default.
 	ToolOutputLimitConfigKey = "maxToolOutputBytes"
 
 	// ToolOutputTruncatedInfix is the stable infix every truncated tool
@@ -42,6 +35,10 @@ const (
 	// without scraping byte counts.
 	ToolOutputTruncatedInfix = "[tool output truncated"
 )
+
+// toolOutputMarkerFormat renders the marker TruncateToolOutput places
+// between the head and the tail. ParseToolOutputTruncation reads it back.
+const toolOutputMarkerFormat = "…" + ToolOutputTruncatedInfix + ": %d-byte output exceeds the %d-byte limit; showing head and tail]…"
 
 // TruncateToolOutput bounds one tool result's content to limit bytes,
 // preserving the head (the command echo) and the tail (the result — e.g.
@@ -59,8 +56,7 @@ func TruncateToolOutput(content string, limit int) (string, bool) {
 	if limit <= 0 || len(content) <= limit {
 		return content, false
 	}
-	marker := fmt.Sprintf("…%s: %d-byte output exceeds the %d-byte limit; showing head and tail]…",
-		ToolOutputTruncatedInfix, len(content), limit)
+	marker := fmt.Sprintf(toolOutputMarkerFormat, len(content), limit)
 	if len(marker) >= limit {
 		return truncateOnRuneBoundary(marker, limit), true
 	}
@@ -95,49 +91,37 @@ func truncateOnRuneBoundary(s string, limit int) string {
 	return s[:cut]
 }
 
+// ParseToolOutputTruncation reports whether content carries the marker
+// TruncateToolOutput places in a truncated result, and if so the original
+// byte size and the limit it names. A consumer that receives an
+// already-bounded copy (for example the runner, from a harness that bounded
+// its tool output before emitting it) uses it to keep recording that a
+// truncation happened. Content that merely mentions the infix without the
+// full numeric marker does not match.
+func ParseToolOutputTruncation(content string) (original, limit int, ok bool) {
+	idx := strings.Index(content, "…"+ToolOutputTruncatedInfix+": ")
+	if idx < 0 {
+		return 0, 0, false
+	}
+	if _, err := fmt.Sscanf(content[idx:], toolOutputMarkerFormat, &original, &limit); err != nil {
+		return 0, 0, false
+	}
+	if original <= 0 || limit <= 0 || original <= limit {
+		return 0, 0, false
+	}
+	return original, limit, true
+}
+
 // ResolveToolOutputLimit returns the per-tool-result byte bound for one
-// session: ProviderConfig[ToolOutputLimitConfigKey] when positive, else the
-// ToolOutputLimitEnvVar entry in env when positive, else
-// DefaultMaxToolOutputBytes. Malformed or non-positive values fall through
-// to the next source, never to unbounded.
-func ResolveToolOutputLimit(providerConfig map[string]any, env map[string]string) int {
+// session: ProviderConfig[ToolOutputLimitConfigKey] when it is a whole
+// number of at least one byte, else DefaultMaxToolOutputBytes. Malformed,
+// fractional-below-one or non-positive values fall through to the default,
+// never to unbounded.
+func ResolveToolOutputLimit(providerConfig map[string]any) int {
 	if n, ok := toolOutputLimitFromConfig(providerConfig); ok {
 		return n
 	}
-	if n, ok := toolOutputLimitFromEnv(env); ok {
-		return n
-	}
 	return DefaultMaxToolOutputBytes
-}
-
-// ToolOutputLimitEnv renders the spawn-time environment entry that carries
-// the resolved bound into the harness child.
-func ToolOutputLimitEnv(limit int) string {
-	if limit <= 0 {
-		limit = DefaultMaxToolOutputBytes
-	}
-	return ToolOutputLimitEnvVar + "=" + strconv.Itoa(limit)
-}
-
-// WithToolOutputLimitEnv returns a copy of env carrying the resolved bound
-// under ToolOutputLimitEnvVar. A caller-supplied positive value is
-// preserved; otherwise the resolved limit is exported so the child-side
-// enforcement applies the same bound the Go-side truncation uses.
-func WithToolOutputLimitEnv(env map[string]string, limit int) map[string]string {
-	if limit <= 0 {
-		limit = DefaultMaxToolOutputBytes
-	}
-	out := make(map[string]string, len(env)+1)
-	for k, v := range env {
-		out[k] = v
-	}
-	if existing, ok := out[ToolOutputLimitEnvVar]; ok {
-		if n, err := strconv.Atoi(strings.TrimSpace(existing)); err == nil && n > 0 {
-			return out
-		}
-	}
-	out[ToolOutputLimitEnvVar] = strconv.Itoa(limit)
-	return out
 }
 
 func toolOutputLimitFromConfig(providerConfig map[string]any) (int, bool) {
@@ -182,31 +166,17 @@ func toolOutputLimitFromConfig(providerConfig map[string]any) (int, bool) {
 			return int(n), true
 		}
 	case float32:
-		if n > 0 {
+		if n >= 1 {
 			return int(n), true
 		}
 	case float64:
-		if n > 0 {
+		if n >= 1 {
 			return int(n), true
 		}
 	case string:
 		if parsed, err := strconv.Atoi(strings.TrimSpace(n)); err == nil && parsed > 0 {
 			return parsed, true
 		}
-	}
-	return 0, false
-}
-
-func toolOutputLimitFromEnv(env map[string]string) (int, bool) {
-	if env == nil {
-		return 0, false
-	}
-	raw, ok := env[ToolOutputLimitEnvVar]
-	if !ok {
-		return 0, false
-	}
-	if n, err := strconv.Atoi(strings.TrimSpace(raw)); err == nil && n > 0 {
-		return n, true
 	}
 	return 0, false
 }

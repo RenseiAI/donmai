@@ -382,7 +382,6 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
 	}
-	spec.Env = agent.WithToolOutputLimitEnv(spec.Env, agent.ResolveToolOutputLimit(spec.ProviderConfig, spec.Env))
 	spec, err = applyEndpoint(spec)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
@@ -549,17 +548,16 @@ func (p *Provider) spawnCLI(ctx context.Context, spec agent.Spec) (*openCodeHand
 	stderrBuf := &boundedBuffer{limit: stderrBufferSize, buf: make([]byte, 0, stderrBufferSize)}
 
 	h := &openCodeHandle{
-		binary:             p.binary,
-		cwd:                spec.Cwd,
-		cmd:                cmd,
-		maxToolOutputBytes: agent.ResolveToolOutputLimit(spec.ProviderConfig, spec.Env),
-		events:             make(chan agent.Event, eventBufferSize),
-		logger:             slog.With("provider", "opencode", "pid", cmd.Process.Pid),
-		stdoutPipe:         stdout,
-		stderrPipe:         stderr,
-		stderrBuf:          stderrBuf,
-		shutdown:           make(chan struct{}),
-		done:               make(chan struct{}),
+		binary:     p.binary,
+		cwd:        spec.Cwd,
+		cmd:        cmd,
+		events:     make(chan agent.Event, eventBufferSize),
+		logger:     slog.With("provider", "opencode", "pid", cmd.Process.Pid),
+		stdoutPipe: stdout,
+		stderrPipe: stderr,
+		stderrBuf:  stderrBuf,
+		shutdown:   make(chan struct{}),
+		done:       make(chan struct{}),
 	}
 	if boundary != nil {
 		h.releaseOwned = boundary.remove
@@ -790,7 +788,6 @@ func (p *Provider) Resume(ctx context.Context, sessionID string, spec agent.Spec
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}
-	spec.Env = agent.WithToolOutputLimitEnv(spec.Env, agent.ResolveToolOutputLimit(spec.ProviderConfig, spec.Env))
 	spec, err = applyEndpoint(spec)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
@@ -829,10 +826,6 @@ type openCodeHandle struct {
 	releaseOwned func() error
 	cleanupOnce  sync.Once
 	cleanupErr   error
-
-	// maxToolOutputBytes bounds one tool result's content handed to the
-	// model and to the runner. Zero means the shared default.
-	maxToolOutputBytes int
 
 	// sessionID captured from the first step_start event.
 	sessionID atomic.Pointer[string]
@@ -925,21 +918,7 @@ func (h *openCodeHandle) cleanupOwned() error {
 	return h.cleanupErr
 }
 
-// toolOutputLimit returns the per-tool-result byte bound for this session.
-func (h *openCodeHandle) toolOutputLimit() int {
-	if h == nil || h.maxToolOutputBytes <= 0 {
-		return agent.DefaultMaxToolOutputBytes
-	}
-	return h.maxToolOutputBytes
-}
-
 func (h *openCodeHandle) sendEvent(ev agent.Event) {
-	if toolRes, ok := ev.(agent.ToolResultEvent); ok {
-		if truncated, changed := agent.TruncateToolOutput(toolRes.Content, h.toolOutputLimit()); changed {
-			toolRes.Content = truncated
-			ev = toolRes
-		}
-	}
 	h.eventsMu.RLock()
 	defer h.eventsMu.RUnlock()
 	if h.eventsClosed.Load() {

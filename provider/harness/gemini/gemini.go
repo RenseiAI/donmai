@@ -206,7 +206,6 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
 	}
-	spec.Env = agent.WithToolOutputLimitEnv(spec.Env, agent.ResolveToolOutputLimit(spec.ProviderConfig, spec.Env))
 
 	// Model resolution: a bound endpoint's model wins over the bare
 	// Spec.Model (the binding is the resolved cell — same rule as the
@@ -277,7 +276,7 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 		turnURL:            turnURL,
 		model:              model,
 		providerConfig:     spec.ProviderConfig,
-		maxToolOutputBytes: agent.ResolveToolOutputLimit(spec.ProviderConfig, spec.Env),
+		maxToolOutputBytes: agent.ResolveToolOutputLimit(spec.ProviderConfig),
 		plan:               plan,
 		client:             p.httpClient,
 		sessionID:          p.sessionIDFn(),

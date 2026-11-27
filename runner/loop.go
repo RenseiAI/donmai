@@ -3085,10 +3085,11 @@ type streamObservation struct {
 	// toolOutputTruncated reports that a tool result of this stream
 	// exceeded the runner's tool-output limit and was truncated around
 	// a marker before the runner retained or forwarded it (see
-	// truncateToolOutput; the harness bounds the model's copy
-	// separately). Protective, never a failure: the turn keeps going.
+	// truncateToolOutput; the model already saw the result the harness
+	// handed it), or arrived already truncated by the harness with the
+	// shared marker. Protective, never a failure: the turn keeps going.
 	// toolOutputBytes is the largest original byte size truncated on
-	// this stream; toolOutputLimit is the limit applied.
+	// this stream; toolOutputLimit is the limit applied to it.
 	toolOutputTruncated bool
 	toolOutputBytes     int
 	toolOutputLimit     int
@@ -3589,28 +3590,37 @@ func (r *Runner) consumeEventsWithin(
 			// forwards it — the audit log, the activity sink, the
 			// pull-request scan — so one escape-laden CI log cannot
 			// balloon the runner's own buffers. This is the runner's
-			// copy; each harness separately bounds the copy it hands the
-			// model with the same shared helper and default (see
-			// agent.TruncateToolOutput). Protective, never a failure: the
-			// turn keeps going, and the observation records the
-			// truncation so the terminal reason can name it when the
+			// copy only: the harness built this event from its tool loop
+			// and has already handed the result to the model, so it does
+			// not bound the model's context (a harness whose tool loop
+			// runs in Go bounds that copy itself). Protective, never a
+			// failure: the turn keeps going, and the observation records
+			// the truncation so the terminal reason can name it when the
 			// turn still dies. Middle-elision keeps the tail, so a pull
 			// request URL at the end of the output still scans.
+			//
+			// A result a harness already bounded with the shared marker
+			// arrives within the limit; the marker still names the
+			// oversize, so it is recorded the same way.
 			if toolRes, ok := ev.(agent.ToolResultEvent); ok {
 				if truncated, changed := truncateToolOutput(toolRes.Content, r.toolOutputLimit()); changed {
 					original := len(toolRes.Content)
 					toolRes.Content = truncated
 					ev = toolRes
-					obs.toolOutputTruncated = true
-					obs.toolOutputLimit = r.toolOutputLimit()
-					if original > obs.toolOutputBytes {
-						obs.toolOutputBytes = original
-					}
+					obs.noteToolOutputTruncated(original, r.toolOutputLimit())
 					r.logger.Warn("tool output exceeded the size limit; truncated with a marker",
 						"sessionId", qw.SessionID,
 						"tool", toolRes.ToolName,
 						"bytes", original,
 						"limit", r.toolOutputLimit(),
+					)
+				} else if original, limit, bounded := agent.ParseToolOutputTruncation(toolRes.Content); bounded {
+					obs.noteToolOutputTruncated(original, limit)
+					r.logger.Warn("tool output exceeded the size limit; the harness truncated it with a marker",
+						"sessionId", qw.SessionID,
+						"tool", toolRes.ToolName,
+						"bytes", original,
+						"limit", limit,
 					)
 				}
 			}

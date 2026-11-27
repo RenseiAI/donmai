@@ -104,10 +104,6 @@ type Handle struct {
 
 	state *mapperState
 
-	// maxToolOutputBytes bounds one tool result's content handed to the
-	// model and to the runner. Zero means the shared default.
-	maxToolOutputBytes int
-
 	// firstTurn carries the bounded safe summary of the actual
 	// outgoing session/first-turn shape plus the once-only emission
 	// flag. Spawn and Resume share one summary per handle.
@@ -135,7 +131,6 @@ type confinementPlan interface {
 var _ confinementPlan = (*confinement.Plan)(nil)
 
 func newHandle(p *Provider, spec agent.Spec, plan SpawnPlan, opts HandleOptions) *Handle {
-	spec.Env = agent.WithToolOutputLimitEnv(spec.Env, agent.ResolveToolOutputLimit(spec.ProviderConfig, spec.Env))
 	if opts.RPCTimeout == 0 {
 		opts.RPCTimeout = DefaultRPCTimeout
 	}
@@ -143,17 +138,16 @@ func newHandle(p *Provider, spec agent.Spec, plan SpawnPlan, opts HandleOptions)
 		opts.EventBuffer = 256
 	}
 	return &Handle{
-		provider:           p,
-		maxToolOutputBytes: agent.ResolveToolOutputLimit(spec.ProviderConfig, spec.Env),
-		bridge:             NewApprovalBridge(spec.PermissionConfig),
-		spec:               spec,
-		plan:               plan,
-		rpcTimeout:         opts.RPCTimeout,
-		events:             make(chan agent.Event, opts.EventBuffer),
-		notifyCh:           make(chan notification, 256),
-		closed:             make(chan struct{}),
-		state:              newMapperState(resolveModel(spec)),
-		decidedApprovals:   make(map[string]struct{}),
+		provider:         p,
+		bridge:           NewApprovalBridge(spec.PermissionConfig),
+		spec:             spec,
+		plan:             plan,
+		rpcTimeout:       opts.RPCTimeout,
+		events:           make(chan agent.Event, opts.EventBuffer),
+		notifyCh:         make(chan notification, 256),
+		closed:           make(chan struct{}),
+		state:            newMapperState(resolveModel(spec)),
+		decidedApprovals: make(map[string]struct{}),
 	}
 }
 
@@ -886,24 +880,9 @@ func (h *Handle) closeEvents() {
 	h.releaseSkills()
 }
 
-// toolOutputLimit returns the per-tool-result byte bound for this session.
-func (h *Handle) toolOutputLimit() int {
-	if h == nil || h.maxToolOutputBytes <= 0 {
-		return agent.DefaultMaxToolOutputBytes
-	}
-	return h.maxToolOutputBytes
-}
-
 // emit publishes an event on the events channel without blocking. If
-// the channel is full, the event is dropped silently. It bounds oversized
-// tool output before handing it to the runner and the model.
+// the channel is full, the event is dropped silently.
 func (h *Handle) emit(ev agent.Event) {
-	if toolRes, ok := ev.(agent.ToolResultEvent); ok {
-		if truncated, changed := agent.TruncateToolOutput(toolRes.Content, h.toolOutputLimit()); changed {
-			toolRes.Content = truncated
-			ev = toolRes
-		}
-	}
 	h.eventsMu.RLock()
 	defer h.eventsMu.RUnlock()
 	if h.eventsClosed.Load() {

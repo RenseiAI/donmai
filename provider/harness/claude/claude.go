@@ -163,7 +163,6 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 		spec.Env = withEffortEnv(spec.Env, spec.Effort)
 	}
 	spec.Env = withAutoMemoryDisabledEnv(spec.Env)
-	spec.Env = agent.WithToolOutputLimitEnv(spec.Env, agent.ResolveToolOutputLimit(spec.ProviderConfig, spec.Env))
 	// A host-login session (host-session/local) must authenticate with the
 	// host's own CLI login: strip every model-provider key and billing
 	// redirect from the spec layer here, and from the composed child env in
@@ -282,7 +281,6 @@ func (p *Provider) Resume(ctx context.Context, sessionID string, spec agent.Spec
 		spec.Env = withEffortEnv(spec.Env, spec.Effort)
 	}
 	spec.Env = withAutoMemoryDisabledEnv(spec.Env)
-	spec.Env = agent.WithToolOutputLimitEnv(spec.Env, agent.ResolveToolOutputLimit(spec.ProviderConfig, spec.Env))
 	spec, unsetEnv := applyAuthMode(spec)
 	return p.spawn(ctx, spec, sessionID, "", unsetEnv)
 }
