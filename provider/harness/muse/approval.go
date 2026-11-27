@@ -7,7 +7,6 @@ import (
 	"strings"
 
 	"github.com/RenseiAI/donmai/agent"
-	"github.com/RenseiAI/donmai/internal/toolpolicy"
 )
 
 // ApprovalAction is the bridge verdict for one inbound approval request.
@@ -133,11 +132,8 @@ type ApprovalBridge struct {
 	allowAllFiles   bool
 
 	// denyPaths are the scoped path denies of every read and write tool
-	// ("Read(~/.ssh/**)", "Edit(docs/**)"), compiled by internal/toolpolicy
-	// with relative patterns anchored at root. A file-access approval does
-	// not say whether it reads or writes, so either kind of deny applies.
-	denyPaths toolpolicy.Paths
-	root      string
+	// ("Read(~/.ssh/**)", "Edit(docs/**)"); see pathDenies.
+	denyPaths pathDenies
 
 	// autoApprove is the default when no pattern matches. True unless
 	// the Spec sets DefaultDecision deny/prompt (autonomous fleets
@@ -153,13 +149,15 @@ func NewApprovalBridge(cfg *agent.PermissionConfig) *ApprovalBridge {
 }
 
 // newApprovalBridgeAt is NewApprovalBridge with relative path denies anchored
-// at root. Without a root, a relative path deny denies every file access.
+// at root, the absolute workspace root the session reports file approvals
+// under. Without an absolute root, a relative path deny denies every file
+// access.
 func newApprovalBridgeAt(cfg *agent.PermissionConfig, root string) *ApprovalBridge {
-	br := &ApprovalBridge{config: cfg, autoApprove: true, root: root}
+	br := &ApprovalBridge{config: cfg, autoApprove: true}
 	if cfg != nil {
 		home, _ := os.UserHomeDir()
 		var errs []error
-		br.denyPaths, errs = toolpolicy.CompilePaths(cfg.DisallowPatterns, isPathToolName, toolpolicy.Deny, root, home)
+		br.denyPaths, errs = compilePathDenies(cfg.DisallowPatterns, root, home, foldPathCase)
 		if len(errs) > 0 {
 			slog.Warn("muse: path denies that cannot be compiled deny every file access", "errors", errs)
 		}
@@ -248,8 +246,8 @@ func (b *ApprovalBridge) evaluateFileAccess(path string) ApprovalDecision {
 	if b.denyAllFiles {
 		return ApprovalDecision{Action: ActionDecline, Reason: "file changes are denied"}
 	}
-	if b.denyPaths.Match(path, b.root) {
-		return ApprovalDecision{Action: ActionDecline, Reason: "path matches a disallow pattern"}
+	if denied, reason := b.denyPaths.denies(path); denied {
+		return ApprovalDecision{Action: ActionDecline, Reason: reason}
 	}
 	if b.denyFiles {
 		for _, re := range b.denyRegexes {
