@@ -94,7 +94,11 @@ func compilePathGlob(glob string, side Side, root, home string) (*regexp.Regexp,
 		return nil, err
 	}
 	tail := `$`
-	if side == Deny {
+	switch {
+	case side == Deny && body == "/":
+		// A deny of the filesystem root covers every path beneath it.
+		tail = `.*$`
+	case side == Deny:
 		tail = `(?:/.*)?$`
 	}
 	// (?s): a newline in a file name must not stop "**" or the deny subtree.
@@ -120,35 +124,34 @@ func escapeGlob(dir string) string {
 // so a multibyte character is quoted whole rather than as Latin-1 bytes.
 func globRegexp(glob string) (string, error) {
 	var b strings.Builder
-	braces := 0
+	// segment: the next token starts a path segment, so a "**/" there spans
+	// directories. Inside a brace set each alternative inherits the segment
+	// state of its "{", as it would after brace expansion.
+	segment := false
+	var braces []bool
 	for i := 0; i < len(glob); {
 		c, size := utf8.DecodeRuneInString(glob[i:])
 		if c == utf8.RuneError && size == 1 {
 			return "", errors.New("invalid UTF-8")
 		}
 		rest := glob[i:]
-		// "**" spans directories only as a whole segment; it is the first
-		// thing in a segment because the glob is absolute and cleaned.
-		segment := i > 0 && glob[i-1] == '/'
+		next := false
 		switch {
 		case c == '\\' && i+size < len(glob):
-			_, next := utf8.DecodeRuneInString(glob[i+size:])
-			b.WriteString(regexp.QuoteMeta(glob[i+size : i+size+next]))
-			i += size + next
-			continue
+			_, n := utf8.DecodeRuneInString(glob[i+size:])
+			b.WriteString(regexp.QuoteMeta(glob[i+size : i+size+n]))
+			next = glob[i+size] == '/'
+			size += n
 		case segment && strings.HasPrefix(rest, "**/"):
 			b.WriteString(`(?:.*/)?`)
-			i += 3
-			continue
+			size, next = 3, true
 		case strings.HasPrefix(rest, "/**") && i+3 == len(glob):
 			b.WriteString(`(?:/.*)?`)
-			i += 3
-			continue
+			size = 3
 		case strings.HasPrefix(rest, "**"):
 			// Not a whole segment: an ordinary "*", as in gitignore.
 			b.WriteString(`[^/]*`)
-			i += 2
-			continue
+			size = 2
 		case c == '*':
 			b.WriteString(`[^/]*`)
 		case c == '?':
@@ -158,39 +161,68 @@ func globRegexp(glob string) (string, error) {
 			if end < 0 {
 				return "", errors.New("unclosed character class")
 			}
-			class := strings.ReplaceAll(glob[i+1:i+1+end], `\`, `\\`)
-			negated, ok := strings.CutPrefix(class, "!")
-			if !ok {
-				negated, ok = strings.CutPrefix(class, "^")
+			class, err := globClass(glob[i+1 : i+1+end])
+			if err != nil {
+				return "", err
 			}
-			if ok {
-				if negated == "" {
-					return "", errors.New("empty character class")
-				}
-				// A class never matches the separator, negated or not.
-				class = "^/" + negated
-			}
-			b.WriteString("[" + class + "]")
-			i += end + 2
-			continue
+			b.WriteString(class)
+			size = end + 2
 		case c == '{':
-			braces++
+			braces = append(braces, segment)
 			b.WriteString(`(?:`)
-		case c == ',' && braces > 0:
+			next = segment
+		case c == ',' && len(braces) > 0:
 			b.WriteString(`|`)
+			next = braces[len(braces)-1]
 		case c == '}':
-			if braces == 0 {
+			if len(braces) == 0 {
 				return "", errors.New("unbalanced brace set")
 			}
-			braces--
+			braces = braces[:len(braces)-1]
 			b.WriteString(`)`)
 		default:
 			b.WriteString(regexp.QuoteMeta(rest[:size]))
+			next = c == '/'
 		}
 		i += size
+		segment = next
 	}
-	if braces != 0 {
+	if len(braces) != 0 {
 		return "", errors.New("unbalanced brace set")
 	}
 	return b.String(), nil
+}
+
+// globClass translates the inside of a "[...]" class. A class never matches
+// the separator, as in gitignore: one that could is an error, as is any form
+// the translation does not reproduce exactly (an empty class, an escape or a
+// nested "[").
+func globClass(inner string) (string, error) {
+	if inner == "" || strings.ContainsAny(inner, `\[`) {
+		return "", errors.New("unsupported character class")
+	}
+	class := inner
+	negated, ok := strings.CutPrefix(inner, "!")
+	if !ok {
+		negated, ok = strings.CutPrefix(inner, "^")
+	}
+	if ok {
+		if negated == "" {
+			return "", errors.New("empty character class")
+		}
+		// After "^/" a leading "-" would start a range at "/".
+		if r, dash := strings.CutPrefix(negated, "-"); dash {
+			negated = `\-` + r
+		}
+		class = "^/" + negated
+	}
+	class = "[" + class + "]"
+	re, err := regexp.Compile(`^` + class + `$`)
+	if err != nil {
+		return "", fmt.Errorf("character class: %w", err)
+	}
+	if re.MatchString("/") {
+		return "", errors.New("character class can match /")
+	}
+	return class, nil
 }

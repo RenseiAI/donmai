@@ -41,6 +41,13 @@ func TestPathForms(t *testing.T) {
 		{"Read(/w/x[!a]y)", Allow, []string{"/w/xby"}, []string{"/w/x/y", "/w/xay"}},
 		{"Read(/w/x[^a]y)", Allow, []string{"/w/xby"}, []string{"/w/x/y", "/w/xay"}},
 		{"Read(/w/docs**)", Allow, []string{"/w/docsx"}, []string{"/w/docsx/secret"}},
+		{"Read(/w/a**/b)", Allow, []string{"/w/ax/b"}, []string{"/w/a/x/b"}},
+		// A negated class starting with "-" excludes "-", not a range from "/".
+		{"Read(/w/x[!-a]y)", Deny, []string{"/w/xBy", "/w/x0y"}, []string{"/w/x-y", "/w/xay"}},
+		{"Read(/w/x[!-a]y)", Allow, []string{"/w/xBy"}, []string{"/w/x-y", "/w/xay", "/w/x/y"}},
+		// Each brace alternative starts where its "{" does.
+		{"Read(/s/{**/x,y})", Deny, []string{"/s/a/b/x", "/s/x", "/s/y"}, []string{"/s/z"}},
+		{"Read(/s/a{**/x,y})", Allow, []string{"/s/aq/x", "/s/ay"}, []string{"/s/a/q/x"}},
 	} {
 		rules, errs := CompilePaths([]string{tc.pattern}, readFamily, tc.side, root, home)
 		if len(errs) != 0 {
@@ -73,6 +80,33 @@ func TestPathRootIsLiteral(t *testing.T) {
 			t.Errorf("%s: errs %v, %q matched %v, %q matched %v", tc.pattern, errs,
 				tc.matched, rules.Match(tc.matched, root), tc.unmatched, rules.Match(tc.unmatched, root))
 		}
+	}
+}
+
+// TestPathRootDeny: a deny that names the filesystem root covers every path.
+func TestPathRootDeny(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct{ pattern, root, home string }{
+		{"Read(/)", "/w", "/h"},
+		{"Read(//)", "/w", "/h"},
+		{"Read(/..)", "/w", "/h"},
+		{"Read(..)", "/", "/h"},
+		{"Read(~)", "/w", "/"},
+		{"Read(~/)", "/w", "/"},
+	} {
+		rules, errs := CompilePaths([]string{tc.pattern}, readFamily, Deny, tc.root, tc.home)
+		if len(errs) != 0 {
+			t.Errorf("%s: unexpected errors %v", tc.pattern, errs)
+		}
+		for _, path := range []string{"/", "/etc/passwd", "/w/main.go", "/a\nb/c"} {
+			if !rules.Match(path, tc.root) {
+				t.Errorf("%s (root %q, home %q): %q not denied", tc.pattern, tc.root, tc.home, path)
+			}
+		}
+	}
+	allow, _ := CompilePaths([]string{"Read(/)"}, readFamily, Allow, "/w", "/h")
+	if !allow.Match("/", "/w") || allow.Match("/etc/passwd", "/w") {
+		t.Errorf("allow Read(/) must match only /")
 	}
 }
 
@@ -126,6 +160,13 @@ func TestPathFailsClosed(t *testing.T) {
 		{"Read(/s/[!].key)", "/w", "/h"},
 		{"Read(/s/\xffa)", "/w", "/h"},
 		{"Read(secret)", "/w\xff", "/h"},
+		// A class never matches "/", and forms it cannot translate exactly fail.
+		{"Read(/w/x[+-0]y)", "/w", "/h"},
+		{"Read(/w/x[/]y)", "/w", "/h"},
+		{"Read(/w/[\\]]x)", "/w", "/h"},
+		{"Read(/w/[]*]x)", "/w", "/h"},
+		{"Read(/w/[[:alpha:]]x)", "/w", "/h"},
+		{"Read(/w/[z-a]x)", "/w", "/h"},
 	} {
 		deny, errs := CompilePaths([]string{tc.pattern}, readFamily, Deny, tc.root, tc.home)
 		if len(errs) != 1 || !strings.Contains(errs[0].Error(), strconv.Quote(tc.pattern)) {
