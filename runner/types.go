@@ -41,6 +41,10 @@ type QueuedWork struct {
 	// ordinary branch work; non-nil makes workarea provisioning fetch and
 	// verify that pull request's head before the agent starts.
 	PullRequest *workarea.PullRequestV1 `json:"pullRequest,omitempty"`
+	// ContextPack is the optional versioned negotiated-document carrier.
+	// Raw until the runner's closed decoder proves the version and shape.
+	// Nil preserves legacy sessions without the carrier byte-for-byte.
+	ContextPack json.RawMessage `json:"contextPack,omitempty"`
 	// Env is the session-scoped operational environment carried by the trusted
 	// work source. It is part of admission digest authority and is distinct from
 	// daemon-local runtime bearers, which remain json:"-" below.
@@ -348,6 +352,13 @@ type ResolvedProfile struct {
 
 	// Endpoint is the resolved serving binding forwarded to agent.Spec.
 	Endpoint *agent.EndpointBinding `json:"endpoint,omitempty"`
+
+	// AuthMode is the auth mode the control plane resolved for this session,
+	// taken from the session detail's resolved profile and forwarded to
+	// agent.Spec.AuthMode. It is deliberately excluded from JSON ("-"): it is
+	// never read from the operational payload, so the canonical payload
+	// projection (and every admission digest over it) stays byte-identical.
+	AuthMode agent.AuthMode `json:"-"`
 }
 
 // interactiveRunMode is the QueuedWork.Mode value that activates the
@@ -479,6 +490,13 @@ type Result struct {
 	// are committed and independently re-read. Nil when no archive committed
 	// for this result; old receivers ignore the key.
 	TerminalArchiveReference *workarea.TerminalArchiveReference `json:"terminalArchiveReference,omitempty"`
+
+	// ContextPack is the sanitized negotiated-document diagnostic for the
+	// pack materialized before the first executor turn. Nil when the work
+	// item carried no carrier. It names only included paths, byte counts
+	// and digests plus excluded paths with sanitized reasons; document
+	// bytes never appear here.
+	ContextPack *workarea.ContextPackReport `json:"contextPack,omitempty"`
 
 	// manifestPrinted records that the envelope's Manifest was recovered
 	// from a printed `Intended manifest:` block rather than read from the

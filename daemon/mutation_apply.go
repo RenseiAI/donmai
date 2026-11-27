@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -82,6 +83,11 @@ func (d *Daemon) applyPendingMutations(_ context.Context, mutations []PendingMut
 			continue
 		}
 		if err := d.applyOneMutation(m); err != nil {
+			if errors.Is(err, errObservationScanDeferred) {
+				slog.Info("[daemon-sync] observations scan deferred",
+					"id", m.ID, "op", m.Op)
+				continue
+			}
 			slog.Warn("[daemon-sync] mutation failed",
 				"id", m.ID, "op", m.Op, "err", err.Error())
 			failures = append(failures, HeartbeatMutationFailure{
@@ -109,6 +115,14 @@ func (d *Daemon) applyOneMutation(m PendingMutation) error {
 	// which takes d.mu itself (Go mutexes are not reentrant).
 	if m.Op == "pool.deleted" {
 		return d.applyPoolDeleted(m)
+	}
+	// observations.scan touches no yaml and runs probes for up to the scan
+	// timeout, so it too stays outside the config lock.
+	if m.Op == observationsScanOp {
+		return d.applyObservationsScan(m, primaryObservationRegistration)
+	}
+	if m.Op == observationsPolicyOp {
+		return d.applyObservationsPolicy(primaryObservationRegistration, m)
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
