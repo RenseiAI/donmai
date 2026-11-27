@@ -364,3 +364,50 @@ func marshalFixture(t *testing.T, v any) json.RawMessage {
 	}
 	return raw
 }
+
+// TestReconcileResolvedProfile_AuthModeReachesSpec pins the auth-mode hop a
+// harness keys its credential surface on: the session detail's resolved
+// authMode survives reconciliation (with and without a model profile) and
+// lands on agent.Spec.AuthMode, while the operational payload projection
+// never carries it (it is not admission authority).
+func TestReconcileResolvedProfile_AuthModeReachesSpec(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name         string
+		modelProfile map[string]any
+		resolved     map[string]any
+		want         agent.AuthMode
+	}{
+		{name: "resolved profile only", resolved: map[string]any{"provider": "claude", "authMode": "host-session"}, want: agent.AuthHostSession},
+		{name: "model profile plus resolved profile", modelProfile: map[string]any{"providerId": "claude", "model": "m"}, resolved: map[string]any{"authMode": "byok"}, want: agent.AuthBYOK},
+		{name: "metered", resolved: map[string]any{"provider": "claude", "authMode": "metered"}, want: agent.AuthMetered},
+		{name: "unstamped", resolved: map[string]any{"provider": "claude"}, want: ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var mp, rp json.RawMessage
+			if tc.modelProfile != nil {
+				mp = marshalFixture(t, tc.modelProfile)
+			}
+			rp = marshalFixture(t, tc.resolved)
+			qw, err := ReconcileResolvedProfile(QueuedWork{}, mp, rp)
+			if err != nil {
+				t.Fatalf("ReconcileResolvedProfile: %v", err)
+			}
+			if qw.ResolvedProfile.AuthMode != tc.want {
+				t.Errorf("ResolvedProfile.AuthMode = %q, want %q", qw.ResolvedProfile.AuthMode, tc.want)
+			}
+			if got := translateSpec(qw, agent.Capabilities{}, SpecInputs{}).AuthMode; got != tc.want {
+				t.Errorf("Spec.AuthMode = %q, want %q", got, tc.want)
+			}
+			payload, err := CanonicalOperationalPayload(qw)
+			if err != nil {
+				t.Fatalf("CanonicalOperationalPayload: %v", err)
+			}
+			if strings.Contains(string(payload), "authMode") {
+				t.Errorf("operational payload carries authMode: %s", payload)
+			}
+		})
+	}
+}

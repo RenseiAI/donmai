@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"math/rand/v2"
 	"net/http"
 	"os"
@@ -1235,6 +1236,24 @@ type agentRunCtorHints struct {
 	// path-override variable, so resolving it there would deny the
 	// default path while the live token sits at the override.
 	ControlTokenPath string
+
+	// PiHandshakeTimeout overrides the pi provider's per-attempt
+	// handshake deadline for this session. Derived from the fetched
+	// SessionDetail's ResolvedProfile.ProviderConfig
+	// (piHandshakeTimeoutHintKey, seconds); zero means absent and the
+	// provider default stands. A negative value means present-but-invalid:
+	// it is preserved so provider construction rejects it loudly instead
+	// of running with an undercut deadline or silently falling back to
+	// the default.
+	PiHandshakeTimeout time.Duration
+
+	// PiHandshakeMaxAttempts overrides the pi provider's handshake-attempt
+	// budget for this session. Derived from the fetched SessionDetail's
+	// ResolvedProfile.ProviderConfig (piHandshakeMaxAttemptsHintKey);
+	// zero means absent and the provider default stands. A negative value
+	// means present-but-invalid: it is preserved so provider construction
+	// rejects it loudly instead of silently falling back to the default.
+	PiHandshakeMaxAttempts int
 }
 
 // agentRunHints collects every per-session constructor signal in one pass.
@@ -1243,6 +1262,8 @@ type agentRunCtorHints struct {
 func agentRunHints(d *daemon.SessionDetail) agentRunCtorHints {
 	h := opencodeCtorHints(d)
 	h.CodexHostSessionAuth = codexHostSessionCtorHint(d)
+	h.PiHandshakeTimeout = piHandshakeTimeoutHint(d)
+	h.PiHandshakeMaxAttempts = piHandshakeMaxAttemptsHint(d)
 	if d != nil {
 		h.ControlTokenPath = strings.TrimSpace(d.ControlTokenPath)
 	}
@@ -1359,6 +1380,29 @@ func localCodexHostSessionHint(detail *daemon.SessionDetail) (bool, error) {
 // map[string]any JSON wire shape.
 const opencodeCtorHintKey = "opencode.preferServer"
 
+// piHandshakeTimeoutHintKey is the typed ResolvedProfile.ProviderConfig
+// knob carrying the pi per-session handshake deadline in seconds — the
+// daemon's harness configuration for how long one handshake attempt may
+// take before the fail-closed gate fires. Same opaque-ProviderConfig
+// namespaced-key pattern as opencodeCtorHintKey.
+const piHandshakeTimeoutHintKey = "pi.handshakeTimeoutSeconds"
+
+// piHandshakeMaxAttemptsHintKey is the typed ResolvedProfile.ProviderConfig
+// knob carrying the pi handshake-attempt budget — how many handshake
+// attempts a session may make before the fail-closed gate fires. Same
+// opaque-ProviderConfig namespaced-key pattern as piHandshakeTimeoutHintKey.
+const piHandshakeMaxAttemptsHintKey = "pi.handshakeMaxAttempts"
+
+// invalidHandshakeTimeout marks a present-but-invalid handshake-deadline
+// declaration. It is non-zero so piCtorOptions threads it through to
+// provider construction, which rejects it loudly; it must never collapse
+// to zero (unset), which would silently install the default.
+const invalidHandshakeTimeout = -time.Second
+
+// invalidHandshakeMaxAttempts marks a present-but-invalid attempt-budget
+// declaration, preserved for the same reason as invalidHandshakeTimeout.
+const invalidHandshakeMaxAttempts = -1
+
 // opencodeCtorHints derives agentRunCtorHints from a fetched SessionDetail.
 // A nil detail/ResolvedProfile, a missing key, or a non-bool value all
 // resolve to the zero value (Lane-A default, unchanged historical
@@ -1391,11 +1435,118 @@ func codexCtorOptions(h agentRunCtorHints) providercodex.Options {
 	return providercodex.Options{HostSessionAuth: h.CodexHostSessionAuth}
 }
 
+// piHandshakeTimeoutHint derives the pi per-session handshake deadline
+// from a fetched SessionDetail. A nil detail/ResolvedProfile, a missing
+// key, or a non-positive value all resolve to zero (provider default,
+// unchanged historical behavior). A positive number of seconds wins; a
+// duration string (e.g. "15s") is accepted too. Positive values ride
+// through to provider construction as-is — even ones below the floor,
+// which construction rejects loudly instead of running with an undercut
+// deadline. A present-but-invalid declaration (zero, negative, garbage
+// string, or wrong type) returns invalidHandshakeTimeout, a non-zero
+// sentinel the ctor threads through so construction rejects it: it must
+// never collapse to zero (unset), which would silently install the
+// default and let malformed policy configuration run.
+func piHandshakeTimeoutHint(d *daemon.SessionDetail) time.Duration {
+	if d == nil || d.ResolvedProfile == nil {
+		return 0
+	}
+	v, ok := d.ResolvedProfile.ProviderConfig[piHandshakeTimeoutHintKey]
+	if !ok {
+		return 0
+	}
+	switch n := v.(type) {
+	case float64:
+		// A value past maxHandshakeTimeoutSeconds (for example a duration
+		// written as nanoseconds) would overflow time.Duration; NaN and
+		// Inf fail these comparisons too. All are invalid, never clamped.
+		// A positive value that truncates to zero (below one nanosecond)
+		// is a present declaration, not an absent one: it must reach
+		// construction as invalid instead of collapsing to unset and
+		// silently installing the default.
+		if n > 0 && n <= float64(maxHandshakeTimeoutSeconds) {
+			if d := time.Duration(n * float64(time.Second)); d > 0 {
+				return d
+			}
+		}
+	case int:
+		if n > 0 && int64(n) <= maxHandshakeTimeoutSeconds {
+			return time.Duration(n) * time.Second
+		}
+	case int64:
+		if n > 0 && n <= maxHandshakeTimeoutSeconds {
+			return time.Duration(n) * time.Second
+		}
+	case string:
+		if s := strings.TrimSpace(n); s != "" {
+			if dur, err := time.ParseDuration(s); err == nil && dur > 0 {
+				return dur
+			}
+		}
+	}
+	return invalidHandshakeTimeout
+}
+
+// maxHandshakeTimeoutSeconds is the largest whole number of seconds a
+// time.Duration can hold. Larger declared values are rejected as invalid
+// instead of overflowing into a wrapped or near-unbounded deadline.
+const maxHandshakeTimeoutSeconds = math.MaxInt64 / int64(time.Second)
+
+// piHandshakeMaxAttemptsHint derives the pi handshake-attempt budget from
+// a fetched SessionDetail. Absent resolves to zero (provider default). A
+// positive integer wins and rides through to provider construction as-is —
+// even one outside the [min, max] bounds, which construction rejects
+// loudly. A present-but-invalid declaration (zero, negative, fractional,
+// garbage string, or wrong type) returns invalidHandshakeMaxAttempts so
+// construction rejects it instead of silently installing the default.
+func piHandshakeMaxAttemptsHint(d *daemon.SessionDetail) int {
+	if d == nil || d.ResolvedProfile == nil {
+		return 0
+	}
+	v, ok := d.ResolvedProfile.ProviderConfig[piHandshakeMaxAttemptsHintKey]
+	if !ok {
+		return 0
+	}
+	switch n := v.(type) {
+	case float64:
+		if n > 0 && n == float64(int(n)) {
+			return int(n)
+		}
+	case int:
+		if n > 0 {
+			return n
+		}
+	case int64:
+		if n > 0 {
+			return int(n)
+		}
+	case string:
+		if s := strings.TrimSpace(n); s != "" {
+			if parsed, err := strconv.Atoi(s); err == nil && parsed > 0 {
+				return parsed
+			}
+		}
+	}
+	return invalidHandshakeMaxAttempts
+}
+
 func piCtorOptions(h agentRunCtorHints) providerpi.Options {
-	return providerpi.Options{
+	opts := providerpi.Options{
 		TrustedExtensions: append([]providerpi.TrustedExtensionIdentity(nil), h.PiTrustedExtensions...),
 		ControlTokenPath:  h.ControlTokenPath,
 	}
+	// Daemon-stated handshake knobs reach the real sessions; absent keeps
+	// the provider defaults. Present-but-invalid values (the negative
+	// sentinels) ride through so provider construction rejects them
+	// loudly — the registry skips pi — never as a silent fallback to the
+	// default.
+	if h.PiHandshakeTimeout != 0 {
+		opts.HandshakeTimeout = h.PiHandshakeTimeout
+	}
+	if h.PiHandshakeMaxAttempts != 0 {
+		opts.HandshakeMaxAttempts = h.PiHandshakeMaxAttempts
+	}
+	return opts
 }
 
 // agentRunProviderCtors returns the single hand-authored ctor list — the SoT

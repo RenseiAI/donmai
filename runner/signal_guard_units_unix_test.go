@@ -5,10 +5,13 @@ package runner
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/RenseiAI/donmai/agent"
 )
@@ -124,6 +127,45 @@ func TestSignalGuardEnvWithoutLayout(t *testing.T) {
 }
 
 func itoaForTest(n int) string { return strconv.Itoa(n) }
+
+// TestWriteSignalGuardFileHoldsForkLock pins the fork guard on the
+// install helper: while the fork lock is held exclusively (as during any
+// concurrent fork), the helper must block instead of writing with the
+// descriptor exposed. Without the read-side hold, the write completes
+// immediately and a fork in that window inherits the open descriptor,
+// so the shim's next exec fails with ETXTBSY (text file busy).
+func TestWriteSignalGuardFileHoldsForkLock(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "shim")
+	syscall.ForkLock.Lock()
+	done := make(chan error, 1)
+	go func() {
+		done <- writeSignalGuardFile(path, []byte("#!/bin/sh\necho ok\n"))
+	}()
+	select {
+	case err := <-done:
+		syscall.ForkLock.Unlock()
+		t.Fatalf("writeSignalGuardFile completed while ForkLock was held exclusively (err %v): the write descriptor is exposed to concurrent forks", err)
+	case <-time.After(500 * time.Millisecond):
+	}
+	syscall.ForkLock.Unlock()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("writeSignalGuardFile: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("writeSignalGuardFile did not complete after ForkLock was released")
+	}
+	// Nothing holds the file open for writing anymore, so it execs
+	// immediately with no text-file-busy failure.
+	out, err := exec.Command(path).CombinedOutput() //nolint:gosec // G204: executing the shim just installed is the point.
+	if err != nil {
+		t.Fatalf("exec installed shim: %v (output %q)", err, out)
+	}
+	if strings.TrimSpace(string(out)) != "ok" {
+		t.Fatalf("shim output = %q, want ok", out)
+	}
+}
 
 func TestChainOnProcessSpawnedRunsBoth(t *testing.T) {
 	t.Parallel()

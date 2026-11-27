@@ -39,6 +39,14 @@ type mapperState struct {
 	usageTotal    *codexTokenUsage
 	usageThisTurn bool
 	reasoning     map[string]*reasoningBuffer
+	// safetyBuffering is the in-progress per-turn buffering episode.
+	// Consecutive model/safetyBuffering/updated notifications collapse
+	// into one started event plus one ended event (flushed on the turn
+	// boundary) instead of one session-stream row per moderated chunk.
+	safetyBuffering *safetyBufferingEpisode
+	// now overrides the wall clock for buffering durations; nil reads
+	// time.Now. Tests inject a fake clock.
+	now func() time.Time
 }
 
 // mapNotification translates one inbound JSON-RPC notification into
@@ -108,14 +116,18 @@ func mapNotification(method string, params json.RawMessage, state *mapperState, 
 		state.usageThisTurn = false
 		state.turnCount++
 		state.turnStarted = time.Now()
-		return []agent.Event{agent.SystemEvent{
+		// A previous turn's buffering episode never closed by its own
+		// turn/completed ends here so the next turn starts clean.
+		ended := flushSafetyBuffering(state, raw)
+		return append(ended, agent.Event(agent.SystemEvent{
 			Subtype: "turn_started",
 			Message: fmt.Sprintf("Turn %d started", state.turnCount),
 			Raw:     raw,
-		}}
+		}))
 
 	case "turn/completed":
 		events := flushReasoning(state, raw)
+		events = append(events, flushSafetyBuffering(state, raw)...)
 		return append(events, mapTurnCompleted(params, state, raw)...)
 
 	// The account rate-limit notification carries the same snapshot
@@ -196,8 +208,10 @@ func mapNotification(method string, params json.RawMessage, state *mapperState, 
 		return mapDiagnostic(method, params)
 	case "thread/tokenUsage/updated":
 		return mapTokenUsageUpdated(params, state, raw)
-	case "model/rerouted", "turn/moderationMetadata", "model/safetyBuffering/updated":
+	case "model/rerouted", "turn/moderationMetadata":
 		return mapWarning(method, params, state, raw)
+	case "model/safetyBuffering/updated":
+		return mapSafetyBuffering(params, state, raw)
 	case "thread/compacted":
 		return []agent.Event{agent.ContextUsageEvent{Harness: "codex", Source: "app-server", NoticeKind: agent.ContextUsageCompaction, Raw: raw}}
 	case "item/reasoning/textDelta", "item/reasoning/summaryTextDelta", "item/reasoning/summaryPartAdded":

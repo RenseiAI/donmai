@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -86,7 +87,7 @@ func TestNotificationStreamWarningsAndProgress(t *testing.T) {
 	for _, tc := range []struct{ method, params, subtype, content string }{
 		{"model/rerouted", `{"fromModel":"first","toModel":"second","reason":"safety"}`, "codex_model_rerouted", "second"},
 		{"turn/moderationMetadata", `{"metadata":{"review":true}}`, "codex_moderation", "review"},
-		{"model/safetyBuffering/updated", `{"model":"first","reasons":["review"]}`, "codex_safety_buffering", "review"},
+		{"model/safetyBuffering/updated", `{"model":"first","reasons":["review"]}`, "codex_safety_buffering_started", "review"},
 	} {
 		t.Run(tc.method, func(t *testing.T) {
 			t.Parallel()
@@ -449,5 +450,180 @@ func TestNotificationStreamGlobalWarnings(t *testing.T) {
 			t.Fatalf("cross-thread diagnostic: %+v", n)
 		default:
 		}
+	}
+}
+
+func TestNotificationStreamSafetyBufferingCollapse(t *testing.T) {
+	t.Parallel()
+	const buffering = `{"model":"sol","reasons":["modapi"]}`
+	burst := func(n int, step time.Duration) []time.Duration {
+		offsets := make([]time.Duration, n)
+		for i := range offsets {
+			offsets[i] = time.Duration(i) * step
+		}
+		return offsets
+	}
+	for _, tc := range []struct {
+		name string
+		// chunkOffsets are fake-clock offsets of each buffering chunk.
+		chunkOffsets []time.Duration
+		// endOffset is the fake-clock offset of the closing turn/completed.
+		endOffset time.Duration
+		// wantSummaries counts the periodic in-progress summaries.
+		wantSummaries int
+		// wantLastSummary is the substring the final summary must carry;
+		// empty skips the check.
+		wantLastSummary string
+	}{
+		{
+			name:         "single chunk",
+			chunkOffsets: []time.Duration{0},
+			endOffset:    1500 * time.Millisecond,
+		},
+		{
+			name:         "rapid burst of 184 chunks collapses",
+			chunkOffsets: burst(184, 5*time.Millisecond),
+			endOffset:    915 * time.Millisecond,
+		},
+		{
+			name:            "long buffering emits a periodic summary at most every 10s",
+			chunkOffsets:    []time.Duration{0, 5 * time.Second, 11 * time.Second, 12 * time.Second, 23 * time.Second},
+			endOffset:       23 * time.Second,
+			wantSummaries:   2,
+			wantLastSummary: "(5 chunks so far)",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			base := time.Now()
+			now := base
+			h := notificationHandle()
+			h.state.now = func() time.Time { return now }
+			// The first chunk emits exactly one started event.
+			got := dispatch(t, h, "model/safetyBuffering/updated", buffering)
+			if len(got) != 1 {
+				t.Fatalf("started events = %+v", got)
+			}
+			started, ok := got[0].(agent.SystemEvent)
+			if !ok || started.Subtype != "codex_safety_buffering_started" || !strings.Contains(started.Message, "sol") || !strings.Contains(started.Message, "modapi") {
+				t.Fatalf("started = %+v", got[0])
+			}
+			// Later chunks stay silent unless the 10s summary interval elapses.
+			summaries := 0
+			for i, off := range tc.chunkOffsets[1:] {
+				now = base.Add(off)
+				got = dispatch(t, h, "model/safetyBuffering/updated", buffering)
+				if len(got) == 0 {
+					continue
+				}
+				if len(got) != 1 {
+					t.Fatalf("chunk %d emitted %+v", i+1, got)
+				}
+				summary, ok := got[0].(agent.SystemEvent)
+				if !ok || summary.Subtype != "codex_safety_buffering" || !strings.Contains(summary.Message, "chunks so far") {
+					t.Fatalf("chunk %d summary = %+v", i+1, got[0])
+				}
+				summaries++
+				if i == len(tc.chunkOffsets)-2 && tc.wantLastSummary != "" && !strings.Contains(summary.Message, tc.wantLastSummary) {
+					t.Fatalf("last summary = %q, want %q", summary.Message, tc.wantLastSummary)
+				}
+			}
+			if summaries != tc.wantSummaries {
+				t.Fatalf("summaries = %d, want %d", summaries, tc.wantSummaries)
+			}
+			// The turn boundary ends the episode with the chunk count and duration.
+			now = base.Add(tc.endOffset)
+			got = dispatch(t, h, "turn/completed", `{"turn":{"id":"t","status":"completed"}}`)
+			if len(got) != 3 {
+				t.Fatalf("turn end = %+v", got)
+			}
+			ended, ok := got[0].(agent.SystemEvent)
+			wantEnded := fmt.Sprintf("chunks=%d duration_ms=%d", len(tc.chunkOffsets), tc.endOffset.Milliseconds())
+			if !ok || ended.Subtype != "codex_safety_buffering_ended" || !strings.Contains(ended.Message, wantEnded) {
+				t.Fatalf("ended = %+v, want %q", got[0], wantEnded)
+			}
+			if _, ok := got[1].(agent.LlmCallEvent); !ok {
+				t.Fatalf("turn spend missing: %+v", got[1])
+			}
+			if result, ok := got[2].(agent.ResultEvent); !ok || !result.Success {
+				t.Fatalf("turn result changed: %+v", got[2])
+			}
+		})
+	}
+}
+
+func TestNotificationStreamSafetyBufferingLeavesModerationAlone(t *testing.T) {
+	t.Parallel()
+	h := notificationHandle()
+	if got := dispatch(t, h, "model/safetyBuffering/updated", `{"model":"sol","reasons":["modapi"]}`); len(got) != 1 {
+		t.Fatalf("started = %+v", got)
+	}
+	// Malformed buffering params emit nothing and poison no episode.
+	if got := dispatch(t, h, "model/safetyBuffering/updated", `{`); len(got) != 0 {
+		t.Fatalf("malformed buffering emitted %+v", got)
+	}
+	// Moderation results still emit per notification, untouched by the collapse.
+	for range 2 {
+		got := dispatch(t, h, "turn/moderationMetadata", `{"metadata":{"review":true}}`)
+		if len(got) != 1 {
+			t.Fatalf("moderation = %+v", got)
+		}
+		event, ok := got[0].(agent.SystemEvent)
+		if !ok || event.Subtype != "codex_moderation" || !strings.Contains(event.Message, "review") {
+			t.Fatalf("moderation = %+v", got[0])
+		}
+	}
+	// The chunk after the malformed payload still collapses into the open episode.
+	if got := dispatch(t, h, "model/safetyBuffering/updated", `{"model":"sol","reasons":["modapi"]}`); len(got) != 0 {
+		t.Fatalf("collapsed chunk emitted %+v", got)
+	}
+	got := dispatch(t, h, "turn/completed", `{"turn":{"id":"t","status":"completed"}}`)
+	if len(got) != 3 {
+		t.Fatalf("turn end = %+v", got)
+	}
+	ended, ok := got[0].(agent.SystemEvent)
+	if !ok || ended.Subtype != "codex_safety_buffering_ended" || !strings.Contains(ended.Message, "chunks=2") {
+		t.Fatalf("ended = %+v", got[0])
+	}
+}
+
+func TestNotificationStreamSafetyBufferingEndsOnNextTurn(t *testing.T) {
+	t.Parallel()
+	base := time.Now()
+	now := base
+	h := notificationHandle()
+	h.state.now = func() time.Time { return now }
+	dispatch(t, h, "turn/started", `{"turn":{"id":"first"}}`)
+	dispatch(t, h, "model/safetyBuffering/updated", `{"model":"sol","reasons":["modapi"]}`)
+	now = base.Add(400 * time.Millisecond)
+	if got := dispatch(t, h, "model/safetyBuffering/updated", `{"model":"sol","reasons":["modapi"]}`); len(got) != 0 {
+		t.Fatalf("collapsed chunk emitted %+v", got)
+	}
+	// A new turn closes the previous episode before announcing itself.
+	now = base.Add(800 * time.Millisecond)
+	got := dispatch(t, h, "turn/started", `{"turn":{"id":"second"}}`)
+	if len(got) != 2 {
+		t.Fatalf("turn reset = %+v", got)
+	}
+	ended, ok := got[0].(agent.SystemEvent)
+	if !ok || ended.Subtype != "codex_safety_buffering_ended" || !strings.Contains(ended.Message, "chunks=2 duration_ms=800") {
+		t.Fatalf("previous episode = %+v", got[0])
+	}
+	if turn, ok := got[1].(agent.SystemEvent); !ok || turn.Subtype != "turn_started" {
+		t.Fatalf("next turn missing: %+v", got[1])
+	}
+	// Buffering in the new turn starts a fresh episode.
+	now = base.Add(900 * time.Millisecond)
+	if got := dispatch(t, h, "model/safetyBuffering/updated", `{"model":"sol","reasons":["modapi"]}`); len(got) != 1 || got[0].(agent.SystemEvent).Subtype != "codex_safety_buffering_started" {
+		t.Fatalf("fresh started = %+v", got)
+	}
+	now = base.Add(1000 * time.Millisecond)
+	got = dispatch(t, h, "turn/completed", `{"turn":{"id":"second","status":"completed"}}`)
+	if len(got) != 3 {
+		t.Fatalf("turn end = %+v", got)
+	}
+	ended, ok = got[0].(agent.SystemEvent)
+	if !ok || ended.Subtype != "codex_safety_buffering_ended" || !strings.Contains(ended.Message, "chunks=1 duration_ms=100") {
+		t.Fatalf("fresh ended = %+v", got[0])
 	}
 }
