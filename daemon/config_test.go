@@ -1710,3 +1710,33 @@ func TestDaemonStart_MaxToolOutputBytesStatesWorkerEnv(t *testing.T) {
 		})
 	}
 }
+
+func TestLoadConfig_QuotaProbeHomesRoundTripAndValidation(t *testing.T) {
+	dir := t.TempDir()
+	a, b := filepath.Join(dir, "a"), filepath.Join(dir, "b")
+	cx, cy := filepath.Join(dir, "cx"), filepath.Join(dir, "cy")
+	path := filepath.Join(dir, "daemon.yaml")
+	cfg := &Config{Machine: MachineConfig{ID: "m"}, Orchestrator: OrchestratorConfig{URL: "https://example.test"}, QuotaProbeHomes: map[string][]string{"claude": {a, b}, "codex": {cx, cy}}}
+	if err := WriteConfig(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded.QuotaProbeHomes["claude"]) != 2 || len(loaded.QuotaProbeHomes["codex"]) != 2 {
+		t.Fatalf("homes = %v, want two per harness", loaded.QuotaProbeHomes)
+	}
+	for _, tc := range []struct{ body, leak string }{{"quotaProbeHomes:\n  bogus: [/forbidden-home-12345]\n", "/forbidden-home-12345"}, {"quotaProbeHomes:\n  claude: [relative-test-home-12345]\n", "relative-test-home-12345"}, {"quotaProbeHomes:\n  claude: ['']\n", ""}, {"quotaProbeHomes:\n  codex: [relative-test-home-12345]\n", "relative-test-home-12345"}} {
+		p := filepath.Join(t.TempDir(), "daemon.yaml")
+		if err := os.WriteFile(p, []byte("machine:\n  id: m\norchestrator:\n  url: https://example.test\n"+tc.body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		err := func() error { _, err := LoadConfig(p); return err }()
+		if err == nil {
+			t.Errorf("invalid homes accepted: %q", tc.body)
+		} else if tc.leak != "" && strings.Contains(err.Error(), tc.leak) {
+			t.Errorf("rejected homes leaked path %q: %v", tc.leak, err)
+		}
+	}
+}

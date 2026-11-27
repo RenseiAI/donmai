@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -374,5 +376,463 @@ func TestQuotaProbeBounds(t *testing.T) {
 	}
 	if providerclaude.UsageProbeTimeout > quotaProbeTimeout {
 		t.Errorf("claude usage read ceiling %v must stay within the probe attempt ceiling %v", providerclaude.UsageProbeTimeout, quotaProbeTimeout)
+	}
+}
+
+func writeClaudeSlotCLI(t *testing.T, usageLog string) string {
+	t.Helper()
+	t.Setenv("USER", "probe-operator")
+	script := "#!/bin/sh\n" +
+		"case \" $* \" in *\" auth status --json \"*)\n" +
+		"case \"$CLAUDE_CONFIG_DIR\" in *hang*) (sleep 1.5; touch \"" + usageLog + ".survived\") & sleep 30; exit 0;; *home-a*) printf '{\"loggedIn\":true,\"authMethod\":\"claude.ai\",\"apiProvider\":\"firstParty\",\"m\":\"a\"}\\n'; exit 0;; *home-b*|*exhausted*) printf '{\"loggedIn\":true,\"authMethod\":\"claude.ai\",\"apiProvider\":\"firstParty\",\"m\":\"b\"}\\n'; exit 0;; *) printf '{\"loggedIn\":true,\"authMethod\":\"claude.ai\",\"apiProvider\":\"firstParty\",\"m\":\"d\"}\\n'; exit 0;; esac;;\n" +
+		"esac\necho \"usage $CLAUDE_CONFIG_DIR\" >> \"" + usageLog + "\"\n" +
+		"case \"$CLAUDE_CONFIG_DIR\" in *hang*) (sleep 1.5; touch \"" + usageLog + ".survived\") & sleep 30; exit 0;; *home-a*) u='{\"five_hour\":{\"utilization\":11,\"resets_at\":\"2030-01-01T00:00:00Z\"},\"seven_day\":{\"utilization\":12,\"resets_at\":\"2030-01-01T00:00:00Z\"}}';; *exhausted*) u='{\"five_hour\":{\"utilization\":100,\"resets_at\":\"2030-01-01T00:00:00Z\"},\"seven_day\":{\"utilization\":100,\"resets_at\":\"2030-01-01T00:00:00Z\"}}';; *home-b*) u='{\"five_hour\":{\"utilization\":33,\"resets_at\":\"2030-01-01T00:00:00Z\"},\"seven_day\":{\"utilization\":34,\"resets_at\":\"2030-01-01T00:00:00Z\"}}';; *) u='{\"five_hour\":{\"utilization\":10,\"resets_at\":\"2030-01-01T00:00:00Z\"},\"seven_day\":{\"utilization\":20,\"resets_at\":\"2030-01-01T00:00:00Z\"}}';; esac\n" +
+		"printf '{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"response\":{\"rate_limits_available\":true,\"rate_limits\":%s}}}\\n' \"$u\"\n"
+	path := filepath.Join(t.TempDir(), "fake-claude")
+	if err := testexec.WriteFile(path, []byte(script), 0o700); err != nil {
+		t.Fatalf("write slot CLI: %v", err)
+	}
+	return path
+}
+
+func slotUsageLines(t *testing.T, log string) []string {
+	t.Helper()
+	raw, _ := os.ReadFile(log)
+	var out []string
+	for _, l := range strings.Split(string(raw), "\n") {
+		if strings.TrimSpace(l) != "" {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+func driveClaudeScan(t *testing.T, bin, def string, extras []string) *Daemon {
+	t.Helper()
+	t.Setenv("CLAUDE_CONFIG_DIR", def)
+	d := New(Options{QuotaProbeBinaries: map[string]string{agent.UsageHarnessClaude: bin}})
+	d.config = &Config{QuotaProbeHomes: map[string][]string{agent.UsageHarnessClaude: extras}}
+	newQuotaPoller(d.quota, d.quotaProbes()).probeDue(context.Background())
+	return d
+}
+
+func TestQuotaPoller_ClaudeSlotsPairAccountsAndPreserveHeartbeat(t *testing.T) {
+	root := t.TempDir()
+	def := filepath.Join(root, "def")
+	a := filepath.Join(root, "home-a")
+	b := filepath.Join(root, "home-b")
+	exh := filepath.Join(root, "exhausted")
+	for _, d := range []string{def, a, b, exh} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	usageLog := filepath.Join(root, "u.log")
+	bin := writeClaudeSlotCLI(t, usageLog)
+	cfgPath := filepath.Join(root, "daemon.yaml")
+	if err := WriteConfig(cfgPath, &Config{Machine: MachineConfig{ID: "m"}, Orchestrator: OrchestratorConfig{URL: "https://example.test"}, QuotaProbeHomes: map[string][]string{"claude": {a, b}}}); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadConfig(cfgPath)
+	if err != nil || len(loaded.QuotaProbeHomes["claude"]) != 2 {
+		t.Fatalf("load homes = %v, %v", loaded, err)
+	}
+	d1 := driveClaudeScan(t, bin, def, []string{a, b})
+	d2 := driveClaudeScan(t, bin, def, []string{b, a})
+	for _, key := range []string{normalizeClaudeProbeHome(a), normalizeClaudeProbeHome(b)} {
+		s1, ok1 := d1.quota.claudeSlotAttempt(key)
+		s2, ok2 := d2.quota.claudeSlotAttempt(key)
+		if !ok1 || !ok2 || s1.accountID == "" || s1.accountID != s2.accountID || len(s1.limits.Windows) != 2 || s1.limits.Windows[0].UsedPercent != s2.limits.Windows[0].UsedPercent {
+			t.Fatalf("slot %s pairing failed: %+v %+v", key, s1, s2)
+		}
+	}
+	if len(d1.QuotaSnapshot()) != 1 || len(d2.QuotaSnapshot()) != 1 {
+		t.Fatalf("snapshots = %v %v, want one default entry", d1.QuotaSnapshot(), d2.QuotaSnapshot())
+	}
+	// Each home must answer with its own identity: a status read routed to
+	// the default would reuse one account id across every slot.
+	sa, _ := d1.quota.claudeSlotAttempt(normalizeClaudeProbeHome(a))
+	sb, _ := d1.quota.claudeSlotAttempt(normalizeClaudeProbeHome(b))
+	if sa.accountID == sb.accountID || sa.accountID == d1.QuotaSnapshot()[0].ID || sb.accountID == d1.QuotaSnapshot()[0].ID {
+		t.Fatalf("claude slot identities not distinct: a=%q b=%q default=%q", sa.accountID, sb.accountID, d1.QuotaSnapshot()[0].ID)
+	}
+	dex := driveClaudeScan(t, bin, def, []string{exh})
+	snapEx := dex.QuotaSnapshot()
+	dDef := driveClaudeScan(t, bin, def, nil)
+	snapDef := dDef.QuotaSnapshot()
+	if len(snapEx) != 1 || len(snapDef) != 1 || snapEx[0].Provider != "claude" {
+		t.Fatalf("heartbeat snapshots = %v %v", snapEx, snapDef)
+	}
+	if snapEx[0].ID != snapDef[0].ID || len(snapEx[0].Limits.Windows) != 2 || snapEx[0].Limits.Windows[0].UsedPercent != 10 || snapDef[0].Limits.Windows[0].UsedPercent != 10 {
+		t.Fatalf("exhausted extra changed heartbeat: %+v vs %+v", snapEx, snapDef)
+	}
+	now := time.Now()
+	if err := decideQuotaClaimAdmission(snapEx, string(agent.AuthHostSession), "claude", now); err != nil {
+		t.Fatalf("claim admission refused on available default: %v", err)
+	}
+	if suspended, _ := quotaExhaustionSuspendsClaiming(snapEx, quotaServedClaimLanesForSnapshot(snapEx, map[string]string{"claude": bin}, nil), now); suspended {
+		t.Fatal("claiming suspended by exhausted extra")
+	}
+}
+
+func TestQuotaPoller_ClaudeDedupCountsUsageOnly(t *testing.T) {
+	root := t.TempDir()
+	def := filepath.Join(root, "def")
+	a := filepath.Join(root, "home-a")
+	eb := filepath.Join(root, "home-b")
+	neighbor := filepath.Join(root, "neighbor")
+	for _, d := range []string{def, a, eb, neighbor} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	linkA := filepath.Join(root, "link-a")
+	linkDef := filepath.Join(root, "link-def")
+	if err := os.Symlink(a, linkA); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(def, linkDef); err != nil {
+		t.Fatal(err)
+	}
+	usageLog := filepath.Join(root, "u.log")
+	bin := writeClaudeSlotCLI(t, usageLog)
+	driveClaudeScan(t, bin, def, nil)
+	if got := len(slotUsageLines(t, usageLog)); got != 1 {
+		t.Fatalf("default-only usage lines = %d, want 1", got)
+	}
+	if err := os.Remove(usageLog); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	d2 := New(Options{QuotaProbeBinaries: map[string]string{agent.UsageHarnessClaude: bin}})
+	t.Setenv("CLAUDE_CONFIG_DIR", def)
+	d2.config = &Config{QuotaProbeHomes: map[string][]string{"claude": {a, a, linkA, eb, linkDef}}}
+	newQuotaPoller(d2.quota, d2.quotaProbes()).probeDue(context.Background())
+	lines := slotUsageLines(t, usageLog)
+	if len(lines) != 3 {
+		t.Fatalf("usage lines = %v, want default plus two distinct extras", lines)
+	}
+	for _, l := range lines {
+		if strings.Contains(l, neighbor) {
+			t.Fatalf("neighbor probed: %v", lines)
+		}
+	}
+	n := len(lines)
+	newQuotaPoller(d2.quota, d2.quotaProbes()).probeDue(context.Background())
+	if got := len(slotUsageLines(t, usageLog)); got != n {
+		t.Fatalf("second scan usage = %d, want %d (no repeat inside interval)", got, n)
+	}
+}
+
+func TestQuotaPoller_ClaudeUnknownHangAndMuseCancel(t *testing.T) {
+	root := t.TempDir()
+	def := filepath.Join(root, "def")
+	good := filepath.Join(root, "home-a")
+	hang := filepath.Join(root, "hang")
+	later := filepath.Join(root, "home-b")
+	for _, d := range []string{def, good, hang, later} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	usageLog := filepath.Join(root, "u.log")
+	bin := writeClaudeSlotCLI(t, usageLog)
+	d := driveClaudeScan(t, bin, def, []string{good, later})
+	goodKey := normalizeClaudeProbeHome(good)
+	first, ok := d.quota.claudeSlotAttempt(goodKey)
+	if !ok || first.accountID == "" {
+		t.Fatalf("first scan missing good slot: %+v", first)
+	}
+	if err := os.RemoveAll(good); err != nil {
+		t.Fatal(err)
+	}
+	d.quota.mu.Lock()
+	d.quota.claudeAt = time.Now().Add(-providercodex.RateLimitsProbeInterval - time.Second)
+	d.quota.mu.Unlock()
+	newQuotaPoller(d.quota, d.quotaProbes()).probeDue(context.Background())
+	after, ok := d.quota.claudeSlotAttempt(goodKey)
+	if !ok {
+		t.Fatal("good slot missing after rescan")
+	}
+	if after.limits.Unavailable == nil || after.limits.Unavailable.Reason != agent.UsageUnavailableProbeFailed || after.limits.Unavailable.Answered {
+		t.Fatalf("unreadable slot not unknown: %+v", after.limits.Unavailable)
+	}
+	if _, ok := d.quota.claudeSlotAttempt(normalizeClaudeProbeHome(later)); !ok {
+		t.Fatal("sibling slot lost after failure")
+	}
+	if err := os.Remove(usageLog); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	if err := os.Remove(usageLog + ".survived"); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	dHang := New(Options{QuotaProbeBinaries: map[string]string{agent.UsageHarnessClaude: bin}})
+	t.Setenv("CLAUDE_CONFIG_DIR", def)
+	dHang.config = &Config{QuotaProbeHomes: map[string][]string{"claude": {hang, later}}}
+	ctx, cancel := context.WithTimeout(context.Background(), 900*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	newQuotaPoller(dHang.quota, dHang.quotaProbes()).probeDue(ctx)
+	if time.Since(start) > 10*time.Second {
+		t.Fatal("hung scan held caller past deadline")
+	}
+	for _, l := range slotUsageLines(t, usageLog) {
+		if strings.Contains(l, later) {
+			t.Fatalf("later slot started after cancellation: %v", l)
+		}
+	}
+	hangAttempt, ok := dHang.quota.claudeSlotAttempt(normalizeClaudeProbeHome(hang))
+	if !ok {
+		t.Fatal("hang slot missing after cancelled scan")
+	}
+	if hangAttempt.limits.Unavailable == nil || hangAttempt.limits.Unavailable.Reason != agent.UsageUnavailableProbeFailed || hangAttempt.limits.Unavailable.Answered {
+		t.Fatalf("hang slot not unknown-unanswered: %+v", hangAttempt.limits.Unavailable)
+	}
+	if _, ok := dHang.quota.claudeSlotAttempt(normalizeClaudeProbeHome(later)); ok {
+		t.Fatal("later slot recorded after cancellation; no launch means no attempt")
+	}
+	time.Sleep(2200 * time.Millisecond)
+	if _, err := os.Stat(usageLog + ".survived"); !os.IsNotExist(err) {
+		t.Fatalf("hung child survived: %v", err)
+	}
+	if _, ok := dHang.quota.claudeSlotAttempt(normalizeClaudeProbeHome(def)); !ok {
+		t.Fatal("earlier slot lost after hang")
+	}
+	goodMuse := writeFakeMuseProbeCLI(t, "Muse Code 1.4.9 (1.4.9-R6297.1)", false)
+	dMuse := New(Options{QuotaProbeBinaries: map[string]string{agent.UsageHarnessMuse: goodMuse}})
+	newQuotaPoller(dMuse.quota, dMuse.quotaProbes()).probeDue(context.Background())
+	if got := dMuse.QuotaSnapshot(); len(got) != 1 || got[0].AuthCheck == nil || !got[0].AuthCheck.OK {
+		t.Fatalf("muse initial verdict = %+v", got)
+	}
+	busy := filepath.Join(root, "busy-muse")
+	if err := testexec.WriteFile(busy, []byte("#!/bin/sh\nwhile :; do :; done\n"), 0o700); err != nil {
+		t.Fatalf("write busy muse: %v", err)
+	}
+	dMuse2 := New(Options{QuotaProbeBinaries: map[string]string{agent.UsageHarnessMuse: busy}})
+	dMuse2.quota = dMuse.quota
+	dMuse2.quota.mu.Lock()
+	dMuse2.quota.museAt = time.Now().Add(-providercodex.RateLimitsProbeInterval - time.Second)
+	dMuse2.quota.mu.Unlock()
+	short, cancel2 := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel2()
+	newQuotaPoller(dMuse2.quota, dMuse2.quotaProbes()).probeDue(short)
+	if got := dMuse.quota.snapshot(); len(got) != 1 || got[0].AuthCheck == nil || !got[0].AuthCheck.OK {
+		t.Fatalf("cancelled muse overwrote verdict: %+v", got)
+	}
+}
+
+func writeCodexSlotCLI(t *testing.T) string {
+	t.Helper()
+	script := `#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *rateLimits/read*)
+      id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+      [ -n "$id" ] || continue
+      marker=$(cat "$CODEX_HOME/auth.json" 2>/dev/null)
+      case "$marker" in
+        *home-a*) acct="fixture-codex-a"; plan="team"; p1=11; p2=12;;
+        *home-b*) acct="fixture-codex-b"; plan="plus"; p1=33; p2=34;;
+        *exhausted*) acct="fixture-codex-exhausted"; plan="team"; p1=100; p2=100;;
+        *) acct="fixture-codex-default"; plan="team"; p1=10; p2=20;;
+      esac
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"accountId":"%s","rateLimits":{"limitId":"codex","planType":"%s","primary":{"usedPercent":%s,"resetsAt":1893456000,"windowDurationMins":300},"secondary":{"usedPercent":%s,"resetsAt":1893456000,"windowDurationMins":10080}}}}\n' "$id" "$acct" "$plan" "$p1" "$p2"
+      ;;
+    *initialized*)
+      ;;
+    *initialize*)
+      id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+      [ -n "$id" ] || continue
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"codexHome":"%s"}}\n' "$id" "$CODEX_HOME"
+      ;;
+  esac
+done
+`
+	path := filepath.Join(t.TempDir(), "fake-codex")
+	if err := testexec.WriteFile(path, []byte(script), 0o700); err != nil {
+		t.Fatalf("write slot CLI: %v", err)
+	}
+	return path
+}
+
+func writeCodexHome(t *testing.T, dir, marker string) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "auth.json"), []byte(`{"marker":"`+marker+`"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// writeCodexCountingCLI writes a stand-in codex binary that answers the
+// production app-server handshake and logs one line per rateLimits/read
+// carrying the isolated home's auth marker, so a poller test can count
+// how many distinct homes were probed without reading the log transport.
+func writeCodexCountingCLI(t *testing.T, probeLog string) string {
+	t.Helper()
+	script := `#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *rateLimits/read*)
+      id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+      [ -n "$id" ] || continue
+      marker=$(cat "$CODEX_HOME/auth.json" 2>/dev/null)
+      printf '%s\n' "$marker" >> "` + probeLog + `"
+      case "$marker" in
+        *home-a*) acct="fixture-codex-a"; plan="team"; p1=11; p2=12;;
+        *home-b*) acct="fixture-codex-b"; plan="plus"; p1=33; p2=34;;
+        *exhausted*) acct="fixture-codex-exhausted"; plan="team"; p1=100; p2=100;;
+        *) acct="fixture-codex-default"; plan="team"; p1=10; p2=20;;
+      esac
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"accountId":"%s","rateLimits":{"limitId":"codex","planType":"%s","primary":{"usedPercent":%s,"resetsAt":1893456000,"windowDurationMins":300},"secondary":{"usedPercent":%s,"resetsAt":1893456000,"windowDurationMins":10080}}}}\n' "$id" "$acct" "$plan" "$p1" "$p2"
+      ;;
+    *initialized*)
+      ;;
+    *initialize*)
+      id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+      [ -n "$id" ] || continue
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"codexHome":"%s"}}\n' "$id" "$CODEX_HOME"
+      ;;
+  esac
+done
+`
+	path := filepath.Join(t.TempDir(), "fake-codex-counting")
+	if err := testexec.WriteFile(path, []byte(script), 0o700); err != nil {
+		t.Fatalf("write counting slot CLI: %v", err)
+	}
+	return path
+}
+
+func codexProbeLines(t *testing.T, log string) []string {
+	t.Helper()
+	raw, _ := os.ReadFile(log)
+	var out []string
+	for _, l := range strings.Split(string(raw), "\n") {
+		if strings.TrimSpace(l) != "" {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+func driveCodexScan(t *testing.T, bin, def string, extras []string) *Daemon {
+	t.Helper()
+	t.Setenv("CODEX_HOME", def)
+	d := New(Options{QuotaProbeBinaries: map[string]string{agent.UsageHarnessCodex: bin}})
+	d.config = &Config{QuotaProbeHomes: map[string][]string{agent.UsageHarnessCodex: extras}}
+	newQuotaPoller(d.quota, d.quotaProbes()).probeDue(context.Background())
+	return d
+}
+
+func TestQuotaPoller_CodexSlotsPairAccountsAndPreserveHeartbeat(t *testing.T) {
+	root := t.TempDir()
+	def := filepath.Join(root, "def")
+	a := filepath.Join(root, "home-a")
+	b := filepath.Join(root, "home-b")
+	exh := filepath.Join(root, "exhausted")
+	writeCodexHome(t, def, "default")
+	writeCodexHome(t, a, "home-a")
+	writeCodexHome(t, b, "home-b")
+	writeCodexHome(t, exh, "exhausted")
+	bin := writeCodexSlotCLI(t)
+	cfgPath := filepath.Join(root, "daemon.yaml")
+	if err := WriteConfig(cfgPath, &Config{Machine: MachineConfig{ID: "m"}, Orchestrator: OrchestratorConfig{URL: "https://example.test"}, QuotaProbeHomes: map[string][]string{"codex": {a, b}}}); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadConfig(cfgPath)
+	if err != nil || len(loaded.QuotaProbeHomes["codex"]) != 2 {
+		t.Fatalf("load homes = %v, %v", loaded, err)
+	}
+	d1 := driveCodexScan(t, bin, def, []string{a, b})
+	d2 := driveCodexScan(t, bin, def, []string{b, a})
+	for _, tc := range []struct {
+		dir         string
+		wantAccount string
+		wantPlan    string
+		wantPrimary float64
+	}{
+		{a, "fixture-codex-a", "team", 11},
+		{b, "fixture-codex-b", "plus", 33},
+	} {
+		key := normalizeCodexProbeHome(tc.dir)
+		s1, ok1 := d1.quota.codexSlotAttempt(key)
+		s2, ok2 := d2.quota.codexSlotAttempt(key)
+		if !ok1 || !ok2 || s1.accountID == "" || s1.accountID != s2.accountID || s1.accountID != tc.wantAccount || s1.plan != tc.wantPlan || s2.plan != tc.wantPlan {
+			t.Fatalf("slot %s pairing failed: %+v %+v", tc.dir, s1, s2)
+		}
+		if len(s1.limits.Windows) != 2 || len(s2.limits.Windows) != 2 || s1.limits.Windows[0].UsedPercent != tc.wantPrimary || s2.limits.Windows[0].UsedPercent != tc.wantPrimary {
+			t.Fatalf("slot %s windows failed: %+v %+v", tc.dir, s1.limits.Windows, s2.limits.Windows)
+		}
+	}
+	if len(d1.QuotaSnapshot()) != 1 || len(d2.QuotaSnapshot()) != 1 {
+		t.Fatalf("snapshots = %v %v, want one default entry", d1.QuotaSnapshot(), d2.QuotaSnapshot())
+	}
+	dex := driveCodexScan(t, bin, def, []string{exh})
+	snapEx := dex.QuotaSnapshot()
+	dDef := driveCodexScan(t, bin, def, nil)
+	snapDef := dDef.QuotaSnapshot()
+	if len(snapEx) != 1 || len(snapDef) != 1 || snapEx[0].Provider != "codex" {
+		t.Fatalf("heartbeat snapshots = %v %v", snapEx, snapDef)
+	}
+	if snapEx[0].ID != snapDef[0].ID || snapEx[0].ID != "fixture-codex-default" || snapEx[0].Plan != "team" || len(snapEx[0].Limits.Windows) != 2 || snapEx[0].Limits.Windows[0].UsedPercent != 10 || snapDef[0].Limits.Windows[0].UsedPercent != 10 {
+		t.Fatalf("exhausted extra changed heartbeat: %+v vs %+v", snapEx, snapDef)
+	}
+	now := time.Now()
+	if err := decideQuotaClaimAdmission(snapEx, string(agent.AuthHostSession), "codex", now); err != nil {
+		t.Fatalf("claim admission refused on available default: %v", err)
+	}
+	if suspended, _ := quotaExhaustionSuspendsClaiming(snapEx, quotaServedClaimLanesForSnapshot(snapEx, map[string]string{"codex": bin}, nil), now); suspended {
+		t.Fatal("claiming suspended by exhausted extra")
+	}
+}
+
+// TestQuotaPoller_CodexDedupCountsProbesOnly is the codex twin of the
+// claude dedup proof: it drives the production poller with a counting
+// fixture CLI, so duplicate and symlink aliases of the default and of one
+// extra collapse to one probe each, an undeclared neighbor stays
+// unprobed, and an immediate second scan starts no new probe.
+func TestQuotaPoller_CodexDedupCountsProbesOnly(t *testing.T) {
+	root := t.TempDir()
+	def := filepath.Join(root, "def")
+	a := filepath.Join(root, "home-a")
+	b := filepath.Join(root, "home-b")
+	neighbor := filepath.Join(root, "neighbor")
+	for _, d := range []string{def, a, b, neighbor} {
+		writeCodexHome(t, d, filepath.Base(d))
+	}
+	linkA := filepath.Join(root, "link-a")
+	linkDef := filepath.Join(root, "link-def")
+	if err := os.Symlink(a, linkA); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(def, linkDef); err != nil {
+		t.Fatal(err)
+	}
+	probeLog := filepath.Join(root, "probes.log")
+	bin := writeCodexCountingCLI(t, probeLog)
+	driveCodexScan(t, bin, def, nil)
+	if got := len(codexProbeLines(t, probeLog)); got != 1 {
+		t.Fatalf("default-only codex probes = %d, want 1", got)
+	}
+	if err := os.Remove(probeLog); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	d2 := New(Options{QuotaProbeBinaries: map[string]string{agent.UsageHarnessCodex: bin}})
+	t.Setenv("CODEX_HOME", def)
+	d2.config = &Config{QuotaProbeHomes: map[string][]string{agent.UsageHarnessCodex: {a, a, linkA, b, linkDef}}}
+	newQuotaPoller(d2.quota, d2.quotaProbes()).probeDue(context.Background())
+	lines := codexProbeLines(t, probeLog)
+	if len(lines) != 3 {
+		t.Fatalf("codex probe lines = %v, want default plus two distinct extras", lines)
+	}
+	for _, l := range lines {
+		if strings.Contains(l, "neighbor") {
+			t.Fatalf("neighbor probed: %v", lines)
+		}
+	}
+	n := len(lines)
+	newQuotaPoller(d2.quota, d2.quotaProbes()).probeDue(context.Background())
+	if got := len(codexProbeLines(t, probeLog)); got != n {
+		t.Fatalf("second scan codex probes = %d, want %d (no repeat inside interval)", got, n)
 	}
 }

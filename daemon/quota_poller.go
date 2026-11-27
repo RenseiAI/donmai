@@ -3,6 +3,10 @@ package daemon
 import (
 	"context"
 	"log/slog"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -26,10 +30,39 @@ func (d *Daemon) quotaProbes() map[string]quotaProbeFunc {
 		return probes
 	}
 	if bin := d.opts.QuotaProbeBinaries[agent.UsageHarnessCodex]; bin != "" {
-		probes[agent.UsageHarnessCodex] = codexQuotaProbe(bin, true)
+		var extras []string
+		if cfg := d.Config(); cfg != nil {
+			extras = cfg.QuotaProbeHomes[agent.UsageHarnessCodex]
+		}
+		probes[agent.UsageHarnessCodex] = codexQuotaProbe(bin, true, extras)
 	}
 	if bin := d.opts.QuotaProbeBinaries[agent.UsageHarnessClaude]; bin != "" {
-		probes[agent.UsageHarnessClaude] = claudeQuotaProbe(bin)
+		var extras []string
+		if cfg := d.Config(); cfg != nil {
+			extras = cfg.QuotaProbeHomes[agent.UsageHarnessClaude]
+		}
+		probes[agent.UsageHarnessClaude] = claudeQuotaProbe(bin, extras)
+	}
+	if bin := d.opts.QuotaProbeBinaries[agent.UsageHarnessMuse]; bin != "" {
+		probes[agent.UsageHarnessMuse] = museQuotaProbe(bin)
+	}
+	return probes
+}
+
+// defaultQuotaProbes builds the on-demand observation probes: the default
+// home of each configured harness only. Extras are never published, so the
+// observation scan must not wait for them; a slow extra would otherwise
+// downgrade an already-verified default to unknown on timeout.
+func (d *Daemon) defaultQuotaProbes() map[string]quotaProbeFunc {
+	probes := map[string]quotaProbeFunc{}
+	if d == nil {
+		return probes
+	}
+	if bin := d.opts.QuotaProbeBinaries[agent.UsageHarnessCodex]; bin != "" {
+		probes[agent.UsageHarnessCodex] = codexQuotaProbe(bin, true, nil)
+	}
+	if bin := d.opts.QuotaProbeBinaries[agent.UsageHarnessClaude]; bin != "" {
+		probes[agent.UsageHarnessClaude] = claudeQuotaProbe(bin, nil)
 	}
 	if bin := d.opts.QuotaProbeBinaries[agent.UsageHarnessMuse]; bin != "" {
 		probes[agent.UsageHarnessMuse] = museQuotaProbe(bin)
@@ -95,42 +128,270 @@ type quotaProbeFunc func(ctx context.Context, q *quotaState)
 // CLI login is projected into the probe's isolated home. An empty
 // binary (codex not installed) disables the probe: the attempt records
 // nothing and the heartbeat keeps omitting the codex entry.
-func codexQuotaProbe(codexBin string, hostAuth bool) quotaProbeFunc {
+func codexQuotaProbe(codexBin string, hostAuth bool, extraHomes []string) quotaProbeFunc {
+	homes := append([]string(nil), extraHomes...)
 	return func(ctx context.Context, q *quotaState) {
-		at := time.Now()
+		if ctx == nil {
+			ctx = context.Background()
+		}
 		if codexBin == "" {
-			q.noteCodexProbe("", "", agent.MakeUnavailableUsageLimits(agent.ISOTime(at), agent.UsageUnavailableProbeFailed, "Codex did not answer the usage request."), at)
+			at := time.Now()
+			plan := buildCodexScanPlan(homes)
+			defKey := ""
+			if len(plan) > 0 {
+				defKey = plan[0].key
+			}
+			q.recordCodexSlotAttempt(defKey, "", "", agent.MakeUnavailableUsageLimits(agent.ISOTime(at), agent.UsageUnavailableProbeFailed, "Codex did not answer the usage request."), at, true)
 			return
 		}
-		// The daemon probes its configured binary with the login selector
-		// omitted: empty selects the existing default host resolution.
-		// Construction, startup, reads, failure cleanup and shutdown are
-		// all bound by the attempt context; a missing host login yields an
-		// unknown snapshot that advances the clock but records no verdict.
-		accountID, plan, probed := providercodex.ProbeQuotaForLogin(ctx, providercodex.Options{
-			CodexBin:         codexBin,
-			HostSessionAuth:  hostAuth,
-			HandshakeTimeout: quotaProbeTimeout / 2,
-			RPCTimeout:       providercodex.RateLimitsProbeTimeout,
-		}, "")
-		q.noteCodexProbe(accountID, plan, probed, at)
+		for _, slot := range buildCodexScanPlan(homes) {
+			if ctx.Err() != nil {
+				return
+			}
+			slotCtx, cancel := context.WithTimeout(ctx, quotaProbeTimeout)
+			at := time.Now()
+			accountID, plan, probed := probeCodexSlot(slotCtx, codexBin, hostAuth, slot.dir)
+			cancel()
+			q.recordCodexSlotAttempt(slot.key, accountID, plan, probed, at, slot.isDefault)
+			if ctx.Err() != nil {
+				return
+			}
+		}
 	}
 }
 
-// claudeQuotaProbe returns the probe that reads the host's claude
-// login through a short-lived CLI usage session. binary is the
-// resolved claude binary; empty disables the probe like the codex
-// one above.
-func claudeQuotaProbe(binary string) quotaProbeFunc {
+// probeCodexSlot runs one codex quota read through the probe-owned
+// app-server, bound by ctx from construction through shutdown. An empty
+// homeDir omits the login selector and reads the default login; a
+// non-empty value is an explicit absolute config directory whose auth.json
+// is projected into the probe's isolated home. A missing or unreadable
+// home yields an unanswered failure, never a verdict.
+func probeCodexSlot(ctx context.Context, codexBin string, hostAuth bool, homeDir string) (string, string, agent.UsageLimits) {
+	return providercodex.ProbeQuotaForLogin(ctx, providercodex.Options{
+		CodexBin:         codexBin,
+		HostSessionAuth:  hostAuth,
+		HandshakeTimeout: quotaProbeTimeout / 2,
+		RPCTimeout:       providercodex.RateLimitsProbeTimeout,
+	}, homeDir)
+}
+
+type codexScanSlot struct {
+	key       string
+	dir       string
+	isDefault bool
+}
+
+// probeParentDir returns the parent of an absolute path without cleaning
+// it first: filepath.Dir cleans, which collapses a ".." through a symlink
+// and resolves to an undeclared sibling. Trimming only trailing slashes
+// preserves the symlink component for EvalSymlinks to resolve as the OS
+// would open it.
+func probeParentDir(p string) string {
+	q := strings.TrimRight(p, "/")
+	if q == "" {
+		return "/"
+	}
+	if idx := strings.LastIndex(q, "/"); idx >= 0 {
+		if idx == 0 {
+			return "/"
+		}
+		return q[:idx]
+	}
+	return "."
+}
+
+// probeBase returns the final element without cleaning the path first,
+// so a name ending in a space keeps it.
+func probeBase(p string) string {
+	q := strings.TrimRight(p, "/")
+	if idx := strings.LastIndex(q, "/"); idx >= 0 {
+		return q[idx+1:]
+	}
+	return q
+}
+
+func sameProbeFile(a, b os.FileInfo) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	return os.SameFile(a, b)
+}
+
+// normalizeProbeHome keys a declared home as the OS opens it: symlinks
+// are resolved first and only the resolved result is cleaned, because
+// cleaning first would collapse a ".." through a symlink and probe an
+// undeclared home. A path whose parent cannot be resolved either keeps
+// its declared spelling verbatim: a lexical clean could turn an
+// unopenable path such as selected/missing/../home into an existing
+// sibling, while the verbatim path makes the probe's own resolution fail
+// unanswered.
+func normalizeProbeHome(dir string) string {
+	if resolved, err := filepath.EvalSymlinks(dir); err == nil && resolved != "" {
+		return filepath.Clean(resolved)
+	}
+	parent, base := probeParentDir(dir), probeBase(dir)
+	if parent != "" && base != "" && base != "." && base != ".." {
+		if resolvedParent, err := filepath.EvalSymlinks(parent); err == nil && resolvedParent != "" {
+			return filepath.Join(filepath.Clean(resolvedParent), base)
+		}
+	}
+	return dir
+}
+
+func normalizeCodexProbeHome(dir string) string { return normalizeProbeHome(dir) }
+
+func buildCodexScanPlan(extraHomes []string) []codexScanSlot {
+	defDir := providercodex.DefaultCodexHome()
+	defKey := ""
+	var defInfo os.FileInfo
+	if defDir != "" {
+		defKey = normalizeCodexProbeHome(defDir)
+		defInfo, _ = os.Stat(defDir)
+	}
+	seen := map[string]struct{}{defKey: {}}
+	var seenInfos []os.FileInfo
+	if defInfo != nil {
+		seenInfos = append(seenInfos, defInfo)
+	}
+	var extras []string
+	for _, raw := range extraHomes {
+		if strings.TrimSpace(raw) == "" || !filepath.IsAbs(raw) {
+			continue
+		}
+		key := normalizeCodexProbeHome(raw)
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		if info, err := os.Stat(raw); err == nil {
+			dup := false
+			for _, s := range seenInfos {
+				if sameProbeFile(s, info) {
+					dup = true
+					break
+				}
+			}
+			// A different spelling that opens the same directory
+			// (case alias, symlink) probes once under the first key.
+			if dup {
+				continue
+			}
+			seen[key] = struct{}{}
+			seenInfos = append(seenInfos, info)
+			extras = append(extras, key)
+			continue
+		}
+		// Unstatable paths dedup by string only; the probe records an
+		// unanswered attempt for the missing home.
+		seen[key] = struct{}{}
+		extras = append(extras, key)
+	}
+	sort.Strings(extras)
+	plan := make([]codexScanSlot, 0, 1+len(extras))
+	plan = append(plan, codexScanSlot{key: defKey, dir: "", isDefault: true})
+	for _, key := range extras {
+		plan = append(plan, codexScanSlot{key: key, dir: key})
+	}
+	return plan
+}
+
+type claudeScanSlot struct {
+	key       string
+	dir       string
+	isDefault bool
+}
+
+func normalizeClaudeProbeHome(dir string) string { return normalizeProbeHome(dir) }
+
+func buildClaudeScanPlan(extraHomes []string) []claudeScanSlot {
+	defDir := providerclaude.DefaultProbeConfigDir()
+	defKey := ""
+	var defInfo os.FileInfo
+	if defDir != "" {
+		defKey = normalizeClaudeProbeHome(defDir)
+		defInfo, _ = os.Stat(defDir)
+	}
+	seen := map[string]struct{}{defKey: {}}
+	var seenInfos []os.FileInfo
+	if defInfo != nil {
+		seenInfos = append(seenInfos, defInfo)
+	}
+	var extras []string
+	for _, raw := range extraHomes {
+		if strings.TrimSpace(raw) == "" || !filepath.IsAbs(raw) {
+			continue
+		}
+		key := normalizeClaudeProbeHome(raw)
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		if info, err := os.Stat(raw); err == nil {
+			dup := false
+			for _, s := range seenInfos {
+				if sameProbeFile(s, info) {
+					dup = true
+					break
+				}
+			}
+			if dup {
+				continue
+			}
+			seen[key] = struct{}{}
+			seenInfos = append(seenInfos, info)
+			extras = append(extras, key)
+			continue
+		}
+		seen[key] = struct{}{}
+		extras = append(extras, key)
+	}
+	sort.Strings(extras)
+	plan := make([]claudeScanSlot, 0, 1+len(extras))
+	plan = append(plan, claudeScanSlot{key: defKey, dir: "", isDefault: true})
+	for _, key := range extras {
+		plan = append(plan, claudeScanSlot{key: key, dir: key})
+	}
+	return plan
+}
+
+func claudeQuotaProbe(binary string, extraHomes []string) quotaProbeFunc {
+	homes := append([]string(nil), extraHomes...)
 	return func(ctx context.Context, q *quotaState) {
-		at := time.Now()
+		if ctx == nil {
+			ctx = context.Background()
+		}
 		if binary == "" {
-			q.noteClaudeProbe("", agent.MakeUnavailableUsageLimits(agent.ISOTime(at), agent.UsageUnavailableProbeFailed, "Claude did not answer the usage request."), at)
+			at := time.Now()
+			plan := buildClaudeScanPlan(homes)
+			defKey := ""
+			if len(plan) > 0 {
+				defKey = plan[0].key
+			}
+			q.recordClaudeSlotAttempt(defKey, "", agent.MakeUnavailableUsageLimits(agent.ISOTime(at), agent.UsageUnavailableProbeFailed, "Claude did not answer the usage request."), at, true)
 			return
 		}
-		accountID, probed, _ := providerclaude.ProbeUsage(ctx, binary)
-		q.noteClaudeProbe(accountID, probed, at)
+		for _, slot := range buildClaudeScanPlan(homes) {
+			if ctx.Err() != nil {
+				return
+			}
+			slotCtx, cancel := context.WithTimeout(ctx, quotaProbeTimeout)
+			at := time.Now()
+			accountID, probed, _ := probeClaudeSlot(slotCtx, binary, slot.dir)
+			cancel()
+			q.recordClaudeSlotAttempt(slot.key, accountID, probed, at, slot.isDefault)
+			if ctx.Err() != nil {
+				return
+			}
+		}
 	}
+}
+
+// probeClaudeSlot runs one claude usage read. An empty dir reads the
+// default login; a non-empty dir is an explicit absolute config home whose
+// usage and status children carry exactly that CLAUDE_CONFIG_DIR.
+func probeClaudeSlot(ctx context.Context, binary, dir string) (string, agent.UsageLimits, providerclaude.ScopedLimitNames) {
+	if dir == "" {
+		return providerclaude.ProbeUsage(ctx, binary)
+	}
+	return providerclaude.ProbeUsageForConfigDir(ctx, binary, dir)
 }
 
 // museHostSessionAccountID is the opaque account identity the muse
@@ -139,29 +400,23 @@ func claudeQuotaProbe(binary string) quotaProbeFunc {
 // slot rather than an account.
 const museHostSessionAccountID = "muse-host-session"
 
-// museQuotaProbe returns the probe that checks the host's muse CLI:
-// resolve the binary through the shared harness resolver, then run
-// the host login check. The CLI exposes no usage read and reports no
-// windows on a cold host, so the entry carries an empty window set
-// beside its verdict. An unresolvable binary disables the probe like
-// the codex one: the attempt records nothing and the heartbeat keeps
-// omitting the muse entry.
-//
-// The check runs under context.Background(), not the per-attempt ctx:
-// a cancelled attempt must not record a false ok:false verdict, so
-// the probe always runs to its own 5 s bound and a stopping poller
-// waits it out instead of publishing the cancellation as a refusal.
+// museQuotaProbe checks the host muse CLI. Cancellation is unanswered.
 func museQuotaProbe(binary string) quotaProbeFunc {
-	return func(_ context.Context, q *quotaState) {
+	return func(ctx context.Context, q *quotaState) {
+		if ctx == nil {
+			ctx = context.Background()
+		}
 		at := time.Now()
 		if binary == "" {
 			q.noteMuseProbe("", agent.MakeUnavailableUsageLimits(agent.ISOTime(at), agent.UsageUnavailableProbeFailed, "Muse did not answer the usage request."), at)
 			return
 		}
 		probed := agent.MakeUsageLimits(agent.ISOTime(at), nil)
-		if err := providermuse.CheckHostSessionLogin(context.Background(), binary); err != nil {
+		if err := providermuse.CheckHostSessionLogin(ctx, binary); err != nil {
 			out := agent.MakeUnavailableUsageLimits(agent.ISOTime(at), agent.UsageUnavailableProbeFailed, "Muse did not answer the usage request.")
-			out.Unavailable.Answered = true
+			// Cancellation never answers: a stopping poller must not
+			// publish its own shutdown as a login refusal.
+			out.Unavailable.Answered = ctx.Err() == nil
 			probed = out
 		}
 		q.noteMuseProbe(museHostSessionAccountID, probed, at)
@@ -273,11 +528,8 @@ func (p *quotaPoller) untilNextDue(now time.Time) time.Duration {
 	return wait
 }
 
-// probeDue runs one attempt for every harness whose probe is due. Each
-// attempt carries the per-attempt timeout and feeds the cache even
-// when the read fails: every attempt advances the probe clock (so
-// retries stay on the interval cadence) and an answered refusal
-// refreshes the login verdict.
+// probeDue runs one attempt per due harness. Claude and codex get a fresh
+// per-slot timeout from the scan context; others share one per-attempt timeout.
 func (p *quotaPoller) probeDue(ctx context.Context) {
 	now := time.Now()
 	for harness, probe := range p.probes {
@@ -298,9 +550,16 @@ func (p *quotaPoller) probeDue(ctx context.Context) {
 		if !due {
 			continue
 		}
-		attemptCtx, cancel := context.WithTimeout(ctx, quotaProbeTimeout)
-		probe(attemptCtx, p.quota)
-		cancel()
+		if ctx.Err() != nil {
+			return
+		}
+		if harness == agent.UsageHarnessClaude || harness == agent.UsageHarnessCodex {
+			probe(ctx, p.quota)
+		} else {
+			attemptCtx, cancel := context.WithTimeout(ctx, quotaProbeTimeout)
+			probe(attemptCtx, p.quota)
+			cancel()
+		}
 		if ctx.Err() != nil {
 			return
 		}

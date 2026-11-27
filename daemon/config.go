@@ -105,7 +105,8 @@ type Config struct {
 	// runner.DefaultMaxToolOutputBytes (262144, 256 KiB); a positive
 	// value states DONMAI_MAX_TOOL_OUTPUT_BYTES in every spawned worker's
 	// environment. Read at daemon start.
-	MaxToolOutputBytes int `yaml:"maxToolOutputBytes,omitempty" json:"maxToolOutputBytes,omitempty"`
+	MaxToolOutputBytes int                 `yaml:"maxToolOutputBytes,omitempty" json:"maxToolOutputBytes,omitempty"`
+	QuotaProbeHomes    map[string][]string `yaml:"quotaProbeHomes,omitempty" json:"-"`
 	// Workarea holds Layer-3 workarea-surface tunables (archive root,
 	// diff streaming threshold). Optional; populated with defaults if
 	// absent.
@@ -760,6 +761,9 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("parse daemon capacity %q: %w", path, err)
 	}
 	cfg.autoUpdateChannelAuthored = authored.AutoUpdate.Channel != nil && strings.TrimSpace(*authored.AutoUpdate.Channel) != ""
+	if err := checkQuotaProbeHomesPresence(data); err != nil {
+		return nil, fmt.Errorf("invalid daemon config %q: %w", path, err)
+	}
 
 	// Apply env-var substitution on authToken.
 	if cfg.Orchestrator.AuthToken != "" {
@@ -1350,6 +1354,115 @@ func validateConfig(c *Config) error {
 	case "", TrustModePermissive, TrustModeSignedByAllowlist, TrustModeAttested:
 	default:
 		return fmt.Errorf("trust.mode invalid: %q (want permissive | signed-by-allowlist | attested)", c.Trust.Mode)
+	}
+	for harness, homes := range c.QuotaProbeHomes {
+		if harness != "claude" && harness != "codex" {
+			return fmt.Errorf("quotaProbeHomes: unsupported harness %q", harness)
+		}
+		for i, home := range homes {
+			if strings.TrimSpace(home) == "" || !filepath.IsAbs(home) {
+				return fmt.Errorf("quotaProbeHomes.%s[%d] must be an absolute path", harness, i)
+			}
+		}
+	}
+	return nil
+}
+
+// checkQuotaProbeHomesPresence rejects authored empty elements the typed
+// decoder silently drops: a bare dash or an explicit null decodes to no
+// element in []string, so validation would never see the missing slot.
+// An omitted list (or an explicit null list) stays valid; only an authored
+// element that carries no path is refused. Errors name the slot index only,
+// never the path, so a rejected value cannot leak through logs.
+func checkQuotaProbeHomesPresence(data []byte) error {
+	var doc yaml.Node
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		return nil
+	}
+	root := &doc
+	if root.Kind == yaml.DocumentNode && len(root.Content) > 0 {
+		root = root.Content[0]
+	}
+	homes := yamlMappingValue(root, "quotaProbeHomes")
+	if homes == nil || homes.Tag == "!!null" || homes.Kind != yaml.MappingNode {
+		return nil
+	}
+	for _, pair := range yamlMappingPairs(homes) {
+		harness := ""
+		if pair[0].Kind == yaml.ScalarNode {
+			harness = pair[0].Value
+		}
+		list := yamlDeref(pair[1])
+		if list.Tag == "!!null" || list.Kind != yaml.SequenceNode {
+			continue
+		}
+		for k, elem := range list.Content {
+			e := yamlDeref(elem)
+			if e.Tag == "!!null" || e.Kind != yaml.ScalarNode || strings.TrimSpace(e.Value) == "" {
+				return fmt.Errorf("quotaProbeHomes.%s[%d] must be an absolute path", harness, k)
+			}
+		}
+	}
+	return nil
+}
+
+// yamlDeref follows an alias to the node it names.
+func yamlDeref(n *yaml.Node) *yaml.Node {
+	for n != nil && n.Kind == yaml.AliasNode && n.Alias != nil {
+		n = n.Alias
+	}
+	return n
+}
+
+// yamlMappingPairs returns a mapping's key/value pairs with merge keys
+// ("<<: *anchor" or "<<: [*a, *b]") expanded, so a value the decoder
+// would read through a merge is validated like an inline one. Explicit
+// keys come first and win over merged ones, matching the decoder.
+func yamlMappingPairs(m *yaml.Node) [][2]*yaml.Node {
+	return yamlMappingPairsDepth(yamlDeref(m), 0)
+}
+
+func yamlMappingPairsDepth(m *yaml.Node, depth int) [][2]*yaml.Node {
+	if m == nil || m.Kind != yaml.MappingNode || depth > 16 {
+		return nil
+	}
+	var explicit, merged [][2]*yaml.Node
+	for i := 0; i+1 < len(m.Content); i += 2 {
+		key, val := m.Content[i], m.Content[i+1]
+		if key.Kind == yaml.ScalarNode && key.Value == "<<" && (key.Tag == "!!merge" || key.Tag == "") {
+			val = yamlDeref(val)
+			sources := []*yaml.Node{val}
+			if val.Kind == yaml.SequenceNode {
+				sources = val.Content
+			}
+			for _, src := range sources {
+				merged = append(merged, yamlMappingPairsDepth(yamlDeref(src), depth+1)...)
+			}
+			continue
+		}
+		explicit = append(explicit, [2]*yaml.Node{key, val})
+	}
+	seen := map[string]bool{}
+	out := make([][2]*yaml.Node, 0, len(explicit)+len(merged))
+	for _, pair := range append(explicit, merged...) {
+		if pair[0].Kind == yaml.ScalarNode {
+			if seen[pair[0].Value] {
+				continue
+			}
+			seen[pair[0].Value] = true
+		}
+		out = append(out, pair)
+	}
+	return out
+}
+
+// yamlMappingValue returns the value under key in mapping m, merge keys
+// included, or nil when absent.
+func yamlMappingValue(m *yaml.Node, key string) *yaml.Node {
+	for _, pair := range yamlMappingPairs(m) {
+		if pair[0].Kind == yaml.ScalarNode && pair[0].Value == key {
+			return yamlDeref(pair[1])
+		}
 	}
 	return nil
 }

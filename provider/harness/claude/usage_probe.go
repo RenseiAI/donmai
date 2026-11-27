@@ -6,6 +6,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -56,6 +58,39 @@ func ProbeUsageForConfigDir(ctx context.Context, binary, configDir string) (acco
 	return probeUsage(ctx, binary, configDir, false)
 }
 
+// DefaultProbeConfigDir reports the default config directory the usage
+// probe reads: CLAUDE_CONFIG_DIR, or ~/.claude under the host home. Empty
+// when no absolute default can be resolved.
+func DefaultProbeConfigDir() string {
+	return interactiveUsageConfigDir(nil)
+}
+
+// selectedConfigDirReadable reports whether a selected config directory
+// exists and can still be read. A home whose permissions were revoked
+// still stats but answers no CLI read, and the status child may then
+// report it logged out; such a home must stay an unanswered attempt,
+// never an answered refusal. Permission bits are checked explicitly so a
+// revoked home reads as unreadable even to a privileged reader.
+func selectedConfigDirReadable(dir string) bool {
+	info, err := os.Stat(dir)
+	if err != nil || !info.IsDir() {
+		return false
+	}
+	if info.Mode().Perm()&0o555 == 0 {
+		return false
+	}
+	// nolint:gosec // dir is the caller-selected config home, already validated absolute.
+	f, err := os.Open(dir)
+	if err != nil {
+		return false
+	}
+	defer func() { _ = f.Close() }()
+	if _, err := f.Readdirnames(1); err != nil && !errors.Is(err, io.EOF) {
+		return false
+	}
+	return true
+}
+
 // probeUsage is the shared implementation behind both entries: the
 // default entry selects the host default locators, the selected entry
 // pins one absolute config directory. The whole attempt derives from
@@ -76,6 +111,12 @@ func probeUsage(ctx context.Context, binary, configDir string, useDefault bool) 
 	// A selected home that is not resolved and absolute is a caller bug,
 	// not a login verdict: fail before launching any child.
 	if !useDefault && (strings.TrimSpace(configDir) == "" || !filepath.IsAbs(configDir) || !filepath.IsAbs(binary)) {
+		return failed()
+	}
+	// A selected home that is missing or unreadable answers no read: the
+	// status child would report it logged out, which is not a refusal of
+	// the selected login. Fail unanswered before launching any child.
+	if !useDefault && !selectedConfigDirReadable(configDir) {
 		return failed()
 	}
 	baseEnv, err := loginBaseEnv(configDir, useDefault)

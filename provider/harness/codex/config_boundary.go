@@ -151,6 +151,25 @@ func newCodexConfigBoundaryWithAuthMode(tempDir, authMode string) (*codexConfigB
 	return b, nil
 }
 
+// DefaultCodexHome reports the default Codex config directory the quota
+// probe reads: the operator's CODEX_HOME, or ~/.codex under the host home.
+// An empty value means the default login has no readable home; a non-empty
+// value is always absolute.
+func DefaultCodexHome() string {
+	codexHome := strings.TrimSpace(os.Getenv("CODEX_HOME"))
+	if codexHome == "" {
+		userHome, err := os.UserHomeDir()
+		if err != nil {
+			return ""
+		}
+		codexHome = filepath.Join(userHome, ".codex")
+	}
+	if !filepath.IsAbs(codexHome) {
+		return ""
+	}
+	return filepath.Clean(codexHome)
+}
+
 // resolveHostSessionAuthFile returns the auth.json used by a normal Codex CLI
 // invocation on this host. It intentionally resolves only the path; credential
 // contents never enter Donmai memory or logs.
