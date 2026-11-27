@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 )
 
 // Paths is one side's compiled path rules for one tool family.
@@ -56,6 +57,10 @@ func CompilePaths(patterns []string, family func(name string) bool, side Side, r
 func (p Paths) Len() int { return len(p.rules) }
 
 // Match reports whether path matches; a relative path is resolved against root.
+// Callers must pass the root and expand a leading "~" first: Match treats "~"
+// as an ordinary directory name. Matching is byte-exact, so on a
+// case-insensitive filesystem a differently cased path is not matched; like a
+// symlink, that alias is a residual risk the caller owns.
 func (p Paths) Match(path, root string) bool {
 	if !filepath.IsAbs(path) && root != "" {
 		path = filepath.Join(root, path)
@@ -92,41 +97,58 @@ func compilePathGlob(glob string, side Side, root, home string) (*regexp.Regexp,
 	if side == Deny {
 		tail = `(?:/.*)?$`
 	}
-	return regexp.Compile(`^` + body + tail)
+	// (?s): a newline in a file name must not stop "**" or the deny subtree.
+	return regexp.Compile(`(?s)^` + body + tail)
 }
 
-// escapeGlob makes a literal directory safe to prefix to a glob.
+// escapeGlob makes a literal directory safe to prefix to a glob. It copies
+// bytes, not runes, so invalid UTF-8 reaches globRegexp and fails closed there
+// instead of becoming U+FFFD.
 func escapeGlob(dir string) string {
 	var b strings.Builder
-	for _, r := range dir {
-		if strings.ContainsRune(`*?[]{}\`, r) {
+	for i := 0; i < len(dir); i++ {
+		if strings.IndexByte(`*?[]{}\`, dir[i]) >= 0 {
 			b.WriteByte('\\')
 		}
-		b.WriteRune(r)
+		b.WriteByte(dir[i])
 	}
 	return b.String()
 }
 
 // globRegexp translates a cleaned absolute glob into a regexp body; a
-// backslash makes the next character literal.
+// backslash makes the next character literal. The glob is walked rune by rune
+// so a multibyte character is quoted whole rather than as Latin-1 bytes.
 func globRegexp(glob string) (string, error) {
 	var b strings.Builder
 	braces := 0
-	for i := 0; i < len(glob); i++ {
-		c := glob[i]
+	for i := 0; i < len(glob); {
+		c, size := utf8.DecodeRuneInString(glob[i:])
+		if c == utf8.RuneError && size == 1 {
+			return "", errors.New("invalid UTF-8")
+		}
+		rest := glob[i:]
+		// "**" spans directories only as a whole segment; it is the first
+		// thing in a segment because the glob is absolute and cleaned.
+		segment := i > 0 && glob[i-1] == '/'
 		switch {
-		case c == '\\' && i+1 < len(glob):
-			b.WriteString(regexp.QuoteMeta(glob[i+1 : i+2]))
-			i++
-		case strings.HasPrefix(glob[i:], "**/"):
+		case c == '\\' && i+size < len(glob):
+			_, next := utf8.DecodeRuneInString(glob[i+size:])
+			b.WriteString(regexp.QuoteMeta(glob[i+size : i+size+next]))
+			i += size + next
+			continue
+		case segment && strings.HasPrefix(rest, "**/"):
 			b.WriteString(`(?:.*/)?`)
-			i += 2
-		case strings.HasPrefix(glob[i:], "/**") && i+3 == len(glob):
+			i += 3
+			continue
+		case strings.HasPrefix(rest, "/**") && i+3 == len(glob):
 			b.WriteString(`(?:/.*)?`)
+			i += 3
+			continue
+		case strings.HasPrefix(rest, "**"):
+			// Not a whole segment: an ordinary "*", as in gitignore.
+			b.WriteString(`[^/]*`)
 			i += 2
-		case strings.HasPrefix(glob[i:], "**"):
-			b.WriteString(`.*`)
-			i++
+			continue
 		case c == '*':
 			b.WriteString(`[^/]*`)
 		case c == '?':
@@ -136,12 +158,21 @@ func globRegexp(glob string) (string, error) {
 			if end < 0 {
 				return "", errors.New("unclosed character class")
 			}
-			class := glob[i+1 : i+1+end]
-			if strings.HasPrefix(class, "!") {
-				class = "^" + class[1:]
+			class := strings.ReplaceAll(glob[i+1:i+1+end], `\`, `\\`)
+			negated, ok := strings.CutPrefix(class, "!")
+			if !ok {
+				negated, ok = strings.CutPrefix(class, "^")
 			}
-			b.WriteString("[" + strings.ReplaceAll(class, `\`, `\\`) + "]")
-			i += end + 1
+			if ok {
+				if negated == "" {
+					return "", errors.New("empty character class")
+				}
+				// A class never matches the separator, negated or not.
+				class = "^/" + negated
+			}
+			b.WriteString("[" + class + "]")
+			i += end + 2
+			continue
 		case c == '{':
 			braces++
 			b.WriteString(`(?:`)
@@ -154,8 +185,9 @@ func globRegexp(glob string) (string, error) {
 			braces--
 			b.WriteString(`)`)
 		default:
-			b.WriteString(regexp.QuoteMeta(string(c)))
+			b.WriteString(regexp.QuoteMeta(rest[:size]))
 		}
+		i += size
 	}
 	if braces != 0 {
 		return "", errors.New("unbalanced brace set")
