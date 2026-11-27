@@ -217,10 +217,15 @@ func sameProbeFile(a, b os.FileInfo) bool {
 	return os.SameFile(a, b)
 }
 
-func normalizeCodexProbeHome(dir string) string {
-	// Resolve the declared path as the OS opens it: symlinks first, clean
-	// only the resolved result. Cleaning before resolving would collapse
-	// a ".." through a symlink and probe an undeclared home.
+// normalizeProbeHome keys a declared home as the OS opens it: symlinks
+// are resolved first and only the resolved result is cleaned, because
+// cleaning first would collapse a ".." through a symlink and probe an
+// undeclared home. A path whose parent cannot be resolved either keeps
+// its declared spelling verbatim: a lexical clean could turn an
+// unopenable path such as selected/missing/../home into an existing
+// sibling, while the verbatim path makes the probe's own resolution fail
+// unanswered.
+func normalizeProbeHome(dir string) string {
 	if resolved, err := filepath.EvalSymlinks(dir); err == nil && resolved != "" {
 		return filepath.Clean(resolved)
 	}
@@ -230,8 +235,10 @@ func normalizeCodexProbeHome(dir string) string {
 			return filepath.Join(filepath.Clean(resolvedParent), base)
 		}
 	}
-	return filepath.Clean(dir)
+	return dir
 }
+
+func normalizeCodexProbeHome(dir string) string { return normalizeProbeHome(dir) }
 
 func buildCodexScanPlan(extraHomes []string) []codexScanSlot {
 	defDir := providercodex.DefaultCodexHome()
@@ -293,18 +300,7 @@ type claudeScanSlot struct {
 	isDefault bool
 }
 
-func normalizeClaudeProbeHome(dir string) string {
-	if resolved, err := filepath.EvalSymlinks(dir); err == nil && resolved != "" {
-		return filepath.Clean(resolved)
-	}
-	parent, base := probeParentDir(dir), probeBase(dir)
-	if parent != "" && base != "" && base != "." && base != ".." {
-		if resolvedParent, err := filepath.EvalSymlinks(parent); err == nil && resolvedParent != "" {
-			return filepath.Join(filepath.Clean(resolvedParent), base)
-		}
-	}
-	return filepath.Clean(dir)
-}
+func normalizeClaudeProbeHome(dir string) string { return normalizeProbeHome(dir) }
 
 func buildClaudeScanPlan(extraHomes []string) []claudeScanSlot {
 	defDir := providerclaude.DefaultProbeConfigDir()

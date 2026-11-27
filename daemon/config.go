@@ -1383,47 +1383,85 @@ func checkQuotaProbeHomesPresence(data []byte) error {
 	if root.Kind == yaml.DocumentNode && len(root.Content) > 0 {
 		root = root.Content[0]
 	}
-	if root.Kind != yaml.MappingNode {
+	homes := yamlMappingValue(root, "quotaProbeHomes")
+	if homes == nil || homes.Tag == "!!null" || homes.Kind != yaml.MappingNode {
 		return nil
 	}
-	for i := 0; i+1 < len(root.Content); i += 2 {
-		if root.Content[i].Kind != yaml.ScalarNode || root.Content[i].Value != "quotaProbeHomes" {
+	for _, pair := range yamlMappingPairs(homes) {
+		harness := ""
+		if pair[0].Kind == yaml.ScalarNode {
+			harness = pair[0].Value
+		}
+		list := yamlDeref(pair[1])
+		if list.Tag == "!!null" || list.Kind != yaml.SequenceNode {
 			continue
 		}
-		val := root.Content[i+1]
-		if val.Kind == yaml.AliasNode && val.Alias != nil {
-			val = val.Alias
-		}
-		if val.Tag == "!!null" {
-			return nil
-		}
-		if val.Kind != yaml.MappingNode {
-			return nil
-		}
-		for j := 0; j+1 < len(val.Content); j += 2 {
-			harness := ""
-			if val.Content[j].Kind == yaml.ScalarNode {
-				harness = val.Content[j].Value
+		for k, elem := range list.Content {
+			e := yamlDeref(elem)
+			if e.Tag == "!!null" || e.Kind != yaml.ScalarNode || strings.TrimSpace(e.Value) == "" {
+				return fmt.Errorf("quotaProbeHomes.%s[%d] must be an absolute path", harness, k)
 			}
-			list := val.Content[j+1]
-			if list.Kind == yaml.AliasNode && list.Alias != nil {
-				list = list.Alias
+		}
+	}
+	return nil
+}
+
+// yamlDeref follows an alias to the node it names.
+func yamlDeref(n *yaml.Node) *yaml.Node {
+	for n != nil && n.Kind == yaml.AliasNode && n.Alias != nil {
+		n = n.Alias
+	}
+	return n
+}
+
+// yamlMappingPairs returns a mapping's key/value pairs with merge keys
+// ("<<: *anchor" or "<<: [*a, *b]") expanded, so a value the decoder
+// would read through a merge is validated like an inline one. Explicit
+// keys come first and win over merged ones, matching the decoder.
+func yamlMappingPairs(m *yaml.Node) [][2]*yaml.Node {
+	return yamlMappingPairsDepth(yamlDeref(m), 0)
+}
+
+func yamlMappingPairsDepth(m *yaml.Node, depth int) [][2]*yaml.Node {
+	if m == nil || m.Kind != yaml.MappingNode || depth > 16 {
+		return nil
+	}
+	var explicit, merged [][2]*yaml.Node
+	for i := 0; i+1 < len(m.Content); i += 2 {
+		key, val := m.Content[i], m.Content[i+1]
+		if key.Kind == yaml.ScalarNode && key.Value == "<<" && (key.Tag == "!!merge" || key.Tag == "") {
+			val = yamlDeref(val)
+			sources := []*yaml.Node{val}
+			if val.Kind == yaml.SequenceNode {
+				sources = val.Content
 			}
-			if list.Tag == "!!null" {
+			for _, src := range sources {
+				merged = append(merged, yamlMappingPairsDepth(yamlDeref(src), depth+1)...)
+			}
+			continue
+		}
+		explicit = append(explicit, [2]*yaml.Node{key, val})
+	}
+	seen := map[string]bool{}
+	out := make([][2]*yaml.Node, 0, len(explicit)+len(merged))
+	for _, pair := range append(explicit, merged...) {
+		if pair[0].Kind == yaml.ScalarNode {
+			if seen[pair[0].Value] {
 				continue
 			}
-			if list.Kind != yaml.SequenceNode {
-				continue
-			}
-			for k, elem := range list.Content {
-				e := elem
-				if e.Kind == yaml.AliasNode && e.Alias != nil {
-					e = e.Alias
-				}
-				if e.Tag == "!!null" || e.Kind != yaml.ScalarNode || strings.TrimSpace(e.Value) == "" {
-					return fmt.Errorf("quotaProbeHomes.%s[%d] must be an absolute path", harness, k)
-				}
-			}
+			seen[pair[0].Value] = true
+		}
+		out = append(out, pair)
+	}
+	return out
+}
+
+// yamlMappingValue returns the value under key in mapping m, merge keys
+// included, or nil when absent.
+func yamlMappingValue(m *yaml.Node, key string) *yaml.Node {
+	for _, pair := range yamlMappingPairs(m) {
+		if pair[0].Kind == yaml.ScalarNode && pair[0].Value == key {
+			return yamlDeref(pair[1])
 		}
 	}
 	return nil

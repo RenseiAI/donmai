@@ -158,6 +158,67 @@ func TestQuotaPoller_SymlinkParentDotDotReadsKernelPath(t *testing.T) {
 	}
 }
 
+// TestQuotaPoller_UnopenableDotDotPathProbesNothing pins the fallback for
+// a declared path whose parent cannot be resolved: with selected linking
+// to physical/current, selected/missing/../home-a is unopenable (missing
+// does not exist), so no login may be read for it. A lexical clean would
+// collapse it to selected/home-a and read physical/current/home-a.
+func TestQuotaPoller_UnopenableDotDotPathProbesNothing(t *testing.T) {
+	skipWithoutShell(t)
+	root := t.TempDir()
+	def := filepath.Join(root, "def")
+	physical := filepath.Join(root, "physical")
+	logical := filepath.Join(root, "logical")
+	if err := os.MkdirAll(filepath.Join(physical, "current"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(logical, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(physical, "current"), filepath.Join(logical, "selected")); err != nil {
+		t.Fatal(err)
+	}
+	declared := filepath.Join(logical, "selected") + "/missing/../home-a"
+	writeCodexHome(t, def, "default")
+	writeCodexHome(t, filepath.Join(physical, "current", "home-a"), "home-a")
+	writeClaudeMarkerHome(t, def, "default")
+	writeClaudeMarkerHome(t, filepath.Join(physical, "current", "home-a"), "physical")
+	if _, err := os.Stat(declared); err == nil {
+		t.Fatal("fixture wrong: the kernel opens the declared path")
+	}
+
+	codexLog := filepath.Join(root, "codex.log")
+	d := driveCodexScan(t, writeCodexCountingCLI(t, codexLog), def, []string{declared})
+	if lines := codexProbeLines(t, codexLog); len(lines) != 1 {
+		t.Errorf("codex probes for an unopenable declared path = %v, want only the default", lines)
+	}
+	if got, ok := d.quota.codexSlotAttempt(normalizeCodexProbeHome(declared)); !ok || got.accountID != "" || got.limits.Unavailable == nil || got.limits.Unavailable.Answered {
+		t.Errorf("codex unopenable home attempt = %+v (recorded %v), want unanswered with no account", got, ok)
+	}
+
+	claudeLog := filepath.Join(root, "claude.log")
+	driveClaudeScan(t, writeClaudeMarkerCLI(t, claudeLog), def, []string{declared})
+	if lines := slotUsageLines(t, claudeLog); strings.Join(lines, ",") != "usage default" {
+		t.Errorf("claude usage reads for an unopenable declared path = %v, want only the default", lines)
+	}
+}
+
+// TestScanPlans_SameMissingHomeDeclaredTwicePlansOnce pins the path-key
+// dedup that covers homes identity dedup cannot see: a missing home has no
+// inode, so declaring it twice must still plan one slot per harness.
+func TestScanPlans_SameMissingHomeDeclaredTwicePlansOnce(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("CODEX_HOME", filepath.Join(root, "def"))
+	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(root, "def"))
+	missing := filepath.Join(root, "missing-home")
+	if got := buildCodexScanPlan([]string{missing, missing}); len(got) != 2 {
+		t.Errorf("codex plan for a missing home declared twice = %+v, want default plus one", got)
+	}
+	if got := buildClaudeScanPlan([]string{missing, missing}); len(got) != 2 {
+		t.Errorf("claude plan for a missing home declared twice = %+v, want default plus one", got)
+	}
+}
+
 // TestQuotaPoller_ClaudeUnreadableHomeIsUnanswered pins that a declared
 // home whose permissions were revoked stays an unanswered local attempt:
 // the CLI cannot read it and reports logged out, which is not a refusal of
@@ -238,6 +299,8 @@ func TestLoadConfig_QuotaProbeHomesRejectsAuthoredEmptyElements(t *testing.T) {
 		"codex bare dash":   "quotaProbeHomes:\n  codex:\n    -\n",
 		"codex tilde null":  "quotaProbeHomes:\n  codex: [~]\n",
 		"claude blank text": "quotaProbeHomes:\n  claude: ['   ']\n",
+		"claude merge key":  "base: &b\n  claude: [/fixture-home-kept-12345, ~]\nquotaProbeHomes:\n  <<: *b\n",
+		"codex merge list":  "a: &a\n  codex: [null]\nb: &b\n  claude: [/fixture-home-kept-12345]\nquotaProbeHomes:\n  <<: [*b, *a]\n",
 	} {
 		p := filepath.Join(t.TempDir(), "daemon.yaml")
 		if err := os.WriteFile(p, []byte(base+body), 0o600); err != nil {
