@@ -252,7 +252,7 @@ func finishReasoning(state *mapperState, id string, raw any) []agent.Event {
 	if strings.TrimSpace(text) == "" {
 		return nil
 	}
-	return []agent.Event{agent.SystemEvent{Subtype: "reasoning", Message: text, Raw: raw}}
+	return []agent.Event{agent.ReasoningEvent{ItemID: id, Summary: b.summary.String(), Text: b.text.String(), Raw: raw}}
 }
 
 func flushReasoning(state *mapperState, raw any) []agent.Event {

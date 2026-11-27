@@ -88,9 +88,6 @@ func TestNotificationStreamWarningsAndProgress(t *testing.T) {
 		{"model/rerouted", `{"fromModel":"first","toModel":"second","reason":"safety"}`, "codex_model_rerouted", "second"},
 		{"turn/moderationMetadata", `{"metadata":{"review":true}}`, "codex_moderation", "review"},
 		{"model/safetyBuffering/updated", `{"model":"first","reasons":["review"]}`, "codex_safety_buffering_started", "review"},
-		{"item/fileChange/outputDelta", `{"delta":"patch output"}`, "codex_progress", "patch output"},
-		{"item/fileChange/patchUpdated", `{"changes":[{"path":"file.go","diff":"+added"}]}`, "codex_progress", "+added"},
-		{"item/plan/delta", `{"delta":"next step"}`, "codex_progress", "next step"},
 	} {
 		t.Run(tc.method, func(t *testing.T) {
 			t.Parallel()
@@ -108,6 +105,78 @@ func TestNotificationStreamWarningsAndProgress(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestNotificationStreamDeltasAreItemProgress(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct{ method, params, tool string }{
+		{"item/commandExecution/outputDelta", `{"itemId":"exec-1","delta":"line"}`, "shell"},
+		{"item/fileChange/outputDelta", `{"itemId":"exec-1","delta":"patch output"}`, "file_change"},
+		{"item/fileChange/patchUpdated", `{"itemId":"exec-1","changes":[{"path":"file.go","diff":"+added"}]}`, "file_change"},
+		{"item/plan/delta", `{"itemId":"exec-1","delta":"next step"}`, "plan"},
+	} {
+		got := dispatch(t, notificationHandle(), tc.method, tc.params)
+		if len(got) != 1 {
+			t.Fatalf("%s: events = %+v", tc.method, got)
+		}
+		p, ok := got[0].(agent.ToolProgressEvent)
+		if !ok || p.ItemID != "exec-1" || p.ToolName != tc.tool || p.Raw == nil {
+			t.Fatalf("%s: event = %#v; want %s progress on exec-1", tc.method, got[0], tc.tool)
+		}
+	}
+}
+
+func TestNotificationStreamPlanUpdatedIsWholePlan(t *testing.T) {
+	t.Parallel()
+	got := dispatch(t, notificationHandle(), "turn/plan/updated", `{"turnId":"t","explanation":"why","plan":[{"step":"read","status":"completed"},{"step":"edit","status":"inProgress"},{"step":"test","status":"pending"}]}`)
+	if len(got) != 1 {
+		t.Fatalf("plan = %+v", got)
+	}
+	plan, ok := got[0].(agent.PlanEvent)
+	if !ok || plan.Summary() != "Plan 1/3 · edit" || plan.Explanation != "why" {
+		t.Fatalf("plan = %#v", got[0])
+	}
+	wantSteps := []agent.PlanStep{
+		{Text: "read", Status: agent.PlanStepCompleted},
+		{Text: "edit", Status: agent.PlanStepInProgress},
+		{Text: "test", Status: agent.PlanStepPending},
+	}
+	if len(plan.Steps) != len(wantSteps) {
+		t.Fatalf("steps = %+v", plan.Steps)
+	}
+	for i, want := range wantSteps {
+		if plan.Steps[i] != want {
+			t.Fatalf("step %d = %+v, want %+v", i, plan.Steps[i], want)
+		}
+	}
+	if got := dispatch(t, notificationHandle(), "turn/plan/updated", `{"plan":[]}`); len(got) != 0 {
+		t.Fatalf("empty plan mapped to %+v", got)
+	}
+}
+
+func TestPlanAndWebSearchItemsEmitOnceOnCompletion(t *testing.T) {
+	t.Parallel()
+	for _, typ := range []string{"plan", "webSearch"} {
+		params := `{"item":{"id":"i","type":"` + typ + `","text":"x"}}`
+		if got := dispatch(t, notificationHandle(), "item/started", params); len(got) != 0 {
+			t.Errorf("%s started emitted %+v", typ, got)
+		}
+		if got := dispatch(t, notificationHandle(), "item/completed", params); len(got) != 1 {
+			t.Errorf("%s completed emitted %d events, want 1", typ, len(got))
+		}
+	}
+}
+
+func reasoningOf(t *testing.T, ev agent.Event) string {
+	t.Helper()
+	r, ok := ev.(agent.ReasoningEvent)
+	if !ok {
+		t.Fatalf("event %T, want ReasoningEvent", ev)
+	}
+	if r.Summary != "" {
+		return r.Summary
+	}
+	return r.Text
 }
 
 func TestNotificationStreamCompaction(t *testing.T) {
@@ -135,8 +204,7 @@ func TestNotificationStreamReasoning(t *testing.T) {
 			if len(got) != 1 {
 				t.Fatalf("thought = %+v", got)
 			}
-			thought, ok := got[0].(agent.SystemEvent)
-			if !ok || thought.Subtype != "reasoning" || !strings.Contains(thought.Message, "Think ") || !strings.Contains(thought.Message, "carefully") {
+			if text := reasoningOf(t, got[0]); !strings.Contains(text, "Think ") || !strings.Contains(text, "carefully") {
 				t.Fatalf("thought = %+v", got[0])
 			}
 			if len(h.state.reasoning) != 0 {
@@ -146,13 +214,30 @@ func TestNotificationStreamReasoning(t *testing.T) {
 	}
 	h := notificationHandle()
 	got := dispatch(t, h, "item/completed", `{"item":{"id":"r","type":"reasoning","summary":["first","second"],"content":[]}}`)
-	if len(got) != 1 || got[0].(agent.SystemEvent).Message != "first\nsecond" {
+	if len(got) != 1 || reasoningOf(t, got[0]) != "first\nsecond" {
 		t.Fatalf("native summary = %+v", got)
 	}
 	dispatch(t, h, "item/reasoning/textDelta", `{"itemId":"r","delta":"final thought"}`)
 	got = dispatch(t, h, "turn/completed", `{"turn":{"id":"t","status":"completed"}}`)
-	if len(got) != 3 || got[0].(agent.SystemEvent).Message != "final thought" {
+	if len(got) != 3 || reasoningOf(t, got[0]) != "final thought" {
 		t.Fatalf("turn reasoning flush = %+v", got)
+	}
+	if flushed, ok := got[0].(agent.ReasoningEvent); !ok || flushed.ItemID != "r" {
+		t.Fatalf("flushed reasoning item id = %q, want r", flushed.ItemID)
+	}
+}
+
+// A completed reasoning item that carries both a native summary and the
+// full reasoning content keeps both on the typed event.
+func TestNotificationStreamReasoningCompletedKeepsSummaryAndText(t *testing.T) {
+	t.Parallel()
+	got := dispatch(t, notificationHandle(), "item/completed", `{"item":{"id":"r","type":"reasoning","summary":["short"],"content":["full","reasoning"]}}`)
+	if len(got) != 1 {
+		t.Fatalf("reasoning = %+v", got)
+	}
+	r, ok := got[0].(agent.ReasoningEvent)
+	if !ok || r.ItemID != "r" || r.Summary != "short" || r.Text != "full\nreasoning" {
+		t.Fatalf("reasoning = %#v", got[0])
 	}
 }
 
@@ -231,7 +316,7 @@ func TestNotificationStreamReasoningPrefersNativeSummary(t *testing.T) {
 	dispatch(t, h, "item/reasoning/textDelta", `{"itemId":"r","delta":"raw reasoning"}`)
 	dispatch(t, h, "item/reasoning/summaryTextDelta", `{"itemId":"r","delta":"partial summary"}`)
 	got := dispatch(t, h, "item/completed", `{"item":{"id":"r","type":"reasoning","summary":["native summary"],"content":[]}}`)
-	if len(got) != 1 || got[0].(agent.SystemEvent).Message != "native summary" {
+	if len(got) != 1 || reasoningOf(t, got[0]) != "native summary" {
 		t.Fatalf("summary duplicated or discarded: %+v", got)
 	}
 	if len(h.state.reasoning) != 0 {
