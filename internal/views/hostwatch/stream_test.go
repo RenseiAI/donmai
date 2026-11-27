@@ -243,6 +243,8 @@ func TestToolUseSummary(t *testing.T) {
 		{agent.ToolUseEvent{ToolName: "Read", Input: map[string]any{"file_path": "a.go"}}, "Read: a.go"},
 		{agent.ToolUseEvent{ToolName: "Grep", Input: map[string]any{"pattern": "foo"}}, "Grep: foo"},
 		{agent.ToolUseEvent{ToolName: "Task", Input: map[string]any{"description": "do x"}}, "Task: do x"},
+		{agent.ToolUseEvent{ToolName: "shell", Input: map[string]any{"command": "/bin/zsh -lc \"git status\""}}, "shell: git status"},
+		{agent.ToolUseEvent{ToolName: "read", Input: map[string]any{"path": "/w/a.go"}}, "read: /w/a.go"},
 		{agent.ToolUseEvent{ToolName: "Unknown"}, "Unknown"},
 		{agent.ToolUseEvent{}, "tool"},
 	}

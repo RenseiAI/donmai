@@ -182,6 +182,17 @@ var pinnedFallbackRoutingEnv = []string{
 // for no redirect it closes — those sessions pin nothing and stay
 // byte-identical. The returned map is a fresh copy; spec is never mutated.
 func pinnedRoutingEnv(spec agent.Spec) map[string]string {
+	// A host-login session (host-session/local) has no route of its own to
+	// hold: it authenticates and routes through the host's CLI login, and
+	// applyAuthMode already removed every routing and credential name from
+	// its env. A pin here would re-read the fallback switches from the
+	// parent process (effectiveRoutingValue) and restate them on the CLI's
+	// winning --settings layer, undoing that strip whenever a region name
+	// (AWS_REGION, CLOUD_ML_REGION) still marks the spec as routed. So a
+	// host-login session pins nothing, on the spawn and on every --resume.
+	if usesHostLogin(spec.AuthMode) {
+		return nil
+	}
 	pin := make(map[string]string)
 	hasOwnRouting := false
 	for k, v := range spec.Env {

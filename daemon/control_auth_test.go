@@ -50,6 +50,7 @@ var mutatingControlRoutes = []controlRoute{
 	{path: kitSourceRoutePrefix + "source-unknown/enable"},
 	{path: kitSourceRoutePrefix + "source-unknown/disable"},
 	{path: "/api/daemon/workareas/archive-unknown/restore"},
+	{path: "/api/daemon/observations/scan"},
 }
 
 // postControl issues a POST against the test server, attaching bearer when
@@ -160,6 +161,7 @@ func TestControlAuth_ReadOnlyRoutesOpenWithoutToken(t *testing.T) {
 		{"/api/daemon/doctor", http.StatusOK},
 		{"/api/daemon/pool/stats", http.StatusOK},
 		{"/api/daemon/capabilities", http.StatusOK},
+		{"/api/daemon/observations", http.StatusOK},
 		{"/healthz", http.StatusOK},
 		{"/api/daemon/sessions", http.StatusOK},
 		{"/api/daemon/sessions/sess-read", http.StatusOK},

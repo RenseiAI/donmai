@@ -196,26 +196,35 @@ func RateLimitEventToUpdate(info *RateLimitInfo, names ScopedLimitNames, checked
 type usageWindowJSON struct {
 	Utilization *float64 `json:"utilization"`
 	ResetsAt    *string  `json:"resets_at"`
+	UsedTokens  *float64 `json:"used_tokens,omitempty"`
+	Limit       *float64 `json:"limit,omitempty"`
 }
 
-// modelScopedWindowJSON is the structural view of one model-scoped
-// entry. It shipped in the CLI after the pinned SDK typings, so it is
-// read structurally.
 type modelScopedWindowJSON struct {
 	DisplayName string   `json:"display_name"`
 	Utilization *float64 `json:"utilization"`
 	ResetsAt    *string  `json:"resets_at"`
+	UsedTokens  *float64 `json:"used_tokens,omitempty"`
+	Limit       *float64 `json:"limit,omitempty"`
 }
 
-// UsageResponse is the structural view of the usage read response.
-// The claude CLI answers it inside the `control_response` to the
-// probe's `get_usage` control request (see usage_probe.go): the probe
-// sends no user message, so the child answers without spending a
-// turn. A control answer that never arrives leaves the read failed,
-// never unsupported.
+// UsageResponse is the structural view of one get_usage control answer.
 type UsageResponse struct {
-	Available *bool           `json:"rate_limits_available"`
-	Windows   json.RawMessage `json:"rate_limits"`
+	Available        *bool           `json:"rate_limits_available"`
+	Windows          json.RawMessage `json:"rate_limits"`
+	SubscriptionType *string         `json:"subscription_type,omitempty"`
+	BillingMode      *string         `json:"billing_mode,omitempty"`
+	CreditBalance    *float64        `json:"credit_balance,omitempty"`
+	AccountID        *string         `json:"account_id,omitempty"`
+	Scope            *string         `json:"scope,omitempty"`
+	UserID           *string         `json:"user_id,omitempty"`
+}
+
+func claudeSeatUser(scope, userID *string) string {
+	if scope == nil || userID == nil || !strings.EqualFold(strings.TrimSpace(*scope), "seat") || strings.TrimSpace(*userID) == "" {
+		return ""
+	}
+	return *userID
 }
 
 // UsageResponseToLimits maps one usage read onto the shared limits
@@ -224,34 +233,68 @@ type UsageResponse struct {
 // mapper to reuse. An unavailable read reports the account as
 // unsupported: an account with no subscription windows never reports
 // them.
+//
+// Availability matches the pre-evidence mapper exactly: it depends
+// only on rate_limits_available and whether the windows payload parses.
+// Meter evidence rides on top without changing Unavailable, so a read
+// with windows but no display rows stays supported with empty windows
+// (as before) and a read with no windows payload stays unsupported
+// (as before).
 func UsageResponseToLimits(raw []byte, checkedAt string) (agent.UsageLimits, ScopedLimitNames) {
 	var resp UsageResponse
 	if err := json.Unmarshal(raw, &resp); err != nil || resp.Available == nil || !*resp.Available || len(resp.Windows) == 0 {
 		return agent.MakeUnavailableUsageLimits(checkedAt, agent.UsageUnavailableUnsupported, ""), ScopedLimitNames{}
 	}
+	var plan string
+	if resp.SubscriptionType != nil {
+		plan = *resp.SubscriptionType
+	}
+	billing := agent.UsageBillingUnknown
+	if resp.BillingMode != nil {
+		billing = agent.ParseUsageBillingMode(*resp.BillingMode)
+	}
+	var account string
+	if resp.AccountID != nil {
+		account = *resp.AccountID
+	}
+	user := claudeSeatUser(resp.Scope, resp.UserID)
 	var windows map[string]json.RawMessage
 	if err := json.Unmarshal(resp.Windows, &windows); err != nil {
 		return agent.MakeUnavailableUsageLimits(checkedAt, agent.UsageUnavailableUnsupported, ""), ScopedLimitNames{}
 	}
+	if windows == nil {
+		windows = map[string]json.RawMessage{}
+	}
 	var out []agent.UsageWindow
+	var evidence []agent.UsageMeterEvidence
 	for _, id := range []string{claudeSessionWindowID, claudeWeeklyWindowID} {
 		rawWindow, ok := windows[id]
 		if !ok {
 			continue
 		}
 		var w usageWindowJSON
-		if err := json.Unmarshal(rawWindow, &w); err != nil || w.Utilization == nil {
+		if err := json.Unmarshal(rawWindow, &w); err != nil || (w.Utilization == nil && w.UsedTokens == nil) {
 			continue
 		}
-		var resetsAt string
-		if w.ResetsAt != nil {
-			resetsAt = isoFromString(*w.ResetsAt)
+		if w.Utilization != nil {
+			out = append(out, makeClaudeWindow(id, *w.Utilization, isoFromString(ptrOrEmpty(w.ResetsAt))))
 		}
-		out = append(out, makeClaudeWindow(id, *w.Utilization, resetsAt))
+		var unit agent.UsageObservedUnit
+		var used float64
+		switch {
+		case w.UsedTokens != nil:
+			unit, used = agent.UsageUnitTokens, *w.UsedTokens
+		case w.Utilization != nil:
+			unit, used = agent.UsageUnitPercent, *w.Utilization
+		default:
+			continue
+		}
+		var resets *string
+		if iso := isoFromString(ptrOrEmpty(w.ResetsAt)); iso != "" {
+			resets = &iso
+		}
+		evidence = append(evidence, agent.UsageMeterEvidence{Provider: "claude", Plan: plan, Allowance: id, Window: id, Account: account, User: user, Unit: unit, Used: used, Limit: w.Limit, ResetsAt: resets, Billing: billing, Balance: resp.CreditBalance})
 	}
-	// The CLI filters model-scoped entries to the overage-included
-	// allowlist; the first entry that draws a row is the one the
-	// streamed event refers to.
 	var names ScopedLimitNames
 	if rawScoped, ok := windows["model_scoped"]; ok && len(rawScoped) > 0 {
 		var entries []modelScopedWindowJSON
@@ -260,19 +303,42 @@ func UsageResponseToLimits(raw []byte, checkedAt string) (agent.UsageLimits, Sco
 				if strings.TrimSpace(e.DisplayName) == "" || e.Utilization == nil {
 					continue
 				}
-				var resetsAt string
-				if e.ResetsAt != nil {
-					resetsAt = isoFromString(*e.ResetsAt)
-				}
-				out = append(out, scopedWindow(e.DisplayName, *e.Utilization, resetsAt))
-				// Only a bucket that drew a row may receive events;
-				// naming one that was skipped would let a mid-turn
-				// event open a row the probe never showed.
+				out = append(out, scopedWindow(e.DisplayName, *e.Utilization, isoFromString(ptrOrEmpty(e.ResetsAt))))
 				if names.OverageIncluded == "" {
 					names.OverageIncluded = e.DisplayName
 				}
+				var sunit agent.UsageObservedUnit
+				var sused float64
+				switch {
+				case e.UsedTokens != nil:
+					sunit, sused = agent.UsageUnitTokens, *e.UsedTokens
+				default:
+					sunit, sused = agent.UsageUnitPercent, *e.Utilization
+				}
+				var sresets *string
+				if iso := isoFromString(ptrOrEmpty(e.ResetsAt)); iso != "" {
+					sresets = &iso
+				}
+				evidence = append(evidence, agent.UsageMeterEvidence{Provider: "claude", Plan: plan, Allowance: "model_scoped", Window: scopedWindowID(e.DisplayName), Account: account, User: user, Unit: sunit, Used: sused, Limit: e.Limit, ResetsAt: sresets, Billing: billing, Balance: resp.CreditBalance})
 			}
 		}
 	}
-	return agent.MakeUsageLimits(checkedAt, out), names
+	if len(out) == 0 && len(evidence) == 0 {
+		if resp.BillingMode != nil || resp.CreditBalance != nil || resp.AccountID != nil || resp.SubscriptionType != nil || user != "" {
+			limits := agent.MakeUsageLimits(checkedAt, nil)
+			limits.Evidence = []agent.UsageMeterEvidence{{Provider: "claude", Plan: plan, Account: account, User: user, Billing: billing, Balance: resp.CreditBalance}}
+			return limits, names
+		}
+		return agent.MakeUsageLimits(checkedAt, out), names
+	}
+	limits := agent.MakeUsageLimits(checkedAt, out)
+	limits.Evidence = evidence
+	return limits, names
+}
+
+func ptrOrEmpty(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
 }

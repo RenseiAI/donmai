@@ -42,6 +42,11 @@ type PublicationTarget struct {
 	Repository      string
 	Branch          string
 	AllowRemoteHEAD bool
+	// SessionDocuments is the checkout-relative directory (trailing slash)
+	// holding the negotiated documents this session published inside the
+	// checkout, or "" when it published none there. Its ignored bytes are
+	// session machinery, not unpublished work; nothing else is.
+	SessionDocuments string
 }
 
 // InteractivePublicationSpec binds a disposition check to one manager-owned
@@ -169,7 +174,7 @@ func (m *Manager) assessRepositoryPublication(
 	if err != nil || len(ignored) > publicationMaxGitOutput {
 		return retain(PublicationReasonUncertain)
 	}
-	if hasMeaningfulIgnoredFiles(ignored) {
+	if hasMeaningfulIgnoredFiles(ignored, target.SessionDocuments) {
 		return retain(PublicationReasonDirty)
 	}
 	branchArgs := append(append([]string{}, localConfig...), "-C", path, "symbolic-ref", "--quiet", "--short", "HEAD")
@@ -315,10 +320,13 @@ func parseRemotePublicationRefs(output []byte) (map[string]string, bool) {
 	return refs, true
 }
 
-func hasMeaningfulIgnoredFiles(output []byte) bool {
+func hasMeaningfulIgnoredFiles(output []byte, sessionDocuments string) bool {
 	for _, rawPath := range strings.Split(string(output), "\x00") {
 		path := filepath.ToSlash(strings.TrimPrefix(rawPath, "./"))
 		if path == "" {
+			continue
+		}
+		if sessionDocuments != "" && strings.HasPrefix(path, sessionDocuments) {
 			continue
 		}
 		top, _, descendant := strings.Cut(path, "/")

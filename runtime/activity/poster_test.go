@@ -552,6 +552,18 @@ func TestEventMappingTable(t *testing.T) {
 			hasInput:    true,
 		},
 		{
+			name: "ToolUse Codex shell -> wrapper removed from summary",
+			event: agent.ToolUseEvent{
+				ToolName: "shell",
+				Input:    map[string]any{"command": "/bin/zsh -lc \"rg -n TODO src\""},
+			},
+			wantSent:    true,
+			wantType:    "action",
+			wantContent: "shell: rg -n TODO src",
+			wantTool:    "shell",
+			hasInput:    true,
+		},
+		{
 			name: "ToolUse Read -> action with file path",
 			event: agent.ToolUseEvent{
 				ToolName: "Read",
