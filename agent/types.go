@@ -1167,7 +1167,24 @@ type TurnManifest struct {
 	// decoded tolerantly — a malformed finding never fails the manifest —
 	// and the runner normalizes, orders (blocking first) and bounds the list
 	// before posting (runner.NormalizeManifestFindings).
-	Findings []TurnManifestFinding `json:"findings,omitempty"`
+	Findings TurnManifestFindings `json:"findings,omitempty"`
+}
+
+// TurnManifestFindings is the manifest's findings list. It decodes
+// tolerantly: a value that is not a JSON array (null, an object, a string)
+// decodes to an empty list rather than failing the manifest, so an agent that
+// writes `"findings": "none"` keeps its summary and verdicts.
+type TurnManifestFindings []TurnManifestFinding
+
+// UnmarshalJSON decodes a JSON array of findings and discards any other
+// value. It never returns an error.
+func (fs *TurnManifestFindings) UnmarshalJSON(data []byte) error {
+	var list []TurnManifestFinding
+	if json.Unmarshal(data, &list) != nil {
+		list = nil
+	}
+	*fs = list
+	return nil
 }
 
 // TurnManifestFinding is one review finding. JSON names match the control

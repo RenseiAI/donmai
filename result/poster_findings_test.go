@@ -47,48 +47,73 @@ func TestTurnManifestFindingsReachThePostedPayload(t *testing.T) {
 				{"blocking": true, "severity": "high", "title": long[:240], "category": "other"},
 			},
 		},
+		// A findings value that is not an array is discarded; it never costs
+		// the rest of the manifest (summary, verdicts), which the runner
+		// accepted before findings were parsed at all.
+		{name: "null findings keep the manifest", findings: `null`},
+		{name: "object findings keep the manifest", findings: `{}`},
+		{name: "string findings keep the manifest", findings: `"none"`},
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
+	// Both parse paths must carry the same findings: the manifest file and
+	// the inline "Intended manifest" block printed in the final message.
+	parsers := []struct {
+		name  string
+		parse func(t *testing.T, manifest string) (*runner.TurnManifest, error)
+	}{
+		{name: "file", parse: func(t *testing.T, manifest string) (*runner.TurnManifest, error) {
+			t.Helper()
 			worktree := t.TempDir()
 			if err := os.MkdirAll(filepath.Join(worktree, state.AgentDirName), 0o750); err != nil {
 				t.Fatal(err)
 			}
-			manifest := `{"schemaVersion":1,"verdict":"passed","reviewVerdict":"REQUEST_CHANGES","summary":"s","findings":` + tc.findings + `}`
 			if err := os.WriteFile(filepath.Join(worktree, state.AgentDirName, runner.ManifestFileName), []byte(manifest), 0o600); err != nil {
 				t.Fatal(err)
 			}
-			m, err := runner.ParseManifest(worktree)
-			if err != nil {
-				t.Fatalf("ParseManifest: %v", err)
-			}
-			ok := func(int) (int, string) { return http.StatusOK, `{"ok":true}` }
-			srv, captured := captureServer(t, ok, ok)
-			res := goodResult()
-			res.Manifest = m
-			if err := newPoster(t, srv.URL, 0).Post(context.Background(), "sess-1", res); err != nil {
-				t.Fatalf("Post: %v", err)
-			}
-			var got []map[string]any
-			captured.mu.Lock()
-			defer captured.mu.Unlock()
-			for _, body := range captured.bodies {
-				var payload struct {
-					Manifest *struct {
-						Findings []map[string]any `json:"findings"`
-					} `json:"manifest"`
+			return runner.ParseManifest(worktree)
+		}},
+		{name: "inline", parse: func(_ *testing.T, manifest string) (*runner.TurnManifest, error) {
+			return runner.ParseInlineManifest("Review done.\n\nIntended manifest: " + manifest + "\n\nWORK_RESULT:passed")
+		}},
+	}
+	for _, tc := range cases {
+		for _, p := range parsers {
+			t.Run(tc.name+"/"+p.name, func(t *testing.T) {
+				t.Parallel()
+				manifest := `{"schemaVersion":1,"verdict":"passed","reviewVerdict":"REQUEST_CHANGES","summary":"s","findings":` + tc.findings + `}`
+				m, err := p.parse(t, manifest)
+				if err != nil {
+					t.Fatalf("parse %s manifest: %v", p.name, err)
 				}
-				if json.Unmarshal([]byte(body), &payload) == nil && payload.Manifest != nil {
-					got = payload.Manifest.Findings
+				if m.Summary != "s" || m.ReviewVerdict != "REQUEST_CHANGES" {
+					t.Fatalf("manifest lost its summary or verdict: %+v", m)
 				}
-			}
-			gotJSON, _ := json.Marshal(got)
-			wantJSON, _ := json.Marshal(tc.want)
-			if string(gotJSON) != string(wantJSON) {
-				t.Fatalf("posted findings\n got %s\nwant %s", gotJSON, wantJSON)
-			}
-		})
+				ok := func(int) (int, string) { return http.StatusOK, `{"ok":true}` }
+				srv, captured := captureServer(t, ok, ok)
+				res := goodResult()
+				res.Manifest = m
+				if err := newPoster(t, srv.URL, 0).Post(context.Background(), "sess-1", res); err != nil {
+					t.Fatalf("Post: %v", err)
+				}
+				var got []map[string]any
+				captured.mu.Lock()
+				defer captured.mu.Unlock()
+				for _, body := range captured.bodies {
+					var payload struct {
+						Manifest *struct {
+							Findings []map[string]any `json:"findings"`
+						} `json:"manifest"`
+					}
+					if json.Unmarshal([]byte(body), &payload) == nil && payload.Manifest != nil {
+						got = payload.Manifest.Findings
+					}
+				}
+				gotJSON, _ := json.Marshal(got)
+				wantJSON, _ := json.Marshal(tc.want)
+				if string(gotJSON) != string(wantJSON) {
+					t.Fatalf("posted findings\n got %s\nwant %s", gotJSON, wantJSON)
+				}
+			})
+		}
 	}
 }
 

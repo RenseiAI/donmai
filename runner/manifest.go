@@ -139,6 +139,10 @@ var validReviewVerdicts = map[string]struct{}{
 // tags — lets a malformed agent-written file be rejected with a precise error
 // rather than silently coerced (e.g. a string "1" schemaVersion, an unknown
 // verdict, a missing required field).
+//
+// "findings" is deliberately absent: it is optional review detail, decoded
+// tolerantly by [agent.TurnManifestFindings], and a value of the wrong shape
+// must never cost the manifest its summary and verdicts.
 const manifestSchema = `{
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
@@ -152,7 +156,6 @@ const manifestSchema = `{
     "pullRequestUrl": { "type": "string" },
     "pullRequest": false,
     "commitSha": { "type": "string" },
-    "findings": { "type": "array" },
     "repositories": {
       "type": "array",
       "items": {

@@ -24,6 +24,8 @@ const (
 	maxFindingTextRunes = 240
 	// maxFindingPathRunes bounds a finding's path.
 	maxFindingPathRunes = 512
+	// maxFindingLabelRunes bounds a finding's category and kind.
+	maxFindingLabelRunes = 64
 	// defaultFindingCategory is the category given to a finding the agent
 	// did not categorize; the control plane drops category-less findings.
 	defaultFindingCategory = "other"
@@ -44,7 +46,8 @@ var (
 // say (no id, title, path or fix) are dropped; a missing category becomes
 // "other"; severity is mapped onto low/medium/high/critical (a blocking
 // finding with no recognisable severity is "high", else "medium"); an id that
-// is not a gate row id (B1…B999) is dropped; text is trimmed and bounded.
+// is not a gate row id (B1…B999) is dropped; text is trimmed and bounded,
+// and a finding too large for the byte budget on its own is shortened.
 // Blocking findings sort first (stable), then the list is cut to
 // MaxManifestFindings and MaxManifestFindingsBytes.
 func NormalizeManifestFindings(in []agent.TurnManifestFinding) []agent.TurnManifestFinding {
@@ -60,7 +63,8 @@ func NormalizeManifestFindings(in []agent.TurnManifestFinding) []agent.TurnManif
 		if f.ID == "" && f.Title == "" && f.Path == "" && f.Fix == "" {
 			continue
 		}
-		if f.Category = strings.TrimSpace(f.Category); f.Category == "" {
+		f.Kind = clipRunes(strings.TrimSpace(f.Kind), maxFindingLabelRunes)
+		if f.Category = clipRunes(strings.TrimSpace(f.Category), maxFindingLabelRunes); f.Category == "" {
 			f.Category = defaultFindingCategory
 		}
 		blocking := f.Blocking != nil && *f.Blocking
@@ -71,7 +75,7 @@ func NormalizeManifestFindings(in []agent.TurnManifestFinding) []agent.TurnManif
 		} else {
 			f.Severity = "medium"
 		}
-		out = append(out, f)
+		out = append(out, fitFinding(f))
 	}
 	slices.SortStableFunc(out, func(a, b agent.TurnManifestFinding) int {
 		ab, bb := a.Blocking != nil && *a.Blocking, b.Blocking != nil && *b.Blocking
@@ -97,6 +101,34 @@ func NormalizeManifestFindings(in []agent.TurnManifestFinding) []agent.TurnManif
 		return nil
 	}
 	return out
+}
+
+// fitFinding shortens one finding until it alone fits the byte budget, so
+// the tail-shedding below can never empty the list: a single finding of
+// maximal text that JSON escapes heavily ('<' encodes as six bytes) would
+// otherwise be shed and the review would post with no finding at all. It
+// halves the longest of fix, title and path in turn; the gate row id,
+// severity, blocking flag and line are kept.
+func fitFinding(f agent.TurnManifestFinding) agent.TurnManifestFinding {
+	for {
+		// The finding is posted inside an array: budget its brackets too.
+		data, err := json.Marshal(f)
+		if err == nil && len(data)+2 <= MaxManifestFindingsBytes {
+			return f
+		}
+		fields := []*string{&f.Fix, &f.Title, &f.Path}
+		longest := fields[0]
+		for _, s := range fields[1:] {
+			if utf8.RuneCountInString(*s) > utf8.RuneCountInString(*longest) {
+				longest = s
+			}
+		}
+		n := utf8.RuneCountInString(*longest)
+		if n == 0 {
+			return f
+		}
+		*longest = clipRunes(*longest, n/2)
+	}
 }
 
 // clipRunes cuts s to at most n runes on a rune boundary.
