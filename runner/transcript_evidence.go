@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -76,6 +77,28 @@ var transcriptEvidenceReadback = verifyTranscriptEvidenceReadback
 // transcriptEvidenceReadTail reads the bounded tail of an already-opened
 // transcript. A variable so tests can inject a read failure.
 var transcriptEvidenceReadTail = readTranscriptTailBounded
+
+// transcriptRedactionTimeout bounds one file's redaction (see
+// redactTranscriptEvidence): JSON nested in strings costs twice per level,
+// so a pathological line must not stall failed-session finalization. On
+// timeout the file falls back to a single {"redactedRecord":true} record.
+// A variable so tests prove the deadline without waiting the production
+// budget.
+var transcriptRedactionTimeout = 2 * time.Second
+
+// transcriptEvidenceUnleasedRetains counts workareas kept after an
+// unleased tail failure ("workarea retained"). With no lease no reaper
+// owns the workarea, so the keep would otherwise be invisible: the count
+// plus the warning names every kept workarea for the operator sweep. It is
+// a process-local metric; tests read it via
+// transcriptEvidenceRetainedWorkareas.
+var transcriptEvidenceUnleasedRetains atomic.Int64
+
+// transcriptEvidenceRetainedWorkareas reports how many unleased workareas
+// this process kept after a tail failure.
+func transcriptEvidenceRetainedWorkareas() int64 {
+	return transcriptEvidenceUnleasedRetains.Load()
+}
 
 // resolveTranscriptEvidencePath resolves one declared transcript path: an
 // absolute path is used as-is (trusted handle output; archives stay
@@ -250,6 +273,31 @@ func transcriptEvidenceValueWithTimeout[T any](fn func() (T, error)) (T, error) 
 	}
 }
 
+// transcriptRedactionValueWithTimeout runs a value-returning redaction
+// with the per-file redaction deadline. The buffered channel avoids a data
+// race when the redaction outlives the timeout: the late sender never blocks
+// and the caller discards its result fail-closed to {"redactedRecord":true}.
+func transcriptRedactionValueWithTimeout(fn func() (string, error)) (string, error) {
+	if transcriptRedactionTimeout <= 0 {
+		return fn()
+	}
+	type result struct {
+		v   string
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		v, err := fn()
+		done <- result{v: v, err: err}
+	}()
+	select {
+	case r := <-done:
+		return r.v, r.err
+	case <-time.After(transcriptRedactionTimeout):
+		return "", fmt.Errorf("transcript redaction timed out")
+	}
+}
+
 // capTranscriptBytes keeps the newest complete lines of s under capBytes.
 // s must end in newline; the result does too, or is empty when no complete
 // line fits. When the window already starts at a line boundary the whole
@@ -284,8 +332,13 @@ func transcriptEvidenceName(i int) string {
 
 // appendTranscriptEvidenceWarning records a value-free path-safe warning on
 // both the runner envelope and the terminal wire copy. disposition states
-// what happened to the workarea; it is a fixed caller literal.
+// what happened to the workarea; it is a fixed caller literal. An unleased
+// "workarea retained" keep has no reaper, so it also bumps the retained
+// metric the operator sweep reads.
 func appendTranscriptEvidenceWarning(res *Result, index int, disposition string) {
+	if disposition == "workarea retained" {
+		transcriptEvidenceUnleasedRetains.Add(1)
+	}
 	warning := fmt.Sprintf("transcript evidence unavailable for file %d; %s", index, disposition)
 	if res == nil {
 		return
@@ -405,7 +458,16 @@ func (r *Runner) archiveFailedSessionEvidence(qw QueuedWork, res *Result, dirFor
 		if len(tail) == 0 {
 			continue
 		}
-		redacted := redactTranscriptEvidence(string(tail), values)
+		// A pathological line (JSON nested in strings) must not stall
+		// finalization: on deadline the file falls back to a single
+		// redacted record rather than leaking or hanging.
+		redacted, err := transcriptRedactionValueWithTimeout(func() (string, error) {
+			return redactTranscriptEvidence(string(tail), values), nil
+		})
+		if err != nil {
+			r.logger.Warn("transcript evidence redaction timed out; storing redacted record", "sessionId", qw.SessionID, "file", i)
+			redacted = "{\"redactedRecord\":true}\n"
+		}
 		redacted = capTranscriptBytes(redacted, transcriptEvidencePerFileCapBytes)
 		if int64(len(redacted)) > remaining {
 			redacted = capTranscriptBytes(redacted, remaining)

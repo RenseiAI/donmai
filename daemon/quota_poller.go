@@ -87,43 +87,33 @@ func (q *quotaState) quotaProbeDueAt(harness string, now time.Time) time.Time {
 type quotaProbeFunc func(ctx context.Context, q *quotaState)
 
 // codexQuotaProbe returns the probe that reads the host's codex login
-// through a short-lived app-server: construct, read, shut down. The
-// read runs under the shared probe mapper, so its rows carry the same
-// window ids the streamed updates merge onto. codexBin is the resolved
-// codex binary; hostAuth selects whether the host's existing CLI
-// login is projected into the probe's isolated home. An empty binary
-// (codex not installed) disables the probe: the attempt records
+// through a short-lived probe-owned app-server: one owned operation
+// constructs, starts, reads and shuts down under the attempt deadline.
+// The read runs under the shared probe mapper, so its rows carry the
+// same window ids the streamed updates merge onto. codexBin is the
+// resolved codex binary; hostAuth selects whether the host's existing
+// CLI login is projected into the probe's isolated home. An empty
+// binary (codex not installed) disables the probe: the attempt records
 // nothing and the heartbeat keeps omitting the codex entry.
 func codexQuotaProbe(codexBin string, hostAuth bool) quotaProbeFunc {
 	return func(ctx context.Context, q *quotaState) {
 		at := time.Now()
-		feed := func(accountID, plan string, probed agent.UsageLimits) {
-			q.noteCodexProbe(accountID, plan, probed, at)
-		}
 		if codexBin == "" {
-			feed("", "", agent.MakeUnavailableUsageLimits(agent.ISOTime(at), agent.UsageUnavailableProbeFailed, "Codex did not answer the usage request."))
+			q.noteCodexProbe("", "", agent.MakeUnavailableUsageLimits(agent.ISOTime(at), agent.UsageUnavailableProbeFailed, "Codex did not answer the usage request."), at)
 			return
 		}
-		provider, err := providercodex.New(providercodex.Options{
+		// The daemon probes its configured binary with the login selector
+		// omitted: empty selects the existing default host resolution.
+		// Construction, startup, reads, failure cleanup and shutdown are
+		// all bound by the attempt context; a missing host login yields an
+		// unknown snapshot that advances the clock but records no verdict.
+		accountID, plan, probed := providercodex.ProbeQuotaForLogin(ctx, providercodex.Options{
 			CodexBin:         codexBin,
 			HostSessionAuth:  hostAuth,
 			HandshakeTimeout: quotaProbeTimeout / 2,
 			RPCTimeout:       providercodex.RateLimitsProbeTimeout,
-		})
-		if err != nil {
-			// No host login, no isolated home: the attempt never
-			// reached the provider, so it advances the clock but
-			// records no verdict.
-			feed("", "", agent.MakeUnavailableUsageLimits(agent.ISOTime(at), agent.UsageUnavailableProbeFailed, "Codex did not answer the usage request."))
-			return
-		}
-		accountID, plan, probed := provider.ProbeQuota(ctx)
-		defer func() {
-			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			_ = provider.Shutdown(shutdownCtx)
-		}()
-		feed(accountID, plan, probed)
+		}, "")
+		q.noteCodexProbe(accountID, plan, probed, at)
 	}
 }
 
