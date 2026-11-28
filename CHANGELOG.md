@@ -10,6 +10,32 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 No unreleased changes.
 
+## v0.73.18 — 2026-11-28
+
+### Features
+
+- Emit event model v2 plans, reasoning and progress ids
+- Add gitignore-style path rules that fail closed
+- Translation report and effective-settings echo
+
+### Fixes
+
+- Match tool-permission denies by their Claude meaning in the approval bridge
+- Forward turn-result review findings to the control plane
+- Readable file changes, moderation and tool results
+- Enforce path-scoped Read/Edit/Write denies through toolpolicy
+- Enforce Claude-grammar tool denies and allows through toolpolicy
+
+### Chores
+
+- Bump the actions group across 1 directory with 2 updates
+- Single update origin with opt-in scheduled pull and link-time default
+- Materialize negotiated documents in execution workarea
+- Consume heartbeat update defaults below host-local configuration
+- Add read-only catalog access-program probe
+- Bound tool output the Gemini harness hands the model; keep the runner oversize warning for harness-bounded results
+- Scan declared login homes and retain each result locally
+
 ## v0.73.17 — 2026-11-25
 
 ### Chores
